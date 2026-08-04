@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const usage = `yip -- a telephone between agents working the same tree.
@@ -34,6 +35,7 @@ COMMANDS
   yip ring                  what is waiting for me
   yip read [call]           print a transcript
   yip say  [call]           speak; body on stdin
+  yip note [call]           one-way; no floor, no reply owed; body on stdin
   yip bye  [call]           propose hanging up
   yip presence [peer]       what everyone is doing
   yip busy <text> [pids..]  declare what I am doing ("" clears)
@@ -43,6 +45,42 @@ COMMANDS
   yip whoami                which agent this checkout is
   yip setup                 print the config (for pasting by hand)
   yip doctor                check the setup
+
+WAITING WITHOUT POLLING
+
+  yip watch                 one line per event, forever (for a monitor)
+  yip watch --once          exit after the first event (for a background wait)
+  yip watch --replay        include what is already there
+  yip watch --interval 5s   how often to look (default 2s)
+  yip watch --timeout 30s   give up waiting (default 10m with --once, else never)
+
+  Exit 0 = an event arrived. Exit 3 = the deadline passed with nothing, which
+  is NOT the same as success and must not be read as it.
+
+  Nobody should poll in a shell. Arm it and be woken:
+
+    Monitor(command: "yip watch", persistent: true)
+    Bash(run_in_background: true, command: "yip watch --once")
+
+WHEN YOU DISAGREE -- name a measurement, not a winner
+
+  yip dispute "<claim>"     open one
+  yip dispute               list them, with what to do next
+  yip measure [id] "<cmd>"  say what would settle it ("none" is a real answer)
+  yip settled [id] "<how>"  record that it is over
+
+  If both sides name the SAME measurement, run it -- no human needed. If
+  NEITHER can name one, the disagreement is not factual: it is a value or
+  scope call, and that is the human's by right.
+
+THE HUMAN SEAT
+
+  yip ratify [call]         speak into the call AS THE HUMAN; body on stdin
+                            (--by <name>, defaults to $USER)
+
+  Deliberately CLI-only: there is no MCP tool for it, so an agent has no verb
+  that can produce a human turn. "The human decides" is unenforceable when the
+  only channel is agent-relayed -- this is the seat that fixes it.
 
 Every command takes --as <agent> to override recorded membership.
 The transcript is plain markdown under $YIP_ROOT/calls/<id>/turns/ --
@@ -242,6 +280,102 @@ func main() {
 			}
 			fmt.Printf("%s%-40s %s->%s  %d turns  %s  %s\n", mark, c.ID, c.From, c.To, len(turns), state, c.Subject)
 		}
+	case "note":
+		me := must(WhoAmI(as, ""))
+		c, err := ResolveCall(first(args), me)
+		check(err)
+		body := stdinBody()
+		n, err := AppendNote(c, me, AuthorAgent, body)
+		check(err)
+		fmt.Printf("note %d on %s (floor unchanged: %s)\n", n, c.ID, floorOf(c))
+	case "ratify":
+		// The human seat. No MCP tool exists for this on purpose.
+		by := os.Getenv("USER")
+		args, by = takeFlag(args, "--by", by)
+		if by == "" {
+			by = "human"
+		}
+		who := must(WhoAmI(as, ""))
+		c, err := ResolveCall(first(args), who)
+		check(err)
+		n, err := AppendNote(c, by, AuthorHuman, stdinBody())
+		check(err)
+		fmt.Printf("ratification %d recorded on %s as %s (human)\n", n, c.ID, by)
+	case "watch":
+		me := must(WhoAmI(as, ""))
+		var ivs, dls string
+		args, ivs = takeFlag(args, "--interval", "2s")
+		once := hasFlag(args, "--once")
+		// A one-shot wait is bounded by default; an explicit stream is not,
+		// because something else (a persistent monitor, a human) stops it.
+		def := "0"
+		if once {
+			def = "10m"
+		}
+		args, dls = takeFlag(args, "--timeout", def)
+		iv, err := time.ParseDuration(ivs)
+		check(err)
+		dl, err := time.ParseDuration(dls)
+		check(err)
+		if err := Watch(me, iv, dl, once, hasFlag(args, "--replay")); err != nil {
+			// 3 = nothing happened, which is not the same as a failure and
+			// must not read as success either.
+			fmt.Fprintln(os.Stderr, "yip:", err)
+			os.Exit(3)
+		}
+	case "dispute":
+		me := must(WhoAmI(as, ""))
+		var callID string
+		args, callID = takeFlag(args, "--call", "")
+		c, err := ResolveCall(callID, me)
+		check(err)
+		if claim := first(args); claim != "" {
+			d, err := NewDispute(c, me, claim)
+			check(err)
+			fmt.Printf("dispute %s opened on %s\n  %s\n\nBoth sides now name a measurement:\n  yip measure %s \"<cmd>\"\n",
+				d.ID, c.ID, d.Claim, d.ID)
+			return
+		}
+		ds, err := ListDisputes(c)
+		check(err)
+		if len(ds) == 0 {
+			fmt.Printf("no disputes on %s\n", c.ID)
+			return
+		}
+		for _, d := range ds {
+			fmt.Printf("%s  %s\n  %s\n", d.ID, d.Claim, DisputeStatus(c, d))
+			for a, m := range Measurements(c, d) {
+				fmt.Printf("    %-10s %s\n", a+":", m.Cmd)
+			}
+		}
+	case "measure":
+		me := must(WhoAmI(as, ""))
+		var callID string
+		args, callID = takeFlag(args, "--call", "")
+		c, err := ResolveCall(callID, me)
+		check(err)
+		id, cmdStr := "", first(args)
+		if len(args) > 1 {
+			id, cmdStr = args[0], args[1]
+		}
+		d, err := ResolveDispute(c, id)
+		check(err)
+		check(SetMeasurement(c, d, me, cmdStr))
+		fmt.Printf("%s recorded for %s\n%s\n", me, d.ID, DisputeStatus(c, d))
+	case "settled":
+		me := must(WhoAmI(as, ""))
+		var callID string
+		args, callID = takeFlag(args, "--call", "")
+		c, err := ResolveCall(callID, me)
+		check(err)
+		id, how := "", first(args)
+		if len(args) > 1 {
+			id, how = args[0], args[1]
+		}
+		d, err := ResolveDispute(c, id)
+		check(err)
+		check(SetResolution(c, d, Resolution{By: me, Kind: "measured", Detail: how, At: now()}))
+		fmt.Printf("%s resolved\n", d.ID)
 	case "whoami":
 		me, err := WhoAmI(as, "")
 		check(err)
@@ -268,6 +402,47 @@ func first(a []string) string {
 		return a[0]
 	}
 	return ""
+}
+
+// takeFlag pulls "--name value" (or "--name=value") out of args and returns
+// what is left, so positional parsing downstream stays simple.
+func takeFlag(args []string, name, def string) ([]string, string) {
+	val, out := def, args[:0:0]
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == name && i+1 < len(args):
+			val = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], name+"="):
+			val = strings.TrimPrefix(args[i], name+"=")
+		default:
+			out = append(out, args[i])
+		}
+	}
+	return out, val
+}
+
+func hasFlag(args []string, name string) bool {
+	for _, a := range args {
+		if a == name {
+			return true
+		}
+	}
+	return false
+}
+
+func stdinBody() string {
+	b, err := io.ReadAll(os.Stdin)
+	check(err)
+	if len(strings.TrimSpace(string(b))) == 0 {
+		check(fmt.Errorf("nothing on stdin"))
+	}
+	return string(b)
+}
+
+func floorOf(c *Call) string {
+	turns, _ := Turns(c)
+	return FloorHolder(c, turns)
 }
 
 func must(s string, err error) string {

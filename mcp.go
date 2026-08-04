@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -109,6 +110,54 @@ func tools() []toolDef {
 			InputSchema: obj(map[string]any{
 				"call": str("Call id. Omit when only one call is open."),
 			}),
+		},
+		{
+			Name: "note",
+			Description: "Say something ONE-WAY: no floor transfer, no reply owed, and it does not clear a " +
+				"pending bye. Use it for the traffic that should be cheap -- a correction to something you " +
+				"already said, a ratification you received, a heads-up that you are stopping. " +
+				"IT CANNOT CARRY A DECISION: there is no way to reply to a note, so it cannot be used to ask " +
+				"the peer to choose. If you need the peer to decide, take the floor and say(). " +
+				"Reach for this instead of stuffing news into busy(), and instead of barging.",
+			InputSchema: obj(map[string]any{
+				"call":      str("Call id. Omit when only one call is open."),
+				"body":      str("What you are telling them, inline."),
+				"body_path": str("Path to a file holding it. Prefer this for anything long."),
+			}),
+		},
+		{
+			Name: "dispute",
+			Description: "When you and the peer disagree, open a dispute instead of arguing. Then BOTH sides " +
+				"name what measurement would settle it (see measure). Same measurement -> run it, nobody else " +
+				"needed. Different ones -> run both. NEITHER side can name one -> that is the signal the " +
+				"disagreement is not factual at all; it is a value or scope call and belongs to the human. " +
+				"Omit claim to list the open disputes and what to do next.",
+			InputSchema: obj(map[string]any{
+				"call":  str("Call id. Omit when only one call is open."),
+				"claim": str("The disputed claim, one line. Omit to list."),
+			}),
+		},
+		{
+			Name: "measure",
+			Description: "Name the measurement that would settle a dispute -- a command to run, a file to read, " +
+				"an experiment. Be concrete: 'git grep -c page_budget kernel/', not 'check the code'. " +
+				"\"none\" is a real and useful answer: it means you believe no measurement can settle this, " +
+				"which is exactly what distinguishes a factual disagreement from a judgment call.",
+			InputSchema: obj(map[string]any{
+				"call":    str("Call id. Omit when only one call is open."),
+				"dispute": str("Dispute id. Omit when only one is open."),
+				"cmd":     str("The measurement, or \"none\"."),
+			}, "cmd"),
+		},
+		{
+			Name: "attach",
+			Description: "Hand the peer a FILE. It is copied into the call at send time, so it cannot change " +
+				"under them and the transcript stays self-contained. Use it instead of quoting a long artifact " +
+				"into a turn -- they can still verify it independently, they just do not have to retype it first.",
+			InputSchema: obj(map[string]any{
+				"call": str("Call id. Omit when only one call is open."),
+				"path": str("File to hand over."),
+			}, "path"),
 		},
 		{
 			Name:        "ring",
@@ -299,6 +348,14 @@ func (s *server) call(name string, a map[string]any) (string, error) {
 		return s.doWait(a)
 	case "bye":
 		return s.doBye(a)
+	case "note":
+		return s.doNote(a)
+	case "dispute":
+		return s.doDispute(a)
+	case "measure":
+		return s.doMeasure(a)
+	case "attach":
+		return s.doAttach(a)
 	case "ring":
 		return RingText(s.me)
 	case "presence":
@@ -313,6 +370,89 @@ func (s *server) call(name string, a map[string]any) (string, error) {
 		return "declared: " + argStr(a, "text"), nil
 	}
 	return "", fmt.Errorf("unknown tool %q", name)
+}
+
+// doNote deliberately does NOT clear byes and does NOT check the floor. That
+// is the whole point: a note cannot create an obligation, so it cannot be used
+// as a cheap assertion.
+func (s *server) doNote(a map[string]any) (string, error) {
+	c, err := ResolveCall(argStr(a, "call"), s.me)
+	if err != nil {
+		return "", err
+	}
+	txt, err := body(a)
+	if err != nil {
+		return "", err
+	}
+	n, err := AppendNote(c, s.me, AuthorAgent, txt)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("note %d left on %s (%d bytes). The floor is unchanged (%s) and no reply is owed.",
+		n, c.ID, len(txt), floorOf(c)), nil
+}
+
+func (s *server) doDispute(a map[string]any) (string, error) {
+	c, err := ResolveCall(argStr(a, "call"), s.me)
+	if err != nil {
+		return "", err
+	}
+	if claim := argStr(a, "claim"); claim != "" {
+		d, err := NewDispute(c, s.me, claim)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("dispute %s opened.\n  %s\n\nNow BOTH sides name a measurement with measure(). "+
+			"If you cannot think of one, say \"none\" -- that is a real answer and it is what tells us this "+
+			"is a judgment call rather than a fact.", d.ID, d.Claim), nil
+	}
+	ds, err := ListDisputes(c)
+	if err != nil {
+		return "", err
+	}
+	if len(ds) == 0 {
+		return "no disputes on " + c.ID, nil
+	}
+	var b strings.Builder
+	for _, d := range ds {
+		fmt.Fprintf(&b, "%s  %s\n  %s\n", d.ID, d.Claim, DisputeStatus(c, d))
+		for agent, m := range Measurements(c, d) {
+			fmt.Fprintf(&b, "    %-10s %s\n", agent+":", m.Cmd)
+		}
+	}
+	return b.String(), nil
+}
+
+func (s *server) doMeasure(a map[string]any) (string, error) {
+	c, err := ResolveCall(argStr(a, "call"), s.me)
+	if err != nil {
+		return "", err
+	}
+	d, err := ResolveDispute(c, argStr(a, "dispute"))
+	if err != nil {
+		return "", err
+	}
+	cmd := argStr(a, "cmd")
+	if strings.TrimSpace(cmd) == "" {
+		return "", fmt.Errorf("give a measurement, or \"none\" if you believe none exists")
+	}
+	if err := SetMeasurement(c, d, s.me, cmd); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("recorded for %s.\n%s", d.ID, DisputeStatus(c, d)), nil
+}
+
+func (s *server) doAttach(a map[string]any) (string, error) {
+	c, err := ResolveCall(argStr(a, "call"), s.me)
+	if err != nil {
+		return "", err
+	}
+	dst, err := Attach(c, s.me, argStr(a, "path"))
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("copied into the call as %s -- it is a snapshot, so it cannot change under them:\n  %s",
+		filepath.Base(dst), dst), nil
 }
 
 func (s *server) doCall(a map[string]any) (string, error) {
