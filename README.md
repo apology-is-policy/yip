@@ -112,39 +112,72 @@ message.
 
 ## Layout
 
-    $YIP_ROOT/                        default ~/projects/.thylacine-relay
+    ~/.yip/lines/<line-id>/
+      members.json                    checkout path -> agent name
       calls/0001-<slug>/
         call.json                     written once, never rewritten
         turns/0001-aux.md             one atomic create per turn
         bye-<agent>                   marker; both present => closed
         agent-<name>.json             seen / blocked / notified; one writer
       presence/<agent>.json
-      yip                             the binary
 
-Mailboxes live **outside** every worktree deliberately. Worktrees are on
+A line lives **outside** every checkout deliberately. Checkouts are on
 different branches, so a file committed on one is invisible to the others
 until merged -- which is the very thing a merge conversation is trying to
 coordinate.
 
+The line id is a readable name plus a short digest of the path it was derived
+from, so two unrelated repositories with the same name cannot end up sharing a
+line by accident.
+
 ## Identity
 
-Derived from the worktree, not from config, so two sessions cannot be
-misconfigured into answering to the same name:
-
-    thylacine       -> main
-    thylacine-aux   -> aux
-    thylacine-<x>   -> <x>
+**Recorded at install, keyed by the checkout's absolute path** -- not derived
+from a naming convention, and not a name a session picks for itself. Two
+sessions therefore cannot answer to one name (install refuses a name another
+checkout already holds), and a peer's location is a known fact rather than a
+guess, which is what lets yip read the peer's HEAD directly.
 
 `--as <agent>` overrides.
 
 ## Install
 
-    go build -o ~/projects/.thylacine-relay/yip .
-    ~/projects/.thylacine-relay/yip init
-    ~/projects/.thylacine-relay/yip setup     # prints the config to paste
+Put the binary anywhere on your PATH, then run this in each checkout that
+should be able to talk:
 
-`setup` emits the `.mcp.json` and the three hook blocks for the worktree you
-run it in.
+    yip install
+
+That is the whole setup. It:
+
+- works out which **line** the checkout belongs to (see below),
+- writes `.mcp.json` and `.claude/settings.json`, **merging** into whatever is
+  already there rather than overwriting it,
+- records who lives where.
+
+Then restart Claude Code and run `yip doctor`.
+
+    yip install --as reviewer      name this checkout explicitly
+    yip install --line myproject   group checkouts that share no repository
+    yip install --local            use .claude/settings.local.json instead
+    yip uninstall                  remove the config and leave the line
+
+**Worktrees of one repository join the same line automatically** -- they share
+a git common dir, which is what the line is keyed on. Separate clones have no
+such link, so group them with `--line <name>`.
+
+Two notes on what install writes:
+
+- The hook command is guarded (`[ ! -x <bin> ] || <bin> hook ...`), so a
+  checkout on a machine without yip is unaffected rather than erroring on
+  every tool call.
+- It is **idempotent**. Re-installing replaces our entries instead of stacking
+  another copy, identified by an explicit `# yip-line-hook` marker rather than
+  by the binary's name -- the name and path are yours to choose, and matching
+  on those would duplicate the hooks for anyone who renamed it.
+
+If two worktrees of one repo merge into each other, prefer `--local` and
+gitignore `.mcp.json`: the binary path is host-specific, and a tracked config
+file in one branch collides with an untracked one in the other.
 
 ## Commands
 

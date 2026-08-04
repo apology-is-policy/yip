@@ -23,10 +23,7 @@ import (
 	"time"
 )
 
-const (
-	relayDirName = ".thylacine-relay"
-	maxTurnBytes = 32 << 20
-)
+const maxTurnBytes = 32 << 20
 
 func homeDir() string {
 	if h, err := os.UserHomeDir(); err == nil {
@@ -35,21 +32,13 @@ func homeDir() string {
 	return "/"
 }
 
-// projectsDir is the parent holding every worktree. All mailboxes live in a
-// sibling of the worktrees so that a message is visible to all of them at
-// once -- a file committed on one branch is not.
-func projectsDir() string {
-	if v := os.Getenv("YIP_PROJECTS"); v != "" {
-		return v
-	}
-	return filepath.Join(homeDir(), "projects")
-}
-
+// Root is the active line's directory: the shared place a group of checkouts
+// talk through. YIP_ROOT forces an explicit one (tests, odd layouts).
 func Root() string {
 	if v := os.Getenv("YIP_ROOT"); v != "" {
 		return v
 	}
-	return filepath.Join(projectsDir(), relayDirName)
+	return lineDirFor(activeLine)
 }
 
 func callsDir() string    { return filepath.Join(Root(), "calls") }
@@ -66,8 +55,10 @@ func EnsureRoot() error {
 
 // ---------------------------------------------------------------- identity
 
-// WhoAmI resolves the calling agent from its worktree, not from config, so
-// two sessions cannot be misconfigured into answering to the same name.
+// WhoAmI resolves the calling agent from RECORDED membership keyed by the
+// checkout's path -- not from a naming convention, and not from a name the
+// session chooses for itself. Two sessions therefore cannot answer to one
+// name, and the answer does not depend on how anybody named a directory.
 func WhoAmI(override, cwd string) (string, error) {
 	if override != "" {
 		return override, nil
@@ -75,34 +66,16 @@ func WhoAmI(override, cwd string) (string, error) {
 	if v := os.Getenv("YIP_AGENT"); v != "" {
 		return v, nil
 	}
-	if cwd == "" {
-		cwd, _ = os.Getwd()
+	root := checkoutRoot(cwd)
+	if a := LoadMembers().AgentAt(root); a != "" {
+		return a, nil
 	}
-	top, err := gitTopLevel(cwd)
-	if err != nil {
-		return "", fmt.Errorf("not in a worktree (%s): pass --as", cwd)
-	}
-	return agentFromWorktree(filepath.Base(top))
+	return "", fmt.Errorf("%s is not on line %s -- run `yip install` here (or pass --as)", root, activeLine)
 }
 
-// thylacine -> main, thylacine-<x> -> <x>. Generalizes to worktrees that do
-// not exist yet without a config edit.
-func agentFromWorktree(base string) (string, error) {
-	if base == "thylacine" {
-		return "main", nil
-	}
-	if s, ok := strings.CutPrefix(base, "thylacine-"); ok && s != "" {
-		return s, nil
-	}
-	return "", fmt.Errorf("cannot derive an agent name from worktree %q: pass --as", base)
-}
-
-func worktreeFor(agent string) string {
-	if agent == "main" {
-		return filepath.Join(projectsDir(), "thylacine")
-	}
-	return filepath.Join(projectsDir(), "thylacine-"+agent)
-}
+// worktreeFor is a lookup, not a guess: a peer's checkout is a fact recorded
+// when it joined.
+func worktreeFor(agent string) string { return LoadMembers().PathOf(agent) }
 
 func gitTopLevel(dir string) (string, error) {
 	out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output()
@@ -116,6 +89,9 @@ func gitTopLevel(dir string) (string, error) {
 // machine, so the stamp on a message is measured, never assumed.
 func GitTip(agent string) (sha, branch string) {
 	dir := worktreeFor(agent)
+	if dir == "" {
+		return "", ""
+	}
 	if out, err := exec.Command("git", "-C", dir, "rev-parse", "--short", "HEAD").Output(); err == nil {
 		sha = strings.TrimSpace(string(out))
 	}

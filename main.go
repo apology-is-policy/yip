@@ -11,6 +11,24 @@ import (
 
 const usage = `yip -- a telephone between agents working the same tree.
 
+SETTING UP A LINE
+
+  Run this in each checkout that should be able to talk:
+
+    yip install
+
+  It joins the line, writes .mcp.json and .claude/settings.json (MERGING
+  into whatever is already there), and records who lives where. Worktrees
+  of one repository land on the same line automatically. Separate clones
+  need --line <name> to be grouped. Then restart Claude Code.
+
+    yip install --as reviewer      name this checkout explicitly
+    yip install --line myproject   group checkouts that share no repo
+    yip install --local            use .claude/settings.local.json instead
+    yip uninstall                  remove the config and leave the line
+
+COMMANDS
+
   yip serve                 MCP server over stdio (what the agents use)
   yip hook <event>          hook handler: posttooluse | stop | sessionstart
   yip ring                  what is waiting for me
@@ -21,11 +39,12 @@ const usage = `yip -- a telephone between agents working the same tree.
   yip busy <text> [pids..]  declare what I am doing ("" clears)
   yip beat                  stamp a heartbeat
   yip calls                 list calls
-  yip whoami                which agent this worktree is
-  yip setup                 print the config to paste into a worktree
+  yip line                  the line and everyone on it
+  yip whoami                which agent this checkout is
+  yip setup                 print the config (for pasting by hand)
   yip doctor                check the setup
 
-Every command takes --as <agent> to override worktree detection.
+Every command takes --as <agent> to override recorded membership.
 The transcript is plain markdown under $YIP_ROOT/calls/<id>/turns/ --
 readable with cat, so nothing here is ever required to read a message.
 `
@@ -51,13 +70,81 @@ func main() {
 			rest = append(rest, all[i])
 		}
 	}
+	// --line groups checkouts that share no repository.
+	var line string
+	var local bool
+	var rest2 []string
+	for i := 0; i < len(rest); i++ {
+		switch {
+		case rest[i] == "--line" && i+1 < len(rest):
+			line = rest[i+1]
+			i++
+		case strings.HasPrefix(rest[i], "--line="):
+			line = strings.TrimPrefix(rest[i], "--line=")
+		case rest[i] == "--local":
+			local = true
+		default:
+			rest2 = append(rest2, rest[i])
+		}
+	}
+	rest = rest2
+
 	if len(rest) == 0 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
 	cmd, args := rest[0], rest[1:]
 
+	// Every command but install needs to know which line it is on before it
+	// can find anything; install resolves its own.
+	if cmd != "install" {
+		switch {
+		case line != "":
+			activeLine = slugify(line)
+		case os.Getenv("YIP_LINE") != "":
+			activeLine = slugify(os.Getenv("YIP_LINE"))
+		default:
+			id, err := resolveLine("")
+			if err == nil {
+				activeLine = id
+			}
+		}
+	}
+
 	switch cmd {
+	case "install":
+		res, err := Install("", line, as, local)
+		check(err)
+		verb := "joined"
+		if res.Reinstall {
+			verb = "rejoined"
+		}
+		fmt.Printf("%s line %q as %q\n", verb, res.Line, res.Agent)
+		fmt.Printf("  line dir: %s\n", res.LineDir)
+		fmt.Printf("  binary:   %s\n", res.Bin)
+		fmt.Printf("  wrote:    %s\n", res.McpPath)
+		fmt.Printf("  wrote:    %s\n", res.HookPath)
+		if len(res.Peers) > 0 {
+			fmt.Printf("  peers:    %s\n", strings.Join(res.Peers, ", "))
+		} else {
+			fmt.Printf("  peers:    none yet -- run `yip install` in another checkout\n")
+		}
+		fmt.Printf("\nRestart Claude Code here, then `yip doctor`.\n")
+	case "uninstall":
+		check(Uninstall(""))
+		fmt.Println("left the line; config removed")
+	case "line":
+		fmt.Printf("line:     %s\n", activeLine)
+		fmt.Printf("line dir: %s\n", Root())
+		m := LoadMembers()
+		if len(m.Members) == 0 {
+			fmt.Println("members:  none -- run `yip install`")
+			return
+		}
+		fmt.Println("members:")
+		for _, name := range m.Names() {
+			fmt.Printf("  %-16s %s\n", name, m.PathOf(name))
+		}
 	case "serve":
 		me := must(WhoAmI(as, ""))
 		if err := Serve(me); err != nil {
@@ -199,7 +286,13 @@ func binPath() string {
 	if v := os.Getenv("YIP_BIN"); v != "" {
 		return v
 	}
-	return filepath.Join(Root(), "yip")
+	if p, err := os.Executable(); err == nil {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return r
+		}
+		return p
+	}
+	return "yip"
 }
 
 func printSetup(me string) {
@@ -247,28 +340,40 @@ func doctor(as string) {
 		fmt.Printf("%s %s\n", mark, fmt.Sprintf(f, a...))
 	}
 
+	root := checkoutRoot("")
 	me, err := WhoAmI(as, "")
 	say(err == nil, "identity: %v", orErr(me, err))
-	say(fileExists(Root()), "relay root: %s", Root())
-	say(fileExists(binPath()), "binary: %s", binPath())
+	say(true, "line: %s", activeLine)
+	say(fileExists(Root()), "line dir: %s", Root())
 
-	if err == nil {
-		for _, peer := range []string{"main", "aux", "vault"} {
-			if peer == me {
-				continue
-			}
-			wt := worktreeFor(peer)
-			if !fileExists(wt) {
-				continue
-			}
-			sha, br := GitTip(peer)
-			p, seen := LoadPresence(peer)
-			state := "no presence yet"
-			if seen {
-				state = fmt.Sprintf("last beat %s", describeAge(p.Age()))
-			}
-			say(sha != "", "peer %s: %s %s -- %s", peer, br, sha, state)
+	// "wrote the file" and "the file says what we meant" are different
+	// claims, so check the config CONTENT, not that install ran.
+	mcpOK, hooksIn := hookInstalled(root)
+	say(mcpOK, "mcp server declared in %s/.mcp.json", root)
+	say(hooksIn != "", "hooks declared in .claude/%s", orDash(hooksIn))
+
+	m := LoadMembers()
+	for _, peer := range m.Names() {
+		if peer == me {
+			continue
 		}
+		wt := m.PathOf(peer)
+		sha, br := GitTip(peer)
+		p, seen := LoadPresence(peer)
+		state := "no presence yet"
+		if seen {
+			state = fmt.Sprintf("last beat %s", describeAge(p.Age()))
+		}
+		if sha == "" {
+			say(fileExists(wt), "peer %s: %s -- %s", peer, wt, state)
+		} else {
+			say(true, "peer %s: %s %s -- %s", peer, br, sha, state)
+		}
+	}
+	if len(m.Members) < 2 {
+		say(true, "peers: none yet -- run `yip install` in another checkout")
+	}
+	if err == nil {
 		if rings, err := RingFor(me); err == nil {
 			say(true, "ringing: %d", len(rings))
 		}
@@ -276,6 +381,13 @@ func doctor(as string) {
 	if !ok {
 		os.Exit(1)
 	}
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "(none found)"
+	}
+	return s
 }
 
 func orErr(s string, err error) string {
