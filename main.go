@@ -213,6 +213,11 @@ func printSetup(me string) {
 }
 `, bin)
 	fmt.Printf("\n## .claude/settings.json  (merge the hooks block into what is there)\n\n")
+	// Guarded so the config is harmless where the binary is absent: a missing
+	// yip means the hook does nothing, rather than erroring every tool call.
+	g := func(event string) string {
+		return fmt.Sprintf("[ ! -x %s ] || %s hook %s", bin, bin, event)
+	}
 	fmt.Printf(`{
   "hooks": {
     "PostToolUse": [
@@ -227,7 +232,7 @@ func printSetup(me string) {
     ]
   }
 }
-`, bin+" hook posttooluse", bin+" hook stop", bin+" hook sessionstart")
+`, g("posttooluse"), g("stop"), g("sessionstart"))
 }
 
 func doctor(as string) {
