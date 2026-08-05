@@ -46,6 +46,7 @@ install: build
 	@echo "installed $(BIN)"
 
 test:
+	$(GO) test ./...
 	@# e2e.sh runs /tmp/yiptest. Building it HERE is not a convenience: without
 	@# it the suite silently exercises whatever stale binary was left there,
 	@# which is a green run that proves nothing about this tree.

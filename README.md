@@ -145,6 +145,43 @@ it.
 
 ---
 
+## The switchboard
+
+```
+yip switchboard          watch it live; ratify and arbitrate from the seat
+```
+
+```
+ 0002-the-merge-instruction   [floor:aux]  (1/2)
+TURN  08:33 aux    #1
+    24 files, 53 hunks. Two hard collisions.
+HUMAN 08:33 michal #2
+    approved: renumber to 104/105
+─ presence ── disputes ────────────────────────────────
+ aux  LIVE 4s  a1b2c3d aux-2   │ > 001  is this worth building
+ main LIVE 9s  e4f5g6h main    │     ESCALATE
+   busy: SMP gate, 40 boots    │   002  does exec charge the budget
+                               │     OPEN
+ [r]atify  [a]rbitrate  [d]ispute-sel  [f]ollow on  [tab]call  [q]uit
+```
+
+**It has no key that speaks as an agent, and that is the design, not an
+omission.** The floor is what makes an assertion expensive; a seat that let
+anyone fire off a quick turn would be the fast lane this whole protocol exists
+to prevent. The only two things it can write are the two that are the human's
+alone — a ratification (`r`) and a resolution on a dispute (`a`).
+
+A test enforces exactly that: it drives every printable key through the input
+handler and asserts the turn count is unchanged. It fails the moment somebody
+adds a convenient `s`-for-say, which is precisely the change that would look
+harmless in review.
+
+Hand-rolled ANSI over `stty`, so the zero dependencies survive. It is three
+panes and a prompt; the alternative was taking this program's first dependency
+to get raw mode and a box.
+
+---
+
 ## Notes — one-way, and unable to carry a decision
 
 ```
@@ -345,6 +382,7 @@ yip read [call]           print a transcript
 yip say  [call]           speak; body on stdin
 yip note [call]           one-way; no floor, no reply owed
 yip ratify [call]         speak as the HUMAN (no MCP tool exists)
+yip switchboard           the human's live seat (--by <name>)
 yip watch                 stream events (--once, --replay, --timeout)
 yip dispute ["claim"]     open one, or list with what to do next
 yip measure [id] "<cmd>"  name what would settle it
@@ -368,8 +406,12 @@ Every command takes `--as <agent>` to override recorded membership.
 make test
 ```
 
-27 assertions over an isolated line. Three notes on how they are written, all
-learned the hard way:
+15 Go tests plus 27 e2e assertions over an isolated line. Four notes on how
+they are written, all learned the hard way:
+
+- The switchboard's rule test drives every printable key and asserts no TURN
+  appeared. Revert-probed by adding the very `s`-for-say it forbids: it fails
+  with `a key wrote a TURN: 1 -> 2`.
 
 - The doctor leg's specimen is a **script that kills itself**, not a genuinely
   poisoned binary. The real reproduction is not deterministic — 1 of 4 attempts

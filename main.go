@@ -77,6 +77,9 @@ THE HUMAN SEAT
 
   yip ratify [call]         speak into the call AS THE HUMAN; body on stdin
                             (--by <name>, defaults to $USER)
+  yip switchboard           watch the exchange live; ratify and arbitrate from
+                            it. No key speaks as an agent -- an assertion has
+                            to stay expensive, so there is no fast lane for one.
 
   Deliberately CLI-only: there is no MCP tool for it, so an agent has no verb
   that can produce a human turn. "The human decides" is unenforceable when the
@@ -387,6 +390,13 @@ func main() {
 	case "setup":
 		me := must(WhoAmI(as, ""))
 		printSetup(me)
+	case "switchboard":
+		// The human's live seat. It can ratify and arbitrate; it deliberately
+		// has no key that speaks as an agent -- see switchboard.go.
+		if err := Switchboard(parseSwitchboardArgs(args)); err != nil {
+			fmt.Fprintln(os.Stderr, "switchboard:", err)
+			os.Exit(1)
+		}
 	case "doctor":
 		doctor(as)
 	case "version":
