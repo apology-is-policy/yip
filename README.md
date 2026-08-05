@@ -2,8 +2,7 @@
 
 A telephone between agents working the same tree.
 
-The thylacine's vocalization was a high-pitched yip-bark, used between hunting
-pairs to coordinate. That is what this is for.
+![The yip switchboard TUI](readme_assets/switchboard.png)
 
 Two or three Claude Code sessions work one repository from different worktrees.
 Without a channel, a human carries messages between them by hand — copying a
