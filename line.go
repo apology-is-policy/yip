@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -232,8 +233,17 @@ func Install(cwd, lineOverride, asOverride string, local bool) (*installResult, 
 	res.McpPath = filepath.Join(root, ".mcp.json")
 
 	hookFile := "settings.json"
+	other := "settings.local.json"
 	if local {
-		hookFile = "settings.local.json"
+		hookFile, other = other, hookFile
+	}
+	// One checkout, one registration. Idempotence used to hold only WITHIN a
+	// file, so `install` followed by `install --local` left BOTH live: six hook
+	// execs per tool call, naming two binary paths that can disagree about
+	// which build is current. Observed on a real checkout, and it made a dead
+	// binary hard to attribute because two were configured.
+	if err := stripHooks(root, other); err != nil {
+		return nil, err
 	}
 	if err := writeHooks(root, bin, hookFile); err != nil {
 		return nil, err
@@ -344,6 +354,99 @@ func hookCommand(bin, event string) string {
 	return fmt.Sprintf("[ ! -x %s ] || %s hook %s  %s", bin, bin, event, hookMarker)
 }
 
+// binFromHookCmd is hookCommand's inverse. The two are COUPLED BY FORMAT and
+// nothing in the type system says so, which is why `doctor` asserts the round
+// trip end-to-end rather than trusting this to keep matching.
+func binFromHookCmd(cmd string) string {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(cmd), "[ ! -x ")
+	if !ok {
+		return ""
+	}
+	bin, _, ok := strings.Cut(rest, " ]")
+	if !ok {
+		return ""
+	}
+	return bin
+}
+
+// configuredBins reports every distinct binary path this checkout's config
+// names -- across .mcp.json AND both settings files.
+//
+// It exists because "the config names us" and "the thing it names can run" are
+// different claims, and only the first was ever checked.
+//
+// MEASURED on macOS/arm64: overwriting the binary in place while a process is
+// running from it can leave that path permanently SIGKILL-on-exec -- valid on
+// disk, passing `codesign -v`, dead at every exec, and it does not clear when
+// the holder exits. The symptom is `Killed: 9` inside a hook error, with
+// nothing in the message naming yip. See the Makefile for the measurement.
+func configuredBins(root string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(p string) {
+		if p != "" && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	if m, err := readJSON(filepath.Join(root, ".mcp.json")); err == nil {
+		if servers, ok := m["mcpServers"].(map[string]any); ok {
+			if y, ok := servers["yip"].(map[string]any); ok {
+				cmd, _ := y["command"].(string)
+				add(cmd)
+			}
+		}
+	}
+	for _, f := range []string{"settings.json", "settings.local.json"} {
+		m, err := readJSON(filepath.Join(root, ".claude", f))
+		if err != nil {
+			continue
+		}
+		hooks, _ := m["hooks"].(map[string]any)
+		for _, ev := range []string{"PostToolUse", "Stop", "SessionStart"} {
+			arr, _ := hooks[ev].([]any)
+			for _, g := range arr {
+				if !isYipGroup(g) {
+					continue
+				}
+				gm, _ := g.(map[string]any)
+				hs, _ := gm["hooks"].([]any)
+				for _, h := range hs {
+					hm, _ := h.(map[string]any)
+					cmd, _ := hm["command"].(string)
+					add(binFromHookCmd(cmd))
+				}
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// BinRuns answers only "does this exec at all". An exit code of -1 means the
+// process was terminated by a SIGNAL, which is the whole point: a binary that
+// runs and reports an error is fine here, one that never gets to report
+// anything is not.
+func BinRuns(bin string) (ok bool, detail string) {
+	if st, err := os.Stat(bin); err != nil {
+		return false, "missing"
+	} else if st.Mode()&0o111 == 0 {
+		return false, "not executable"
+	}
+	err := exec.Command(bin, "whoami").Run()
+	if err == nil {
+		return true, ""
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		if ee.ProcessState.ExitCode() == -1 {
+			return false, "killed by a signal -- reinstall it (see `make install`)"
+		}
+		return true, "" // ran, said no; that is not our question
+	}
+	return false, err.Error()
+}
+
 func isYipGroup(group any) bool {
 	g, _ := group.(map[string]any)
 	hooks, _ := g["hooks"].([]any)
@@ -429,12 +532,16 @@ func stripHooks(root, file string) error {
 
 // hookInstalled reports whether a checkout's config actually names us --
 // "wrote the file" and "the file says what we meant" are different claims.
-func hookInstalled(root string) (mcp bool, hooksIn string) {
+func hookInstalled(root string) (mcp bool, hooksIn []string) {
 	if m, err := readJSON(filepath.Join(root, ".mcp.json")); err == nil {
 		if servers, ok := m["mcpServers"].(map[string]any); ok {
 			_, mcp = servers["yip"]
 		}
 	}
+	// Every file is reported, NOT just the first. Two files can each carry a
+	// full registration -- `install` then `install --local` used to leave both
+	// -- and stopping at the first hides the duplicate that makes a broken
+	// binary hard to attribute.
 	for _, f := range []string{"settings.json", "settings.local.json"} {
 		m, err := readJSON(filepath.Join(root, ".claude", f))
 		if err != nil {
@@ -451,8 +558,7 @@ func hookInstalled(root string) (mcp bool, hooksIn string) {
 			}
 		}
 		if n > 0 {
-			hooksIn = fmt.Sprintf("%s (%d/3)", f, n)
-			break
+			hooksIn = append(hooksIn, fmt.Sprintf("%s (%d/3)", f, n))
 		}
 	}
 	return

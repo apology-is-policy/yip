@@ -93,6 +93,24 @@ ck "artifact crossed" "the union list" "$(cat "$YIP_ROOT"/calls/*/attachments/* 
 echo "MUTATED AFTER SENDING" > /tmp/yip-artifact.txt
 ckn "cannot change under the reader" "MUTATED" "$(cat "$YIP_ROOT"/calls/*/attachments/* 2>/dev/null)"
 
+echo "=== 12. doctor checks the configured binary RUNS, not just that it is named ==="
+# The real specimen is a binary overwritten in place while mapped, which on
+# macOS can end up permanently SIGKILLed at exec. That reproduction is NOT
+# deterministic (1 of 4 attempts did not take), and a flaky gate is worse than
+# no gate -- so the specimen here is a script that kills itself, which reaches
+# the same branch (`ExitCode() == -1`, terminated by a signal) every time.
+D=/tmp/yip-doctor-test
+rm -rf $D; mkdir -p $D/.claude
+printf '#!/bin/sh\nkill -9 $$\n' > $D/badbin && chmod +x $D/badbin
+printf '{"mcpServers":{"yip":{"command":"%s","args":["serve"]}}}\n' "$D/badbin" > $D/.mcp.json
+out=$(cd $D && $Y doctor --as probe 2>&1)
+ck "names the dead binary"  "DOES NOT RUN"      "$out"
+ck "says a signal killed it" "killed by a signal" "$out"
+# The control matters as much as the specimen: a detector that reports
+# everything dead would pass the assertion above and be useless.
+printf '{"mcpServers":{"yip":{"command":"%s","args":["serve"]}}}\n' "$Y" > $D/.mcp.json
+ckn "a WORKING binary is not reported dead" "DOES NOT RUN" "$(cd $D && $Y doctor --as probe 2>&1)"
+
 echo; echo "=========================================="
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi
 exit $fails

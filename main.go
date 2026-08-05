@@ -525,7 +525,28 @@ func doctor(as string) {
 	// claims, so check the config CONTENT, not that install ran.
 	mcpOK, hooksIn := hookInstalled(root)
 	say(mcpOK, "mcp server declared in %s/.mcp.json", root)
-	say(hooksIn != "", "hooks declared in .claude/%s", orDash(hooksIn))
+	say(len(hooksIn) > 0, "hooks declared in .claude/%s", orDash(strings.Join(hooksIn, ", ")))
+	// One checkout, one registration. Two files each carrying a full set means
+	// every event fires twice, at paths that can name different builds.
+	if len(hooksIn) < 2 {
+		say(true, "single registration")
+	} else {
+		say(false, "TWO registrations (%s) -- every event fires twice; re-run `yip install`",
+			strings.Join(hooksIn, " + "))
+	}
+
+	// And the third claim, which nothing used to check: the thing the config
+	// NAMES actually runs. A binary overwritten in place while something is
+	// running from it can end up permanently SIGKILLed at exec, and the only
+	// symptom is `Killed: 9` inside a hook error that never mentions yip.
+	for _, bin := range configuredBins(root) {
+		runs, why := BinRuns(bin)
+		if runs {
+			say(true, "binary runs: %s", bin)
+		} else {
+			say(false, "binary DOES NOT RUN: %s -- %s", bin, why)
+		}
+	}
 
 	m := LoadMembers()
 	for _, peer := range m.Names() {

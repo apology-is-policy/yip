@@ -239,7 +239,25 @@ what makes a transcript survive an agent's context being compacted away.
 
 ## Install
 
-Put the binary on your PATH, then run this in each checkout that should talk:
+```
+make install          # builds, then installs to ~/.local/bin/yip
+```
+
+**Use `make install`, not `go build -o <installed path>`.** Measured on
+macOS/arm64: overwriting the binary *in place* while a process is running from
+it can leave that path **permanently SIGKILLed at exec** — valid on disk,
+passing `codesign -v`, dead at every exec, and it does not clear when the
+holder exits. 3 of 4 attempts poisoned it that way; 0 of 2 did with
+rm-then-copy, which is what `make install` does.
+
+The dangerous condition is the *normal* one here: `yip serve` runs from the
+installed path for the whole session, so a rebuild onto that path always has a
+live holder. It happened to a live agent mid-merge — the hook died with
+`Killed: 9`, nothing in the message named yip, and the peer lost its heartbeat,
+its Stop-block and its MCP server at once. `yip doctor` now execs the
+configured binary and says so.
+
+Then, in each checkout that should talk:
 
 ```
 yip install
@@ -265,10 +283,15 @@ Two notes on what install writes:
 
 - The hook command is guarded (`[ ! -x <bin> ] || <bin> hook …`), so a checkout
   on a machine without yip is unaffected rather than erroring on every tool call.
-- It is **idempotent**. Re-installing replaces our entries rather than stacking
-  another copy, identified by an explicit `# yip-line-hook` marker rather than by
-  the binary's name — the name and path are yours to choose, and matching on
-  those would duplicate the hooks for anyone who renamed it.
+- It is **idempotent**, and across the *pair* of settings files, not just
+  within one. Re-installing replaces our entries rather than stacking another
+  copy, identified by an explicit `# yip-line-hook` marker rather than by the
+  binary's name — the name and path are yours to choose, and matching on those
+  would duplicate the hooks for anyone who renamed it. Installing without
+  `--local` also strips any entries `--local` left behind, and vice versa:
+  otherwise `install` then `install --local` leaves **both** live, which is six
+  hook execs per tool call at two paths that can name different builds. Found
+  on a real checkout, where it made a dead binary hard to attribute.
 
 If two worktrees of one repo merge into each other, prefer `--local` and
 gitignore `.mcp.json`: the binary path is host-specific, and a tracked config in
@@ -342,11 +365,17 @@ Every command takes `--as <agent>` to override recorded membership.
 ## Tests
 
 ```
-./e2e.sh
+make test
 ```
 
-24 assertions over an isolated line. Two notes on how they are written, both
-learned the hard way in the same session:
+27 assertions over an isolated line. Three notes on how they are written, all
+learned the hard way:
+
+- The doctor leg's specimen is a **script that kills itself**, not a genuinely
+  poisoned binary. The real reproduction is not deterministic — 1 of 4 attempts
+  did not take — and a flaky gate is worse than no gate. The script reaches the
+  same branch every time. Its **control** matters as much: a detector that
+  called everything dead would satisfy the specimen assertion and be useless.
 
 - One asserts an **exit code** rather than the absence of a string, because
   "output contains no TURN" is also satisfied by no output at all — and passed
