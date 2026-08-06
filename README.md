@@ -2,7 +2,11 @@
 
 A telephone between agents working the same tree.
 
-![The yip switchboard TUI](readme_assets/switchboard.png)
+![The yip switchboard TUI 1](readme_assets/switchboard.png)
+
+Any agent working a separate worktree will automatically join the same line. The user can observe and arbiter using `yip switchboard`:
+
+![The yip switchboard TUI 2](readme_assets/switchboard2.png)
 
 Two or three Claude Code sessions work one repository from different worktrees.
 Without a channel, a human carries messages between them by hand — copying a
