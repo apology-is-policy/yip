@@ -380,6 +380,47 @@ func (v *view) disputeLines(w int) []string {
 	return out
 }
 
+// resourceLines is the right half of the main pane: who holds each machine and
+// who is queued behind them.
+//
+// Read live rather than through loadState because this is the panel whose whole
+// value is being current -- the operator looks at it to answer "is anybody
+// blocked right now", and a cached answer to that is worse than none. Two small
+// file reads per frame.
+func (v *view) resourceLines(w int) []string {
+	var out []string
+	add := func(s string) { out = append(out, trunc(s, w)) }
+	for _, r := range knownResources {
+		l, held := LoadLease(r.Name)
+		q := Queue(r.Name)
+		switch {
+		case !held:
+			add(sgrBold + r.Name + sgrReset + " " + sgrDim + "free" + sgrReset)
+		case l.Expired():
+			add(sgrBold + r.Name + sgrReset + " " + sgrBold + "EXPIRED" + sgrReset + " " + l.Holder)
+			add("  " + sgrDim + "ttl gone " + span(-l.Remaining()) + " -- still not free" + sgrReset)
+		default:
+			add(sgrBold + r.Name + sgrReset + " " + l.Holder + " " + sgrDim + span(l.Remaining()) + " left" + sgrReset)
+		}
+		if held && l.Reason != "" {
+			for _, ln := range wrap(l.Reason, max(4, w-2)) {
+				add("  " + sgrDim + ln + sgrReset)
+			}
+		}
+		if l.StolenFrom != "" {
+			add("  " + sgrBold + "STOLEN from " + l.StolenFrom + sgrReset)
+		}
+		for i, e := range q {
+			add(fmt.Sprintf("  %s%d. %s waiting %s%s", sgrDim, i+1, e.Agent, span(time.Since(e.sinceTime())), sgrReset))
+		}
+		add("")
+	}
+	if len(out) == 0 {
+		add(sgrDim + "no resources" + sgrReset)
+	}
+	return out
+}
+
 // render builds the WHOLE frame into one buffer and writes it once. Positioning
 // each row and clearing to end-of-line means there is never a clear-then-draw
 // gap, so no flicker and no partial frame.
@@ -419,20 +460,48 @@ func (v *view) render() {
 		transH = 3
 	}
 
-	lines := v.transcriptLines(cols - 1)
+	// The main pane splits vertically: transcript left, shared machines right.
+	// The resource panel earns a permanent seat rather than a keystroke because
+	// the question it answers -- is a peer blocked on something I am holding --
+	// is one the operator needs ambiently, and would never think to ask.
+	resW := cols / 3
+	if resW > 40 {
+		resW = 40
+	}
+	if resW < 18 || cols < 60 {
+		resW = 0 // too narrow to split; transcript takes the whole width
+	}
+	transW := cols - 1
+	if resW > 0 {
+		transW = cols - resW - 3
+	}
+
+	lines := v.transcriptLines(transW)
 	if v.follow {
 		v.scroll = max(0, len(lines)-transH)
 	}
 	if v.scroll > max(0, len(lines)-1) {
 		v.scroll = max(0, len(lines)-1)
 	}
+	var res []string
+	if resW > 0 {
+		res = v.resourceLines(resW)
+	}
 	for i := 0; i < transH; i++ {
 		idx := v.scroll + i
+		l := ""
 		if idx < len(lines) {
-			put(lines[idx])
-		} else {
-			put("")
+			l = lines[idx]
 		}
+		if resW == 0 {
+			put(l)
+			continue
+		}
+		r := ""
+		if i < len(res) {
+			r = res[i]
+		}
+		put(padVisible(l, transW) + sgrDim + "│" + sgrReset + " " + r)
 	}
 
 	rule("─ presence ── disputes ")

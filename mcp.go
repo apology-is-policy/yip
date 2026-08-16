@@ -184,6 +184,40 @@ func tools() []toolDef {
 					"description": "Process ids you own, so the peer leaves them alone."},
 			}, "text"),
 		},
+		{
+			Name: "resources",
+			Description: "Who holds each shared machine, for how much longer, and who is queued. " +
+				"Non-blocking. Answers 'should I wait or go do something else', which `ps` cannot: " +
+				"an idle machine and one BETWEEN PHASES of a peer's gate are identical on every " +
+				"measurable dimension, so only a declared lease settles it.",
+			InputSchema: obj(map[string]any{}),
+		},
+		{
+			Name: "hold",
+			Description: "Take a shared machine, blocking until it is free (bounded; default 60s, max 600s). " +
+				"Acquire this BEFORE anything that needs cores -- a build, TLC, a QEMU boot, a gate. " +
+				"Holding means no peer STARTS work there; it is NOT a licence to kill what is already " +
+				"running. FIFO: your queue place survives re-issuing a bounded wait. " +
+				"Leases expire on WALL CLOCK, never on heartbeat -- a peer running a 40-minute gate in " +
+				"one call goes silent while very much holding the machine.",
+			InputSchema: obj(map[string]any{
+				"resource":  str("Which machine: mac (the 8-core dev host, incl. the thyla-gl VM) or pi (thyla-pi)."),
+				"reason":    str("What you will do with it. Required -- announce the RESOURCE and the UNCERTAINTY, not a duration you cannot honour."),
+				"ttl_s":     num("How long you expect to hold it, seconds. Default 7200, max 28800. A backstop against a dead agent, not a promise."),
+				"timeout_s": num("How long to block waiting. Default 60, max 600. Re-issue to keep your place."),
+				"pids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"},
+					"description": "Process ids this work owns, so a peer can attribute them."},
+			}, "resource", "reason"),
+		},
+		{
+			Name: "release",
+			Description: "Give a machine back and resolve the next waiter's block. " +
+				"Release when the RESOURCE frees, not when your workflow finishes: pushing, verifying and " +
+				"writing up need no cores, and a peer idles for every minute of it.",
+			InputSchema: obj(map[string]any{
+				"resource": str("Which machine to release."),
+			}, "resource"),
+		},
 	}
 }
 
@@ -360,6 +394,21 @@ func (s *server) call(name string, a map[string]any) (string, error) {
 		return RingText(s.me)
 	case "presence":
 		return presenceText(argStr(a, "peer"), s.me)
+	case "resources":
+		return ResourcesText(s.me), nil
+	case "hold":
+		return s.doHold(a)
+	case "release":
+		name := argStr(a, "resource")
+		l, err := Release(name, s.me)
+		if err != nil {
+			return "", err
+		}
+		if q := Queue(name); len(q) > 0 {
+			return fmt.Sprintf("released %s after %s -- %s is next and their wait will resolve now.",
+				name, span(l.Age()), q[0].Agent), nil
+		}
+		return fmt.Sprintf("released %s after %s -- nobody is waiting.", name, span(l.Age())), nil
 	case "busy":
 		if err := SetBusy(s.me, argStr(a, "text"), argInts(a, "pids")); err != nil {
 			return "", err
@@ -607,6 +656,31 @@ func (s *server) doWait(a map[string]any) (string, error) {
 	}
 	return fmt.Sprintf("no reply within %s. %s is in a session but has not spoken -- "+
 		"the turn stays queued, so carry on and check ring later.", timeout, peer), nil
+}
+
+// doHold mirrors doWait's bounded-blocking shape: an unbounded wait would hold
+// the agent's turn open with no way for a human to interrupt it, and re-issuing
+// is cheap because queue position survives.
+func (s *server) doHold(a map[string]any) (string, error) {
+	name := argStr(a, "resource")
+	reason := argStr(a, "reason")
+	if strings.TrimSpace(reason) == "" {
+		return "", fmt.Errorf("hold needs a reason -- a lease nobody can read has the legibility of a stale busy flag, which is the thing this replaces")
+	}
+	ttl := time.Duration(argInt(a, "ttl_s", int(defaultTTL/time.Second))) * time.Second
+	timeout := time.Duration(argInt(a, "timeout_s", 60)) * time.Second
+	if timeout > 600*time.Second {
+		timeout = 600 * time.Second
+	}
+	if timeout < 0 {
+		timeout = 0
+	}
+	start := time.Now()
+	got, cur, pos, err := Acquire(name, s.me, reason, ttl, timeout, argInts(a, "pids"))
+	if err != nil {
+		return "", err
+	}
+	return HoldText(name, s.me, got, cur, pos, time.Since(start)), nil
 }
 
 func (s *server) doBye(a map[string]any) (string, error) {

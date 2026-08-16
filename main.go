@@ -39,6 +39,21 @@ COMMANDS
   yip bye  [call]           propose hanging up
   yip presence [peer]       what everyone is doing
   yip busy <text> [pids..]  declare what I am doing ("" clears)
+
+SHARED MACHINES -- take the lock, do not measure the machine
+
+  yip resources             who holds what, how long left, who is queued
+  yip hold <res> <reason>   take it, blocking until free (--wait 60s, --now)
+                            --for 2h sets the TTL; trailing pids register work
+  yip release <res>         give it back; the next waiter's block resolves
+  yip steal <res> <why>     take an EXPIRED lease. Recorded. Tell them.
+
+  A quiet machine is NOT a free one: an idle host and one BETWEEN PHASES of
+  a peer's gate are identical on every dimension you can measure. Only the
+  holder's word ends a claim -- so leases expire on WALL CLOCK, never on a
+  heartbeat, because a 40-minute gate in one call beats not at all.
+
+  Holding means nobody else STARTS. It is not a licence to kill what runs.
   yip beat                  stamp a heartbeat
   yip calls                 list calls
   yip line                  the line and everyone on it
@@ -260,6 +275,73 @@ func main() {
 		}
 		check(SetBusy(me, args[0], pids))
 		fmt.Println("ok")
+	case "resources":
+		me, _ := WhoAmI(as, "")
+		fmt.Println(ResourcesText(me))
+	case "hold":
+		me := must(WhoAmI(as, ""))
+		var ttlS, waitS string
+		args, ttlS = takeFlag(args, "--for", "2h")
+		args, waitS = takeFlag(args, "--wait", "60s")
+		for i, a := range args {
+			if a == "--now" {
+				args = append(args[:i:i], args[i+1:]...)
+				waitS = "0s"
+				break
+			}
+		}
+		if len(args) < 2 {
+			check(fmt.Errorf("usage: yip hold <%s> <reason> [--for 2h] [--wait 60s] [--now] [pid...]",
+				strings.Join(ResourceNames(), "|")))
+		}
+		name := args[0]
+		reason := ""
+		var pids []int
+		for _, a := range args[1:] {
+			if n, err := strconv.Atoi(a); err == nil {
+				pids = append(pids, n)
+				continue
+			}
+			if reason != "" {
+				reason += " "
+			}
+			reason += a
+		}
+		if strings.TrimSpace(reason) == "" {
+			check(fmt.Errorf("hold needs a reason -- a lease nobody can read is a lock with the legibility of a stale flag"))
+		}
+		ttl, err := time.ParseDuration(ttlS)
+		check(err)
+		wait, err := time.ParseDuration(waitS)
+		check(err)
+		start := time.Now()
+		got, cur, pos, err := Acquire(name, me, reason, ttl, wait, pids)
+		check(err)
+		fmt.Println(HoldText(name, me, got, cur, pos, time.Since(start)))
+		if !got {
+			os.Exit(1)
+		}
+	case "release":
+		me := must(WhoAmI(as, ""))
+		if len(args) < 1 {
+			check(fmt.Errorf("usage: yip release <%s>", strings.Join(ResourceNames(), "|")))
+		}
+		l, err := Release(args[0], me)
+		check(err)
+		if q := Queue(args[0]); len(q) > 0 {
+			fmt.Printf("released %s after %s -- %s is next and their wait will resolve.\n",
+				args[0], span(l.Age()), q[0].Agent)
+		} else {
+			fmt.Printf("released %s after %s -- nobody is waiting.\n", args[0], span(l.Age()))
+		}
+	case "steal":
+		me := must(WhoAmI(as, ""))
+		if len(args) < 2 {
+			check(fmt.Errorf("usage: yip steal <resource> <why>   (EXPIRED leases only; recorded)"))
+		}
+		l, err := Steal(args[0], me, strings.Join(args[1:], " "))
+		check(err)
+		fmt.Printf("STOLE %s from %s. Recorded, and it is on you to tell them.\nwhy: %s\n", args[0], l.StolenFrom, l.StealWhy)
 	case "beat":
 		me := must(WhoAmI(as, ""))
 		check(Beat(me, ""))
