@@ -37,12 +37,16 @@ package main
 // WHAT THIS DELIBERATELY DOES NOT DO: it grants no licence to kill a peer's
 // processes. Holding a resource means nobody else STARTS; it does not mean
 // anything already running is a trespasser. On the day this was designed the
-// host carried a `caffeinate` belonging to a FOURTH session that no agent had
-// registered, and a QEMU that neither of the two active agents could account
-// for. "In violation" is an inference, and the inferences were wrong all day.
-// The costs are also wildly asymmetric: killing a peer's gate at boot 39 of 40
-// destroys 40 minutes AND the evidence, while tolerating a freeloader costs
-// some wall clock. So: report, notify, escalate -- see ViolationAdvice.
+// host carried a `caffeinate` that one agent attributed to "a FOURTH session
+// no agent had registered", and a QEMU that neither active agent could account
+// for. The fourth session turned out to be that agent's OWN claude (`--resume
+// aux_gfx` is aux's conversation) -- the census had no control, and the
+// control was its own identity. That correction sharpens the point rather
+// than weakening it: "in violation" is an inference, and the inferences were
+// wrong all day, from both sides. The costs are also wildly asymmetric:
+// killing a peer's gate at boot 39 of 40 destroys 40 minutes AND the
+// evidence, while tolerating a freeloader costs some wall clock. So: report,
+// notify, escalate -- see ViolationAdvice.
 
 import (
 	"encoding/json"

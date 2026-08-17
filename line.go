@@ -447,6 +447,17 @@ func BinRuns(bin string) (ok bool, detail string) {
 	return false, err.Error()
 }
 
+// BinVersion asks the wired binary what it is, so doctor can tell "runs" from
+// "is the build you meant". Empty when it cannot answer -- a build older than
+// the version subcommand, or a dead path (BinRuns reports that separately).
+func BinVersion(bin string) string {
+	out, err := exec.Command(bin, "version").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func isYipGroup(group any) bool {
 	g, _ := group.(map[string]any)
 	hooks, _ := g["hooks"].([]any)

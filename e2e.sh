@@ -109,7 +109,23 @@ ck "says a signal killed it" "killed by a signal" "$out"
 # The control matters as much as the specimen: a detector that reports
 # everything dead would pass the assertion above and be useless.
 printf '{"mcpServers":{"yip":{"command":"%s","args":["serve"]}}}\n' "$Y" > $D/.mcp.json
-ckn "a WORKING binary is not reported dead" "DOES NOT RUN" "$(cd $D && $Y doctor --as probe 2>&1)"
+out=$(cd $D && $Y doctor --as probe 2>&1)
+ckn "a WORKING binary is not reported dead" "DOES NOT RUN" "$out"
+# "runs" is not "is this build". Two real installs three weeks apart both ran
+# and both said 0.1.0. The wired binary must report the SAME version as the
+# doctor asking, or be named STALE with both paths.
+ck  "the same build is reported current" "current" "$out"
+ckn "the same build is not STALE" "STALE" "$out"
+
+echo "=== 13. doctor tells a stale wired binary from the current one ==="
+# The specimen: a binary that runs fine and answers `version` with something
+# else. That is exactly what an older real install looks like from here.
+printf '#!/bin/sh\ncase "$1" in version) echo 0.0.0-elsewhere;; *) exit 0;; esac\n' > $D/oldbin && chmod +x $D/oldbin
+printf '{"mcpServers":{"yip":{"command":"%s","args":["serve"]}}}\n' "$D/oldbin" > $D/.mcp.json
+out=$(cd $D && $Y doctor --as probe 2>&1)
+ck  "names the stale binary"        "STALE"           "$out"
+ck  "quotes its version"            "0.0.0-elsewhere" "$out"
+ckn "and does not call it dead"     "DOES NOT RUN"    "$out"
 
 echo; echo "=========================================="
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi

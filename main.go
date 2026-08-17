@@ -631,12 +631,29 @@ func doctor(as string) {
 	// NAMES actually runs. A binary overwritten in place while something is
 	// running from it can end up permanently SIGKILLed at exec, and the only
 	// symptom is `Killed: 9` inside a hook error that never mentions yip.
+	// And the FOURTH claim, which "runs" cannot make: the wired binary is THIS
+	// build. Two installs at two paths, three weeks apart, both ran and both
+	// answered "0.1.0" -- so a checkout wired to the old one passed doctor and
+	// still had no lease tools after a restart. Compare what the wired binary
+	// SAYS its version is against what this one says. Different answers mean a
+	// stale install: re-run `yip install [--local]` from the current binary and
+	// restart Claude Code (the running server keeps its old inode).
+	self := binPath()
 	for _, bin := range configuredBins(root) {
 		runs, why := BinRuns(bin)
-		if runs {
-			say(true, "binary runs: %s", bin)
-		} else {
+		if !runs {
 			say(false, "binary DOES NOT RUN: %s -- %s", bin, why)
+			continue
+		}
+		v := BinVersion(bin)
+		switch {
+		case v == serverVersion:
+			say(true, "binary runs, current (%s): %s", v, bin)
+		case v == "":
+			say(false, "binary runs but reports no version: %s -- older than `yip version`; reinstall", bin)
+		default:
+			say(false, "binary STALE: %s reports %s, this yip (%s) is %s -- re-run `yip install` from the current binary, then restart Claude Code",
+				bin, v, self, serverVersion)
 		}
 	}
 

@@ -231,6 +231,56 @@ the advisor decided"* is the relay problem with an extra step.
 
 ---
 
+## Shared machines — take the lease, do not measure the machine
+
+```
+yip resources             who holds what, how long left, who is queued
+yip hold <res> <reason>   take it, blocking until free (--wait 60s, --now)
+                          --for 2h sets the TTL; trailing pids register work
+yip release <res>         give it back; the next waiter's block resolves
+yip steal <res> <why>     take an EXPIRED lease. Recorded. Tell them.
+```
+
+Three agents shared one 8-core Mac, and "is it free?" turned out to have **no
+local answer**. In one day all three wrote waiters for it and all three were
+wrong. The instructive one required zero QEMU *and* zero builds *and* low load
+— and fired into the gap between a peer's build and its boot, taking the cores
+out from under a running control. **A machine between phases is identical to
+an idle machine on every dimension a machine exposes.** The difference is
+intent, and intent is not on the machine; no detector settles it at any
+sensitivity. A lease is testimony where every waiter was measurement.
+
+Three design points, each the correction of a first draft:
+
+- **The resource is a physical machine**, not a tool. "QEMU" and "CPU" as
+  separate locks would let two agents hold two leases and saturate one set of
+  cores while the protocol told both they were fine. QEMU, a `cargo build -j`,
+  a TLC run and a sanitizer build contend for one thing, so they are one class.
+- **Leases expire on wall clock, never on heartbeat.** A beat is written per
+  *tool call*, not per unit of work, so an agent running a 40-minute gate in
+  one blocking call goes silent while very much holding the machine (measured:
+  "36m ago" mid-gate). Heartbeat expiry would have handed its cores away at
+  minute 3. A test pins this. And an **expired lease is not an open one** — it
+  takes a deliberate `steal` with a reason, which is recorded; a lease that
+  silently evaporates is the original bug with a timer attached.
+- **Holding is no licence to kill.** It means nobody else *starts*. "In
+  violation" is an inference, and on the day this was designed the inferences
+  were wrong from both sides — one agent's "unregistered fourth session" was
+  its own claude. Identify by cwd (`ps` does not distinguish worktrees),
+  notify, give grace, escalate. Killing a peer's gate at boot 39 of 40 destroys
+  the work and the evidence, and the killer never sees what they destroyed.
+
+Mutual exclusion is `link(2)` onto the lease file — a compare-and-set, never a
+read-then-write. FIFO by request time, tie-broken by agent name (RFC3339 is
+second-granular, and `sort.Slice` is not stable). A bounded `hold` can be
+re-issued without losing your place.
+
+The registry is currently compiled in (`knownResources` in `resource.go`:
+`mac`, `pi`). Edit it for your machines; a per-line `resources.json` is the
+obvious next step.
+
+---
+
 ## Artifacts
 
 ```
@@ -307,6 +357,13 @@ That is the whole setup. It works out which **line** the checkout belongs to,
 writes `.mcp.json` and `.claude/settings.json` (**merging** into whatever is
 already there), and records who lives where. Then restart Claude Code and run
 `yip doctor`.
+
+`doctor` also asks the **wired** binary for its version and compares it with
+its own. Two installs three weeks apart both ran and both said `0.1.0`, so a
+checkout wired to the old path passed every check and still had no new tools
+after a restart. Versions are now stamped from `git describe` by `make`, so
+"binary runs" and "binary is this build" are separate lines — a stale wiring
+fails loudly with the two paths named.
 
 ```
 yip install --as reviewer      name this checkout explicitly
@@ -393,6 +450,11 @@ yip settled [id] "<how>"  record that it is over
 yip bye  [call]           propose hanging up
 yip presence [peer]       what everyone is doing
 yip busy <text> [pids..]  declare what I am doing ("" clears)
+yip beat                  stamp a heartbeat
+yip resources             who holds each shared machine, for how long, who waits
+yip hold <res> <reason>   take a machine (bounded wait; --for TTL; pids)
+yip release <res>         give it back
+yip steal <res> <why>     take an EXPIRED lease; recorded
 yip calls                 list calls
 yip line                  the line and everyone on it
 yip whoami                which agent this checkout is
@@ -409,7 +471,8 @@ Every command takes `--as <agent>` to override recorded membership.
 make test
 ```
 
-15 Go tests plus 27 e2e assertions over an isolated line. Four notes on how
+Go tests (including a 24-goroutine lease-exclusivity race under `-race`) plus
+the e2e assertions over an isolated line. Four notes on how
 they are written, all learned the hard way:
 
 - The switchboard's rule test drives every printable key and asserts no TURN

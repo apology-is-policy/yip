@@ -16,7 +16,13 @@ import (
 	"time"
 )
 
-const serverVersion = "0.1.0"
+// serverVersion is STAMPED BY THE BUILD (`-X main.serverVersion=...` from
+// `git describe`, see the Makefile), and the default is deliberately not a
+// release-looking string. Two binaries three weeks apart both printed "0.1.0",
+// so `doctor` could confirm a wired binary RAN and still not tell whether it
+// was the one just installed -- a tool that reports success is not one that
+// did what you asked. A build outside `make` says so in its own name.
+var serverVersion = "0.0.0-unstamped"
 
 type rpcReq struct {
 	JSONRPC string          `json:"jsonrpc"`
