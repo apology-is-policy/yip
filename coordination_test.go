@@ -81,6 +81,34 @@ func TestExpiredRequestRejoinsAtTail(t *testing.T) {
 		t.Fatalf("expired waiter jumped queue: %+v", qs)
 	}
 }
+
+func TestLegacyQueueAdoptionGetsStableIdentityWithoutReordering(t *testing.T) {
+	resTestRoot(t)
+	TryAcquire("mac", "main", "build", time.Hour, nil)
+	TryAcquire("mac", "astra", "legacy waiter", time.Minute, nil)
+	before, ok := loadRequest("mac", "astra")
+	if !ok || before.ID != "" {
+		t.Fatal("not a legacy entry", before)
+	}
+	got, _, pos, err := Request("mac", "astra", "durable waiter", time.Minute, nil)
+	if got || pos != 1 || err != nil {
+		t.Fatal(got, pos, err)
+	}
+	after, _ := loadRequest("mac", "astra")
+	if after.ID == "" || after.Since != before.Since {
+		t.Fatal("identity or position lost", before, after)
+	}
+	Request("mac", "astra", "same request", time.Minute, nil)
+	again, _ := loadRequest("mac", "astra")
+	if again.ID != after.ID {
+		t.Fatal("identity changed", after, again)
+	}
+	CancelRequest("mac", "astra")
+	history, _ := QueueHistory("mac")
+	if !strings.Contains(history, after.ID+" astra cancelled") {
+		t.Fatal(history)
+	}
+}
 func TestLifecycleDoesNotResolveByAge(t *testing.T) {
 	tmpLine(t)
 	c, e := NewCall("a", "b", "old question")

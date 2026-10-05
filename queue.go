@@ -160,6 +160,11 @@ func Request(name, agent, reason string, ttl time.Duration, pids []int) (bool, L
 		}
 		q = QueueEntry{ID: requestID(), Agent: agent, Since: time.Now().UTC().Format(time.RFC3339Nano)}
 	}
+	// Adopt a legacy hold entry without losing its FIFO timestamp, while giving
+	// the durable request the identity used by notifications and its history.
+	if q.ID == "" {
+		q.ID = requestID()
+	}
 	q.Reason = reason
 	q.Seen = now()
 	q.Expires = time.Now().Add(requestLifetime).UTC().Format(time.RFC3339)

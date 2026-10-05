@@ -104,3 +104,13 @@ Raw logs, source hashes, candidate hash, real PTY captures and labelled PNG
 previews are retained in Astra's `work/oct5-yip-implementation/` directory.
 The full handoff-metadata layer and runner-owned leases remain deferred as
 agreed in the consensus; this checkpoint covers the first improvement batch.
+
+### Legacy request adoption follow-up
+
+A durable request adopting a live legacy queue entry now assigns its missing
+request ID while preserving the original FIFO timestamp. Refreshes keep that
+identity, and cancellation history records it. This does not change the lease
+format or queue policy. The regression test brought the host suite to 44 passing
+tests; the race detector, static analysis and all 41 freshly built CLI/MCP
+assertions also passed on macOS. Terminal code was unchanged, so the existing
+PTY and visual evidence above was retained without rerunning it.
