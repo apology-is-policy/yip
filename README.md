@@ -1,557 +1,402 @@
 # yip
 
-A telephone between agents working the same tree.
+A telephone and switchboard for coding agents working in separate checkouts.
 
-![The yip switchboard TUI 1](readme_assets/switchboard.png)
+Yip gives agents a shared line for questions, handoffs, evidence and resource
+coordination. Conversations survive restarts and context compaction. A human
+can follow the exchange, record an approval, or settle a dispute from a live
+terminal interface.
 
-Any agent working a separate worktree will automatically join the same line. The user can observe and arbiter using `yip switchboard`:
+One Go binary. No external Go dependencies. Plain files you can read without Yip.
 
-![The yip switchboard TUI 2](readme_assets/switchboard2.png)
+<!-- Screenshot slot: replace readme_assets/switchboard.png with a current
+     Switchboard capture, then remove the temporary caption below. -->
+![Yip Switchboard](readme_assets/switchboard.png)
 
-Two or three Claude Code sessions work one repository from different worktrees.
-Without a channel, a human carries messages between them by hand — copying a
-merge instruction out of one terminal and pasting it into another, which is
-lossy for anything longer than a paragraph and impossible for a 14 KB one.
-`yip` gives them a real channel and leaves the human to say, at most, one word.
+*Screenshot from the earlier interface; a refreshed capture is forthcoming.*
 
+## What it does
+
+- **Calls with a floor:** agents take turns making requests and responding.
+- **Notes without obligations:** share an FYI without demanding another reply.
+- **A readable inbox:** distinguish active work from stale, deferred, archived
+  and resolved conversations; see unread turns and notes together.
+- **Explicit machine ownership:** leases, durable FIFO requests, cancellation,
+  phase and runner visibility, and a history of queue transitions.
+- **A human switchboard:** colored conversations, resource panels, agent contact
+  and branch information, and controls for approvals and dispute resolution.
+- **CLI and MCP access:** the same agent operations through either interface,
+  with hooks and event notifications to bring new work to an agent's attention.
+
+## Get started
+
+You need Go 1.25 or newer and Git. Switchboard also needs a terminal and `stty`.
+Python 3 is used only by the optional terminal smoke test.
+
+Build and install the executable:
+
+```sh
+make install                     # installs to ~/.local/bin/yip
 ```
-    aux                                   main
-     |-- call(main, "merge instruction") --->|   rings
-     |                                       |   reads, checks, has an insight
-     |<---------------- say ------------------|
-     |------------------ say ---------------->|
-     |                                       |   executes, hits a conflict
-     |<---------------- say ------------------|
-     |------------------ say ---------------->|
-     |-- bye --------------------------------->
-     |<-------------------------------- bye ---   both agree; closed
+
+Then register each participating checkout:
+
+```sh
+cd /path/to/checkout
+yip install --as main --local
+yip doctor
 ```
 
----
+Use a different name in each checkout. Restart or reconnect that agent's MCP
+server after installation so it discovers Yip's tools.
 
-## The rule the whole thing is built on
+Worktrees of the same Git repository automatically use the same line. Separate
+clones or unrelated repositories can share a named line:
+
+```sh
+yip install --as reviewer --line myproject --local
+```
+
+Registration merges Yip into `.mcp.json` and the Claude Code hook settings.
+`--local` selects `.claude/settings.local.json`; without it, installation uses
+`.claude/settings.json`. Registration is idempotent. Keep host-specific config
+out of Git when checkouts will merge with one another.
+
+```sh
+yip whoami                       # this checkout's registered identity
+yip line                         # its line and members
+yip doctor                       # identity, wiring, hooks and binary version
+yip uninstall                    # remove this checkout's registration/config
+```
+
+Identity is recorded against an absolute checkout path. `--as NAME` is an
+explicit override, not a second installation.
+
+### Upgrading an existing line
+
+Coordinate a brief pause in resource operations, install the replacement, then
+restart **every resource-coordinating client** before resuming. That includes
+standalone `yip hold` waiters, not just MCP servers. Quit and reopen Switchboard
+to load its new interface. Leave peers' builds, VMs and leases alone.
+
+Older clients do not understand durable request expiry, offer windows, renewal
+timestamps or the resource transaction lock. Transcripts and existing leases
+need no destructive migration, but mixed resource clients are not supported.
+
+**Use `make install`, not `go build -o ~/.local/bin/yip .`.** Replacing a running
+executable's contents in place caused reproducible SIGKILL-on-exec failures on
+macOS. The install target builds separately and replaces the installed file.
+An already-running MCP server keeps its old executable until restarted.
+`yip doctor` checks the configured binary on disk; it does not prove that an
+existing server process has restarted.
+
+## The Switchboard
+
+```sh
+yip switchboard
+yip switchboard --by your-name
+```
+
+Wide terminals show a conversation rail, transcript and shared-machine/agent
+panel. Smaller terminals keep the same information accessible through views.
+Human decisions use violet, waiting uses amber, and expired leases use coral;
+text labels carry the meaning even without color.
+
+Selection stays attached to the same call when new traffic reorders the list,
+including while you are typing an approval. Long text wraps, prompts accept
+UTF-8, and terminal settings are restored on normal exit and handled signals.
+
+| Key | Action |
+| --- | --- |
+| `1`, `2`, `3` | Conversation, desk, calls |
+| `Tab` / `n`, `p` | Next / previous call |
+| `j` / `k`, arrow keys | Scroll |
+| `g`, `G`, `f` | Top, follow the end, toggle following |
+| `r` | Record a human ratification on the selected call |
+| `d`, `a` | Select a dispute, arbitrate it |
+| `Enter`, `Esc` | Submit or cancel a prompt |
+| `?`, `q` | Key help, quit |
+
+```sh
+NO_COLOR=1 yip switchboard             # monochrome and static indicators
+YIP_REDUCED_MOTION=1 yip switchboard    # color, without activity animation
+```
+
+Activity indicators describe recent agent **contact**, not proof that a job is
+running. A resource shown as available means it has no lease; it is not a host
+reachability check. The desk shows free space on the current directory's
+filesystem, not a disk reservation.
+
+The human seat never writes an agent turn. Its only writes are human notes and
+dispute resolutions. These operations are deliberately absent from the agent
+MCP tool set; ordinary agent messages stay subject to the floor.
+
+## Calls, notes and the inbox
 
 > **An assertion must stay expensive. Everything else should be cheap.**
 
-An *assertion* is a claim that changes what the peer does. The **floor** is what
-makes one expensive: you may speak only if you did not write the last turn, so
-you get one shot — and that forces you to check before speaking rather than
-after being contradicted.
+A request or claim that changes a peer's work belongs in a call. The floor is
+permission to speak: ordinary turns alternate between participants. It is
+derived from the transcript rather than stored separately.
 
-**That expense is the feature.** It is not friction to be optimized away. In the
-exchange this was built from, two agents produced seven false-cleans between
-them and **not one survived**, because each was caught by the other side
-checking a claim about its own code. A cheap, fast channel would have produced a
-worse conversation: three "wait, actually—" messages per idea and none of the
-greps.
+```sh
+printf '%s\n' 'Please review this change before I merge it.' |
+  yip call aux 'Review request'
 
-So nothing here makes an ordinary turn cheaper. Everything here is for traffic
-that is **not** an assertion — corrections, ratifications, status, artifacts —
-and each verb is shaped so it cannot quietly become one.
-
----
-
-## Why atomic rename, not a lock
-
-A writer stages into `.tmp/` and hard-links the result into place. Three
-consequences, all structural rather than remembered:
-
-- A partial message is **unobservable**. The reader lists a directory that can
-  only ever contain complete files — there is no half-written state to guard.
-- A writer that dies mid-write leaves a fragment **nobody ever sees**. A
-  lock-holder that dies leaves a stale lock that blocks the peer forever, and an
-  agent session absolutely can die mid-write.
-- `os.Link` fails if the destination exists, so two writers racing the same turn
-  number cannot silently clobber one another; the loser re-renders.
-
-Maildir has run on this for thirty years for the same reasons.
-
-The **floor** is likewise *derived* from the turn files rather than stored, so it
-cannot disagree with the transcript it describes.
-
----
-
-## How the phone rings
-
-An agent between turns is not executing, so nothing can interrupt it. The ring
-is layered over the moments when it *is*:
-
-| Recipient is…                      | Mechanism       | Latency        |
-|------------------------------------|-----------------|----------------|
-| working (making tool calls)        | `PostToolUse`   | next tool call |
-| about to go idle owing a reply     | `Stop` (blocks) | immediate      |
-| opening, resuming, or post-compact | `SessionStart`  | at open        |
-| idle, owing nothing                | `yip watch`     | one interval   |
-
-The `Stop` hook is what makes an exchange *finish*: an agent cannot end its turn
-while the floor sits with it. `BlockedAt` is the loop guard — it blocks once per
-turn count, and speaking advances the count, so it re-arms without wedging.
-
-That last row used to read "irreducible — one word from the human". `watch`
-closed it.
-
----
-
-## Waiting without polling
-
-`wait()` needs a call that already exists, so learning that a peer *opened* one
-used to mean a hand-rolled shell loop. `watch` is an event stream instead: one
-line of stdout per event, which is exactly the shape an agent harness wants.
-
-```
-Monitor(command: "yip watch", persistent: true)     # every event, no blocking
-Bash(run_in_background: true, "yip watch --once")   # just the next one
+yip inbox
+yip read CALL
+printf '%s\n' 'Reviewed; the boundary case needs one correction.' | yip say CALL
+yip bye CALL
 ```
 
-An idle agent pays nothing to wait and is woken by its peer's write.
+`bye` proposes closing the call; both participants saying it closes the call.
+You can omit a call ID when exactly one active call involves you.
 
-`--once` is **bounded** (10m default). A tool that fixes somebody's poll loop by
-introducing an infinite one has done nothing. **Exit 0** means an event arrived;
-**exit 3** means the deadline passed with nothing — which is not success and
-must not be read as it.
+Use notes for information that needs no answer:
 
----
-
-## Presence
-
-Not every question needs a call. `presence` answers "is main running a gate",
-"whose QEMU is that", "what is aux's HEAD" by reading a file:
-
-```
-aux: LIVE, last beat 4s ago
-  tip a1b2c3d4 (aux-2)
-  busy: SMP gate, 40 boots, started 16:12
-  owns pids: [41234 41250] -- do not kill these
+```sh
+printf '%s\n' 'The evidence log is attached; no action needed.' | yip note CALL
+yip read CALL --since 4 --since-note 2
 ```
 
-The hook stamps last contact (it does not prove runner liveness); you declare `busy` (says
-what you are doing).
+Turn and note numbers are independent. Notes do not transfer the floor, clear
+bye markers or create a stop-hook obligation. Do not put a question in a note
+and expect the peer to treat it as a request.
 
----
+### Lifecycle and unread work
 
-## The human seat
+The floor is not a permanent obligation to revive every old conversation.
+After 48 hours without a turn, a call becomes visibly **stale**, retaining its
+unresolved status. Silence never means agreement.
 
-```
-yip ratify [call]        speak into the call AS THE HUMAN; body on stdin
-```
-
-**Deliberately CLI-only. There is no MCP tool for it**, so an agent has no verb
-that can produce a human turn. That is the enforcement, not a convention.
-
-The gap it closes is a correctness one. "Some decisions are the human's" is
-unenforceable when the only channel is agent-relayed — a peer saying *"the human
-approved"* converts *the human decides* into *an agent told me the human
-decided*, and those differ exactly when the guarantee is being tested. This was
-observed live: one agent relayed an approval, the other correctly refused to act
-on it, and resolving it cost a context switch. `ratify` is the seat that fixes
-it.
-
----
-
-## The switchboard
-
-```
-yip switchboard          watch it live; ratify and arbitrate from the seat
+```sh
+yip inbox --all
+yip api call_status '{"call":"CALL","state":"deferred","reason":"Waiting for evidence"}'
+yip api call_status '{"call":"CALL","state":"open","reason":"Evidence is ready"}'
+yip api call_status '{"call":"CALL","state":"resolved","reason":"The decision is recorded"}'
+yip api call_status '{"call":"CALL","state":"archived","reason":"Keep for later reference"}'
+yip api call_status '{"call":"CALL","state":"linked","related":"OTHER_CALL","reason":"Same issue"}'
 ```
 
-```
- 0002-the-merge-instruction   [floor:aux]  (1/2)
-TURN  08:33 aux    #1
-    24 files, 53 hunks. Two hard collisions.
-HUMAN 08:33 michal #2
-    approved: renumber to 104/105
-─ presence ── disputes ────────────────────────────────
- aux  LIVE 4s  a1b2c3d aux-2   │ > 001  is this worth building
- main LIVE 9s  e4f5g6h main    │     ESCALATE
-   busy: SMP gate, 40 boots    │   002  does exec charge the budget
-                               │     OPEN
- [r]atify  [a]rbitrate  [d]ispute-sel  [f]ollow on  [tab]call  [q]uit
-```
+Each change records its author, time and reason. Archive and defer do not
+resolve a question. Linking keeps both transcripts. Stale, deferred and
+archived calls stop creating repeated hook obligations; reopening is explicit.
+`inbox` includes active calls and unread traffic; `--all` also includes history.
 
-**It has no key that speaks as an agent, and that is the design, not an
-omission.** The floor is what makes an assertion expensive; a seat that let
-anyone fire off a quick turn would be the fast lane this whole protocol exists
-to prevent. The only two things it can write are the two that are the human's
-alone — a ratification (`r`) and a resolution on a dispute (`a`).
+### How attention works
 
-A test enforces exactly that: it drives every printable key through the input
-handler and asserts the turn count is unchanged. It fails the moment somebody
-adds a convenient `s`-for-say, which is precisely the change that would look
-harmless in review.
+| Agent state | Mechanism |
+| --- | --- |
+| Making tool calls | `PostToolUse` reports new traffic |
+| Stopping with active work awaiting a reply | `Stop` blocks once per revision |
+| Starting or resuming a session | `SessionStart` summarizes active work |
+| Waiting in a harness with a monitor | `yip watch` emits new events |
 
-Hand-rolled ANSI over `stty`, so the zero dependencies survive. It is three
-panes and a prompt; the alternative was taking this program's first dependency
-to get raw mode and a box.
+The stop-hook loop guard prevents an unchanged obligation from trapping the
+session. Notes can notify without blocking. Watch is an event stream for the
+harness to consume; it does not itself start an idle agent.
 
----
-
-## Notes — one-way, and unable to carry a decision
-
-```
-yip note [call]          no floor transfer, no reply owed
+```sh
+yip watch                                  # stream until stopped
+yip watch --once --timeout 10m              # one event, bounded wait
+yip watch --once --replay --timeout 5s       # include existing events
 ```
 
-A note does not take the floor, does not clear a pending bye, and does not make
-the `Stop` hook block. **There is no way to reply to one**, so it structurally
-cannot be used to ask the peer to choose — which is what keeps it from becoming
-a cheap assertion. If you need a decision, take the floor.
+For `--once`, exit `0` means an event arrived and exit `3` means the deadline
+passed without one. Call-specific MCP `wait` remains bounded; use nonblocking
+operations when a long wait would tie up a serial tool connection.
 
-It exists because the alternative was observed: an agent holding a correction it
-could not send stuffed it into `busy` (a *status* field) three times, and barged
-once.
+## Shared resources
 
----
+An idle machine is not necessarily available: its owner may be between a build
+and a boot. Yip records intent through leases rather than inferring ownership
+from CPU load or quiet agents. A resource is a whole physical machine, covering
+all workloads that compete for it.
 
-## When you disagree — name a measurement, not a winner
-
-```
-yip dispute "<claim>"      open one
-yip measure [id] "<cmd>"   what would settle it ("none" is a real answer)
+```sh
+yip resources
+yip api request '{"resource":"mac","reason":"Run the host suite","ttl_s":600}'
 ```
 
-Every disagreement in the exchange this was built from — several, on genuinely
-contested ground — was settled by one side going and measuring. **Not one needed
-a third party.** So the useful question is not *who is right* but *what
-measurement would settle this*:
+- **HELD:** the lease is yours. Release it when the resource work finishes.
+- **QUEUED:** no permission to work. Watch for changes, then request again to
+  claim your offer.
+- **EXPIRED lease:** still owned. Expiry does not silently grant it to a waiter.
 
-| both sides say | verdict |
-|---|---|
-| the same measurement | **run it** — nobody else needed |
-| different measurements | **run both** — usually one is better posed |
-| one says "none" | run the other; escalate if it does not settle it |
-| **both say "none"** | **escalate** — this is not a factual disagreement at all |
+A durable request retains its identity and FIFO position for 24 hours without
+reissue. When an unheld resource offers its head request, the claim window is
+two minutes from the first observation of availability. A missed offer expires
+that request, never a lease. Rejoining after expiry puts you at the tail.
 
-That last row is the point. It distinguishes *we disagree about a fact*
-(measurable, no human) from *we disagree about what matters* — which is the
-human's by right and is not delegable to anything.
-
-There is deliberately **no automated arbiter**. Its trigger condition has never
-occurred, and a deferred one reopens the hole `ratify` closes: *"an agent told me
-the advisor decided"* is the relay problem with an extra step.
-
----
-
-## Shared machines — take the lease, do not measure the machine
-
-```
-yip resources             who holds what, how long left, who is queued
-yip hold <res> <reason>   take it, blocking until free (--wait 60s, --now)
-                          --for 2h sets the TTL; trailing pids register work
-yip release <res>         give it back; the next waiter's block resolves
-yip steal <res> <why>     take an EXPIRED lease. Recorded. Tell them.
+```sh
+yip api cancel_request '{"resource":"mac"}'
+yip api queue_history '{"resource":"mac"}'
+yip api lease_update '{"resource":"mac","phase":"Host tests","pids":[12345]}'
+yip release mac
 ```
 
-Three agents shared one 8-core Mac, and "is it free?" turned out to have **no
-local answer**. In one day all three wrote waiters for it and all three were
-wrong. The instructive one required zero QEMU *and* zero builds *and* low load
-— and fired into the gap between a peer's build and its boot, taking the cores
-out from under a running control. **A machine between phases is identical to
-an idle machine on every dimension a machine exposes.** The difference is
-intent, and intent is not on the machine; no detector settles it at any
-sensitivity. A lease is testimony where every waiter was measurement.
+Cancel only your own queued interest when the work is no longer ready. History
+shows served, cancelled and expired requests. `lease_update` records the owner's
+phase and current runner PIDs without renewing the lease. Reacquiring your own
+lease renews its duration from that moment.
 
-Three design points, each the correction of a first draft:
+Legacy bounded waits remain available:
 
-- **The resource is a physical machine**, not a tool. "QEMU" and "CPU" as
-  separate locks would let two agents hold two leases and saturate one set of
-  cores while the protocol told both they were fine. QEMU, a `cargo build -j`,
-  a TLC run and a sanitizer build contend for one thing, so they are one class.
-- **Leases expire on wall clock, never on heartbeat.** A beat is written per
-  *tool call*, not per unit of work, so an agent running a 40-minute gate in
-  one blocking call goes silent while very much holding the machine (measured:
-  "36m ago" mid-gate). Heartbeat expiry would have handed its cores away at
-  minute 3. A test pins this. And an **expired lease is not an open one** — it
-  takes a deliberate `steal` with a reason, which is recorded; a lease that
-  silently evaporates is the original bug with a timer attached.
-- **Holding is no licence to kill.** It means nobody else *starts*. "In
-  violation" is an inference, and on the day this was designed the inferences
-  were wrong from both sides — one agent's "unregistered fourth session" was
-  its own claude. Identify by cwd (`ps` does not distinguish worktrees),
-  notify, give grace, escalate. Killing a peer's gate at boot 39 of 40 destroys
-  the work and the evidence, and the killer never sees what they destroyed.
-
-Mutual exclusion is `link(2)` onto the lease file — a compare-and-set, never a
-read-then-write. FIFO by request time, tie-broken by agent name (RFC3339 is
-second-granular, and `sort.Slice` is not stable). A bounded `hold` can be
-re-issued without losing your place.
-
-The registry is currently compiled in (`knownResources` in `resource.go`:
-`mac`, `pi`). Edit it for your machines; a per-line `resources.json` is the
-obvious next step.
-
----
-
-## Artifacts
-
-```
-yip attach --path FILE
+```sh
+yip hold mac 'Run the host suite' --for 10m --wait 1s
 ```
 
-Copied into the call **at send time**. An artifact that can change under the
-reader is worse than none — the same reason turns are staged and linked — and
-copying keeps the transcript self-contained.
+A legacy queue entry needs refreshing within 15 minutes. Prefer durable
+`request` for work that spans compaction or reconnects. Neither form treats an
+expired lease as free.
 
----
+### Recovery and runner visibility
 
-## The staleness stamp
+Only the owner releases or updates a lease. Explicit expired-lease recovery
+requires a reason and verified-dead registered runners:
 
-Every turn records **both** worktrees' HEAD as observed when it was written. A
-reader whose HEAD no longer matches gets told:
-
-```
-!! written when your HEAD was 300c1320 (main); you are now at a0b41718.
-   Anything this turn computed about your tree may be stale.
+```sh
+yip steal mac 'Evidence explaining why this abandoned lease can be recovered'
 ```
 
-Without it there is no external reference at all, so no disagreement can even be
-reported — and an instruction computed against a tree that has since moved is
-exactly the failure neither agent can otherwise detect.
+Runner observations use host, PID and process start identity. Live or unknown
+runners require coordination with the holder or operator. Missing registrations
+remain an observability limit; quiet contact is never evidence of death.
+Recovery records the previous lease and evidence and notifies the peer through
+inbox, watch and hooks. Unreadable lease data fails closed.
 
----
+Holding or recovering a lease **never authorizes killing another agent's jobs**.
+Identify the owner, notify them, and escalate unresolved cases to the operator.
 
-## Two faces, one binary
+The resource registry currently contains `mac` and `pi` in `resource.go`.
+Customize it for your machines; there is no dynamic resource configuration yet.
 
-```
-yip serve            MCP server over stdio — what the agents use
-yip ring|read|say    CLI — what the HOOKS use, and what a human uses
-```
+## Presence and evidence
 
-The hooks are deliberately CLI, not MCP: a hook has to work when the MCP server
-is down, and the hook is exactly what would tell you it is down. A ring system
-that depends on the thing it is ringing about is circular.
-
-And the transcript is plain markdown under `calls/<id>/turns/`, so **reading a
-message never requires this program**. `cat` is always enough. That is what lets
-a peer who has not installed anything yet still receive the first message — and
-what makes a transcript survive an agent's context being compacted away.
-
----
-
-## Install
-
-```
-make install          # builds, then installs to ~/.local/bin/yip
+```sh
+yip presence
+yip busy 'Checking the session lifecycle' 12345
+yip retire                         # hide this identity from default presence
+yip retire --undo                  # restore it; history was never deleted
 ```
 
-**Use `make install`, not `go build -o <installed path>`.** Measured on
-macOS/arm64: overwriting the binary *in place* while a process is running from
-it can leave that path **permanently SIGKILLed at exec** — valid on disk,
-passing `codesign -v`, dead at every exec, and it does not clear when the
-holder exits. 3 of 4 attempts poisoned it that way; 0 of 2 did with
-rm-then-copy, which is what `make install` does.
+CLI, MCP and hook activity update contact information. Branch and HEAD help
+identify what an agent is working from; declared activity, lease ownership and
+observed runner state remain separate facts.
 
-The dangerous condition is the *normal* one here: `yip serve` runs from the
-installed path for the whole session, so a rebuild onto that path always has a
-live holder. It happened to a live agent mid-merge — the hook died with
-`Killed: 9`, nothing in the message named yip, and the peer lost its heartbeat,
-its Stop-block and its MCP server at once. `yip doctor` now execs the
-configured binary and says so.
+Each turn also records the sender's HEAD and the peer's HEAD as observed when
+it was written. If your checkout has since moved, `read` warns that the peer's
+claims may describe an older tree.
 
-Then, in each checkout that should talk:
-
-```
-yip install
+```sh
+yip api attach '{"call":"CALL","path":"/absolute/path/to/evidence.txt"}'
 ```
 
-That is the whole setup. It works out which **line** the checkout belongs to,
-writes `.mcp.json` and `.claude/settings.json` (**merging** into whatever is
-already there), and records who lives where. Then restart Claude Code and run
-`yip doctor`.
+Attachments are copied into the call at send time. Later edits to the source do
+not alter the evidence already sent.
 
-`doctor` also asks the **wired** binary for its version and compares it with
-its own. Two installs three weeks apart both ran and both said `0.1.0`, so a
-checkout wired to the old path passed every check and still had no new tools
-after a restart. Versions are now stamped from `git describe` by `make`, so
-"binary runs" and "binary is this build" are separate lines — a stale wiring
-fails loudly with the two paths named.
+## Disputes and human decisions
 
-```
-yip install --as reviewer      name this checkout explicitly
-yip install --line myproject   group checkouts that share no repository
-yip install --local            use .claude/settings.local.json instead
-yip uninstall                  remove the config and leave the line
+Name a measurement rather than choosing a winner:
+
+```sh
+yip dispute 'Does this path charge the page budget?'
+yip measure DISPUTE_ID 'The command that would settle it'
+yip measure DISPUTE_ID none
 ```
 
-**Worktrees of one repository join the same line automatically** — they share a
-git common dir, which is what the line is keyed on. Separate clones have no such
-link, so group them with `--line`.
+| Both sides propose | Next step |
+| --- | --- |
+| The same measurement | Run it |
+| Different measurements | Run both |
+| One measurement and `none` | Run the measurement; escalate if inconclusive |
+| Both `none` | Escalate: the decision belongs to the human |
 
-Two notes on what install writes:
+A human can act through Switchboard or the CLI:
 
-- The hook command is guarded (`[ ! -x <bin> ] || <bin> hook …`), so a checkout
-  on a machine without yip is unaffected rather than erroring on every tool call.
-- It is **idempotent**, and across the *pair* of settings files, not just
-  within one. Re-installing replaces our entries rather than stacking another
-  copy, identified by an explicit `# yip-line-hook` marker rather than by the
-  binary's name — the name and path are yours to choose, and matching on those
-  would duplicate the hooks for anyone who renamed it. Installing without
-  `--local` also strips any entries `--local` left behind, and vice versa:
-  otherwise `install` then `install --local` leaves **both** live, which is six
-  hook execs per tool call at two paths that can name different builds. Found
-  on a real checkout, where it made a dead binary hard to attribute.
-
-If two worktrees of one repo merge into each other, prefer `--local` and
-gitignore `.mcp.json`: the binary path is host-specific, and a tracked config in
-one branch collides with an untracked one in the other.
-
----
-
-## Identity
-
-**Recorded at install, keyed by the checkout's absolute path** — not derived from
-a naming convention, and not a name a session picks for itself. Two sessions
-therefore cannot answer to one name (install refuses a name another checkout
-holds), and a peer's location is a known fact rather than a guess, which is what
-lets yip read the peer's HEAD directly. `--as <agent>` overrides.
-
----
-
-## Layout
-
-```
-~/.yip/lines/<line-id>/
-  members.json                    checkout path -> agent name
-  calls/0001-<slug>/
-    call.json                     written once, never rewritten
-    turns/0001-aux.md             one atomic create per turn
-    notes/0001-main.md            one-way; `kind: human` for a ratification
-    disputes/001-<slug>/          claim.json + one m-<agent>.json per side
-    attachments/<name>            snapshots, copied at send time
-    bye-<agent>                   marker; both present => closed
-    agent-<name>.json             seen / blocked / notified; one writer
-  presence/<agent>.json
+```sh
+printf '%s\n' 'Approved with the documented limits.' | yip ratify CALL --by your-name
 ```
 
-A line lives **outside** every checkout deliberately. Checkouts are on different
-branches, so a file committed on one is invisible to the others until merged —
-which is the very thing a merge conversation is trying to coordinate.
+Use Switchboard's arbitration control for a human dispute resolution. Agents
+can record a measured outcome with `yip settled DISPUTE_ID 'Measured result'`.
+There is no automated arbiter; human ratification and arbitration are absent
+from the agent MCP tools.
 
-The line id is a readable name plus a short digest of the path it was derived
-from, so two unrelated repositories with the same name cannot end up sharing a
-line by accident.
+## CLI and MCP
 
----
+`yip serve` exposes agent tools over stdio. The CLI can invoke the same dispatch
+with JSON arguments and a JSON `{ok, result, error?}` response:
 
-## Commands
-
-```
-yip serve                 MCP server over stdio
-yip hook <event>          posttooluse | stop | sessionstart
-yip ring                  what is waiting for me
-yip read [call]           print a transcript
-yip say  [call]           speak; body on stdin
-yip note [call]           one-way; no floor, no reply owed
-yip ratify [call]         speak as the HUMAN (no MCP tool exists)
-yip switchboard           the human's live seat (--by <name>)
-yip watch                 stream events (--once, --replay, --timeout)
-yip dispute ["claim"]     open one, or list with what to do next
-yip measure [id] "<cmd>"  name what would settle it
-yip settled [id] "<how>"  record that it is over
-yip bye  [call]           propose hanging up
-yip presence [peer]       what everyone is doing
-yip busy <text> [pids..]  declare what I am doing ("" clears)
-yip beat                  stamp a heartbeat
-yip resources             who holds each shared machine, for how long, who waits
-yip hold <res> <reason>   take a machine (bounded wait; --for TTL; pids)
-yip release <res>         give it back
-yip steal <res> <why>     take an EXPIRED lease; recorded
-yip calls                 list calls
-yip line                  the line and everyone on it
-yip whoami                which agent this checkout is
-yip doctor                check the setup
+```sh
+yip api list
+yip api inbox '{}'
+yip api read '{"call":"CALL","since":4,"since_note":2}'
 ```
 
-Every command takes `--as <agent>` to override recorded membership.
+Convenience commands cover everyday work: `call`, `read`, `say`, `note`, `bye`,
+`inbox`, `calls`, `ring`, `watch`, `presence`, `busy`, `beat`, `resources`, `hold`,
+`release`, `steal` and `retire`. Run `yip` without arguments for the command
+reference. Hooks deliberately use the CLI so they can still report problems
+when an MCP connection is down.
 
----
+## Storage and concurrency
+
+A line lives outside the worktrees, under `~/.yip/lines/<line-id>/`:
+
+```text
+members.json                         checkout paths and agent names
+calls/<call-id>/
+  call.json                          call metadata
+  turns/                             immutable Markdown turns
+  notes/                             agent or human notes
+  events/                            attributed lifecycle changes
+  disputes/                          claims, measurements and resolutions
+  attachments/                       evidence snapshots
+  bye-<agent>                        bilateral close markers
+  agent-<name>.json                   read and notification positions
+presence/                            contact, retirement and notice state
+resources/
+  mac.lease                          current owner, phase and runners
+  mac.queue/                         queued requests
+  mac.history/                       terminal request states
+  mac.events/                        release/recovery intent and evidence
+  mac.lock                           short OS resource-transaction lock
+```
+
+Immutable writes are staged and hard-linked into place: partial turns stay
+invisible, and a competing writer cannot overwrite an existing turn number.
+Replaceable state uses atomic replacement. Resource read/modify/write steps use
+an OS `flock`, released on process exit; waits do not hold that transaction lock.
+Resource intent events are evidence of a requested transition, not grants.
+
+The floor is derived from turns, and plain Markdown remains readable with
+`cat`. `YIP_HOME` relocates Yip's home; `YIP_ROOT` selects an explicit line
+storage directory, useful for isolated tests.
 
 ## Tests
 
+```sh
+make test                              # host tests + freshly built CLI/MCP e2e
+GOMAXPROCS=2 go test -race ./...
+go vet ./...
+python3 scripts/test-switchboard.py /absolute/path/to/yip /tmp/yip-pty-evidence
 ```
-make test
-```
 
-Go tests (including a 24-goroutine lease-exclusivity race under `-race`) plus
-the e2e assertions over an isolated line. Four notes on how
-they are written, all learned the hard way:
+The suite checks resource exclusion and fairness, request transitions, lease
+renewal and recovery, call lifecycle and hook guards, note visibility, CLI/MCP
+parity, and Switchboard layout and human-only writes. The optional real-PTY
+check exercises fragmented Unicode input, resizing, normal exit, SIGTERM and
+terminal-mode restoration against a temporary synthetic line.
 
-- The switchboard's rule test drives every printable key and asserts no TURN
-  appeared. Revert-probed by adding the very `s`-for-say it forbids: it fails
-  with `a key wrote a TURN: 1 -> 2`.
-
-- The doctor leg's specimen is a **script that kills itself**, not a genuinely
-  poisoned binary. The real reproduction is not deterministic — 1 of 4 attempts
-  did not take — and a flaky gate is worse than no gate. The script reaches the
-  same branch every time. Its **control** matters as much: a detector that
-  called everything dead would satisfy the specimen assertion and be useless.
-
-- One asserts an **exit code** rather than the absence of a string, because
-  "output contains no TURN" is also satisfied by no output at all — and passed
-  vacuously in the first draft.
-- The dispute check asserts the specific string `ESCALATE`. That is what caught
-  the sharpest bug this code has had: an equality test that ran *before* the
-  none-check, so two sides both answering "none" compared equal and were
-  reported as **"AGREED — no human needed"**. The one case that most needs a
-  person was reported as needing none.
-
----
+The October 5 refresh passed 43 host tests and 41 CLI/MCP assertions, plus
+the race detector, static analysis and PTY checks on macOS. A follow-up legacy
+queue adoption fix passed all 44 host tests, the race detector, static analysis
+and the 41 CLI/MCP assertions again. See
+[the coordination design and verification record](docs/coordination-refresh.md)
+for policy details and qualification limits. The production binary has no
+Python or third-party Go runtime dependency.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
-## Coordination refresh (candidate)
-
-The refreshed switchboard uses a responsive, colored terminal layout with a
-conversation rail, transcript, machine leases and agent activity. `1` / `2` /
-`3` select conversation, desk and call views on compact terminals; `p` goes to
-the previous call; `?` shows the full key map. Selection follows the call when
-new activity changes list order. `NO_COLOR=1` disables color and motion;
-`YIP_REDUCED_MOTION=1` keeps color with static activity indicators. Color and
-motion carry no information that is absent from text.
-
-New CLI/MCP operations share an implementation:
-
-```sh
-# First turn on stdin, same behavior as MCP call.
-printf '%s\n' 'Please review the attached change.' | yip call aux 'Review request'
-yip inbox
-yip inbox --all
-yip read CALL --since 4 --since-note 2
-
-# JSON arguments and a JSON {ok,result,error?} envelope for every agent tool.
-yip api list
-yip api call_status '{"call":"CALL","state":"deferred","reason":"Waiting for the next evidence run"}'
-yip api call_status '{"call":"CALL","state":"open","reason":"Evidence is ready"}'
-yip api request '{"resource":"mac","reason":"Run focused Go tests","ttl_s":600}'
-yip api cancel_request '{"resource":"mac"}'
-yip api queue_history '{"resource":"mac"}'
-yip api lease_update '{"resource":"mac","phase":"Host tests","pids":[12345]}'
-yip retire                 # this identity only; history stays
-yip retire --undo
-```
-
-`request` is nonblocking. **QUEUED does not grant a lease.** A request lasts 24
-hours without reissue, and an available queue head gets a two-minute claim
-window. Watch for resource/request changes and call `request` again to claim.
-Expired requests rejoin at the tail. `hold` remains available with its legacy
-15-minute refresh behavior for older scripts. Lease expiry remains completely
-separate: it never hands someone else's machine to you automatically.
-
-An inactive call becomes *stale* after 48 hours, retaining its unresolved
-status. `call_status` explicitly records resolve/defer/archive/reopen/link
-operations and reasons. Stale/deferred/archived calls do not repeatedly block
-stop hooks. Read notes in the same transcript or inbox; notes never create a
-reply obligation. Use a note, not a call, for an FYI.
-
-**Rollout:** restart all resource-coordinating MCP servers onto the new version
-before using new resource operations. Old clients do not understand durable
-request lifetimes, offers, renewal timestamps or the resource transaction lock. Existing turns, notes and leases need no destructive migration.
-Build and test with an isolated `YIP_ROOT`; use `make install` only at the agreed
-boundary, preserving the running executable's inode. The full policy and
-verification plan is in [coordination-refresh](docs/coordination-refresh.md).
-
-The terminal smoke check is also available without a framework dependency:
-`python3 scripts/test-switchboard.py /absolute/path/to/yip /tmp/yip-pty-evidence`.
-It uses a temporary synthetic line, exercises Unicode input and resizing, and
-verifies terminal restoration on both normal exit and SIGTERM.
