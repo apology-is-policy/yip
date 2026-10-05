@@ -62,7 +62,7 @@ func num(desc string) map[string]any   { return map[string]any{"type": "integer"
 func yesno(desc string) map[string]any { return map[string]any{"type": "boolean", "description": desc} }
 
 func tools() []toolDef {
-	return []toolDef{
+	return append(coordinationTools(), []toolDef{
 		{
 			Name: "call",
 			Description: "Open a call to the other agent and speak the first turn. Rings them: " +
@@ -94,8 +94,9 @@ func tools() []toolDef {
 				"HEAD as observed when it was written -- if the peer-tip on a turn is not your current HEAD, " +
 				"that turn predates your commits and anything it computed may be stale. Check before acting on it.",
 			InputSchema: obj(map[string]any{
-				"call":  str("Call id. Omit when only one call is open."),
-				"since": num("Only turns after this number. Omit for the whole transcript."),
+				"call":       str("Call id. Omit when only one call is open."),
+				"since":      num("Only turns after this number. Omit for the whole transcript."),
+				"since_note": num("Only notes after this independent note number."),
 			}),
 		},
 		{
@@ -224,7 +225,7 @@ func tools() []toolDef {
 				"resource": str("Which machine to release."),
 			}, "resource"),
 		},
-	}
+	}...)
 }
 
 // ---------------------------------------------------------------- dispatch
@@ -377,6 +378,10 @@ func body(a map[string]any) (string, error) {
 // ----------------------------------------------------------------- actions
 
 func (s *server) call(name string, a map[string]any) (string, error) {
+	_ = Beat(s.me, name)
+	if out, handled, err := coordinationCall(s.me, name, a); handled {
+		return out, err
+	}
 	switch name {
 	case "call":
 		return s.doCall(a)
@@ -545,8 +550,9 @@ func (s *server) doSay(a map[string]any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if IsClosed(c) {
-		return "", fmt.Errorf("call %s is closed -- open a new one", c.ID)
+	turnState, _ := Turns(c)
+	if CallStatus(c, turnState) != "open" {
+		return "", fmt.Errorf("call %s is %s -- explicitly reopen it with call_status first", c.ID, CallStatus(c, turnState))
 	}
 	text, err := body(a)
 	if err != nil {
@@ -599,7 +605,7 @@ func (s *server) doRead(a map[string]any) (string, error) {
 			continue
 		}
 		shown++
-		fmt.Fprintf(&b, "===== turn %d -- %s -- %s\n", t.N, t.From, t.At)
+		fmt.Fprintf(&b, "===== turn %d -- %s -- %s -- %s\n", t.N, t.From, t.At, t.Tip)
 		if t.From != s.me && t.PeerTip != "" && mySha != "" && !strings.HasPrefix(t.PeerTip, mySha) {
 			fmt.Fprintf(&b, "!! written when your HEAD was %s; you are now at %s. "+
 				"Anything this turn computed about your tree may be stale.\n", t.PeerTip, mySha)
@@ -609,6 +615,21 @@ func (s *server) doRead(a map[string]any) (string, error) {
 		}
 		fmt.Fprintf(&b, "\n%s\n\n", strings.TrimRight(t.Body, "\n"))
 	}
+	notes, _ := Notes(c)
+	sinceNotes := argInt(a, "since_note", 0)
+	for _, n := range notes {
+		if n.N > sinceNotes {
+			shown++
+			fmt.Fprintf(&b, "===== %s note %d -- %s -- %s\n\n%s\n\n", n.Kind, n.N, n.From, n.At, n.Body)
+		}
+	}
+	if len(notes) > 0 {
+		MarkNotesSeen(c, s.me, notes[len(notes)-1].N)
+	}
+	for _, e := range CallEvents(c) {
+		fmt.Fprintf(&b, "STATE %s by %s at %s: %s %s\n", e.State, e.By, e.At, e.Reason, e.Related)
+	}
+	fmt.Fprintf(&b, "Status: %s\n", CallStatus(c, turns))
 	if shown == 0 {
 		fmt.Fprintf(&b, "(nothing new)\n")
 	}
@@ -620,6 +641,7 @@ func (s *server) doRead(a map[string]any) (string, error) {
 	} else {
 		fmt.Fprintf(&b, "The floor is %s's.\n", FloorHolder(c, turns))
 	}
+	fmt.Fprintf(&b, "floor: %s\n", FloorHolder(c, turns))
 	return b.String(), nil
 }
 
@@ -638,12 +660,15 @@ func (s *server) doWait(a map[string]any) (string, error) {
 	peer := c.Peer(s.me)
 
 	turns, _ := Turns(c)
+	if state := CallStatus(c, turns); state != "open" {
+		return "not waiting: call is " + state + "; reopen explicitly to resume", nil
+	}
 	start := len(turns)
 	if FloorHolder(c, turns) == s.me && start > 0 {
 		return fmt.Sprintf("nothing to wait for -- the floor is already yours on %s (turn %d). Read it.", c.ID, start), nil
 	}
 	if p, _ := LoadPresence(peer); !p.Live() {
-		return fmt.Sprintf("not waiting: %s last beat %s, so they are not in a live session. "+
+		return fmt.Sprintf("not waiting: %s last contact %s, so current activity is unknown. "+
 			"Turn %d is queued and will ring at their next session start. Carry on with something else.",
 			peer, describeAge(p.Age()), start), nil
 	}
@@ -656,11 +681,11 @@ func (s *server) doWait(a map[string]any) (string, error) {
 			return fmt.Sprintf("%s replied -- %s is now at turn %d and the floor is yours. Read it.",
 				peer, c.ID, len(turns)), nil
 		}
-		if IsClosed(c) {
-			return fmt.Sprintf("%s closed the call.", peer), nil
+		if state := CallStatus(c, turns); state != "open" {
+			return "call is now " + state, nil
 		}
 	}
-	return fmt.Sprintf("no reply within %s. %s is in a session but has not spoken -- "+
+	return fmt.Sprintf("no reply within %s. %s has not sent a new turn -- "+
 		"the turn stays queued, so carry on and check ring later.", timeout, peer), nil
 }
 
@@ -751,12 +776,15 @@ func presenceText(peer, me string) (string, error) {
 	}
 	var b strings.Builder
 	for _, a := range agents {
+		if peer == "" && Retired(a) {
+			continue
+		}
 		p, ok := LoadPresence(a)
 		if !ok {
 			fmt.Fprintf(&b, "%s: no presence recorded\n", a)
 			continue
 		}
-		state := "idle"
+		state := "quiet (runner state separate)"
 		if p.Live() {
 			state = "LIVE"
 		}
@@ -764,7 +792,7 @@ func presenceText(peer, me string) (string, error) {
 		if a == me {
 			self = " (you)"
 		}
-		fmt.Fprintf(&b, "%s%s: %s, last beat %s\n", a, self, state, describeAge(p.Age()))
+		fmt.Fprintf(&b, "%s%s: %s, last contact %s\n", a, self, state, describeAge(p.Age()))
 		fmt.Fprintf(&b, "  tip %s (%s)\n", p.Tip, p.Branch)
 		if p.Busy != "" {
 			fmt.Fprintf(&b, "  busy: %s\n", p.Busy)

@@ -130,12 +130,15 @@ func ensureResourceDirs(name string) error {
 // -------------------------------------------------------------------- lease
 
 type Lease struct {
-	Resource string `json:"resource"`
-	Holder   string `json:"holder"`
-	Reason   string `json:"reason"`
-	Since    string `json:"since"`
-	TTLSecs  int    `json:"ttl_secs"`
-	Pids     []int  `json:"pids,omitempty"`
+	Resource string   `json:"resource"`
+	Holder   string   `json:"holder"`
+	Reason   string   `json:"reason"`
+	Since    string   `json:"since"`
+	TTLSecs  int      `json:"ttl_secs"`
+	Pids     []int    `json:"pids,omitempty"`
+	Renewed  string   `json:"renewed,omitempty"`
+	Phase    string   `json:"phase,omitempty"`
+	Runners  []Runner `json:"runners,omitempty"`
 	// StolenFrom records a reclaim so it can never look like an ordinary
 	// acquire in the log. An expired lease taken silently would be the
 	// original bug with a timer on it.
@@ -152,16 +155,30 @@ const (
 	queueStaleAfter = 15 * time.Minute
 )
 
+// Observation fails closed: an unreadable lease is never rendered FREE.
 func LoadLease(name string) (Lease, bool) {
+	l, ok, err := readLease(name)
+	if err != nil {
+		return Lease{Resource: name, Holder: "unknown", Reason: "lease unreadable: " + err.Error()}, true
+	}
+	return l, ok
+}
+func readLease(name string) (Lease, bool, error) {
 	var l Lease
 	b, err := os.ReadFile(leasePath(name))
+	if os.IsNotExist(err) {
+		return l, false, nil
+	}
 	if err != nil {
-		return l, false
+		return l, false, err
 	}
-	if json.Unmarshal(b, &l) != nil {
-		return l, false
+	if err = json.Unmarshal(b, &l); err != nil {
+		return l, false, err
 	}
-	return l, true
+	if l.Holder == "" || l.Resource != name {
+		return l, false, fmt.Errorf("invalid lease identity")
+	}
+	return l, true, nil
 }
 
 func (l Lease) Age() time.Duration {
@@ -173,7 +190,15 @@ func (l Lease) Age() time.Duration {
 }
 
 func (l Lease) Remaining() time.Duration {
-	return time.Duration(l.TTLSecs)*time.Second - l.Age()
+	at := l.Since
+	if l.Renewed != "" {
+		at = l.Renewed
+	}
+	t, e := time.Parse(time.RFC3339, at)
+	if e != nil {
+		return -time.Second
+	}
+	return time.Duration(l.TTLSecs)*time.Second - time.Since(t)
 }
 
 // Expired means the TTL ran out. It does NOT mean the resource is free: see
@@ -183,10 +208,14 @@ func (l Lease) Expired() bool { return l.Remaining() <= 0 }
 // ------------------------------------------------------------------- queue
 
 type QueueEntry struct {
-	Agent  string `json:"agent"`
-	Reason string `json:"reason"`
-	Since  string `json:"since"` // FIFO order -- never rewritten
-	Seen   string `json:"seen"`  // liveness of the WAIT -- rewritten each poll
+	ID      string `json:"id,omitempty"`
+	Expires string `json:"expires,omitempty"`
+	Offered string `json:"offered,omitempty"`
+	State   string `json:"state,omitempty"`
+	Agent   string `json:"agent"`
+	Reason  string `json:"reason"`
+	Since   string `json:"since"` // FIFO order -- never rewritten
+	Seen    string `json:"seen"`  // liveness of the WAIT -- rewritten each poll
 }
 
 func (q QueueEntry) sinceTime() time.Time {
@@ -198,6 +227,10 @@ func (q QueueEntry) sinceTime() time.Time {
 }
 
 func (q QueueEntry) stale() bool {
+	if q.Expires != "" {
+		t, e := time.Parse(time.RFC3339, q.Expires)
+		return e != nil || !time.Now().Before(t)
+	}
 	t, err := time.Parse(time.RFC3339, q.Seen)
 	if err != nil {
 		return true
@@ -245,22 +278,34 @@ func Queue(name string) []QueueEntry {
 
 // touchQueue records (or refreshes) my interest. Since is preserved across
 // refreshes so a bounded wait can be re-issued without losing FIFO position.
-func touchQueue(name, agent, reason string) {
+func touchQueue(name, agent, reason string) error {
 	if err := ensureResourceDirs(name); err != nil {
-		return
+		return err
 	}
 	q := QueueEntry{Agent: agent, Reason: reason, Since: now(), Seen: now()}
 	if b, err := os.ReadFile(queuePath(name, agent)); err == nil {
 		var prev QueueEntry
-		if json.Unmarshal(b, &prev) == nil && prev.Since != "" {
-			q.Since = prev.Since
+		if json.Unmarshal(b, &prev) == nil && prev.Since != "" && !prev.stale() {
+			q = prev
+			q.Reason = reason
+			q.Seen = now()
+		} else if prev.Agent != "" {
+			if err := archiveRequest(name, prev, "expired"); err != nil {
+				return err
+			}
 		}
 	}
 	b, _ := json.MarshalIndent(q, "", "  ")
-	_ = atomicReplace(queuePath(name, agent), append(b, '\n'))
+	return atomicReplace(queuePath(name, agent), append(b, '\n'))
 }
 
-func dropQueue(name, agent string) { _ = os.Remove(queuePath(name, agent)) }
+// Once a lease exists it is authoritative even if queue housekeeping fails.
+// Surface the failure without telling an owner that acquisition failed.
+func dropQueue(name, agent string) {
+	if err := finishRequest(name, agent, "served"); err != nil {
+		fmt.Fprintf(os.Stderr, "yip: lease held; queue cleanup failed: %v\n", err)
+	}
+}
 
 func queuePosition(name, agent string) int {
 	for i, q := range Queue(name) {
@@ -279,6 +324,17 @@ func queuePosition(name, agent string) int {
 // fails if it exists -- a real compare-and-set on a local filesystem, not a
 // read-then-write that two agents could interleave.
 func TryAcquire(name, agent, reason string, ttl time.Duration, pids []int) (got bool, cur Lease, pos int, err error) {
+	if err := validatePids(pids); err != nil {
+		return false, Lease{}, 0, err
+	}
+	unlock, e := resourceGuard(name)
+	if e != nil {
+		return false, Lease{}, 0, e
+	}
+	defer unlock()
+	if e = advanceOffers(name); e != nil {
+		return false, Lease{}, 0, e
+	}
 	if _, ok := KnownResource(name); !ok {
 		return false, Lease{}, 0, fmt.Errorf("unknown resource %q -- known: %s", name, strings.Join(ResourceNames(), ", "))
 	}
@@ -292,30 +348,48 @@ func TryAcquire(name, agent, reason string, ttl time.Duration, pids []int) (got 
 		ttl = maxTTL
 	}
 
-	if l, ok := LoadLease(name); ok {
+	l, held, readErr := readLease(name)
+	if readErr != nil {
+		return false, Lease{}, 0, readErr
+	}
+	if held {
 		if l.Holder == agent {
 			// Idempotent re-acquire doubles as renewal, so a long holder can
 			// extend without a release/acquire gap another agent could win.
-			l.Reason, l.TTLSecs, l.Pids = reason, int(ttl/time.Second), pids
+			l.Reason, l.TTLSecs = reason, int(ttl/time.Second)
+			l.Renewed = now()
+			if pids != nil {
+				l.Pids = pids
+				l.Runners = captureRunners(pids)
+			}
 			b, _ := json.MarshalIndent(l, "", "  ")
-			_ = atomicReplace(leasePath(name), append(b, '\n'))
+			if e := atomicReplace(leasePath(name), append(b, '\n')); e != nil {
+				return false, l, 0, e
+			}
 			dropQueue(name, agent)
 			return true, l, 0, nil
 		}
-		touchQueue(name, agent, reason)
+		if err := touchQueue(name, agent, reason); err != nil {
+			return false, Lease{}, 0, err
+		}
 		return false, l, queuePosition(name, agent), nil
 	}
 
 	// Unheld. Take it only if I am at the head of the queue, so a latecomer
 	// polling at the right instant cannot jump the line.
-	touchQueue(name, agent, reason)
+	if err := touchQueue(name, agent, reason); err != nil {
+		return false, Lease{}, 0, err
+	}
 	if q := Queue(name); len(q) > 0 && q[0].Agent != agent {
 		return false, Lease{}, queuePosition(name, agent), nil
 	}
-	l := Lease{Resource: name, Holder: agent, Reason: reason, Since: now(), TTLSecs: int(ttl / time.Second), Pids: pids}
+	l = Lease{Resource: name, Holder: agent, Reason: reason, Since: now(), TTLSecs: int(ttl / time.Second), Pids: pids, Runners: captureRunners(pids)}
 	b, _ := json.MarshalIndent(l, "", "  ")
 	if err := atomicCreate(leasePath(name), append(b, '\n')); err != nil {
-		// Lost the race; somebody created it between our check and our link.
+		if !os.IsExist(err) {
+			return false, Lease{}, 0, err
+		}
+		// An older client may have created it between our check and link.
 		cur, _ := LoadLease(name)
 		return false, cur, queuePosition(name, agent), nil
 	}
@@ -346,28 +420,49 @@ func Acquire(name, agent, reason string, ttl, timeout time.Duration, pids []int)
 // than tolerated: the whole value of the scheme is that the holder's word is
 // authoritative, which fails if anyone may end their claim.
 func Release(name, agent string) (Lease, error) {
-	l, ok := LoadLease(name)
+	unlock, e := resourceGuard(name)
+	if e != nil {
+		return Lease{}, e
+	}
+	defer unlock()
+	l, ok, readErr := readLease(name)
+	if readErr != nil {
+		return Lease{}, readErr
+	}
 	if !ok {
-		dropQueue(name, agent)
-		return Lease{}, fmt.Errorf("%s is not held by anyone", name)
+		return Lease{}, fmt.Errorf("%s is not held by anyone; use cancel_request to withdraw queued interest", name)
 	}
 	if l.Holder != agent {
 		return l, fmt.Errorf("%s is held by %s, not you -- ask them to release it (or `steal` it if it has expired)", name, l.Holder)
+	}
+	if err := recordResourceEvent(name, agent, "release requested", l, nil); err != nil {
+		return l, err
 	}
 	if err := os.Remove(leasePath(name)); err != nil {
 		return l, err
 	}
 	dropQueue(name, agent)
+	if err := advanceOffers(name); err != nil {
+		fmt.Fprintf(os.Stderr, "yip: resource released; offering queue failed: %v\n", err)
+	}
 	return l, nil
 }
 
 // Steal takes an EXPIRED lease. Deliberate, recorded, and refused while the
 // TTL still has time on it -- an expired lease is not an open one.
 func Steal(name, agent, why string) (Lease, error) {
+	unlock, e := resourceGuard(name)
+	if e != nil {
+		return Lease{}, e
+	}
+	defer unlock()
 	if strings.TrimSpace(why) == "" {
 		return Lease{}, fmt.Errorf("steal needs a reason -- it is recorded, and an unexplained reclaim is indistinguishable from a protocol breach")
 	}
-	l, ok := LoadLease(name)
+	l, ok, readErr := readLease(name)
+	if readErr != nil {
+		return Lease{}, readErr
+	}
 	if !ok {
 		return Lease{}, fmt.Errorf("%s is not held -- acquire it normally", name)
 	}
@@ -377,6 +472,17 @@ func Steal(name, agent, why string) (Lease, error) {
 	if !l.Expired() {
 		return l, fmt.Errorf("%s is held by %s with %s still to run -- not stealable. Ask them, or wait",
 			name, l.Holder, span(l.Remaining()))
+	}
+	if len(l.Pids) > len(l.Runners) {
+		return l, fmt.Errorf("legacy runner identities unknown; coordinate with holder/operator")
+	}
+	for _, r := range l.Runners {
+		if !strings.HasPrefix(runnerStatus(r), "dead") {
+			return l, fmt.Errorf("runner %d alive or unknown; coordinate with holder/operator", r.PID)
+		}
+	}
+	if err := recordResourceEvent(name, agent, "recovery requested: "+why, l, l.Runners); err != nil {
+		return l, err
 	}
 	prev := l.Holder
 	nl := Lease{Resource: name, Holder: agent, Reason: "(stolen) " + why, Since: now(),
@@ -434,6 +540,12 @@ func ResourcesText(me string) string {
 		if held && l.Reason != "" {
 			fmt.Fprintf(&b, "        why: %s\n", l.Reason)
 		}
+		if held && l.Phase != "" {
+			fmt.Fprintf(&b, "        phase: %s\n", l.Phase)
+		}
+		for _, runner := range l.Runners {
+			fmt.Fprintf(&b, "        runner: %s pid %d %s (start %s)\n", runner.Host, runner.PID, runnerStatus(runner), runner.Start)
+		}
 		if held && len(l.Pids) > 0 {
 			fmt.Fprintf(&b, "        pids: %v (their registered work -- not a kill list)\n", l.Pids)
 		}
@@ -451,6 +563,7 @@ func ResourcesText(me string) string {
 	if b.Len() == 0 {
 		return "no resources defined"
 	}
+	fmt.Fprintf(&b, "%s\n", diskText(worktreeFor(me)))
 	return strings.TrimRight(b.String(), "\n")
 }
 

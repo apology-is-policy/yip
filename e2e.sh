@@ -1,8 +1,11 @@
 #!/bin/bash
 # End-to-end exercise of the new yip verbs, in an isolated line.
-Y=/tmp/yiptest
-export YIP_ROOT=/tmp/yip-e2e
-rm -rf "$YIP_ROOT"; mkdir -p "$YIP_ROOT"
+Y=${YIP_TEST_BIN:-/tmp/yiptest}
+fixture=$(mktemp -d "${TMPDIR:-/tmp}/yip-e2e.XXXXXX") || exit 1
+trap 'rm -rf "$fixture"' EXIT
+export YIP_ROOT="$fixture/line"
+export YIP_HOME="$fixture/home"
+mkdir -p "$YIP_ROOT" "$YIP_HOME"
 fails=0
 ck()  { if printf '%s' "$3" | grep -qF "$2"; then echo "PASS $1"
         else echo "FAIL $1: wanted '$2', got: $(printf '%s' "$3" | head -2)"; fails=$((fails+1)); fi; }
@@ -87,10 +90,10 @@ $Y measure --as main 004 "git merge-file -p o b t" >/dev/null 2>&1
 ck "differ" "DIFFER" "$($Y dispute --as aux 2>&1)"
 
 echo "=== 11. attach is a SNAPSHOT ==="
-echo "the union list" > /tmp/yip-artifact.txt
-seed attach '{"path":"/tmp/yip-artifact.txt"}' aux >/dev/null 2>&1
+echo "the union list" > $fixture/artifact.txt
+seed attach "{\"path\":\"$fixture/artifact.txt\"}" aux >/dev/null 2>&1
 ck "artifact crossed" "the union list" "$(cat "$YIP_ROOT"/calls/*/attachments/* 2>/dev/null)"
-echo "MUTATED AFTER SENDING" > /tmp/yip-artifact.txt
+echo "MUTATED AFTER SENDING" > $fixture/artifact.txt
 ckn "cannot change under the reader" "MUTATED" "$(cat "$YIP_ROOT"/calls/*/attachments/* 2>/dev/null)"
 
 echo "=== 12. doctor checks the configured binary RUNS, not just that it is named ==="
@@ -99,8 +102,8 @@ echo "=== 12. doctor checks the configured binary RUNS, not just that it is name
 # deterministic (1 of 4 attempts did not take), and a flaky gate is worse than
 # no gate -- so the specimen here is a script that kills itself, which reaches
 # the same branch (`ExitCode() == -1`, terminated by a signal) every time.
-D=/tmp/yip-doctor-test
-rm -rf $D; mkdir -p $D/.claude
+D="$fixture/doctor"
+mkdir -p "$D/.claude"
 printf '#!/bin/sh\nkill -9 $$\n' > $D/badbin && chmod +x $D/badbin
 printf '{"mcpServers":{"yip":{"command":"%s","args":["serve"]}}}\n' "$D/badbin" > $D/.mcp.json
 out=$(cd $D && $Y doctor --as probe 2>&1)
@@ -126,6 +129,23 @@ out=$(cd $D && $Y doctor --as probe 2>&1)
 ck  "names the stale binary"        "STALE"           "$out"
 ck  "quotes its version"            "0.0.0-elsewhere" "$out"
 ckn "and does not call it dead"     "DOES NOT RUN"    "$out"
+
+echo "=== 14. shared CLI/MCP operations and lifecycle ==="
+out=$(printf '%s' 'review this change' | $Y call --as aux main 'parity check' 2>&1)
+ck "CLI opens call" "parity-check" "$out"
+id=$(basename "$YIP_ROOT"/calls/*parity-check)
+ck "MCP reads CLI turn" "review this change" "$(seed read "{\"call\":\"$id\"}" main)"
+printf '%s' 'an FYI only' | $Y note --as main "$id" >/dev/null
+ck "CLI reads notes" "an FYI only" "$($Y read --as aux "$id")"
+$Y api --as aux call_status "{\"call\":\"$id\",\"state\":\"deferred\",\"reason\":\"wait for evidence\"}" >/dev/null
+ck "shared lifecycle" "deferred" "$(seed read "{\"call\":\"$id\"}" main)"
+ckn "deferred not a stop obligation" "$id" "$($Y ring --as main)"
+ck "human API still absent" 'false' "$($Y api --as aux ratify '{}' 2>&1)"
+$Y api --as aux request '{"resource":"mac","reason":"fixture","ttl_s":60}' >/dev/null
+ck "MCP queues behind CLI" "QUEUED" "$(seed request '{"resource":"mac","reason":"wait"}' main)"
+ck "CLI cancels same request" 'true' "$($Y api --as main cancel_request '{"resource":"mac"}')"
+ck "history keeps cancellation" "cancelled" "$(seed queue_history '{"resource":"mac"}' aux)"
+$Y release --as aux mac >/dev/null
 
 echo; echo "=========================================="
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi

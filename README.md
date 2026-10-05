@@ -124,7 +124,7 @@ aux: LIVE, last beat 4s ago
   owns pids: [41234 41250] -- do not kill these
 ```
 
-The hook stamps the heartbeat (proves you are alive); you declare `busy` (says
+The hook stamps last contact (it does not prove runner liveness); you declare `busy` (says
 what you are doing).
 
 ---
@@ -499,3 +499,59 @@ they are written, all learned the hard way:
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Coordination refresh (candidate)
+
+The refreshed switchboard uses a responsive, colored terminal layout with a
+conversation rail, transcript, machine leases and agent activity. `1` / `2` /
+`3` select conversation, desk and call views on compact terminals; `p` goes to
+the previous call; `?` shows the full key map. Selection follows the call when
+new activity changes list order. `NO_COLOR=1` disables color and motion;
+`YIP_REDUCED_MOTION=1` keeps color with static activity indicators. Color and
+motion carry no information that is absent from text.
+
+New CLI/MCP operations share an implementation:
+
+```sh
+# First turn on stdin, same behavior as MCP call.
+printf '%s\n' 'Please review the attached change.' | yip call aux 'Review request'
+yip inbox
+yip inbox --all
+yip read CALL --since 4 --since-note 2
+
+# JSON arguments and a JSON {ok,result,error?} envelope for every agent tool.
+yip api list
+yip api call_status '{"call":"CALL","state":"deferred","reason":"Waiting for the next evidence run"}'
+yip api call_status '{"call":"CALL","state":"open","reason":"Evidence is ready"}'
+yip api request '{"resource":"mac","reason":"Run focused Go tests","ttl_s":600}'
+yip api cancel_request '{"resource":"mac"}'
+yip api queue_history '{"resource":"mac"}'
+yip api lease_update '{"resource":"mac","phase":"Host tests","pids":[12345]}'
+yip retire                 # this identity only; history stays
+yip retire --undo
+```
+
+`request` is nonblocking. **QUEUED does not grant a lease.** A request lasts 24
+hours without reissue, and an available queue head gets a two-minute claim
+window. Watch for resource/request changes and call `request` again to claim.
+Expired requests rejoin at the tail. `hold` remains available with its legacy
+15-minute refresh behavior for older scripts. Lease expiry remains completely
+separate: it never hands someone else's machine to you automatically.
+
+An inactive call becomes *stale* after 48 hours, retaining its unresolved
+status. `call_status` explicitly records resolve/defer/archive/reopen/link
+operations and reasons. Stale/deferred/archived calls do not repeatedly block
+stop hooks. Read notes in the same transcript or inbox; notes never create a
+reply obligation. Use a note, not a call, for an FYI.
+
+**Rollout:** restart all resource-coordinating MCP servers onto the new version
+before using new resource operations. Old clients do not understand durable
+request lifetimes, offers, renewal timestamps or the resource transaction lock. Existing turns, notes and leases need no destructive migration.
+Build and test with an isolated `YIP_ROOT`; use `make install` only at the agreed
+boundary, preserving the running executable's inode. The full policy and
+verification plan is in [coordination-refresh](docs/coordination-refresh.md).
+
+The terminal smoke check is also available without a framework dependency:
+`python3 scripts/test-switchboard.py /absolute/path/to/yip /tmp/yip-pty-evidence`.
+It uses a temporary synthetic line, exercises Unicode input and resizing, and
+verifies terminal restoration on both normal exit and SIGTERM.
