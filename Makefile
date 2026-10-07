@@ -23,12 +23,19 @@
 BIN ?= $(HOME)/.local/bin/yip
 GO  ?= go
 
+# The version is the tree, not a constant. `git describe --always --dirty`
+# gives every build a distinct name (tag or short sha, "-dirty" if uncommitted),
+# and `yip doctor` compares the WIRED binary's answer against its own, so a
+# checkout still pointing at a stale install fails loudly instead of "ok".
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
+LDFLAGS  = -ldflags "-X main.serverVersion=$(VERSION)"
+
 .PHONY: all build install uninstall test clean
 
 all: build
 
 build:
-	$(GO) build -o yip .
+	$(GO) build $(LDFLAGS) -o yip .
 
 install: build
 	@mkdir -p $(dir $(BIN))
@@ -43,14 +50,14 @@ install: build
 	   echo "FAIL: $(BIN) died with signal $$(($$rc - 128)) -- the install did not take"; \
 	   exit 1; \
 	 fi
-	@echo "installed $(BIN)"
+	@echo "installed $(BIN) ($$($(BIN) version))"
 
 test:
 	$(GO) test ./...
 	@# e2e.sh runs /tmp/yiptest. Building it HERE is not a convenience: without
 	@# it the suite silently exercises whatever stale binary was left there,
 	@# which is a green run that proves nothing about this tree.
-	$(GO) build -o /tmp/yiptest .
+	$(GO) build $(LDFLAGS) -o /tmp/yiptest .
 	./e2e.sh
 
 clean:

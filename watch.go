@@ -48,6 +48,11 @@ func watchSnapshot(me string) map[string]string {
 		if !c.Involves(c.Peer(me)) || !c.Involves(me) {
 			continue
 		}
+		for _, e := range CallEvents(c) {
+			if e.By != me {
+				out["state:"+c.ID+":"+e.ID] = "STATE " + c.ID + " " + e.State + " by " + e.By + ": " + e.Reason
+			}
+		}
 		turns, _ := Turns(c)
 
 		if c.From != me {
@@ -92,6 +97,26 @@ func watchSnapshot(me string) map[string]string {
 				fmt.Sprintf("DISPUTE %s  %s  -- %s", c.ID, d.ID, st)
 		}
 	}
+	for _, r := range knownResources {
+		for _, e := range ResourceEvents(r.Name) {
+			if e.By != me {
+				out["resource-event:"+r.Name+":"+e.ID] = "RESOURCE " + r.Name + " " + e.Action + " by " + e.By + "; inspect current lease before work"
+			}
+		}
+		l, held := LoadLease(r.Name)
+		if held && l.Holder != me {
+			out["lease:"+r.Name+":"+l.Holder+":"+l.Since+":"+l.Renewed] = "LEASE " + r.Name + " held by " + l.Holder
+		}
+		for _, q := range Queue(r.Name) {
+			out["queue:"+r.Name+":"+q.ID+":"+q.Agent+":"+q.Offered] = "QUEUE " + r.Name + " " + q.Agent + " " + q.Reason
+		}
+		history, _ := QueueHistory(r.Name)
+		for _, line := range strings.Split(history, "\n") {
+			if line != "" {
+				out["queue-state:"+r.Name+":"+line] = "REQUEST " + r.Name + " " + line
+			}
+		}
+	}
 	return out
 }
 
@@ -105,9 +130,7 @@ func firstLine(s string) string {
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		s = s[:i]
 	}
-	if len(s) > 72 {
-		s = s[:69] + "..."
-	}
+	s = trunc(terminalText(s), 72)
 	return s
 }
 

@@ -70,22 +70,22 @@ func hookPostToolUse(me string, in hookInput) any {
 	_ = Beat(me, in.ToolName)
 
 	rings, err := RingFor(me)
-	if err != nil || len(rings) == 0 {
+	if err != nil {
 		return nil
 	}
-	var lines []string
-	fresh := false
+	lines := append(NoteNotices(me), FreshRecoveryNotices(me)...)
+	fresh := len(lines) > 0
 	brandNew := false
 	for _, r := range rings {
 		st := LoadAgentState(r.Call, me)
-		if r.LastTurn <= st.NotifiedAt {
+		if r.Revision <= st.NotifiedAt {
 			continue
 		}
 		fresh = true
 		if st.NotifiedAt == 0 && st.Seen == 0 {
 			brandNew = true
 		}
-		st.NotifiedAt = r.LastTurn
+		st.NotifiedAt = r.Revision
 		_ = SaveAgentState(r.Call, me, st)
 		lines = append(lines, ringLine(r, me))
 	}
@@ -94,7 +94,7 @@ func hookPostToolUse(me string, in hookInput) any {
 	}
 	out := map[string]any{
 		"hookEventName":     "PostToolUse",
-		"additionalContext": "[yip] " + strings.Join(lines, " ") + " Use mcp__yip__read then mcp__yip__say.",
+		"additionalContext": "[yip] " + strings.Join(lines, " ") + " Use read; reply only when a call requires it. Notes are FYIs.",
 	}
 	res := map[string]any{"hookSpecificOutput": out}
 	if brandNew {
@@ -136,10 +136,10 @@ func hookStop(me string) any {
 			continue
 		}
 		st := LoadAgentState(r.Call, me)
-		if r.LastTurn <= st.BlockedAt {
+		if r.Revision <= st.BlockedAt {
 			continue // already blocked at this state; do not wedge the session
 		}
-		st.BlockedAt = r.LastTurn
+		st.BlockedAt = r.Revision
 		_ = SaveAgentState(r.Call, me, st)
 		lines = append(lines, ringLine(r, me))
 	}
@@ -167,6 +167,12 @@ func hookSessionStart(me string) any {
 	_ = Beat(me, "")
 
 	var parts []string
+	if notices := FreshRecoveryNotices(me); len(notices) > 0 {
+		parts = append(parts, "[yip resources] "+strings.Join(notices, " "))
+	}
+	if notices := NoteNotices(me); len(notices) > 0 {
+		parts = append(parts, "[yip notes] "+strings.Join(notices, " "))
+	}
 	if rings, err := RingFor(me); err == nil && len(rings) > 0 {
 		var lines []string
 		for _, r := range rings {

@@ -4,8 +4,8 @@ package main
 //
 // Everything that two agents could touch concurrently is either an atomic
 // create (a turn, a bye marker) or owned by exactly one writer (presence,
-// per-agent call state). Nothing is read-modify-written by both sides, so
-// there is no lock and no lost update to reason about.
+// per-agent call state). Resource transitions use a short OS lock because
+// their queue and lease read/modify/write steps are shared between agents.
 //
 // The floor -- whose turn it is to speak -- is DERIVED from the turn files
 // rather than stored, so it cannot desync from the transcript it describes.
@@ -258,8 +258,11 @@ func ResolveCall(id, agent string) (*Call, error) {
 	}
 	var open []*Call
 	for _, c := range all {
-		if c.Involves(agent) && !IsClosed(c) {
-			open = append(open, c)
+		if c.Involves(agent) {
+			turns, _ := Turns(c)
+			if CallStatus(c, turns) == "open" {
+				open = append(open, c)
+			}
 		}
 	}
 	switch len(open) {
@@ -449,9 +452,11 @@ func IsClosed(c *Call) bool { return HasBye(c, c.From) && HasBye(c, c.To) }
 // ------------------------------------------------- per-agent, single writer
 
 type AgentState struct {
-	Seen       int `json:"seen"`
-	BlockedAt  int `json:"blocked_at"`  // Stop-hook loop guard
-	NotifiedAt int `json:"notified_at"` // PostToolUse repeat guard
+	Seen          int `json:"seen"`
+	SeenNotes     int `json:"seen_notes,omitempty"`
+	NotesNotified int `json:"notes_notified,omitempty"`
+	BlockedAt     int `json:"blocked_at"`  // Stop-hook loop guard
+	NotifiedAt    int `json:"notified_at"` // PostToolUse repeat guard
 }
 
 func agentStatePath(c *Call, agent string) string {
@@ -560,6 +565,7 @@ func describeAge(d time.Duration) string {
 // ------------------------------------------------------------------- ring
 
 type Ring struct {
+	Revision  int
 	Call      *Call
 	LastTurn  int
 	Unseen    int
@@ -596,12 +602,12 @@ func RingFor(agent string) ([]Ring, error) {
 			}
 		}
 		r := Ring{
-			Call: c, LastTurn: last, Unseen: unseen,
+			Call: c, LastTurn: last, Unseen: unseen, Revision: last + len(CallEvents(c)),
 			HaveFloor: FloorHolder(c, turns) == agent,
 			PeerBye:   HasBye(c, c.Peer(agent)),
 			Closed:    IsClosed(c),
 		}
-		if r.Closed {
+		if r.Closed || CallStatus(c, turns) != "open" {
 			continue
 		}
 		if r.Unseen > 0 || r.HaveFloor {

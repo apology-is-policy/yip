@@ -27,6 +27,7 @@ package main
 // has ever had in order to get raw mode and a box drawing routine.
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"os"
@@ -91,12 +92,16 @@ func (t *tty) readSize() {
 // restore must be safe to call twice: it runs from a defer AND from the signal
 // path, and a terminal left raw is the worst way to exit.
 func (t *tty) restore() {
+	if t.f == nil {
+		return
+	}
 	if t.saved != "" {
 		_, _ = t.stty(t.saved)
 		t.saved = ""
 	}
-	fmt.Fprint(t.f, escShowCursor+escAltOff)
+	fmt.Fprint(t.f, escMouseOff+escShowCursor+escAltOff)
 	t.f.Close()
+	t.f = nil
 }
 
 const (
@@ -104,6 +109,8 @@ const (
 	escAltOff     = "\033[?1049l"
 	escHideCursor = "\033[?25l"
 	escShowCursor = "\033[?25h"
+	escMouseOn    = "\033[?1000h\033[?1006h"
+	escMouseOff   = "\033[?1006l\033[?1000l"
 	escClearLine  = "\033[K"
 	sgrReset      = "\033[0m"
 	sgrBold       = "\033[1m"
@@ -134,14 +141,25 @@ type sbCall struct {
 	floor    string
 	closed   bool
 	disputes []*sbDispute
+	status   string
 	lastAt   string
 }
 
+type sbResource struct {
+	name    string
+	lease   Lease
+	held    bool
+	queue   []QueueEntry
+	runners []string
+}
+
 type sbState struct {
-	calls    []*sbCall
-	members  []string
-	presence map[string]Presence
-	err      string
+	resources []sbResource
+	disk      string
+	calls     []*sbCall
+	members   []string
+	presence  map[string]Presence
+	err       string
 }
 
 // mergeEntries interleaves turns and notes into one transcript.
@@ -197,7 +215,12 @@ func loadState() sbState {
 		turns, _ := Turns(c)
 		notes, _ := Notes(c)
 		sc.floor = FloorHolder(c, turns)
+		sc.status = CallStatus(c, turns)
 		sc.entries = mergeEntries(turns, notes)
+		for _, e := range CallEvents(c) {
+			sc.entries = append(sc.entries, sbEntry{kind: "STATE", from: e.By, at: e.At, body: e.State + ": " + e.Reason, n: 0})
+		}
+		sort.SliceStable(sc.entries, func(i, j int) bool { return sc.entries[i].at < sc.entries[j].at })
 		if n := len(sc.entries); n > 0 {
 			sc.lastAt = sc.entries[n-1].at
 		}
@@ -211,71 +234,101 @@ func loadState() sbState {
 	// Most recently active first: the call a watching human cares about is the
 	// one that just moved, not the one with the lowest id.
 	sort.SliceStable(st.calls, func(i, j int) bool {
-		if st.calls[i].closed != st.calls[j].closed {
-			return !st.calls[i].closed
+		rank := func(c *sbCall) int {
+			switch c.status {
+			case "open":
+				return 0
+			case "deferred":
+				return 1
+			case "stale":
+				return 2
+			case "archived":
+				return 3
+			default:
+				return 4
+			}
+		}
+		if rank(st.calls[i]) != rank(st.calls[j]) {
+			return rank(st.calls[i]) < rank(st.calls[j])
 		}
 		return st.calls[i].lastAt > st.calls[j].lastAt
 	})
+	for _, r := range knownResources {
+		l, held := LoadLease(r.Name)
+		sr := sbResource{name: r.Name, lease: l, held: held, queue: Queue(r.Name)}
+		for _, runner := range l.Runners {
+			sr.runners = append(sr.runners, fmt.Sprintf("pid %d %s", runner.PID, runnerStatus(runner)))
+		}
+		st.resources = append(st.resources, sr)
+	}
+	path, _ := os.Getwd()
+	st.disk = diskText(path)
 	return st
 }
 
 // -------------------------------------------------------------------- view
 
 type view struct {
-	t        *tty
-	by       string
-	st       sbState
-	sel      int // selected call
-	selD     int // selected dispute within that call
-	scroll   int
-	follow   bool
-	prompt   string // non-empty => input mode
-	input    []rune
-	flash    string
-	quitting bool
+	t          *tty
+	by         string
+	st         sbState
+	sel        int // selected call
+	selD       int // selected dispute within that call
+	scroll     int
+	railScroll int
+	sideScroll int
+	panes      sbLayout // geometry and content lengths of the last displayed frame
+	follow     bool
+	prompt     string // non-empty => input mode
+	input      []rune
+	flash      string
+	quitting   bool
+	frame      int
+	tab        int
 }
 
 func wrap(s string, w int) []string {
-	if w < 8 {
-		w = 8
+	if w < 1 {
+		w = 1
 	}
 	var out []string
-	for _, line := range strings.Split(strings.TrimRight(s, "\n"), "\n") {
+	for _, line := range strings.Split(strings.TrimRight(terminalText(s), "\n"), "\n") {
 		r := []rune(line)
 		if len(r) == 0 {
 			out = append(out, "")
 			continue
 		}
-		for len(r) > w {
-			cut := w
-			// Prefer a space near the edge so words survive; fall back to a
-			// hard cut, because a long unbroken token must not stall the loop.
-			for i := w; i > w*2/3; i-- {
-				if r[i] == ' ' {
-					cut = i
-					break
+		for start := 0; start < len(r); {
+			used, end, lastSpace := 0, start, -1
+			for end < len(r) && used+cellWidth(r[end]) <= w {
+				used += cellWidth(r[end])
+				if r[end] == ' ' {
+					lastSpace = end
 				}
+				end++
 			}
-			out = append(out, string(r[:cut]))
-			r = r[cut:]
-			for len(r) > 0 && r[0] == ' ' {
-				r = r[1:]
+			if end == start {
+				start++
+				continue
 			}
+			if end < len(r) && lastSpace > start {
+				end = lastSpace + 1
+			}
+			out = append(out, string(r[start:end]))
+			start = end
 		}
-		out = append(out, string(r))
 	}
 	return out
 }
 
 func trunc(s string, w int) string {
-	r := []rune(s)
-	if len(r) <= w {
+	if plainWidth(s) <= w {
 		return s
 	}
 	if w <= 1 {
-		return string(r[:max(0, w)])
+		return fitCells(s, w, false)
 	}
-	return string(r[:w-1]) + "…"
+	return fitCells(s, w-1, false) + "…"
 }
 
 func max(a, b int) int {
@@ -367,7 +420,7 @@ func (v *view) disputeLines(w int) []string {
 		// slug OF THE CLAIM, so printing both spends the pane twice on the
 		// same words and truncates the readable copy down to nothing.
 		num, _, _ := strings.Cut(sd.d.ID, "-")
-		out = append(out, fmt.Sprintf("%s%s%s  %s%s", pre, mark, num, trunc(sd.d.Claim, max(4, w-8)), post))
+		out = append(out, fmt.Sprintf("%s%s%s  %s%s", pre, mark, num, trunc(terminalText(sd.d.Claim), max(4, w-8)), post))
 		// The status line is the whole value of the mechanism -- it is the only
 		// thing that says "this one needs a person" -- so it is never elided.
 		head := strings.SplitN(sd.status, " -- ", 2)[0]
@@ -375,7 +428,48 @@ func (v *view) disputeLines(w int) []string {
 		if strings.HasPrefix(head, "ESCALATE") {
 			style = sgrBold
 		}
-		out = append(out, fmt.Sprintf("    %s%s%s", style, trunc(head, w-6), sgrReset))
+		out = append(out, fmt.Sprintf("    %s%s%s", style, trunc(terminalText(head), w-6), sgrReset))
+	}
+	return out
+}
+
+// resourceLines is the right half of the main pane: who holds each machine and
+// who is queued behind them.
+//
+// Read live rather than through loadState because this is the panel whose whole
+// value is being current -- the operator looks at it to answer "is anybody
+// blocked right now", and a cached answer to that is worse than none. Two small
+// file reads per frame.
+func (v *view) resourceLines(w int) []string {
+	var out []string
+	add := func(s string) { out = append(out, trunc(s, w)) }
+	for _, r := range knownResources {
+		l, held := LoadLease(r.Name)
+		q := Queue(r.Name)
+		switch {
+		case !held:
+			add(sgrBold + r.Name + sgrReset + " " + sgrDim + "free" + sgrReset)
+		case l.Expired():
+			add(sgrBold + r.Name + sgrReset + " " + sgrBold + "EXPIRED" + sgrReset + " " + l.Holder)
+			add("  " + sgrDim + "ttl gone " + span(-l.Remaining()) + " -- still not free" + sgrReset)
+		default:
+			add(sgrBold + r.Name + sgrReset + " " + l.Holder + " " + sgrDim + span(l.Remaining()) + " left" + sgrReset)
+		}
+		if held && l.Reason != "" {
+			for _, ln := range wrap(l.Reason, max(4, w-2)) {
+				add("  " + sgrDim + ln + sgrReset)
+			}
+		}
+		if l.StolenFrom != "" {
+			add("  " + sgrBold + "STOLEN from " + l.StolenFrom + sgrReset)
+		}
+		for i, e := range q {
+			add(fmt.Sprintf("  %s%d. %s waiting %s%s", sgrDim, i+1, e.Agent, span(time.Since(e.sinceTime())), sgrReset))
+		}
+		add("")
+	}
+	if len(out) == 0 {
+		add(sgrDim + "no resources" + sgrReset)
 	}
 	return out
 }
@@ -384,87 +478,12 @@ func (v *view) disputeLines(w int) []string {
 // each row and clearing to end-of-line means there is never a clear-then-draw
 // gap, so no flicker and no partial frame.
 func (v *view) render() {
-	rows, cols := v.t.rows, v.t.cols
 	var b bytes.Buffer
-	row := 1
-	put := func(s string) {
-		if row > rows {
-			return
+	for row, line := range v.frameLines(v.t.rows, v.t.cols) {
+		if !colors().enabled {
+			line = stripSGR(line)
 		}
-		fmt.Fprintf(&b, "\033[%d;1H%s%s", row, s, escClearLine)
-		row++
-	}
-	rule := func(label string) {
-		put(sgrDim + trunc(label+" "+strings.Repeat("─", max(0, cols-len(label)-2)), cols) + sgrReset)
-	}
-
-	// header
-	title := "yip switchboard"
-	if v.sel < len(v.st.calls) {
-		sc := v.st.calls[v.sel]
-		state := "floor:" + sc.floor
-		if sc.closed {
-			state = "CLOSED"
-		}
-		title = fmt.Sprintf("%s  %s  [%s]  (%d/%d)", sc.call.ID, sc.call.Subject, state, v.sel+1, len(v.st.calls))
-	}
-	put(sgrRev + trunc(" "+title+strings.Repeat(" ", cols), cols) + sgrReset)
-
-	bottomH := 8
-	if rows < 20 {
-		bottomH = 5
-	}
-	transH := rows - 1 /*header*/ - 1 /*rule*/ - bottomH - 1 /*footer*/
-	if transH < 3 {
-		transH = 3
-	}
-
-	lines := v.transcriptLines(cols - 1)
-	if v.follow {
-		v.scroll = max(0, len(lines)-transH)
-	}
-	if v.scroll > max(0, len(lines)-1) {
-		v.scroll = max(0, len(lines)-1)
-	}
-	for i := 0; i < transH; i++ {
-		idx := v.scroll + i
-		if idx < len(lines) {
-			put(lines[idx])
-		} else {
-			put("")
-		}
-	}
-
-	rule("─ presence ── disputes ")
-
-	// Two columns, rendered as one string per row so a single write does the
-	// whole frame.
-	lw := cols/2 - 1
-	if lw < 20 {
-		lw = cols - 1
-	}
-	left, right := v.presenceLines(lw), v.disputeLines(cols-lw-3)
-	for i := 0; i < bottomH; i++ {
-		l, r := "", ""
-		if i < len(left) {
-			l = left[i]
-		}
-		if i < len(right) {
-			r = right[i]
-		}
-		put(padVisible(l, lw) + sgrDim + "│" + sgrReset + " " + r)
-	}
-
-	// footer: prompt when the human is typing, otherwise the key map
-	if v.prompt != "" {
-		put(sgrBold + v.prompt + sgrReset + " " + string(v.input) + "█")
-	} else {
-		help := " [r]atify  [a]rbitrate  [d]ispute-sel  [f]ollow " + onOff(v.follow) +
-			"  [tab]call  [jk]scroll  [q]uit"
-		if v.flash != "" {
-			help = " " + v.flash
-		}
-		put(sgrDim + trunc(help, cols-1) + sgrReset)
+		fmt.Fprintf(&b, "\033[%d;1H%s%s", row+1, line, escClearLine)
 	}
 	fmt.Fprint(v.t.f, b.String())
 }
@@ -479,32 +498,12 @@ func onOff(b bool) string {
 // padVisible pads to a visible width, ignoring SGR escapes -- otherwise the
 // column separator drifts by however many bytes of colour a row happens to
 // carry, which is invisible in a unit test and obvious on screen.
-func padVisible(s string, w int) string {
-	vis, inEsc := 0, false
-	var out []rune
-	for _, r := range s {
-		switch {
-		case r == '\033':
-			inEsc = true
-		case inEsc:
-			if r == 'm' {
-				inEsc = false
-			}
-		default:
-			if vis >= w {
-				continue
-			}
-			vis++
-		}
-		out = append(out, r)
-	}
-	return string(out) + strings.Repeat(" ", max(0, w-vis))
-}
+func padVisible(s string, w int) string { return fitCells(s, w, true) }
 
 // ------------------------------------------------------------------- input
 
 func (v *view) selectedCall() *sbCall {
-	if v.sel < len(v.st.calls) {
+	if v.sel >= 0 && v.sel < len(v.st.calls) {
 		return v.st.calls[v.sel]
 	}
 	return nil
@@ -566,20 +565,44 @@ func (v *view) key(k rune) {
 	}
 	v.flash = ""
 	switch k {
+	case '?':
+		v.flash = "click a call · wheel over a pane · tab/n next · p prev · j/k scroll · g top G end · f follow · r ratify a arbitrate"
+	case '1', '2', '3':
+		v.tab = int(k - '1')
+		v.scroll = 0
+	case 'p':
+		if len(v.st.calls) > 0 {
+			v.sel = (v.sel + len(v.st.calls) - 1) % len(v.st.calls)
+			v.scroll = 0
+			v.selD = 0
+			v.revealCall()
+		}
 	case 'q', 3: // q or Ctrl-C
 		v.quitting = true
 	case 'j':
-		v.scroll++
+		if v.tab == 2 {
+			v.railScroll++
+		} else {
+			v.scroll++
+		}
 		v.follow = false
 	case 'k':
-		if v.scroll > 0 {
+		if v.tab == 2 {
+			v.railScroll = max(0, v.railScroll-1)
+		} else if v.scroll > 0 {
 			v.scroll--
 		}
 		v.follow = false
 	case 'g':
 		v.scroll, v.follow = 0, false
+		if v.tab == 2 {
+			v.railScroll = 0
+		}
 	case 'G':
 		v.follow = true
+		if v.tab == 2 {
+			v.railScroll = max(0, 2+3*len(v.st.calls)-v.panes.height)
+		}
 	case 'f':
 		v.follow = !v.follow
 	case '\t', 'n':
@@ -587,6 +610,7 @@ func (v *view) key(k rune) {
 			v.sel = (v.sel + 1) % len(v.st.calls)
 			v.scroll, v.selD = 0, 0
 			v.follow = true
+			v.revealCall()
 		}
 	case 'd':
 		if sc := v.selectedCall(); sc != nil && len(sc.disputes) > 0 {
@@ -625,45 +649,35 @@ func Switchboard(by string) error {
 		return err
 	}
 	// A terminal left in raw mode is the worst way to exit, so restore is wired
-	// to BOTH the normal path and a signal. os.Exit skips defers, so the signal
-	// path has to restore for itself.
+	// to both normal exit and the signal path, which returns through this defer.
 	defer t.restore()
 	sigs := make(chan os.Signal, 4)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
+	defer signal.Stop(sigs)
 
-	fmt.Fprint(t.f, escAltOn+escHideCursor)
+	fmt.Fprint(t.f, escAltOn+escHideCursor+escMouseOn)
 
 	v := &view{t: t, by: by, follow: true, st: loadState()}
 	v.render()
 
 	keys := make(chan rune, 64)
 	go func() {
-		buf := make([]byte, 16)
+		reader := bufio.NewReader(t.f)
 		for {
-			n, err := t.f.Read(buf)
-			if err != nil || n == 0 {
+			r, _, err := reader.ReadRune()
+			if err != nil {
 				close(keys)
 				return
 			}
-			for i := 0; i < n; i++ {
-				// Arrow keys arrive as ESC [ A..D. Map them onto the same
-				// handlers as jk so both work without a second code path.
-				if buf[i] == 27 && i+2 < n && buf[i+1] == '[' {
-					switch buf[i+2] {
-					case 'A':
-						keys <- 'k'
-					case 'B':
-						keys <- 'j'
-					}
-					i += 2
-					continue
-				}
-				keys <- rune(buf[i])
-			}
+			keys <- r
 		}
 	}()
 
-	tick := time.NewTicker(500 * time.Millisecond)
+	tick := time.NewTicker(time.Second)
+	var decoder sbInputDecoder
+	escapeTimer := time.NewTimer(time.Hour)
+	escapeTimer.Stop()
+	defer escapeTimer.Stop()
 	defer tick.Stop()
 
 	for !v.quitting {
@@ -672,13 +686,31 @@ func Switchboard(by string) error {
 			if !ok {
 				return nil
 			}
-			v.key(k)
-			v.render()
-		case <-tick.C:
-			v.st = loadState()
-			if v.sel >= len(v.st.calls) {
-				v.sel = 0
+			events := decoder.feed(k)
+			for _, event := range events {
+				v.handleInput(event)
 			}
+			if !escapeTimer.Stop() {
+				select {
+				case <-escapeTimer.C:
+				default:
+				}
+			}
+			if decoder.loneEscape() {
+				escapeTimer.Reset(100 * time.Millisecond)
+			}
+			if len(events) > 0 {
+				v.render()
+			}
+		case <-escapeTimer.C:
+			if decoder.loneEscape() {
+				decoder = sbInputDecoder{}
+				v.key(27)
+				v.render()
+			}
+		case <-tick.C:
+			v.refresh(loadState())
+			v.frame++
 			v.render()
 		case s := <-sigs:
 			if s == syscall.SIGWINCH {
@@ -686,8 +718,7 @@ func Switchboard(by string) error {
 				v.render()
 				continue
 			}
-			t.restore()
-			os.Exit(0)
+			return nil
 		}
 	}
 	return nil
@@ -704,4 +735,31 @@ func parseSwitchboardArgs(args []string) string {
 		}
 	}
 	return ""
+}
+
+// Preserve the identity, including while a human is typing a decision.
+func (v *view) refresh(next sbState) {
+	id := ""
+	if sc := v.selectedCall(); sc != nil {
+		id = sc.call.ID
+	}
+	v.st = next
+	for i, c := range next.calls {
+		if c.call.ID == id {
+			moved := v.sel != i
+			v.sel = i
+			if moved {
+				v.revealCall()
+			}
+			return
+		}
+	}
+	v.sel = 0
+	v.selD = 0
+	v.revealCall()
+	if id != "" && v.prompt != "" {
+		v.prompt = ""
+		v.input = nil
+		v.flash = "selected call disappeared; input cancelled"
+	}
 }

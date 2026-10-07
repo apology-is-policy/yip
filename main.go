@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -30,6 +31,10 @@ SETTING UP A LINE
 
 COMMANDS
 
+  yip call PEER SUBJECT     open a call; body on stdin
+  yip inbox [--all]         compact turns + notes + lifecycle digest
+  yip api TOOL [JSON]       all agent operations, JSON result (api list)
+  yip retire [--undo]       retire this identity from active views
   yip serve                 MCP server over stdio (what the agents use)
   yip hook <event>          hook handler: posttooluse | stop | sessionstart
   yip ring                  what is waiting for me
@@ -39,6 +44,21 @@ COMMANDS
   yip bye  [call]           propose hanging up
   yip presence [peer]       what everyone is doing
   yip busy <text> [pids..]  declare what I am doing ("" clears)
+
+SHARED MACHINES -- take the lock, do not measure the machine
+
+  yip resources             who holds what, how long left, who is queued
+  yip hold <res> <reason>   take it, blocking until free (--wait 60s, --now)
+                            --for 2h sets the TTL; trailing pids register work
+  yip release <res>         give it back; the next waiter's block resolves
+  yip steal <res> <why>     take an EXPIRED lease. Recorded. Tell them.
+
+  A quiet machine is NOT a free one: an idle host and one BETWEEN PHASES of
+  a peer's gate are identical on every dimension you can measure. Only the
+  holder's word ends a claim -- so leases expire on WALL CLOCK, never on a
+  heartbeat, because a 40-minute gate in one call beats not at all.
+
+  Holding means nobody else STARTS. It is not a licence to kill what runs.
   yip beat                  stamp a heartbeat
   yip calls                 list calls
   yip line                  the line and everyone on it
@@ -152,7 +172,63 @@ func main() {
 		}
 	}
 
+	// A human observer does not beat as the agent registered at this checkout.
+	if cmd != "serve" && cmd != "hook" && cmd != "switchboard" && cmd != "ratify" && cmd != "settled" && cmd != "install" && cmd != "retire" {
+		if me, err := WhoAmI(as, ""); err == nil {
+			_ = Beat(me, cmd)
+		}
+	}
 	switch cmd {
+	case "api":
+		me := must(WhoAmI(as, ""))
+		if len(args) == 0 {
+			check(fmt.Errorf("usage: yip api TOOL [JSON]; api list lists agent tools"))
+		}
+		if args[0] == "list" {
+			b, _ := json.MarshalIndent(tools(), "", "  ")
+			fmt.Println(string(b))
+			return
+		}
+		var a map[string]any
+		var raw []byte
+		if len(args) > 1 {
+			raw = []byte(args[1])
+		} else {
+			raw, _ = io.ReadAll(os.Stdin)
+		}
+		if len(strings.TrimSpace(string(raw))) == 0 {
+			raw = []byte("{}")
+		}
+		check(json.Unmarshal(raw, &a))
+		out, err := (&server{me: me}).call(args[0], a)
+		result := map[string]any{"ok": err == nil, "result": out}
+		if err != nil {
+			result["error"] = err.Error()
+		}
+		b, _ := json.Marshal(result)
+		fmt.Println(string(b))
+		if err != nil {
+			os.Exit(1)
+		}
+	case "call":
+		me := must(WhoAmI(as, ""))
+		if len(args) < 2 {
+			check(fmt.Errorf("usage: yip call PEER SUBJECT < body.txt"))
+		}
+		b, err := io.ReadAll(os.Stdin)
+		check(err)
+		out, err := (&server{me: me}).call("call", map[string]any{"peer": args[0], "subject": strings.Join(args[1:], " "), "body": string(b)})
+		check(err)
+		fmt.Println(out)
+	case "inbox":
+		me := must(WhoAmI(as, ""))
+		out, err := Inbox(me, first(args) == "--all")
+		check(err)
+		fmt.Println(out)
+	case "retire":
+		me := must(WhoAmI(as, ""))
+		check(Retire(me, first(args) != "--undo"))
+		fmt.Println("retirement updated")
 	case "install":
 		res, err := Install("", line, as, local)
 		check(err)
@@ -203,35 +279,29 @@ func main() {
 		fmt.Println(out)
 	case "read":
 		me := must(WhoAmI(as, ""))
-		c, err := ResolveCall(first(args), me)
-		check(err)
-		turns, err := Turns(c)
-		check(err)
-		fmt.Printf("call %s -- %s\n%s -> %s\n\n", c.ID, c.Subject, c.From, c.To)
-		for _, t := range turns {
-			fmt.Printf("===== turn %d -- %s -- %s\n\n%s\n\n", t.N, t.From, t.At, strings.TrimRight(t.Body, "\n"))
+		a := map[string]any{"call": first(args)}
+		for i := 1; i+1 < len(args); i++ {
+			if args[i] == "--since" || args[i] == "--since-note" {
+				n, err := strconv.Atoi(args[i+1])
+				check(err)
+				key := "since"
+				if args[i] == "--since-note" {
+					key = "since_note"
+				}
+				a[key] = float64(n)
+				i++
+			}
 		}
-		if len(turns) > 0 {
-			MarkSeen(c, me, turns[len(turns)-1].N)
-		}
-		fmt.Printf("floor: %s\n", FloorHolder(c, turns))
+		out, err := (&server{me: me}).call("read", a)
+		check(err)
+		fmt.Print(strings.TrimRight(out, "\n") + "\n")
 	case "say":
 		me := must(WhoAmI(as, ""))
-		c, err := ResolveCall(first(args), me)
-		check(err)
 		b, err := io.ReadAll(os.Stdin)
 		check(err)
-		if len(strings.TrimSpace(string(b))) == 0 {
-			check(fmt.Errorf("nothing on stdin to say"))
-		}
-		turns, _ := Turns(c)
-		if h := FloorHolder(c, turns); h != me {
-			check(fmt.Errorf("the floor is %s's", h))
-		}
-		ClearByes(c)
-		n, err := AppendTurn(c, me, string(b), false)
+		out, err := (&server{me: me}).call("say", map[string]any{"call": first(args), "body": string(b)})
 		check(err)
-		fmt.Printf("turn %d sent on %s\n", n, c.ID)
+		fmt.Println(out)
 	case "bye":
 		me := must(WhoAmI(as, ""))
 		c, err := ResolveCall(first(args), me)
@@ -260,6 +330,73 @@ func main() {
 		}
 		check(SetBusy(me, args[0], pids))
 		fmt.Println("ok")
+	case "resources":
+		me, _ := WhoAmI(as, "")
+		fmt.Println(ResourcesText(me))
+	case "hold":
+		me := must(WhoAmI(as, ""))
+		var ttlS, waitS string
+		args, ttlS = takeFlag(args, "--for", "2h")
+		args, waitS = takeFlag(args, "--wait", "60s")
+		for i, a := range args {
+			if a == "--now" {
+				args = append(args[:i:i], args[i+1:]...)
+				waitS = "0s"
+				break
+			}
+		}
+		if len(args) < 2 {
+			check(fmt.Errorf("usage: yip hold <%s> <reason> [--for 2h] [--wait 60s] [--now] [pid...]",
+				strings.Join(ResourceNames(), "|")))
+		}
+		name := args[0]
+		reason := ""
+		var pids []int
+		for _, a := range args[1:] {
+			if n, err := strconv.Atoi(a); err == nil {
+				pids = append(pids, n)
+				continue
+			}
+			if reason != "" {
+				reason += " "
+			}
+			reason += a
+		}
+		if strings.TrimSpace(reason) == "" {
+			check(fmt.Errorf("hold needs a reason -- a lease nobody can read is a lock with the legibility of a stale flag"))
+		}
+		ttl, err := time.ParseDuration(ttlS)
+		check(err)
+		wait, err := time.ParseDuration(waitS)
+		check(err)
+		start := time.Now()
+		got, cur, pos, err := Acquire(name, me, reason, ttl, wait, pids)
+		check(err)
+		fmt.Println(HoldText(name, me, got, cur, pos, time.Since(start)))
+		if !got {
+			os.Exit(1)
+		}
+	case "release":
+		me := must(WhoAmI(as, ""))
+		if len(args) < 1 {
+			check(fmt.Errorf("usage: yip release <%s>", strings.Join(ResourceNames(), "|")))
+		}
+		l, err := Release(args[0], me)
+		check(err)
+		if q := Queue(args[0]); len(q) > 0 {
+			fmt.Printf("released %s after %s -- %s is next and their wait will resolve.\n",
+				args[0], span(l.Age()), q[0].Agent)
+		} else {
+			fmt.Printf("released %s after %s -- nobody is waiting.\n", args[0], span(l.Age()))
+		}
+	case "steal":
+		me := must(WhoAmI(as, ""))
+		if len(args) < 2 {
+			check(fmt.Errorf("usage: yip steal <resource> <why>   (EXPIRED leases only; recorded)"))
+		}
+		l, err := Steal(args[0], me, strings.Join(args[1:], " "))
+		check(err)
+		fmt.Printf("STOLE %s from %s. Recorded, and it is on you to tell them.\nwhy: %s\n", args[0], l.StolenFrom, l.StealWhy)
 	case "beat":
 		me := must(WhoAmI(as, ""))
 		check(Beat(me, ""))
@@ -273,12 +410,9 @@ func main() {
 		}
 		for _, c := range calls {
 			turns, _ := Turns(c)
-			state := "open"
-			if IsClosed(c) {
-				state = "closed"
-			}
+			state := CallStatus(c, turns)
 			mark := "  "
-			if me != "" && c.Involves(me) && !IsClosed(c) && FloorHolder(c, turns) == me {
+			if me != "" && c.Involves(me) && state == "open" && FloorHolder(c, turns) == me {
 				mark = "* "
 			}
 			fmt.Printf("%s%-40s %s->%s  %d turns  %s  %s\n", mark, c.ID, c.From, c.To, len(turns), state, c.Subject)
@@ -549,12 +683,29 @@ func doctor(as string) {
 	// NAMES actually runs. A binary overwritten in place while something is
 	// running from it can end up permanently SIGKILLed at exec, and the only
 	// symptom is `Killed: 9` inside a hook error that never mentions yip.
+	// And the FOURTH claim, which "runs" cannot make: the wired binary is THIS
+	// build. Two installs at two paths, three weeks apart, both ran and both
+	// answered "0.1.0" -- so a checkout wired to the old one passed doctor and
+	// still had no lease tools after a restart. Compare what the wired binary
+	// SAYS its version is against what this one says. Different answers mean a
+	// stale install: re-run `yip install [--local]` from the current binary and
+	// restart Claude Code (the running server keeps its old inode).
+	self := binPath()
 	for _, bin := range configuredBins(root) {
 		runs, why := BinRuns(bin)
-		if runs {
-			say(true, "binary runs: %s", bin)
-		} else {
+		if !runs {
 			say(false, "binary DOES NOT RUN: %s -- %s", bin, why)
+			continue
+		}
+		v := BinVersion(bin)
+		switch {
+		case v == serverVersion:
+			say(true, "binary runs, current (%s): %s", v, bin)
+		case v == "":
+			say(false, "binary runs but reports no version: %s -- older than `yip version`; reinstall", bin)
+		default:
+			say(false, "binary STALE: %s reports %s, this yip (%s) is %s -- re-run `yip install` from the current binary, then restart Claude Code",
+				bin, v, self, serverVersion)
 		}
 	}
 

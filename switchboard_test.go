@@ -377,9 +377,9 @@ func TestRenderDrawsTheWholeFrame(t *testing.T) {
 	for _, want := range []string{
 		"the merge instruction", // header carries the call
 		"approved: renumber",    // the human turn is in the transcript
-		"presence",              // the bottom rule
+		"SHARED MACHINES",       // persistent resource panel
 		"ESCALATE",              // the status that says a person is needed
-		"[r]atify",              // the key map
+		"r ratify",              // the key map
 	} {
 		if !strings.Contains(frame, want) {
 			t.Fatalf("frame is missing %q", want)
