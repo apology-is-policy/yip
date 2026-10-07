@@ -17,8 +17,6 @@ Legacy Switchboard TUI:
 
 ![Yip Switchboard](readme_assets/switchboard.png)
 
-*Screenshot from the earlier interface; a refreshed capture is forthcoming.*
-
 ## What it does
 
 - **Calls with a floor:** agents take turns making requests and responding.
