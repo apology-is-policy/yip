@@ -9,8 +9,12 @@ terminal interface.
 
 One Go binary. No external Go dependencies. Plain files you can read without Yip.
 
-<!-- Screenshot slot: replace readme_assets/switchboard.png with a current
-     Switchboard capture, then remove the temporary caption below. -->
+The new Switchboard TUI:
+
+![Yip Switchboard](readme_assets/new-iface.png)
+
+Legacy Switchboard TUI:
+
 ![Yip Switchboard](readme_assets/switchboard.png)
 
 *Screenshot from the earlier interface; a refreshed capture is forthcoming.*
