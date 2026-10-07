@@ -34,6 +34,7 @@ func (v *view) frameLines(rows, cols int) []string {
 		return nil
 	}
 	p := colors()
+	v.panes = paneLayout(rows, cols)
 	var out []string
 	put := func(s string) {
 		if len(out) < rows {
@@ -75,56 +76,47 @@ func (v *view) frameLines(rows, cols int) []string {
 	put("  " + p.text(p.ink, title))
 	put("  " + p.text(p.muted, detail))
 	put("")
-	bodyH := max(1, rows-8)
-	railW := 0
-	if cols >= 125 {
-		railW = 27
-	}
-	sideW := 0
-	if cols >= 85 {
-		sideW = 31
-		if cols >= 150 {
-			sideW = 36
-		}
-	}
-	centerW := cols - railW - sideW
-	if railW > 0 {
-		centerW -= 2
-	}
-	if sideW > 0 {
-		centerW -= 2
-	}
+	bodyH := v.panes.height
+	railW, sideW, centerW := v.panes.railW, v.panes.sideW, v.panes.centerW
 	transcript := v.styledTranscript(max(8, centerW-4), p)
 	if v.tab == 1 {
 		transcript = v.dashboard(centerW-4, p)
 	}
 	if v.tab == 2 {
-		transcript = v.callRail(centerW-4, p, bodyH)
+		transcript = v.callRail(centerW-4, p)
 	}
 	if v.follow && v.tab == 0 {
 		v.scroll = max(0, len(transcript)-bodyH+1)
 	}
-	v.scroll = min(max(0, v.scroll), max(0, len(transcript)-1))
+	v.scroll = min(max(0, v.scroll), max(0, len(transcript)-bodyH))
 	side := v.dashboard(sideW-2, p)
-	rail := v.callRail(railW-2, p, bodyH)
+	rail := v.callRail(railW-2, p)
+	v.panes.centerLen, v.panes.sideLen = len(transcript), len(side)
+	v.panes.railLen = 2 + 3*len(v.st.calls)
+	v.railScroll = min(max(0, v.railScroll), max(0, v.panes.railLen-bodyH))
+	v.sideScroll = min(max(0, v.sideScroll), max(0, len(side)-bodyH))
+	centerScroll := v.scroll
+	if v.tab == 2 {
+		centerScroll = v.railScroll
+	}
 	for i := 0; i < bodyH; i++ {
 		l := ""
-		if i+v.scroll < len(transcript) {
-			l = transcript[i+v.scroll]
+		if i+centerScroll < len(transcript) {
+			l = transcript[i+centerScroll]
 		}
 		line := ""
 		if railW > 0 {
 			r := ""
-			if i < len(rail) {
-				r = rail[i]
+			if i+v.railScroll < len(rail) {
+				r = rail[i+v.railScroll]
 			}
 			line = fitCells(r, railW, true) + p.text(p.line, "│ ")
 		}
 		line += fitCells("  "+l, centerW, true)
 		if sideW > 0 {
 			r := ""
-			if i < len(side) {
-				r = side[i]
+			if i+v.sideScroll < len(side) {
+				r = side[i+v.sideScroll]
 			}
 			line += p.text(p.line, "│ ") + fitCells(r, sideW, true)
 		}
@@ -136,7 +128,7 @@ func (v *view) frameLines(rows, cols int) []string {
 		typed := tailCells(terminalText(string(v.input)), max(1, cols-plainWidth(prompt)-5))
 		put("  " + p.text(p.violet, prompt) + " " + typed + p.text(p.cyan, "▏"))
 	} else {
-		help := "  tab/n next · p prev · j/k scroll · f follow · 1 chat 2 desk 3 calls · r ratify · a arbitrate · q quit"
+		help := "  click call · wheel over pane · tab/n next · p prev · j/k scroll · f follow · 1 chat 2 desk 3 calls · r ratify · a arbitrate · q quit"
 		if cols < 125 {
 			help = "  1 chat 2 desk 3 calls · r ratify · a arbitrate · ? help · q quit"
 		}
@@ -179,13 +171,12 @@ func (v *view) styledTranscript(w int, p palette) []string {
 	}
 	return out
 }
-func (v *view) callRail(w int, p palette, h int) []string {
+func (v *view) callRail(w int, p palette) []string {
 	if w < 1 {
 		return nil
 	}
 	out := []string{p.text(p.muted, "CONVERSATIONS"), ""}
-	start := max(0, v.sel-(h-4)/3)
-	for i := start; i < len(v.st.calls) && len(out) < h; i++ {
+	for i := range v.st.calls {
 		c := v.st.calls[i]
 		marker := "○"
 		color := p.muted
@@ -201,7 +192,13 @@ func (v *view) callRail(w int, p palette, h int) []string {
 			bg = p.selected
 			marker = "▸"
 		}
-		out = append(out, p.text(bg+color, fitCells(marker+" "+c.call.From+" / "+c.call.To, w, true)), p.text(bg+p.ink, fitCells("  "+trunc(terminalText(c.call.Subject), max(4, w-2)), w, true)), "")
+		floor := "  → floor: " + c.floor
+		if c.closed || c.status == "resolved" || c.status == "archived" {
+			floor = "  — " + c.status
+		} else if c.floor == "" {
+			floor = "  — no floor"
+		}
+		out = append(out, p.text(bg+color, fitCells(marker+" "+c.call.From+" / "+c.call.To, w, true)), p.text(bg+p.ink, fitCells("  "+trunc(terminalText(c.call.Subject), max(4, w-2)), w, true)), p.text(bg+p.amber, fitCells(terminalText(floor), w, true)))
 	}
 	return out
 }

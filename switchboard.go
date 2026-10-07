@@ -99,7 +99,7 @@ func (t *tty) restore() {
 		_, _ = t.stty(t.saved)
 		t.saved = ""
 	}
-	fmt.Fprint(t.f, escShowCursor+escAltOff)
+	fmt.Fprint(t.f, escMouseOff+escShowCursor+escAltOff)
 	t.f.Close()
 	t.f = nil
 }
@@ -109,6 +109,8 @@ const (
 	escAltOff     = "\033[?1049l"
 	escHideCursor = "\033[?25l"
 	escShowCursor = "\033[?25h"
+	escMouseOn    = "\033[?1000h\033[?1006h"
+	escMouseOff   = "\033[?1006l\033[?1000l"
 	escClearLine  = "\033[K"
 	sgrReset      = "\033[0m"
 	sgrBold       = "\033[1m"
@@ -267,19 +269,22 @@ func loadState() sbState {
 // -------------------------------------------------------------------- view
 
 type view struct {
-	t        *tty
-	by       string
-	st       sbState
-	sel      int // selected call
-	selD     int // selected dispute within that call
-	scroll   int
-	follow   bool
-	prompt   string // non-empty => input mode
-	input    []rune
-	flash    string
-	quitting bool
-	frame    int
-	tab      int
+	t          *tty
+	by         string
+	st         sbState
+	sel        int // selected call
+	selD       int // selected dispute within that call
+	scroll     int
+	railScroll int
+	sideScroll int
+	panes      sbLayout // geometry and content lengths of the last displayed frame
+	follow     bool
+	prompt     string // non-empty => input mode
+	input      []rune
+	flash      string
+	quitting   bool
+	frame      int
+	tab        int
 }
 
 func wrap(s string, w int) []string {
@@ -561,7 +566,7 @@ func (v *view) key(k rune) {
 	v.flash = ""
 	switch k {
 	case '?':
-		v.flash = "tab/n next · p previous · j/k scroll · g top G end · f follow · d dispute · r ratify a arbitrate"
+		v.flash = "click a call · wheel over a pane · tab/n next · p prev · j/k scroll · g top G end · f follow · r ratify a arbitrate"
 	case '1', '2', '3':
 		v.tab = int(k - '1')
 		v.scroll = 0
@@ -570,21 +575,34 @@ func (v *view) key(k rune) {
 			v.sel = (v.sel + len(v.st.calls) - 1) % len(v.st.calls)
 			v.scroll = 0
 			v.selD = 0
+			v.revealCall()
 		}
 	case 'q', 3: // q or Ctrl-C
 		v.quitting = true
 	case 'j':
-		v.scroll++
+		if v.tab == 2 {
+			v.railScroll++
+		} else {
+			v.scroll++
+		}
 		v.follow = false
 	case 'k':
-		if v.scroll > 0 {
+		if v.tab == 2 {
+			v.railScroll = max(0, v.railScroll-1)
+		} else if v.scroll > 0 {
 			v.scroll--
 		}
 		v.follow = false
 	case 'g':
 		v.scroll, v.follow = 0, false
+		if v.tab == 2 {
+			v.railScroll = 0
+		}
 	case 'G':
 		v.follow = true
+		if v.tab == 2 {
+			v.railScroll = max(0, 2+3*len(v.st.calls)-v.panes.height)
+		}
 	case 'f':
 		v.follow = !v.follow
 	case '\t', 'n':
@@ -592,6 +610,7 @@ func (v *view) key(k rune) {
 			v.sel = (v.sel + 1) % len(v.st.calls)
 			v.scroll, v.selD = 0, 0
 			v.follow = true
+			v.revealCall()
 		}
 	case 'd':
 		if sc := v.selectedCall(); sc != nil && len(sc.disputes) > 0 {
@@ -636,7 +655,7 @@ func Switchboard(by string) error {
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
 	defer signal.Stop(sigs)
 
-	fmt.Fprint(t.f, escAltOn+escHideCursor)
+	fmt.Fprint(t.f, escAltOn+escHideCursor+escMouseOn)
 
 	v := &view{t: t, by: by, follow: true, st: loadState()}
 	v.render()
@@ -655,7 +674,10 @@ func Switchboard(by string) error {
 	}()
 
 	tick := time.NewTicker(time.Second)
-	escape := 0
+	var decoder sbInputDecoder
+	escapeTimer := time.NewTimer(time.Hour)
+	escapeTimer.Stop()
+	defer escapeTimer.Stop()
 	defer tick.Stop()
 
 	for !v.quitting {
@@ -664,30 +686,28 @@ func Switchboard(by string) error {
 			if !ok {
 				return nil
 			}
-			if escape == 1 {
-				if k == '[' {
-					escape = 2
-					continue
-				}
-				escape = 0
+			events := decoder.feed(k)
+			for _, event := range events {
+				v.handleInput(event)
 			}
-			if escape == 2 {
-				escape = 0
-				switch k {
-				case 'A':
-					k = 'k'
-				case 'B':
-					k = 'j'
+			if !escapeTimer.Stop() {
+				select {
+				case <-escapeTimer.C:
 				default:
-					continue
 				}
 			}
-			if k == 27 && v.prompt == "" {
-				escape = 1
-				continue
+			if decoder.loneEscape() {
+				escapeTimer.Reset(100 * time.Millisecond)
 			}
-			v.key(k)
-			v.render()
+			if len(events) > 0 {
+				v.render()
+			}
+		case <-escapeTimer.C:
+			if decoder.loneEscape() {
+				decoder = sbInputDecoder{}
+				v.key(27)
+				v.render()
+			}
 		case <-tick.C:
 			v.refresh(loadState())
 			v.frame++
@@ -726,12 +746,17 @@ func (v *view) refresh(next sbState) {
 	v.st = next
 	for i, c := range next.calls {
 		if c.call.ID == id {
+			moved := v.sel != i
 			v.sel = i
+			if moved {
+				v.revealCall()
+			}
 			return
 		}
 	}
 	v.sel = 0
 	v.selD = 0
+	v.revealCall()
 	if id != "" && v.prompt != "" {
 		v.prompt = ""
 		v.input = nil

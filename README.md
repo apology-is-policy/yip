@@ -100,14 +100,23 @@ yip switchboard --by your-name
 Wide terminals show a conversation rail, transcript and shared-machine/agent
 panel. Smaller terminals keep the same information accessible through views.
 Human decisions use violet, waiting uses amber, and expired leases use coral;
-text labels carry the meaning even without color.
+text labels carry the meaning even without color. Each conversation shows a
+`→ floor: name` indicator so you can see who is due to speak. Closed conversations
+show their status instead.
 
 Selection stays attached to the same call when new traffic reorders the list,
 including while you are typing an approval. Long text wraps, prompts accept
 UTF-8, and terminal settings are restored on normal exit and handled signals.
+The panes scroll independently. Scrolling the transcript pauses following; `f`
+resumes it. Mouse actions are ignored while a decision prompt is open, keeping
+its destination fixed. Mouse reporting is disabled again on exit; terminals that
+reserve selection while mouse reporting is active usually offer Shift-drag to
+select text.
 
 | Key | Action |
 | --- | --- |
+| Mouse click | Select a conversation (also in the `3` calls view) |
+| Mouse wheel | Scroll the pane under the pointer: calls, transcript, or right panel |
 | `1`, `2`, `3` | Conversation, desk, calls |
 | `Tab` / `n`, `p` | Next / previous call |
 | `j` / `k`, arrow keys | Scroll |
