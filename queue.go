@@ -137,6 +137,10 @@ func Request(name, agent, reason string, ttl time.Duration, pids []int) (bool, L
 	if e != nil {
 		return false, Lease{}, 0, e
 	}
+	if r, ok := KnownResource(name); !ok || r.Disabled {
+		unlock()
+		return false, Lease{}, 0, fmt.Errorf("resource %s is unknown or disabled", name)
+	}
 	if e = advanceOffers(name); e != nil {
 		unlock()
 		return false, Lease{}, 0, e

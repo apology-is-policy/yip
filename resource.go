@@ -71,20 +71,25 @@ import (
 // vCPU threads, and `cargo build -j` / TLC / a sanitizer build each saturate
 // every core. They are one contention class because they contend for one thing.
 type Resource struct {
-	Name string
-	Desc string
+	Name       string  `json:"name"`
+	Desc       string  `json:"description"`
+	Machine    string  `json:"machine"`
+	Host       string  `json:"host,omitempty"`
+	DiskPath   string  `json:"disk_path,omitempty"`
+	MinFreeGiB float64 `json:"min_free_gib,omitempty"`
+	Disabled   bool    `json:"disabled,omitempty"`
 }
 
-var knownResources = []Resource{
+var legacyResources = []Resource{
 	{
-		Name: "mac",
+		Name: "mac", Machine: "legacy-mac",
 		Desc: "the 8-core dev Mac -- ONE class covering builds, TLC, sanitizers, " +
 			"QEMU/HVF guests and the SMP gate. Includes the `thyla-gl` Parallels VM, " +
 			"whose 4 vCPUs are carved out of these same 8 cores rather than being " +
 			"separate hardware.",
 	},
 	{
-		Name: "pi",
+		Name: "pi", Machine: "legacy-pi",
 		Desc: "thyla-pi -- ARM64/KVM/V3D. Exclusive by necessity as well as by " +
 			"protocol: 4 GB RAM means one 2048 MiB guest at a time, and QEMU there " +
 			"is single-flight.",
@@ -92,7 +97,7 @@ var knownResources = []Resource{
 }
 
 func KnownResource(name string) (Resource, bool) {
-	for _, r := range knownResources {
+	for _, r := range resourceList() {
 		if r.Name == name {
 			return r, true
 		}
@@ -101,8 +106,8 @@ func KnownResource(name string) (Resource, bool) {
 }
 
 func ResourceNames() []string {
-	out := make([]string, 0, len(knownResources))
-	for _, r := range knownResources {
+	out := make([]string, 0, len(resourceList()))
+	for _, r := range resourceList() {
 		out = append(out, r.Name)
 	}
 	return out
@@ -332,6 +337,9 @@ func TryAcquire(name, agent, reason string, ttl time.Duration, pids []int) (got 
 		return false, Lease{}, 0, e
 	}
 	defer unlock()
+	if r, ok := KnownResource(name); !ok || r.Disabled {
+		return false, Lease{}, 0, fmt.Errorf("resource %s is unknown or disabled", name)
+	}
 	if e = advanceOffers(name); e != nil {
 		return false, Lease{}, 0, e
 	}
@@ -373,6 +381,10 @@ func TryAcquire(name, agent, reason string, ttl time.Duration, pids []int) (got 
 			return false, Lease{}, 0, err
 		}
 		return false, l, queuePosition(name, agent), nil
+	}
+
+	if err := checkResourceAdmission(name); err != nil {
+		return false, Lease{}, 0, err
 	}
 
 	// Unheld. Take it only if I am at the head of the queue, so a latecomer
@@ -484,6 +496,9 @@ func Steal(name, agent, why string) (Lease, error) {
 	if err := recordResourceEvent(name, agent, "recovery requested: "+why, l, l.Runners); err != nil {
 		return l, err
 	}
+	if err := checkResourceAdmission(name); err != nil {
+		return l, err
+	}
 	prev := l.Holder
 	nl := Lease{Resource: name, Holder: agent, Reason: "(stolen) " + why, Since: now(),
 		TTLSecs: int(defaultTTL / time.Second), StolenFrom: prev, StealWhy: why}
@@ -521,10 +536,15 @@ func span(d time.Duration) string {
 // else" rather than just "free/busy".
 func ResourcesText(me string) string {
 	var b strings.Builder
-	for _, r := range knownResources {
+	if _, e := LoadResourceConfig(); e != nil {
+		return "CONFIGURATION ERROR: " + e.Error()
+	}
+	for _, r := range resourceList() {
 		l, held := LoadLease(r.Name)
 		q := Queue(r.Name)
 		switch {
+		case r.Disabled && !held:
+			fmt.Fprintf(&b, "%-5s DISABLED\n", r.Name)
 		case !held:
 			fmt.Fprintf(&b, "%-5s FREE\n", r.Name)
 		case l.Expired():

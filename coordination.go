@@ -15,18 +15,21 @@ import (
 
 // New agent operations use the same dispatch from MCP and `yip api`.
 func coordinationTools() []toolDef {
-	return []toolDef{
+	return append(deliveryTools(), []toolDef{
 		{Name: "steal", Description: "Explicit expired-lease recovery. Requires a recorded reason, all registered runners verified dead, and peer notification. Alive or unknown runners require holder/operator coordination. Never kills jobs.", InputSchema: obj(map[string]any{"resource": str("Resource"), "reason": str("Recovery evidence and reason")}, "resource", "reason")},
 		{Name: "inbox", Description: "Compact call/notes digest; stale calls stay unresolved without blocking. all includes history.", InputSchema: obj(map[string]any{"all": yesno("Include stale and resolved history")})},
 		{Name: "call_status", Description: "Explicitly resolve, defer, archive, reopen (open) or link a call. Reason is durable; archive does not resolve. Notes are FYIs and never need this just to avoid a reply.", InputSchema: obj(map[string]any{"call": str("Call id"), "state": str("open, resolved, deferred, archived, linked"), "reason": str("Why"), "related": str("Other call for linked")}, "call", "state", "reason")},
-		{Name: "request", Description: "Nonblocking durable resource request; returns HELD only after acquisition, otherwise queues for 24h. Watch for changes, then call again to claim. An available queue head has a 2m offer window. No permission to work while queued. Requires upgraded resource clients.", InputSchema: obj(map[string]any{"resource": str("mac or pi"), "reason": str("Purpose"), "ttl_s": num("Lease duration, default 2h"), "pids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}}, "resource", "reason")},
+		{Name: "request", Description: "Nonblocking durable resource request; returns HELD only after acquisition, otherwise queues for 24h. Watch for changes, then call again to claim. An available queue head has a 2m offer window. No permission to work while queued. Requires upgraded resource clients.", InputSchema: obj(map[string]any{"resource": str("Configured resource name; use resources to list"), "reason": str("Purpose"), "ttl_s": num("Lease duration, default 2h"), "pids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}}, "resource", "reason")},
 		{Name: "cancel_request", Description: "Cancel only your queued interest, never a held lease.", InputSchema: obj(map[string]any{"resource": str("Resource")}, "resource")},
 		{Name: "queue_history", Description: "Resource request state including served, cancelled and expired entries.", InputSchema: obj(map[string]any{"resource": str("Resource")}, "resource")},
 		{Name: "lease_update", Description: "Update your held lease's phase and exact runner registrations. This does not renew it. Pass every current runner PID; observation failure is unknown, not dead.", InputSchema: obj(map[string]any{"resource": str("Resource"), "phase": str("Current phase"), "pids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}}, "resource", "phase", "pids")},
 		{Name: "retire", Description: "Retire your identity from default presence views; undo=true restores it. No history is deleted.", InputSchema: obj(map[string]any{"undo": yesno("Reactivate")})},
-	}
+	}...)
 }
 func coordinationCall(me, name string, a map[string]any) (string, bool, error) {
+	if out, handled, err := deliveryCall(me, name, a); handled {
+		return out, true, err
+	}
 	switch name {
 	case "steal":
 		l, e := Steal(argStr(a, "resource"), me, argStr(a, "reason"))
@@ -94,6 +97,19 @@ func coordinationCall(me, name string, a map[string]any) (string, bool, error) {
 // OS locks cover resource read/modify/write intervals, not waits. Kernel-owned
 // flock is released on crash; an agent cannot strand an on-disk lock marker.
 func resourceGuard(name string) (func(), error) {
+	registryUnlock, err := registryGuard(false)
+	if err != nil {
+		return nil, err
+	}
+	okay := false
+	defer func() {
+		if !okay {
+			registryUnlock()
+		}
+	}()
+	if _, err := LoadResourceConfig(); err != nil {
+		return nil, err
+	}
 	if _, ok := KnownResource(name); !ok {
 		return nil, fmt.Errorf("unknown resource %q", name)
 	}
@@ -108,7 +124,8 @@ func resourceGuard(name string) (func(), error) {
 		f.Close()
 		return nil, err
 	}
-	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }, nil
+	okay = true
+	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close(); registryUnlock() }, nil
 }
 
 type Runner struct {

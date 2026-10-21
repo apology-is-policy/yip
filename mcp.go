@@ -6,6 +6,7 @@ package main
 // stdout is the wire. Nothing here may print to it except protocol frames.
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -66,7 +68,7 @@ func tools() []toolDef {
 		{
 			Name: "call",
 			Description: "Open a call to the other agent and speak the first turn. Rings them: " +
-				"they see it on their next tool call, and they cannot end a turn while owing you a reply. " +
+				"enabled push delivery notifies them, with hooks/inbox as fallback; Stop hooks can remind them of an owed reply. " +
 				"Use this for anything needing back-and-forth. For a plain status question " +
 				"(is the peer running a gate, whose QEMU is that) use presence instead -- it is free and needs no answer.",
 			InputSchema: obj(map[string]any{
@@ -208,7 +210,7 @@ func tools() []toolDef {
 				"Leases expire on WALL CLOCK, never on heartbeat -- a peer running a 40-minute gate in " +
 				"one call goes silent while very much holding the machine.",
 			InputSchema: obj(map[string]any{
-				"resource":  str("Which machine: mac (the 8-core dev host, incl. the thyla-gl VM) or pi (thyla-pi)."),
+				"resource":  str("Configured exclusive resource name; inspect resources first."),
 				"reason":    str("What you will do with it. Required -- announce the RESOURCE and the UNCERTAINTY, not a duration you cannot honour."),
 				"ttl_s":     num("How long you expect to hold it, seconds. Default 7200, max 28800. A backstop against a dead agent, not a promise."),
 				"timeout_s": num("How long to block waiting. Default 60, max 600. Re-issue to keep your place."),
@@ -231,61 +233,114 @@ func tools() []toolDef {
 // ---------------------------------------------------------------- dispatch
 
 type server struct {
-	me  string
-	enc *json.Encoder
+	me           string
+	enc          *json.Encoder
+	writeMu      sync.Mutex
+	channelMode  bool
+	channel      string
+	initialized  bool
+	negotiated   bool
+	startChannel func() error
 }
 
-func Serve(me string) error {
+func Serve(me string) error         { return serveIO(me, false, os.Stdin, os.Stdout) }
+func ServeChannels(me string) error { return serveIO(me, true, os.Stdin, os.Stdout) }
+func serveIO(me string, channels bool, input io.Reader, output io.Writer) error {
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
-	s := &server{me: me, enc: json.NewEncoder(os.Stdout)}
-	dec := json.NewDecoder(os.Stdin)
+	s := &server{me: me, enc: json.NewEncoder(output), channelMode: channels}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	var release func()
+	defer func() {
+		cancel()
+		wg.Wait()
+		if release != nil {
+			endChannel(me, s.channel)
+			release()
+		}
+	}()
+	if channels {
+		unlock, err := channelOwner(me)
+		if err != nil {
+			return err
+		}
+		release = unlock
+		// Fixed before goroutines start; immutable for this MCP connection.
+		s.channel = requestID()
+		// Clear crash-stale readiness immediately, before waiting for a client
+		// handshake. No notification is emitted until initialized arrives.
+		if err := beginChannel(me, s.channel); err != nil {
+			return err
+		}
+		s.startChannel = func() error {
+			wg.Add(1)
+			go func() { defer wg.Done(); s.channelLoop(ctx) }()
+			return nil
+		}
+	}
+	dec := json.NewDecoder(input)
 	for {
 		var req rpcReq
 		if err := dec.Decode(&req); err != nil {
 			if err == io.EOF {
 				return nil
 			}
-			fmt.Fprintf(os.Stderr, "yip: decode: %v\n", err)
 			return err
 		}
 		s.handle(&req)
 	}
+}
+func (s *server) writeFrame(frame any) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.enc.Encode(frame)
 }
 
 func (s *server) reply(id json.RawMessage, result any) {
 	if id == nil {
 		return // notification
 	}
-	_ = s.enc.Encode(rpcResp{JSONRPC: "2.0", ID: id, Result: result})
+	_ = s.writeFrame(rpcResp{JSONRPC: "2.0", ID: id, Result: result})
 }
 
 func (s *server) fail(id json.RawMessage, code int, msg string) {
 	if id == nil {
 		return
 	}
-	_ = s.enc.Encode(rpcResp{JSONRPC: "2.0", ID: id, Error: &rpcErr{Code: code, Message: msg}})
+	_ = s.writeFrame(rpcResp{JSONRPC: "2.0", ID: id, Error: &rpcErr{Code: code, Message: msg}})
 }
 
 func (s *server) handle(req *rpcReq) {
 	switch req.Method {
 	case "initialize":
-		var p struct {
-			ProtocolVersion string `json:"protocolVersion"`
-		}
-		_ = json.Unmarshal(req.Params, &p)
-		version := p.ProtocolVersion
-		if version == "" {
-			version = "2024-11-05"
+		s.negotiated = true
+		// Do not echo unsupported client revisions. In particular 2026-07-28
+		// cannot carry Claude channel notifications on the v2 client.
+		caps := map[string]any{"tools": map[string]any{}}
+		if s.channelMode {
+			caps["experimental"] = map[string]any{"claude/channel": map[string]any{}}
 		}
 		s.reply(req.ID, map[string]any{
-			"protocolVersion": version,
-			"capabilities":    map[string]any{"tools": map[string]any{}},
+			"protocolVersion": "2024-11-05",
+			"capabilities":    caps,
 			"serverInfo":      map[string]any{"name": "yip", "version": serverVersion},
+			"instructions":    channelInstructions,
 		})
-	case "notifications/initialized", "notifications/cancelled":
+	case "notifications/initialized":
+		if s.negotiated && !s.initialized {
+			s.initialized = true
+			if s.startChannel != nil {
+				if err := s.startChannel(); err != nil {
+					fmt.Fprintln(os.Stderr, "yip channel:", err)
+				}
+			}
+		}
+	case "notifications/cancelled":
 		// no reply
+
 	case "ping":
 		s.reply(req.ID, map[string]any{})
 	case "tools/list":
@@ -379,6 +434,12 @@ func body(a map[string]any) (string, error) {
 
 func (s *server) call(name string, a map[string]any) (string, error) {
 	_ = Beat(s.me, name)
+	if name == "channel_ack" {
+		if !s.channelMode || !s.initialized || s.channel == "" {
+			return "", fmt.Errorf("channel_ack requires the receiving Channels MCP connection")
+		}
+		return "channel probe acknowledged for this session", acknowledgeChannel(s.me, s.channel, argStr(a, "id"))
+	}
 	if out, handled, err := coordinationCall(s.me, name, a); handled {
 		return out, err
 	}

@@ -20,6 +20,8 @@
 # `Killed: 9`, nothing in the message named yip, and the peer lost its
 # heartbeat, its Stop-block and its MCP server at once.
 
+.DEFAULT_GOAL := all
+
 BIN ?= $(HOME)/.local/bin/yip
 GO  ?= go
 
@@ -30,7 +32,12 @@ GO  ?= go
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
 LDFLAGS  = -ldflags "-X main.serverVersion=$(VERSION)"
 
-.PHONY: all build install uninstall test clean
+.PHONY: all build install uninstall test clean release
+
+OUT_DIR ?= dist
+
+release:
+	GO="$(GO)" python3 scripts/release.py --version "$(VERSION)" --out "$(OUT_DIR)"
 
 all: build
 
@@ -38,19 +45,19 @@ build:
 	$(GO) build $(LDFLAGS) -o yip .
 
 install: build
-	@mkdir -p $(dir $(BIN))
-	rm -f $(BIN)
-	cp yip $(BIN)
+	@mkdir -p "$(dir $(BIN))"
+	rm -f "$(BIN)"
+	cp yip "$(BIN)"
 	@# Verify the INSTALLED path, not the build output. An exit >= 128 means a
 	@# signal killed it -- the exact failure this target exists to prevent --
 	@# and it must fail loudly rather than leave a dead hook behind. Any other
 	@# exit code means the binary RAN, which is all that is being asked here.
-	@$(BIN) whoami >/dev/null 2>&1; rc=$$?; \
+	@"$(BIN)" version >/dev/null 2>&1; rc=$$?; \
 	 if [ $$rc -ge 128 ]; then \
 	   echo "FAIL: $(BIN) died with signal $$(($$rc - 128)) -- the install did not take"; \
 	   exit 1; \
 	 fi
-	@echo "installed $(BIN) ($$($(BIN) version))"
+	@echo "installed $(BIN) ($$("$(BIN)" version))"
 
 test:
 	$(GO) test ./...
@@ -62,3 +69,7 @@ test:
 
 clean:
 	rm -f yip
+
+uninstall:
+	rm -f "$(BIN)"
+	@echo "removed executable only; line state and runtime config retained"

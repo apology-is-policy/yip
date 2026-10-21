@@ -1,0 +1,25 @@
+name: test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: go build -o "$RUNNER_TEMP/yip" .
+      - run: YIP_TEST_BIN="$RUNNER_TEMP/yip" bash e2e.sh
+      - run: python3 channels_e2e.py "$RUNNER_TEMP/yip"
+      - run: YIP_TEST_BIN="$RUNNER_TEMP/yip" python3 delivery_e2e.py
+      - run: python3 scripts/package_smoke.py "$RUNNER_TEMP/yip"

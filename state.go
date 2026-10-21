@@ -3,7 +3,7 @@ package main
 // On-disk state for yip.
 //
 // Everything that two agents could touch concurrently is either an atomic
-// create (a turn, a bye marker) or owned by exactly one writer (presence,
+// create (a turn, a bye marker) or updated under a transaction lock (presence,
 // per-agent call state). Resource transitions use a short OS lock because
 // their queue and lease read/modify/write steps are shared between agents.
 //
@@ -116,7 +116,8 @@ func atomicCreate(dst string, data []byte) error {
 	return os.Link(tmp, dst)
 }
 
-// atomicReplace overwrites. Used only for state with exactly one writer.
+// atomicReplace atomically replaces bytes. Shared read-modify-write callers
+// must hold a transaction lock; rename alone does not prevent lost updates.
 func atomicReplace(dst string, data []byte) error {
 	tmp, err := stage(dst, data)
 	if err != nil {
@@ -471,9 +472,19 @@ func LoadAgentState(c *Call, agent string) AgentState {
 	return s
 }
 
+// All fields are monotonic cursors. Merge under the lock even when a caller
+// passes an older snapshot; no read or notice can erase another field's progress.
 func SaveAgentState(c *Call, agent string, s AgentState) error {
-	b, _ := json.MarshalIndent(s, "", "  ")
-	return atomicReplace(agentStatePath(c, agent), append(b, '\n'))
+	return UpdateAgentState(c, agent, func(cur *AgentState) {
+		cur.Seen = max(cur.Seen, s.Seen)
+		cur.SeenNotes = max(cur.SeenNotes, s.SeenNotes)
+		cur.NotesNotified = max(cur.NotesNotified, s.NotesNotified)
+		cur.BlockedAt = max(cur.BlockedAt, s.BlockedAt)
+		cur.NotifiedAt = max(cur.NotifiedAt, s.NotifiedAt)
+	})
+}
+func UpdateAgentState(c *Call, agent string, edit func(*AgentState)) error {
+	return updateJSON(agentStatePath(c, agent), func(s *AgentState) error { edit(s); return nil })
 }
 
 // ---------------------------------------------------------------- presence
@@ -510,29 +521,26 @@ func Beat(agent, lastTool string) error {
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
-	p, _ := LoadPresence(agent)
-	p.Agent = agent
-	p.Tip, p.Branch = GitTip(agent)
-	p.Beat = now()
-	if lastTool != "" {
-		p.LastTool = lastTool
-	}
-	b, _ := json.MarshalIndent(p, "", "  ")
-	return atomicReplace(presencePath(agent), append(b, '\n'))
+	tip, branch := GitTip(agent)
+	return updateJSON(presencePath(agent), func(p *Presence) error {
+		p.Agent, p.Tip, p.Branch, p.Beat = agent, tip, branch, now()
+		if lastTool != "" {
+			p.LastTool = lastTool
+		}
+		return nil
+	})
 }
 
 func SetBusy(agent, text string, pids []int) error {
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
-	p, _ := LoadPresence(agent)
-	p.Agent = agent
-	p.Tip, p.Branch = GitTip(agent)
-	p.Beat = now()
-	p.Busy = text
-	p.Pids = pids
-	b, _ := json.MarshalIndent(p, "", "  ")
-	return atomicReplace(presencePath(agent), append(b, '\n'))
+	tip, branch := GitTip(agent)
+	return updateJSON(presencePath(agent), func(p *Presence) error {
+		p.Agent, p.Tip, p.Branch, p.Beat = agent, tip, branch, now()
+		p.Busy, p.Pids = text, pids
+		return nil
+	})
 }
 
 func (p Presence) Age() time.Duration {

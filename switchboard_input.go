@@ -128,6 +128,13 @@ func (v *view) handleInput(e sbInput) {
 		return
 	}
 	if e.arrow && v.prompt != "" {
+		if v.broadcastComposing && v.broadcast != nil && v.broadcast.Stage == "confirm" {
+			if e.key == 'j' {
+				v.scroll++
+			} else {
+				v.scroll = max(0, v.scroll-1)
+			}
+		}
 		return
 	}
 	v.key(e.key)
@@ -194,8 +201,6 @@ func (v *view) mouse(m sbMouse) {
 		v.scroll, v.selD = 0, 0
 		v.follow = true
 		v.flash = ""
-		if pane == 2 {
-			v.tab = 0
-		} // narrow-screen calls view opens the chat
+		v.tab = 0 // either conversation rail opens the selected transcript
 	}
 }

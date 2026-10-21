@@ -97,6 +97,26 @@ with tempfile.TemporaryDirectory(prefix='yip-pty-') as tmp:
                 for fragment in [b'\x1b', b'[', b'A']:
                     os.write(master, fragment)
                     drain(.03)
+                # A new broadcast joins the same rail and opens a colored transcript.
+                (root/'line/members.json').write_text(json.dumps(dict(line='isolated-ui-fixture', members={str(root/'a'):'fixture-a', str(root/'b'):'fixture-b'})))
+                cli('broadcast','regroup','--to','fixture-a,fixture-b','--by','test-operator',body='Regroup for the next milestone.')
+                broadcast = json.loads(next((root/'line/broadcasts').glob('*.json')).read_text())
+                cli('api','broadcast_reply',json.dumps(dict(id=broadcast['id'],body='The checkpoint is complete.')),'--as','fixture-b')
+                drain(2.3)
+                rows=screen()
+                row=next(row for row,text in rows.items() if 'BROADCAST / regroup' in text[:27])
+                os.write(master, ('\x1b[<0;4;%dM'%row).encode())
+                drain(.2)
+                os.write(master,b'g')
+                drain(.2)
+                current='\n'.join(screen().values())
+                assert 'RECIPIENTS' in current and 'REPLY' in current and 'The checkpoint is complete.' in current, current
+                assert b'\x1b[38;5;183m' in output and b'\x1b[38;5;117m' in output
+                (evidence/'broadcast-frame.txt').write_text(current)
+                # Grouped view and narrow conversation list retain broadcasts.
+                os.write(master,b'4')
+                drain(.2)
+                assert 'BROADCASTS / b' in '\n'.join(screen().values())
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH',24,80,0,0))
                 os.kill(int(pidfile.read_text()),signal.SIGWINCH)
                 drain(.3)

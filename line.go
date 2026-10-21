@@ -184,6 +184,12 @@ type installResult struct {
 }
 
 func Install(cwd, lineOverride, asOverride string, local bool) (*installResult, error) {
+	return InstallRuntime(cwd, lineOverride, asOverride, local, "claude")
+}
+func InstallRuntime(cwd, lineOverride, asOverride string, local bool, runtime string) (*installResult, error) {
+	if runtime != "claude" && runtime != "claude-channels" && runtime != "codex" {
+		return nil, fmt.Errorf("runtime must be claude, claude-channels or codex")
+	}
 	root := checkoutRoot(cwd)
 
 	if lineOverride != "" {
@@ -199,8 +205,19 @@ func Install(cwd, lineOverride, asOverride string, local bool) (*installResult, 
 		return nil, err
 	}
 
+	unlock, err := fileGuard(membersPath())
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	agent := asOverride
-	m := LoadMembers()
+	m := Members{Line: activeLine, Members: map[string]string{}}
+	if err := readState(membersPath(), &m); err != nil {
+		return nil, err
+	}
+	if m.Members == nil {
+		return nil, fmt.Errorf("members map is null")
+	}
 	if agent == "" {
 		if a := m.AgentAt(root); a != "" {
 			agent = a // already a member; keep the name
@@ -227,28 +244,44 @@ func Install(cwd, lineOverride, asOverride string, local bool) (*installResult, 
 		Reinstall: m.AgentAt(root) != "",
 	}
 
-	if err := writeMCP(root, bin); err != nil {
-		return nil, err
-	}
-	res.McpPath = filepath.Join(root, ".mcp.json")
+	if runtime == "codex" {
+		if err := codexFiles(root, bin, activeLine, agent, false); err != nil {
+			return nil, err
+		}
+		res.McpPath = filepath.Join(root, ".codex", "config.toml")
+		res.HookPath = filepath.Join(root, ".codex", "hooks.json")
+	} else {
+		if runtime == "claude-channels" {
+			if err := RegisterChannel(agent, false); err != nil {
+				return nil, err
+			}
+			if err := configureChannel(root, bin, activeLine, agent); err != nil {
+				return nil, err
+			}
+		} else if err := writeMCP(root, bin); err != nil {
+			return nil, err
+		}
+		res.McpPath = filepath.Join(root, ".mcp.json")
 
-	hookFile := "settings.json"
-	other := "settings.local.json"
-	if local {
-		hookFile, other = other, hookFile
+		hookFile := "settings.json"
+		other := "settings.local.json"
+		if local {
+			hookFile, other = other, hookFile
+		}
+		// One checkout, one registration. Idempotence used to hold only WITHIN a
+		// file, so `install` followed by `install --local` left BOTH live: six hook
+		// execs per tool call, naming two binary paths that can disagree about
+		// which build is current. Observed on a real checkout, and it made a dead
+		// binary hard to attribute because two were configured.
+		if err := stripHooks(root, other); err != nil {
+			return nil, err
+		}
+		if err := writeHooks(root, bin, hookFile); err != nil {
+			return nil, err
+		}
+		res.HookPath = filepath.Join(root, ".claude", hookFile)
+
 	}
-	// One checkout, one registration. Idempotence used to hold only WITHIN a
-	// file, so `install` followed by `install --local` left BOTH live: six hook
-	// execs per tool call, naming two binary paths that can disagree about
-	// which build is current. Observed on a real checkout, and it made a dead
-	// binary hard to attribute because two were configured.
-	if err := stripHooks(root, other); err != nil {
-		return nil, err
-	}
-	if err := writeHooks(root, bin, hookFile); err != nil {
-		return nil, err
-	}
-	res.HookPath = filepath.Join(root, ".claude", hookFile)
 
 	m.Line = activeLine
 	m.Members[root] = agent
@@ -265,6 +298,11 @@ func Install(cwd, lineOverride, asOverride string, local bool) (*installResult, 
 
 func Uninstall(cwd string) error {
 	root := checkoutRoot(cwd)
+	unlock, err := fileGuard(membersPath())
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := stripMCP(root); err != nil {
 		return err
 	}
@@ -273,7 +311,15 @@ func Uninstall(cwd string) error {
 			return err
 		}
 	}
-	m := LoadMembers()
+	if _, err := os.Stat(filepath.Join(root, ".codex", "config.toml")); err == nil {
+		if err := codexFiles(root, "", "", "", true); err != nil {
+			return err
+		}
+	}
+	m := Members{Members: map[string]string{}}
+	if err := readState(membersPath(), &m); err != nil {
+		return err
+	}
 	delete(m.Members, root)
 	return SaveMembers(m)
 }
@@ -298,6 +344,9 @@ func readJSON(path string) (map[string]any, error) {
 	var m map[string]any
 	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, fmt.Errorf("%s is not valid JSON: %v", path, err)
+	}
+	if m == nil {
+		return nil, fmt.Errorf("%s must contain a JSON object", path)
 	}
 	return m, nil
 }

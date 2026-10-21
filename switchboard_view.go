@@ -19,7 +19,11 @@ func colors() palette {
 	return palette{bg: "\033[48;5;234m", ink: "\033[38;5;255m", muted: "\033[38;5;248m", line: "\033[38;5;239m", cyan: "\033[38;5;117m", green: "\033[38;5;114m", amber: "\033[38;5;222m", red: "\033[38;5;210m", violet: "\033[38;5;183m", selected: "\033[48;5;237m", enabled: true}
 }
 func (p palette) text(style, s string) string {
-	return style + strings.ReplaceAll(terminalText(s), "\n", " ") + sgrReset + p.bg + p.ink
+	s = strings.ReplaceAll(terminalText(s), "\n", " ")
+	if !p.enabled {
+		return s
+	}
+	return style + s + sgrReset + p.bg + p.ink
 }
 func (p palette) tag(style, s string) string { return p.text(style, " "+s+" ") }
 func motionEnabled() bool                    { return colors().enabled && os.Getenv("YIP_REDUCED_MOTION") == "" }
@@ -66,12 +70,20 @@ func (v *view) frameLines(rows, cols int) []string {
 	right := fmt.Sprintf("%s  %d active · %d stale  ", name, open, stale)
 	put(fitCells(header, max(1, cols-plainWidth(right)), true) + p.text(p.muted, right))
 	put(p.text(p.line, "  ╰"+strings.Repeat("─", max(0, cols-5))) + p.text(p.cyan, "╮"))
-	sc := v.selectedCall()
+	sc := v.selectedConversation()
 	title := "No conversations yet"
 	detail := "Calls will appear here as the line becomes active."
 	if sc != nil {
 		title = sc.call.Subject
 		detail = fmt.Sprintf("%s  ⇄  %s    %s    #%s", sc.call.From, sc.call.To, strings.ToUpper(sc.status), strings.SplitN(sc.call.ID, "-", 2)[0])
+	}
+	if sc != nil && sc.broadcast != nil {
+		b := sc.broadcast
+		title = firstLine(b.Body)
+		detail = fmt.Sprintf("%s · BROADCAST / %s · %d recipients · #%s", b.By, strings.ToUpper(b.Kind), len(b.Recipients), b.ID)
+	}
+	if v.tab == 3 {
+		title, detail = "Broadcasts and briefings", "Operator attribution · individual receipts and responses"
 	}
 	put("  " + p.text(p.ink, title))
 	put("  " + p.text(p.muted, detail))
@@ -84,6 +96,9 @@ func (v *view) frameLines(rows, cols int) []string {
 	}
 	if v.tab == 2 {
 		transcript = v.callRail(centerW-4, p)
+	}
+	if v.tab == 3 {
+		transcript = v.broadcastLines(centerW-4, p)
 	}
 	if v.follow && v.tab == 0 {
 		v.scroll = max(0, len(transcript)-bodyH+1)
@@ -128,9 +143,9 @@ func (v *view) frameLines(rows, cols int) []string {
 		typed := tailCells(terminalText(string(v.input)), max(1, cols-plainWidth(prompt)-5))
 		put("  " + p.text(p.violet, prompt) + " " + typed + p.text(p.cyan, "▏"))
 	} else {
-		help := "  click call · wheel over pane · tab/n next · p prev · j/k scroll · f follow · 1 chat 2 desk 3 calls · r ratify · a arbitrate · q quit"
+		help := "  click call · wheel over pane · tab/n next · p prev · j/k scroll · f follow · 1 chat 2 desk 3 calls 4 broadcasts · b compose · r ratify · a arbitrate · q quit"
 		if cols < 125 {
-			help = "  1 chat 2 desk 3 calls · r ratify · a arbitrate · ? help · q quit"
+			help = "  1 chat 2 desk 3 calls 4 broadcasts · b compose · r ratify · a arbitrate · ? help · q quit"
 		}
 		if v.flash != "" {
 			help = "  " + v.flash
@@ -143,9 +158,12 @@ func (v *view) frameLines(rows, cols int) []string {
 	return out
 }
 func (v *view) styledTranscript(w int, p palette) []string {
-	sc := v.selectedCall()
+	sc := v.selectedConversation()
 	if sc == nil {
 		return []string{"", p.text(p.cyan, "A quiet line."), "", p.text(p.muted, "Open a call to begin a conversation.")}
+	}
+	if sc.broadcast != nil {
+		return broadcastTranscript(sc.broadcast, w, p)
 	}
 	var out []string
 	for _, e := range sc.entries {
@@ -191,6 +209,13 @@ func (v *view) callRail(w int, p palette) []string {
 		if i == v.sel {
 			bg = p.selected
 			marker = "▸"
+		}
+		if b := c.broadcast; b != nil {
+			out = append(out,
+				p.text(bg+p.violet, fitCells(marker+" BROADCAST / "+b.Kind, w, true)),
+				p.text(bg+p.ink, fitCells("  "+trunc(terminalText(firstLine(b.Body)), max(4, w-2)), w, true)),
+				p.text(bg+p.amber, fitCells("  "+broadcastProgress(b), w, true)))
+			continue
 		}
 		floor := "  → floor: " + c.floor
 		if c.closed || c.status == "resolved" || c.status == "archived" {
