@@ -11,7 +11,7 @@ package main
 // event, consumed by a persistent monitor. The agent is not blocked while it
 // waits and pays nothing to be idle -- the peer's write is what wakes it.
 //
-//	Monitor(command: "yip watch", persistent: true)   # every event
+//	Monitor(command: "yip watch --timeout 25m", timeout_ms: 1500000)   # every event
 //	Bash(run_in_background: true, "yip watch --once") # just the next one
 //
 // It also closes the one row the README called irreducible: "idle, owing
@@ -40,6 +40,14 @@ type watchEvent struct {
 // drop an event -- it just arrives one interval later.
 func watchSnapshot(me string) map[string]string {
 	out := map[string]string{}
+	if _, e := LoadResourceConfig(); e != nil {
+		out["config-error:"+e.Error()] = "RESOURCE CONFIGURATION ERROR: " + e.Error()
+	}
+	for _, b := range ListBroadcastsQuiet() {
+		if b.hasRecipient(me) {
+			out["broadcast:"+b.ID] = "BROADCAST " + b.ID + " [" + b.Kind + "] " + firstLine(b.Body)
+		}
+	}
 	calls, err := ListCalls()
 	if err != nil {
 		return out
@@ -97,7 +105,7 @@ func watchSnapshot(me string) map[string]string {
 				fmt.Sprintf("DISPUTE %s  %s  -- %s", c.ID, d.ID, st)
 		}
 	}
-	for _, r := range knownResources {
+	for _, r := range resourceList() {
 		for _, e := range ResourceEvents(r.Name) {
 			if e.By != me {
 				out["resource-event:"+r.Name+":"+e.ID] = "RESOURCE " + r.Name + " " + e.Action + " by " + e.By + "; inspect current lease before work"

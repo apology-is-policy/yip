@@ -58,7 +58,7 @@ func ResourceEvents(name string) []ResourceEvent {
 
 func RecoveryNotices(me string) []string {
 	var out []string
-	for _, r := range knownResources {
+	for _, r := range resourceList() {
 		for _, e := range ResourceEvents(r.Name) {
 			if e.Previous.Holder == me && e.By != me {
 				out = append(out, fmt.Sprintf("RESOURCE %s %s: %s by %s; previous owner %s. Inspect resources; event is not a grant.", r.Name, e.At, e.Action, e.By, me))
@@ -76,7 +76,7 @@ func FreshRecoveryNotices(me string) []string {
 	if os.MkdirAll(dir, 0755) != nil {
 		return nil
 	}
-	for _, r := range knownResources {
+	for _, r := range resourceList() {
 		for _, e := range ResourceEvents(r.Name) {
 			if e.Previous.Holder != me || e.By == me {
 				continue

@@ -42,7 +42,8 @@ func emit(v any) {
 
 // RunHook dispatches and always succeeds. A relay that is not set up yet, a
 // worktree we cannot name, an unreadable call -- all mean "say nothing".
-func RunHook(event string, override string) {
+func RunHook(event string, override string) { RunHookRuntime(event, override, "claude") }
+func RunHookRuntime(event string, override string, runtime string) {
 	in := readHookInput()
 	me, err := WhoAmI(override, in.Cwd)
 	if err != nil {
@@ -51,14 +52,19 @@ func RunHook(event string, override string) {
 	if _, err := os.Stat(Root()); err != nil {
 		return
 	}
+	var result any
 	switch strings.ToLower(event) {
 	case "posttooluse":
-		emit(hookPostToolUse(me, in))
+		result = hookPostToolUse(me, in)
 	case "stop":
-		emit(hookStop(me))
+		result = hookStop(me)
 	case "sessionstart":
-		emit(hookSessionStart(me))
+		result = hookSessionStart(me)
 	}
+	if runtime == "codex" {
+		result = codexHookOutput(event, result)
+	}
+	emit(result)
 }
 
 // ------------------------------------------------------------ PostToolUse
@@ -68,25 +74,34 @@ func RunHook(event string, override string) {
 // new turn, not one per tool call until the agent reads.
 func hookPostToolUse(me string, in hookInput) any {
 	_ = Beat(me, in.ToolName)
+	if channelPreferred(me) {
+		return nil
+	}
 
 	rings, err := RingFor(me)
 	if err != nil {
 		return nil
 	}
 	lines := append(NoteNotices(me), FreshRecoveryNotices(me)...)
+	lines = append(lines, BroadcastNotices(me)...)
 	fresh := len(lines) > 0
 	brandNew := false
 	for _, r := range rings {
-		st := LoadAgentState(r.Call, me)
-		if r.Revision <= st.NotifiedAt {
+		notify := false
+		err := UpdateAgentState(r.Call, me, func(st *AgentState) {
+			if r.Revision <= st.NotifiedAt {
+				return
+			}
+			notify = true
+			if st.NotifiedAt == 0 && st.Seen == 0 {
+				brandNew = true
+			}
+			st.NotifiedAt = r.Revision
+		})
+		if err != nil || !notify {
 			continue
 		}
 		fresh = true
-		if st.NotifiedAt == 0 && st.Seen == 0 {
-			brandNew = true
-		}
-		st.NotifiedAt = r.Revision
-		_ = SaveAgentState(r.Call, me, st)
 		lines = append(lines, ringLine(r, me))
 	}
 	if !fresh {
@@ -135,12 +150,16 @@ func hookStop(me string) any {
 		if !r.HaveFloor && r.Unseen == 0 {
 			continue
 		}
-		st := LoadAgentState(r.Call, me)
-		if r.Revision <= st.BlockedAt {
-			continue // already blocked at this state; do not wedge the session
+		block := false
+		err := UpdateAgentState(r.Call, me, func(st *AgentState) {
+			if r.Revision > st.BlockedAt {
+				st.BlockedAt = r.Revision
+				block = true
+			}
+		})
+		if err != nil || !block {
+			continue
 		}
-		st.BlockedAt = r.Revision
-		_ = SaveAgentState(r.Call, me, st)
 		lines = append(lines, ringLine(r, me))
 	}
 	if len(lines) == 0 {
@@ -167,6 +186,9 @@ func hookSessionStart(me string) any {
 	_ = Beat(me, "")
 
 	var parts []string
+	if b := BroadcastInbox(me, false); b != "" {
+		parts = append(parts, b)
+	}
 	if notices := FreshRecoveryNotices(me); len(notices) > 0 {
 		parts = append(parts, "[yip resources] "+strings.Join(notices, " "))
 	}

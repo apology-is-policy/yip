@@ -136,13 +136,14 @@ type sbDispute struct {
 }
 
 type sbCall struct {
-	call     *Call
-	entries  []sbEntry
-	floor    string
-	closed   bool
-	disputes []*sbDispute
-	status   string
-	lastAt   string
+	broadcast *Broadcast // display-only conversation; never a call mutation target
+	call      *Call
+	entries   []sbEntry
+	floor     string
+	closed    bool
+	disputes  []*sbDispute
+	status    string
+	lastAt    string
 }
 
 type sbResource struct {
@@ -231,10 +232,34 @@ func loadState() sbState {
 		}
 		st.calls = append(st.calls, sc)
 	}
-	// Most recently active first: the call a watching human cares about is the
-	// one that just moved, not the one with the lowest id.
+	bs, err := ListBroadcasts()
+	if err != nil {
+		st.err = err.Error()
+	}
+	for _, b := range bs {
+		sc := &sbCall{broadcast: &b, call: &Call{ID: "broadcast:" + b.ID, From: b.By, To: "broadcast", Subject: firstLine(b.Body)}, status: "resolved", lastAt: b.At}
+		for _, a := range b.Recipients {
+			r, e := broadcastReceipt(b.ID, a)
+			if e != nil || r.ReadAt == "" || (b.Kind != "announcement" && len(r.Replies) == 0) {
+				sc.status = "open"
+			}
+			for _, reply := range r.Replies {
+				if reply.At > sc.lastAt {
+					sc.lastAt = reply.At
+				}
+			}
+		}
+		st.calls = append(st.calls, sc)
+	}
+	// Broadcasts stay at the top, newest activity first, including after all
+	// recipients reply. Otherwise completed briefings disappear below the
+	// potentially long stale-call history just when the operator wants to read them.
+	// Ordinary calls retain their existing status/activity ordering.
 	sort.SliceStable(st.calls, func(i, j int) bool {
 		rank := func(c *sbCall) int {
+			if c.broadcast != nil {
+				return -1
+			}
 			switch c.status {
 			case "open":
 				return 0
@@ -253,7 +278,7 @@ func loadState() sbState {
 		}
 		return st.calls[i].lastAt > st.calls[j].lastAt
 	})
-	for _, r := range knownResources {
+	for _, r := range resourceList() {
 		l, held := LoadLease(r.Name)
 		sr := sbResource{name: r.Name, lease: l, held: held, queue: Queue(r.Name)}
 		for _, runner := range l.Runners {
@@ -269,22 +294,24 @@ func loadState() sbState {
 // -------------------------------------------------------------------- view
 
 type view struct {
-	t          *tty
-	by         string
-	st         sbState
-	sel        int // selected call
-	selD       int // selected dispute within that call
-	scroll     int
-	railScroll int
-	sideScroll int
-	panes      sbLayout // geometry and content lengths of the last displayed frame
-	follow     bool
-	prompt     string // non-empty => input mode
-	input      []rune
-	flash      string
-	quitting   bool
-	frame      int
-	tab        int
+	broadcast          *broadcastDraft
+	broadcastComposing bool
+	t                  *tty
+	by                 string
+	st                 sbState
+	sel                int // selected call
+	selD               int // selected dispute within that call
+	scroll             int
+	railScroll         int
+	sideScroll         int
+	panes              sbLayout // geometry and content lengths of the last displayed frame
+	follow             bool
+	prompt             string // non-empty => input mode
+	input              []rune
+	flash              string
+	quitting           bool
+	frame              int
+	tab                int
 }
 
 func wrap(s string, w int) []string {
@@ -441,12 +468,17 @@ func (v *view) disputeLines(w int) []string {
 // blocked right now", and a cached answer to that is worse than none. Two small
 // file reads per frame.
 func (v *view) resourceLines(w int) []string {
+	if _, e := LoadResourceConfig(); e != nil {
+		return wrap("CONFIGURATION ERROR: "+terminalText(e.Error()), w)
+	}
 	var out []string
 	add := func(s string) { out = append(out, trunc(s, w)) }
-	for _, r := range knownResources {
+	for _, r := range resourceList() {
 		l, held := LoadLease(r.Name)
 		q := Queue(r.Name)
 		switch {
+		case r.Disabled && !held:
+			add(r.Name + " DISABLED")
 		case !held:
 			add(sgrBold + r.Name + sgrReset + " " + sgrDim + "free" + sgrReset)
 		case l.Expired():
@@ -503,6 +535,14 @@ func padVisible(s string, w int) string { return fitCells(s, w, true) }
 // ------------------------------------------------------------------- input
 
 func (v *view) selectedCall() *sbCall {
+	c := v.selectedConversation()
+	if c != nil && c.broadcast == nil {
+		return c
+	}
+	return nil
+}
+
+func (v *view) selectedConversation() *sbCall {
 	if v.sel >= 0 && v.sel < len(v.st.calls) {
 		return v.st.calls[v.sel]
 	}
@@ -511,6 +551,10 @@ func (v *view) selectedCall() *sbCall {
 
 func (v *view) submit() {
 	text := strings.TrimSpace(string(v.input))
+	if v.broadcastComposing {
+		v.submitBroadcast(text)
+		return
+	}
 	kind := v.prompt
 	v.prompt, v.input = "", nil
 	if text == "" {
@@ -552,6 +596,7 @@ func (v *view) key(k rune) {
 			v.submit()
 		case 27: // ESC
 			v.prompt, v.input, v.flash = "", nil, "cancelled"
+			v.broadcastComposing = false
 		case 127, 8:
 			if len(v.input) > 0 {
 				v.input = v.input[:len(v.input)-1]
@@ -566,8 +611,10 @@ func (v *view) key(k rune) {
 	v.flash = ""
 	switch k {
 	case '?':
-		v.flash = "click a call · wheel over a pane · tab/n next · p prev · j/k scroll · g top G end · f follow · r ratify a arbitrate"
-	case '1', '2', '3':
+		v.flash = "click a call · wheel over a pane · tab/n next · p prev · j/k scroll · g top G end · f follow · r ratify a arbitrate · 4 broadcasts · b compose"
+	case 'b':
+		v.startBroadcast()
+	case '1', '2', '3', '4':
 		v.tab = int(k - '1')
 		v.scroll = 0
 	case 'p':
@@ -740,7 +787,7 @@ func parseSwitchboardArgs(args []string) string {
 // Preserve the identity, including while a human is typing a decision.
 func (v *view) refresh(next sbState) {
 	id := ""
-	if sc := v.selectedCall(); sc != nil {
+	if sc := v.selectedConversation(); sc != nil {
 		id = sc.call.ID
 	}
 	v.st = next

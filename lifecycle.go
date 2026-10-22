@@ -136,6 +136,9 @@ func Inbox(me string, all bool) (string, error) {
 		return "", err
 	}
 	out := RecoveryNotices(me)
+	if broadcasts := BroadcastInbox(me, all); broadcasts != "" {
+		out = append(out, broadcasts)
+	}
 	for _, c := range calls {
 		if !c.Involves(me) {
 			continue
@@ -172,10 +175,20 @@ func Retire(me string, retired bool) error {
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
+	// Serialize retirement with an in-flight dispatcher. Once retirement
+	// returns, a later dispatch cannot begin a send using an earlier check.
+	if !validComponent(me) {
+		return fmt.Errorf("invalid agent")
+	}
+	unlock, err := fileGuard(endpointPath(me))
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if retired {
 		return atomicReplace(retirePath(me), []byte(now()+"\n"))
 	}
-	err := os.Remove(retirePath(me))
+	err = os.Remove(retirePath(me))
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -191,24 +204,23 @@ func NoteNotices(me string) []string {
 		if !c.Involves(me) {
 			continue
 		}
-		st := LoadAgentState(c, me)
-		notes, _ := Notes(c)
-		count, last := 0, st.NotesNotified
-		for _, n := range notes {
-			if n.N > st.NotesNotified && n.N > st.SeenNotes && n.From != me {
-				count++
-			}
-			if n.N > last {
-				last = n.N
-			}
+		notes, err := Notes(c)
+		if err != nil {
+			continue
 		}
-		if count > 0 {
+		count := 0
+		err = UpdateAgentState(c, me, func(st *AgentState) {
+			for _, n := range notes {
+				if n.N > st.NotesNotified && n.N > st.SeenNotes && n.From != me {
+					count++
+				}
+				st.NotesNotified = max(st.NotesNotified, n.N)
+			}
+		})
+		if err == nil && count > 0 {
 			out = append(out, fmt.Sprintf("%s: %d new note(s), no reply owed; read or inbox.", c.ID, count))
 		}
-		if last > st.NotesNotified {
-			st.NotesNotified = last
-			_ = SaveAgentState(c, me, st)
-		}
+
 	}
 	return out
 }

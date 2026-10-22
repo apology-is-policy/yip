@@ -29,6 +29,18 @@ SETTING UP A LINE
     yip install --local            use .claude/settings.local.json instead
     yip uninstall                  remove the config and leave the line
 
+DELIVERY AND BROADCASTS
+
+  yip install --runtime codex    configure Codex MCP and lifecycle hooks
+  yip delivery register UUID    opt this agent into one exact Codex chat
+  yip delivery dispatch --watch 1h   bounded dispatcher; no automatic install
+  yip delivery pause|resume|status   control/inspect the registered endpoint
+  yip delivery ack ID            acknowledge read (also MCP delivery_ack)
+  yip delivery retry ID          explicit retry; duplicate delivery possible
+  yip broadcast briefing --to a,b    body on stdin; CLI/operator attribution
+  yip broadcast announcement|regroup --to a,b    same recipient snapshot
+  yip api broadcasts             addressed broadcasts, including reply requests
+
 COMMANDS
 
   yip call PEER SUBJECT     open a call; body on stdin
@@ -51,7 +63,7 @@ SHARED MACHINES -- take the lock, do not measure the machine
   yip hold <res> <reason>   take it, blocking until free (--wait 60s, --now)
                             --for 2h sets the TTL; trailing pids register work
   yip release <res>         give it back; the next waiter's block resolves
-  yip steal <res> <why>     take an EXPIRED lease. Recorded. Tell them.
+  yip steal <res> <why>     recover expired lease only after runner checks.
 
   A quiet machine is NOT a free one: an idle host and one BETWEEN PHASES of
   a peer's gate are identical on every dimension you can measure. Only the
@@ -79,7 +91,7 @@ WAITING WITHOUT POLLING
 
   Nobody should poll in a shell. Arm it and be woken:
 
-    Monitor(command: "yip watch", persistent: true)
+    Monitor(command: "yip watch --timeout 25m", timeout_ms: 1500000)
     Bash(run_in_background: true, command: "yip watch --once")
 
 WHEN YOU DISAGREE -- name a measurement, not a winner
@@ -101,9 +113,9 @@ THE HUMAN SEAT
                             it. No key speaks as an agent -- an assertion has
                             to stay expensive, so there is no fast lane for one.
 
-  Deliberately CLI-only: there is no MCP tool for it, so an agent has no verb
-  that can produce a human turn. "The human decides" is unenforceable when the
-  only channel is agent-relayed -- this is the seat that fixes it.
+  CLI-only attribution is not human authentication: a process with shell/file
+  access as the same OS user can produce these notes. Do not use the label
+  alone as proof of operator approval.
 
 Every command takes --as <agent> to override recorded membership.
 The transcript is plain markdown under $YIP_ROOT/calls/<id>/turns/ --
@@ -111,6 +123,9 @@ readable with cat, so nothing here is ever required to read a message.
 `
 
 func main() {
+	if printHelp(os.Args[1:], os.Stdout) {
+		return
+	}
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
@@ -155,6 +170,8 @@ func main() {
 		os.Exit(2)
 	}
 	cmd, args := rest[0], rest[1:]
+	var runtime string
+	args, runtime = takeFlag(args, "--runtime", "claude")
 
 	// Every command but install needs to know which line it is on before it
 	// can find anything; install resolves its own.
@@ -173,12 +190,18 @@ func main() {
 	}
 
 	// A human observer does not beat as the agent registered at this checkout.
-	if cmd != "serve" && cmd != "hook" && cmd != "switchboard" && cmd != "ratify" && cmd != "settled" && cmd != "install" && cmd != "retire" {
+	if cmd != "config" && cmd != "doctor" && cmd != "version" && cmd != "serve" && cmd != "hook" && cmd != "switchboard" && cmd != "ratify" && cmd != "settled" && cmd != "install" && cmd != "retire" && cmd != "broadcast" && cmd != "delivery" {
 		if me, err := WhoAmI(as, ""); err == nil {
 			_ = Beat(me, cmd)
 		}
 	}
 	switch cmd {
+	case "config":
+		check(ResourceConfigCLI(args))
+	case "broadcast":
+		check(BroadcastCLI(args))
+	case "delivery":
+		check(DeliveryCLI(args, must(WhoAmI(as, ""))))
 	case "api":
 		me := must(WhoAmI(as, ""))
 		if len(args) == 0 {
@@ -230,7 +253,7 @@ func main() {
 		check(Retire(me, first(args) != "--undo"))
 		fmt.Println("retirement updated")
 	case "install":
-		res, err := Install("", line, as, local)
+		res, err := InstallRuntime("", line, as, local, runtime)
 		check(err)
 		verb := "joined"
 		if res.Reinstall {
@@ -246,7 +269,12 @@ func main() {
 		} else {
 			fmt.Printf("  peers:    none yet -- run `yip install` in another checkout\n")
 		}
-		fmt.Printf("\nRestart Claude Code here, then `yip doctor`.\n")
+		if runtime == "claude-channels" {
+			fmt.Println("\nStart Claude here with: claude --dangerously-load-development-channels server:yip")
+			fmt.Println("Accept the preview warning yourself; organization policy still applies. After Claude acknowledges the probe, run yip doctor --runtime claude-channels.")
+		} else {
+			fmt.Printf("\nRestart %s here, then yip doctor --runtime %s. Review and trust new hooks in the runtime.\n", runtime, runtime)
+		}
 	case "uninstall":
 		check(Uninstall(""))
 		fmt.Println("left the line; config removed")
@@ -264,14 +292,23 @@ func main() {
 		}
 	case "serve":
 		me := must(WhoAmI(as, ""))
-		if err := Serve(me); err != nil {
+		var err error
+		if len(args) == 1 && args[0] == "--channels" {
+			err = ServeChannels(me)
+		} else if len(args) == 0 {
+			err = Serve(me)
+		} else {
+			err = fmt.Errorf("serve [--channels]")
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 	case "hook":
 		if len(args) < 1 {
 			os.Exit(0) // a malformed hook invocation must not break a session
 		}
-		RunHook(args[0], as)
+		RunHookRuntime(args[0], as, runtime)
 	case "ring":
 		me := must(WhoAmI(as, ""))
 		out, err := RingText(me)
@@ -532,6 +569,18 @@ func main() {
 			os.Exit(1)
 		}
 	case "doctor":
+		if runtime == "claude-channels" {
+			me := must(WhoAmI(as, ""))
+			fmt.Println(EndpointStatus(me))
+			if !channelPreferred(me) {
+				os.Exit(1)
+			}
+			return
+		}
+		if runtime == "codex" {
+			check(CodexDoctor(""))
+			return
+		}
 		doctor(as)
 	case "version":
 		fmt.Println(serverVersion)

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "resources": [
+    {
+      "name": "build-host",
+      "description": "Exclusive build host, including all VMs sharing its CPUs",
+      "machine": "physical-build-host-01"
+    },
+    {
+      "name": "test-device",
+      "description": "Exclusive hardware test device",
+      "machine": "physical-test-device-01"
+    }
+  ]
+}
