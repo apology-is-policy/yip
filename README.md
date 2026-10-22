@@ -53,6 +53,7 @@ repositories, pass the same `--line NAME` in their setup commands and subsequent
 operations.
 
 ### Claude Code: Channels
+## What it does
 
 Channels is the recommended notification transport when the running Claude Code
 session supports it. Yip currently uses the custom-channel research-preview
