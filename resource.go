@@ -447,7 +447,7 @@ func Release(name, agent string) (Lease, error) {
 	if l.Holder != agent {
 		return l, fmt.Errorf("%s is held by %s, not you -- ask them to release it (or `steal` it if it has expired)", name, l.Holder)
 	}
-	if err := recordResourceEvent(name, agent, "release requested", l, nil); err != nil {
+	if err := recordResourceEvent(name, agent, "released", l, nil); err != nil {
 		return l, err
 	}
 	if err := os.Remove(leasePath(name)); err != nil {

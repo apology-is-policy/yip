@@ -106,8 +106,9 @@ func watchSnapshot(me string) map[string]string {
 		}
 	}
 	for _, r := range resourceList() {
+		queue := Queue(r.Name)
 		for _, e := range ResourceEvents(r.Name) {
-			if e.By != me {
+			if resourceEventConcerns(e, me, queue) {
 				out["resource-event:"+r.Name+":"+e.ID] = "RESOURCE " + r.Name + " " + e.Action + " by " + e.By + "; inspect current lease before work"
 			}
 		}
