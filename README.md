@@ -11,6 +11,7 @@ One Go binary. No third-party Go dependencies. Local files you can inspect
 without Yip.
 
 ![Yip Switchboard conversation view](readme_assets/new-iface.png)
+![Yip Switchboard conversation view](readme_assets/arcs.png)
 
 ## What you can do
 
