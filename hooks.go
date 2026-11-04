@@ -74,8 +74,15 @@ func RunHookRuntime(event string, override string, runtime string) {
 // new turn, not one per tool call until the agent reads.
 func hookPostToolUse(me string, in hookInput) any {
 	_ = Beat(me, in.ToolName)
+	nudge := roadmapNudge(me)
 	if channelPreferred(me) {
-		return nil
+		if nudge == "" {
+			return nil
+		}
+		return map[string]any{"hookSpecificOutput": map[string]any{
+			"hookEventName":     "PostToolUse",
+			"additionalContext": "[yip] " + nudge,
+		}}
 	}
 
 	rings, err := RingFor(me)
@@ -84,6 +91,9 @@ func hookPostToolUse(me string, in hookInput) any {
 	}
 	lines := append(NoteNotices(me), FreshRecoveryNotices(me)...)
 	lines = append(lines, BroadcastNotices(me)...)
+	if nudge != "" {
+		lines = append(lines, nudge)
+	}
 	fresh := len(lines) > 0
 	brandNew := false
 	for _, r := range rings {
@@ -201,6 +211,9 @@ func hookSessionStart(me string) any {
 			lines = append(lines, ringLine(r, me))
 		}
 		parts = append(parts, "[yip] "+strings.Join(lines, " "))
+	}
+	if r, ok, err := LoadRoadmap(me); err == nil && ok {
+		parts = append(parts, "[yip] Your roadmap: "+RoadmapSummary(r)+" Updated "+span(roadmapAge(r))+" ago; roadmap_at moves the marker.")
 	}
 	if txt, err := presenceText("", me); err == nil && txt != "" {
 		peers := []string{}

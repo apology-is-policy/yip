@@ -27,6 +27,11 @@ func coordinationTools() []toolDef {
 	}...)
 }
 func coordinationCall(me, name string, a map[string]any) (string, bool, error) {
+	switch name {
+	case "roadmap_post", "roadmap_at", "roadmaps", "roadmap_clear":
+		out, err := doRoadmap(me, name, a)
+		return out, true, err
+	}
 	if out, handled, err := deliveryCall(me, name, a); handled {
 		return out, true, err
 	}

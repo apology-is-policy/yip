@@ -354,6 +354,9 @@ func main() {
 		out, err := presenceText(first(args), me)
 		check(err)
 		fmt.Println(out)
+	case "roadmap":
+		me := must(WhoAmI(as, ""))
+		check(RoadmapCLI(args, me))
 	case "busy":
 		me := must(WhoAmI(as, ""))
 		if len(args) < 1 {

@@ -314,6 +314,13 @@ func EndpointStatus(agent string) string {
 		return "retired; no wake"
 	}
 	ep, err := readEndpoint(agent)
+	return endpointStatusFrom(agent, ep, err)
+}
+
+func endpointStatusFrom(agent string, ep Endpoint, err error) string {
+	if Retired(agent) {
+		return "retired; no wake"
+	}
 	if err != nil {
 		return "no endpoint; inbox only"
 	}
