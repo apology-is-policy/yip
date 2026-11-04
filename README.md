@@ -399,6 +399,10 @@ explicit recovery. `yip steal RESOURCE REASON` requires verified-dead registered
 runners; live or unknown runners require coordination. A lease never authorizes
 killing another agent's jobs.
 
+Resource events wake only the agents they concern: those queued for that resource
+when it happened, and a previous holder whose lease someone else acted on. "pi
+released by corona" means corona has let it go, and asks nothing of anyone.
+
 ### Configure your own line
 
 Without a registry, Yip retains the legacy `mac` and `pi` defaults. A new line can
