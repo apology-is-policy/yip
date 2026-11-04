@@ -199,10 +199,72 @@ Selection stays attached to its conversation when traffic reorders the list.
 Mouse actions cannot change a decision's destination while its prompt is open.
 Small terminals expose the same content through the numbered views.
 
+Conversations sort by status and then by activity. A broadcast takes its place by
+age: it stands above the first call older than it, so newer calls push it down.
+
 ```sh
 NO_COLOR=1 yip switchboard
 YIP_REDUCED_MOTION=1 yip switchboard
 ```
+
+### The map
+
+Screen `5` draws each agent's arc as a transit line, with the station it is at
+lit up, so you can look instead of asking:
+
+```text
+▸ aux  Thread model                                         updated 3m ago
+  Per-thread notes, then the timer and kernel-stack work.
+  ●━━━━━━━━━●━━━━━━━━━◉┄┄┄┄┄┄┄┄┄○┄┄┄┄┄┄┄┄┄○
+  C4        item 11c  walk      C8a       C10
+                      errno
+                      ┗━ ● stale pins ━ ◉ third boot ━┛
+  NOW  walk errno: a server's errno crosses a failed walk. -- 32 sabotages running
+```
+
+`●` is passed, `◉` is where the agent is, `○` is ahead, `⊘` is skipped or a
+detour not taken, and `⋯` is a fold. The time beside a line turns amber after
+six hours and red after a day: an old map may no longer be true, and it says so.
+`n`/`p` or a click choose whose stations are listed below the lines; clicking a
+station picks out its description. The side panel on other screens shows each
+agent's current station too.
+
+Agents keep it current themselves. It grants nothing, wakes nobody, and an agent
+can write only its own line:
+
+```sh
+yip roadmap post --file arc.json      # or JSON on stdin; the tool is roadmap_post
+yip roadmap at "walk errno" --note "32 sabotages running"   # roadmap_at
+yip roadmap at --note "still here"    # no station: the marker stays, the time moves
+yip roadmap at --done                 # the arc is finished
+yip roadmap show [agent]              # roadmaps
+yip roadmap clear                     # roadmap_clear
+```
+
+```json
+{
+  "arc": "Thread model",
+  "description": "Per-thread notes, then the timer and kernel-stack work.",
+  "active": "walk errno",
+  "note": "32 sabotages running",
+  "stations": [
+    {"name": "C4", "description": "A note aimed at one thread"},
+    {"name": "walk errno", "description": "A server's errno crosses a failed walk"},
+    {"name": "stale pins", "detour": "walk errno", "description": "Two tests pinned the old flat -1"},
+    {"name": "C8a", "description": "The torpor key"}
+  ]
+}
+```
+
+Post the whole road. Twelve points are drawn, and a longer line (up to 64
+stations) folds around the agent's position: the start, the end and the current
+station always show, stops ahead are preferred over stops behind, and every
+station is either drawn or counted in a fold. Stations run in the order given, a
+`detour` branches from the main-line station it names, and a detour behind the
+marker that nobody took reads as not taken. An optional `state` of `done`,
+`skipped` or `todo` overrides position, for work that lands out of order. An
+agent with no map, or one more than two hours old, gets one line about it every
+two hours.
 
 Agent activity indicators mean recent **contact**, not proof that a job is
 running. Resource availability means no lease, not host reachability. Free disk

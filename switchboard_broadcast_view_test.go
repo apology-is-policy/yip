@@ -121,7 +121,7 @@ func TestDispatchWatchLivenessAndExclusiveOwner(t *testing.T) {
 
 // Regression for the operator's fully answered regroup: completion must not
 // bury its mouse-selectable row below open, stale and archived call history.
-func TestCompletedBroadcastStaysVisibleAboveCallHistory(t *testing.T) {
+func TestBroadcastRemainsSelectableWherePlaced(t *testing.T) {
 	seedBroadcastMembers(t)
 	for i := 0; i < 20; i++ {
 		if _, err := NewCall("a", "b", "Old conversation"); err != nil {
@@ -137,9 +137,13 @@ func TestCompletedBroadcastStaysVisibleAboveCallHistory(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	b.At = "2099-01-01T00:00:00Z" // newer than every call, so it heads the list
+	if err := writeState(filepath.Join(broadcastDir(), b.ID+".json"), b); err != nil {
+		t.Fatal(err)
+	}
 	st := loadState()
 	if len(st.calls) != 21 || st.calls[0].broadcast == nil || st.calls[0].broadcast.ID != b.ID || st.calls[0].status != "resolved" {
-		t.Fatal("completed broadcast buried below call history")
+		t.Fatal("a broadcast newer than every call is not at the top")
 	}
 	v := &view{st: st, sel: 1, tab: 3}
 	v.frameLines(24, 160)
@@ -153,13 +157,12 @@ func TestCompletedBroadcastStaysVisibleAboveCallHistory(t *testing.T) {
 	if !strings.Contains(strings.Join(v.styledTranscript(60, palette{}), "\n"), "2/2 read · 2 replied") {
 		t.Fatal("completed replies not displayed")
 	}
-	// New broadcasts also sort ahead of completed ones by their own activity,
-	// while refresh preserves the operator's selected transcript.
+	// A newer broadcast goes above it, and refresh keeps the operator's selected transcript.
 	newer, err := CreateBroadcast("operator", "announcement", "New bulletin", []string{"a"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	newer.At = "2099-01-01T00:00:00Z"
+	newer.At = "2100-01-01T00:00:00Z"
 	if err := writeState(filepath.Join(broadcastDir(), newer.ID+".json"), newer); err != nil {
 		t.Fatal(err)
 	}

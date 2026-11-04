@@ -299,6 +299,10 @@ func TestChannelPreferredDoesNotConsumeHookCursors(t *testing.T) {
 	channelSend("a", session, false)
 	ep, _ := readEndpoint("a")
 	acknowledgeChannel("a", session, ep.ChannelProbe)
+	// The roadmap nudge has its own test; this one is about the call cursors.
+	if _, e = PostRoadmap("a", Roadmap{Arc: "x", Stations: []RoadmapStation{{Name: "s"}}}); e != nil {
+		t.Fatal(e)
+	}
 	if v := hookPostToolUse("a", hookInput{}); v != nil {
 		t.Fatal(v)
 	}
