@@ -315,8 +315,26 @@ func main() {
 			fmt.Printf("\nRestart %s here, then yip doctor --runtime %s. Review and trust new hooks in the runtime.\n", runtime, runtime)
 		}
 	case "uninstall":
-		check(UninstallWith("", as, profile))
-		fmt.Println("left the line; config removed")
+		// Without an explicit line, leave the lines this checkout actually
+		// joined -- not the one derived from its folder, which differs after
+		// an install with --line and used to leave the membership behind.
+		lines := []string{activeLine}
+		if line == "" && os.Getenv("YIP_LINE") == "" && os.Getenv("YIP_ROOT") == "" && profile == "" {
+			if hosting := linesHosting(checkoutRoot("")); len(hosting) > 0 {
+				lines = hosting
+			}
+		}
+		for _, l := range lines {
+			activeLine = l
+			if err := UninstallWith("", as, profile); err != nil {
+				// --as narrows to one identity: skip lines it is not on.
+				if as != "" && len(lines) > 1 && strings.Contains(err.Error(), "is not a member or seat") {
+					continue
+				}
+				check(err)
+			}
+			fmt.Printf("left line %q; config removed\n", l)
+		}
 	case "line":
 		fmt.Printf("line:     %s\n", activeLine)
 		fmt.Printf("line dir: %s\n", Root())

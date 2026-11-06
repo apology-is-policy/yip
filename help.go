@@ -136,10 +136,12 @@ TRANSPORT SETUP AND DIAGNOSTICS
     yip doctor --runtime codex --profile yip-reviewer
     yip uninstall [--as NAME | --profile NAME]
   A checkout has one path member, which install never replaces. A Codex install
-  into an owned checkout becomes a seat; --profile writes only
-  $CODEX_HOME/NAME.config.toml (MCP plus inline hooks). Inside a Codex shell,
-  yip answers as the identity bound to CODEX_THREAD_ID, not the path owner. A
-  second Claude identity needs its own worktree. yip line lists seats.
+  into an owned checkout becomes a seat, and a Claude install into a checkout
+  owned by a Codex agent seats that agent, so order does not matter. --profile
+  writes only $CODEX_HOME/NAME.config.toml (MCP plus inline hooks). Inside a
+  Codex shell, yip answers as the identity bound to CODEX_THREAD_ID, not the
+  path owner. A second Claude identity needs its own worktree. yip line lists
+  seats. Without --line, uninstall leaves every line the checkout joined.
 
   Delivery states: pending -> sending -> accepted (Codex) or sent (Channels).
   accepted/sent do not mean read. A crash/error can leave unknown delivery.

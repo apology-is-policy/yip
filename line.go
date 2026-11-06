@@ -278,12 +278,22 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 	// One checkout, one path member. Replacing it used to be silent: the
 	// previous agent vanished from the line while its hooks -- which resolve
 	// identity by path -- started answering to the new name.
+	// A Codex owner never needed the path: its config names it. So a Claude
+	// install moves it to a seat beside the new member instead of refusing,
+	// and the two can be installed in either order.
+	movedOwner := false
 	if owner != "" && owner != agent && !seatMode {
-		if runtime != "codex" {
-			return nil, fmt.Errorf("%s already belongs to %q on line %s. Claude's hooks identify an agent by its checkout, so a second Claude identity needs its own worktree. "+
-				"(If %q is a Codex agent, move it to a seat first: yip install --runtime codex --as %s --seat)", root, owner, activeLine, owner, owner)
+		switch {
+		case runtime == "codex":
+			seatMode = true // a Codex config names its identity; share the checkout
+		case isCodexIdentity(owner, root):
+			if _, taken := seats.Seats[owner]; taken {
+				return nil, fmt.Errorf("%q is both %s's member and a seat elsewhere; uninstall it first", owner, root)
+			}
+			movedOwner = true
+		default:
+			return nil, fmt.Errorf("%s already belongs to %q on line %s. Claude's hooks identify an agent by its checkout, so a second Claude identity needs its own worktree", root, owner, activeLine)
 		}
-		seatMode = true // a Codex config names its identity; share the checkout
 	}
 	// A name is one identity's. Claiming another's would make two sessions
 	// answer to it, which is the thing membership exists to prevent.
@@ -406,11 +416,18 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 		if converting {
 			delete(m.Members, root)
 			res.Notes = append(res.Notes, fmt.Sprintf("%s no longer owns %s by path; it is now a seat there.", agent, root))
-		} else if owner != "" && owner != agent && !opts.Seat && opts.Profile == "" {
+		} else if owner != "" && owner != agent && !opts.Seat && opts.Profile == "" && !hadSeat {
 			res.Notes = append(res.Notes, fmt.Sprintf("%s belongs to %s; %s joined as a Codex seat beside it, so %s is unaffected.", root, owner, agent, owner))
 		}
 		res.Seat = seatDescription(seat)
 	} else {
+		if movedOwner {
+			seats.Seats[owner] = Seat{Agent: owner, Runtime: "codex", Workdir: root, Created: now()}
+			if err := saveSeats(seats); err != nil {
+				return nil, err
+			}
+			res.Notes = append(res.Notes, fmt.Sprintf("%s was this checkout's member; it is now a Codex seat beside %s (its config names it, so nothing changes for it).", owner, agent))
+		}
 		m.Members[root] = agent
 	}
 	if err := SaveMembers(m); err != nil {
@@ -422,6 +439,52 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 		}
 	}
 	return res, nil
+}
+
+// isCodexIdentity: is this agent demonstrably a Codex agent -- by its delivery
+// record, or by this checkout's .codex/ config naming it? Anything less leaves
+// it a path member, because moving a Claude identity would break its hooks.
+func isCodexIdentity(agent, root string) bool {
+	if ep, err := readEndpoint(agent); err == nil && ep.Runtime == "codex" {
+		return true
+	}
+	if b, err := os.ReadFile(filepath.Join(root, ".codex", "config.toml")); err == nil {
+		if block, _, err := codexManagedBlock(string(b)); err == nil && codexBlockAgent(block) == agent {
+			return true
+		}
+	}
+	return false
+}
+
+// linesHosting lists the lines on which this checkout has a member or a seat,
+// read from recorded state. Uninstall uses it when no line is given: the line
+// derived from a folder is NOT necessarily the one it joined (install --line),
+// and uninstalling from the derived one left the real membership behind.
+func linesHosting(root string) []string {
+	ents, _ := os.ReadDir(filepath.Join(yipHome(), "lines"))
+	var out []string
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(yipHome(), "lines", e.Name())
+		var m Members
+		if readState(filepath.Join(dir, "members.json"), &m) == nil && m.Members[root] != "" {
+			out = append(out, e.Name())
+			continue
+		}
+		var s Seats
+		if readState(filepath.Join(dir, "seats.json"), &s) == nil {
+			for _, seat := range s.Seats {
+				if seat.Workdir == root {
+					out = append(out, e.Name())
+					break
+				}
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Uninstall removes integrations and line membership, never history.

@@ -112,9 +112,7 @@ func TestSeatConversionAndNarrowUninstall(t *testing.T) {
 	if _, err := InstallWith(dir, "t", "reviewer", false, "codex", InstallOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := InstallWith(dir, "t", "main", true, "claude", InstallOptions{}); err == nil || !strings.Contains(err.Error(), "--seat") {
-		t.Fatal("Claude evicted the Codex member, or the error gives no way forward", err)
-	}
+	// Explicit conversion frees the path.
 	res, err := InstallWith(dir, "t", "reviewer", false, "codex", InstallOptions{Seat: true})
 	if err != nil || !strings.Contains(strings.Join(res.Notes, " "), "now a seat") {
 		t.Fatal(res, err)
@@ -145,6 +143,70 @@ func TestSeatConversionAndNarrowUninstall(t *testing.T) {
 	}
 	if len(LineNames()) != 0 {
 		t.Fatal(LineNames())
+	}
+}
+
+// Codex installed first, then Claude: the order must not matter.
+func TestClaudeInstallMovesACodexOwnerToASeat(t *testing.T) {
+	dir := seatFixture(t)
+	root := checkoutRoot(dir)
+	if _, err := InstallWith(dir, "t", "codex", false, "codex", InstallOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if LoadMembers().AgentAt(root) != "codex" {
+		t.Fatal("fixture: codex should own the unowned folder")
+	}
+	res, err := InstallWith(dir, "t", "claude", true, "claude-rewake", InstallOptions{})
+	if err != nil {
+		t.Fatal("Claude refused a folder owned by a Codex agent:", err)
+	}
+	if !strings.Contains(strings.Join(res.Notes, " "), "now a Codex seat") {
+		t.Fatal(res.Notes)
+	}
+	if LoadMembers().AgentAt(root) != "claude" {
+		t.Fatal("Claude did not become the member")
+	}
+	if s := LoadSeats().Seats["codex"]; s.Workdir != root || s.Runtime != "codex" {
+		t.Fatal("codex not seated beside claude", s)
+	}
+	// Its Codex config was untouched and still names it.
+	if codexBlockAgent(codexBlockOf(t, filepath.Join(dir, ".codex", "config.toml"))) != "codex" {
+		t.Fatal("codex config changed")
+	}
+	// Re-running the Codex install now just refreshes the seat.
+	if res, err := InstallWith(dir, "t", "codex", false, "codex", InstallOptions{}); err != nil || !res.Reinstall {
+		t.Fatal(res, err)
+	}
+	// A Claude owner is never moved: a second Claude identity is refused.
+	if _, err := InstallWith(dir, "t", "other", true, "claude", InstallOptions{}); err == nil || !strings.Contains(err.Error(), "own worktree") {
+		t.Fatal("second Claude identity accepted", err)
+	}
+}
+
+// Uninstall must leave the line the folder joined, not the one derived from it.
+func TestLinesHostingFindsTheJoinedLine(t *testing.T) {
+	dir := seatFixture(t)
+	t.Setenv("YIP_ROOT", "") // resolve lines under YIP_HOME, as a real install does
+	root := checkoutRoot(dir)
+	if _, err := InstallWith(dir, "strategies", "claude", true, "claude-rewake", InstallOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InstallWith(dir, "strategies", "codex", false, "codex", InstallOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(linesHosting(root), ","); got != "strategies" {
+		t.Fatal("lines hosting the folder:", got)
+	}
+	derived, _ := resolveLine(root)
+	if derived == "strategies" {
+		t.Fatal("fixture: the derived line should differ from --line")
+	}
+	activeLine = "strategies"
+	if err := UninstallWith(dir, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(linesHosting(root)) != 0 {
+		t.Fatal("membership left behind", linesHosting(root))
 	}
 }
 

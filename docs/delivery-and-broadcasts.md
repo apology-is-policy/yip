@@ -341,7 +341,10 @@ codex -p yip-reviewer -C /path/to/checkout -s read-only
 
 Seats are recorded in `seats.json` beside `members.json`, so older binaries that
 rewrite `members.json` cannot drop them. Names are unique across both. A second
-Claude identity in an owned checkout is refused: Claude's hooks identify an
+Claude identity in an owned checkout is refused, but a Claude install into a
+checkout owned by a demonstrably Codex agent (its delivery record or `.codex/`
+config names it) moves that agent to a seat, so install order does not matter.
+A second Claude identity is refused: Claude's hooks identify an
 agent by checkout path. One `.codex/` layer or profile serves one identity.
 A profile that already defines hooks is refused rather than merged.
 
@@ -351,7 +354,9 @@ before the path. An unbound chat in a checkout shared with seats is refused
 Revision stamps for a seat use the checkout it shares, or else the bound
 session's working directory.
 
-`yip uninstall` removes the checkout's member and its seats; `--as NAME` limits
+`yip uninstall` removes the checkout's member and its seats, from every line
+the checkout joined (without `--line` it used to leave only the folder's
+derived line, keeping the real membership); `--as NAME` limits
 it to one identity; `--profile NAME` removes a profile seat without touching any
 checkout. `yip line` lists seats with their delivery state.
 `yip doctor --runtime codex [--profile NAME]` checks the layer and reports the

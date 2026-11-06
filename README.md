@@ -189,7 +189,8 @@ yip doctor --runtime codex --profile yip-reviewer --line myproject
 The profile seat writes only `~/.codex/yip-reviewer.config.toml` (MCP server and
 inline hooks); nothing goes into the repository. Inside a Codex shell, `yip`
 identifies the seat by its bound chat, never by the checkout path it shares.
-Use `--seat` to convert an existing Codex path member into a seat. A second
+Install order doesn't matter: a Claude install into a folder owned by a Codex
+agent moves that agent to a seat beside it (`--seat` does the same by hand). A second
 *Claude* identity still needs its own worktree, because Claude's hooks identify
 an agent by its checkout.
 
