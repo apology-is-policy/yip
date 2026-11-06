@@ -81,6 +81,11 @@ func WhoAmI(override, cwd string) (string, error) {
 		if here := seats.At(root); len(here) > 0 {
 			return "", fmt.Errorf("this Codex chat is not bound to a Yip identity yet, and %s is shared by seat(s) %s -- use the Yip MCP tools (which binds this chat) or pass --as NAME", root, strings.Join(here, ", "))
 		}
+		// A Codex chat is never the folder's Claude member, whatever the
+		// path says -- e.g. a profile seat started in a Claude-owned folder.
+		if owner := m.AgentAt(root); owner != "" && !isCodexIdentity(owner, root) {
+			return "", fmt.Errorf("this Codex chat is not bound to a Yip identity yet, and %s belongs to %q, which is not a Codex agent -- use the Yip MCP tools (which binds this chat) or pass --as NAME", root, owner)
+		}
 	}
 	if a := m.AgentAt(root); a != "" {
 		return a, nil

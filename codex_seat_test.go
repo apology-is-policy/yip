@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,8 +29,10 @@ func seatFixture(t *testing.T) string {
 	t.Setenv("CODEX_HOME", t.TempDir())
 	t.Setenv("CODEX_THREAD_ID", "")
 	t.Setenv("YIP_AGENT", "")
-	prev := activeLine
-	t.Cleanup(func() { activeLine = prev })
+	prev, prevList := activeLine, codexMCPList
+	t.Cleanup(func() { activeLine, codexMCPList = prev, prevList })
+	// Never ask a real Codex from tests; individual tests stub an answer.
+	codexMCPList = func(string, string) ([]byte, error) { return nil, errors.New("no codex in tests") }
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -639,5 +642,59 @@ func TestReadOnlyToolsAreAnnotated(t *testing.T) {
 		if !seen[name] {
 			t.Fatal("annotation names a missing tool:", name)
 		}
+	}
+}
+
+// Writing .codex/ is not Codex loading it: install and doctor ask Codex.
+func TestCodexLoadCheckExplainsUntrustedAndDisabled(t *testing.T) {
+	dir := seatFixture(t)
+	answer := `[]`
+	codexMCPList = func(got, profile string) ([]byte, error) {
+		if got != dir || profile != "" {
+			t.Errorf("asked Codex about %q (profile %q), want %q", got, profile, dir)
+		}
+		return []byte(answer), nil
+	}
+	res, err := InstallWith(dir, "t", "codex", false, "codex", InstallOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes := strings.Join(res.Notes, " ")
+	if !strings.Contains(notes, "NOT LOADED YET") || !strings.Contains(notes, "trust_level = \"trusted\"") || !strings.Contains(notes, dir) {
+		t.Fatal("untrusted folder not reported at install:", notes)
+	}
+	answer = `[{"name":"yip","enabled":true,"disabled_reason":null,"transport":{"args":["serve","--codex","--line","t","--as","codex"]}}]`
+	if ok, why, err := codexLoadsYip(dir, "", "codex"); !ok || err != nil {
+		t.Fatal(why, err)
+	}
+	if ok, why, _ := codexLoadsYip(dir, "", "other"); ok || !strings.Contains(why, `"codex", not "other"`) {
+		t.Fatal(why)
+	}
+	answer = `[{"name":"yip","enabled":false,"disabled_reason":"not allowed by requirements","transport":{"args":[]}}]`
+	if ok, why, _ := codexLoadsYip(dir, "", "codex"); ok || !strings.Contains(why, "not allowed by requirements") {
+		t.Fatal("policy-disabled server not explained:", why)
+	}
+	codexMCPList = func(string, string) ([]byte, error) { return nil, errors.New("codex: command not found") }
+	if res, _ := InstallWith(dir, "t", "codex", false, "codex", InstallOptions{}); strings.Contains(strings.Join(res.Notes, " "), "NOT LOADED") {
+		t.Fatal("claimed not-loaded without being able to ask Codex")
+	}
+}
+
+// A Codex chat, unbound, in a Claude-owned folder must not answer as Claude.
+func TestUnboundCodexShellNeverAnswersAsTheClaudeMember(t *testing.T) {
+	dir := seatFixture(t)
+	if _, err := InstallWith(dir, "t", "claude", true, "claude-rewake", InstallOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_THREAD_ID", threadB)
+	if me, err := WhoAmI("", dir); err == nil {
+		t.Fatal("unbound Codex shell answered as", me)
+	}
+	if me, _ := WhoAmI("claude", dir); me != "claude" {
+		t.Fatal("explicit --as lost")
+	}
+	t.Setenv("CODEX_THREAD_ID", "")
+	if me, _ := WhoAmI("", dir); me != "claude" {
+		t.Fatal(me)
 	}
 }

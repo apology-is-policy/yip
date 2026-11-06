@@ -353,6 +353,16 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 			res.McpPath = filepath.Join(root, ".codex", "config.toml")
 			res.HookPath = filepath.Join(root, ".codex", "hooks.json")
 		}
+		// Writing the layer is not Codex loading it: an untrusted folder's
+		// .codex/ is ignored. Ask Codex now, so the operator hears it here
+		// rather than from a silent session. No Codex installed: say nothing.
+		startDir := cwd
+		if startDir == "" {
+			startDir, _ = os.Getwd()
+		}
+		if loaded, why, err := codexLoadsYip(startDir, opts.Profile, agent); err == nil && !loaded {
+			res.Notes = append(res.Notes, "NOT LOADED YET: "+why)
+		}
 	} else {
 		switch runtime {
 		case "claude-channels":

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -268,6 +269,70 @@ func codexProfileFiles(profile, bin, line, agent string, remove bool) error {
 	return atomicReplace(path, []byte(config))
 }
 
+// codexMCPList asks Codex which MCP servers it resolves when started in dir
+// (with an optional profile layer). Injectable so tests do not depend on an
+// installed Codex. MEASURED on codex-cli 0.162.0: a checkout's .codex/ layer
+// appears here only once the folder is trusted, git repository or not.
+var codexMCPList = func(dir, profile string) ([]byte, error) {
+	args := []string{"mcp", "list", "--json"}
+	if profile != "" {
+		args = append([]string{"-p", profile}, args...)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "codex", args...)
+	cmd.Dir = dir
+	return cmd.Output()
+}
+
+// codexLoadsYip reports whether Codex, started in dir, would run Yip as
+// agent. ok=false with a nil error is a definite "no", and why says what to
+// do; an error means Codex could not be asked (not installed, too old).
+func codexLoadsYip(dir, profile, agent string) (ok bool, why string, err error) {
+	out, err := codexMCPList(dir, profile)
+	if err != nil {
+		return false, "", err
+	}
+	var servers []struct {
+		Name           string  `json:"name"`
+		Enabled        bool    `json:"enabled"`
+		DisabledReason *string `json:"disabled_reason"`
+		Transport      struct {
+			Args []string `json:"args"`
+		} `json:"transport"`
+	}
+	if err := json.Unmarshal(out, &servers); err != nil {
+		return false, "", fmt.Errorf("unexpected codex mcp list output: %w", err)
+	}
+	for _, s := range servers {
+		if s.Name != "yip" {
+			continue
+		}
+		if !s.Enabled {
+			reason := "disabled"
+			if s.DisabledReason != nil && *s.DisabledReason != "" {
+				reason = *s.DisabledReason
+			}
+			return false, "Codex sees the Yip server but it is disabled (" + reason + "); a managed policy may restrict MCP servers", nil
+		}
+		for i := 0; i+1 < len(s.Transport.Args); i++ {
+			if s.Transport.Args[i] == "--as" && s.Transport.Args[i+1] != agent {
+				return false, fmt.Sprintf("Codex here loads a Yip server for %q, not %q (another config layer wins)", s.Transport.Args[i+1], agent), nil
+			}
+		}
+		return true, "", nil
+	}
+	if profile != "" {
+		return false, "Codex does not load the Yip server from profile " + profile, nil
+	}
+	root := checkoutRoot(dir)
+	where := ""
+	if root != dir {
+		where = fmt.Sprintf(" Yip's config is in %s/.codex/ because %s is inside that checkout; start Codex there, or trust it.", root, dir)
+	}
+	return false, fmt.Sprintf("Codex started in %s does not load the Yip server: Codex ignores a folder's .codex/ until the folder is trusted.%s Start codex there and accept the trust prompt, or add to ~/.codex/config.toml:\n  [projects.%q]\n  trust_level = \"trusted\"\nthen restart Codex", dir, where, root), nil
+}
+
 // CodexDoctor checks one Codex config layer: a checkout's .codex/ (hooks in
 // hooks.json) or, with profile set, $CODEX_HOME/PROFILE.config.toml (hooks
 // inline). It reports the identity's delivery state; it cannot prove receipt.
@@ -336,7 +401,19 @@ func CodexDoctor(root, profile string) error {
 		return fmt.Errorf("Codex queue unavailable: %w", err)
 	}
 	agent := codexBlockAgent(block)
-	fmt.Printf("Codex MCP and hook registrations present for %s in %s; queue command available.\n", agent, configPath)
+	// The files being right is not the same as Codex loading them.
+	startDir := root // where Codex will be started; "" = here
+	if startDir == "" {
+		startDir, _ = os.Getwd()
+	}
+	loaded, why, err := codexLoadsYip(startDir, profile, agent)
+	if err != nil {
+		return fmt.Errorf("could not ask Codex what it loads here (codex mcp list --json): %w", err)
+	}
+	if !loaded {
+		return fmt.Errorf("%s", why)
+	}
+	fmt.Printf("Codex MCP and hook registrations present for %s in %s, and Codex loads them here; queue command available.\n", agent, configPath)
 	fmt.Printf("delivery: %s\n", EndpointStatus(agent))
 	fmt.Println("Review hook trust in /hooks. This does not prove runtime delivery or receipt: verify that the intended chat receives and acknowledges a notice.")
 	return nil

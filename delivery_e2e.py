@@ -22,8 +22,10 @@ with tempfile.TemporaryDirectory(prefix="yip-delivery-e2e-") as temp:
     root = pathlib.Path(temp)
     env = dict(os.environ, YIP_ROOT=str(root / "line"), YIP_HOME=str(root / "home"), NO_COLOR="1", TERM="xterm", YIP_REDUCED_MOTION="1")
     # Run from inside a Codex shell, this would make the CLI answer as a seat.
-    for leaked in ("CODEX_THREAD_ID", "CODEX_HOME", "YIP_AGENT", "YIP_LINE"):
+    for leaked in ("CODEX_THREAD_ID", "YIP_AGENT", "YIP_LINE"):
         env.pop(leaked, None)
+    # Install now asks Codex what it loads; never let it read the real ~/.codex.
+    env["CODEX_HOME"] = str(root / "codex-home-isolated")
     checkouts = {}
     def run(*args, body=None, cwd=None):
         return subprocess.check_output([binary, *args], input=body, text=True, cwd=cwd or root, env=env)
