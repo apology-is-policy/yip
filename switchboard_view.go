@@ -39,6 +39,10 @@ func (v *view) frameLines(rows, cols int) []string {
 	}
 	p := colors()
 	v.panes = paneLayout(rows, cols)
+	if v.tab == 4 && v.panes.height > 0 { // the map wants the whole width
+		v.panes.railW, v.panes.sideW, v.panes.centerX, v.panes.sideX = 0, 0, 0, 0
+		v.panes.centerW = cols
+	}
 	var out []string
 	put := func(s string) {
 		if len(out) < rows {
@@ -85,27 +89,33 @@ func (v *view) frameLines(rows, cols int) []string {
 	if v.tab == 3 {
 		title, detail = "Broadcasts and briefings", "Operator attribution · individual receipts and responses"
 	}
+	if v.tab == 4 {
+		title, detail = "Where everyone is", "n/p or click: whose stations are listed · click a station: its description"
+	}
 	put("  " + p.text(p.ink, title))
 	put("  " + p.text(p.muted, detail))
 	put("")
 	bodyH := v.panes.height
 	railW, sideW, centerW := v.panes.railW, v.panes.sideW, v.panes.centerW
-	transcript := v.styledTranscript(max(8, centerW-4), p)
-	if v.tab == 1 {
-		transcript = v.dashboard(centerW-4, p)
-	}
-	if v.tab == 2 {
-		transcript = v.callRail(centerW-4, p)
-	}
-	if v.tab == 3 {
-		transcript = v.broadcastLines(centerW-4, p)
+	var transcript []string
+	switch v.tab {
+	case 1:
+		transcript = v.memoDashboard(centerW-4, p)
+	case 2:
+		transcript = v.memoRail(centerW-4, p)
+	case 3:
+		transcript = v.memoBroadcasts(centerW-4, p)
+	case 4:
+		transcript = v.mapLines(centerW-4, p)
+	default:
+		transcript = v.memoTranscript(max(8, centerW-4), p)
 	}
 	if v.follow && v.tab == 0 {
 		v.scroll = max(0, len(transcript)-bodyH+1)
 	}
 	v.scroll = min(max(0, v.scroll), max(0, len(transcript)-bodyH))
-	side := v.dashboard(sideW-2, p)
-	rail := v.callRail(railW-2, p)
+	side := v.memoDashboard(sideW-2, p)
+	rail := v.memoRail(railW-2, p)
 	v.panes.centerLen, v.panes.sideLen = len(transcript), len(side)
 	v.panes.railLen = 2 + 3*len(v.st.calls)
 	v.railScroll = min(max(0, v.railScroll), max(0, v.panes.railLen-bodyH))
@@ -143,9 +153,9 @@ func (v *view) frameLines(rows, cols int) []string {
 		typed := tailCells(terminalText(string(v.input)), max(1, cols-plainWidth(prompt)-5))
 		put("  " + p.text(p.violet, prompt) + " " + typed + p.text(p.cyan, "▏"))
 	} else {
-		help := "  click call · wheel over pane · tab/n next · p prev · j/k scroll · f follow · 1 chat 2 desk 3 calls 4 broadcasts · b compose · r ratify · a arbitrate · q quit"
+		help := "  click call · wheel over pane · tab/n next · p prev · j/k scroll · f follow · 1 chat 2 desk 3 calls 4 broadcasts 5 map · b compose · r ratify · a arbitrate · q quit"
 		if cols < 125 {
-			help = "  1 chat 2 desk 3 calls 4 broadcasts · b compose · r ratify · a arbitrate · ? help · q quit"
+			help = "  1 chat 2 desk 3 calls 4 broadcasts 5 map · b compose · r ratify · a arbitrate · ? help · q quit"
 		}
 		if v.flash != "" {
 			help = "  " + v.flash
@@ -157,13 +167,57 @@ func (v *view) frameLines(rows, cols int) []string {
 	}
 	return out
 }
+
+// A frame draws a window of each pane, and a wheel packet asks for a frame. Building a pane costs
+// thousands of cells of wrapping, so it is built once per snapshot and scrolling only moves the window.
+func (v *view) memo(key string, build func() []string) []string {
+	if v.memoLines == nil || v.memoGen != v.gen {
+		v.memoLines, v.memoGen = map[string][]string{}, v.gen
+	}
+	if l, ok := v.memoLines[key]; ok {
+		return l
+	}
+	l := build()
+	v.memoLines[key] = l
+	return l
+}
+func (v *view) memoDashboard(w int, p palette) []string {
+	key := fmt.Sprintf("dash|%d|%d|%d|%d|%v", w, v.frame, v.sel, v.selD, p.enabled)
+	return v.memo(key, func() []string { return v.dashboard(w, p) })
+}
+func (v *view) memoRail(w int, p palette) []string {
+	key := fmt.Sprintf("rail|%d|%d|%v", w, v.sel, p.enabled)
+	return v.memo(key, func() []string { return v.callRail(w, p) })
+}
+func (v *view) memoBroadcasts(w int, p palette) []string {
+	if v.broadcast != nil { // a draft changes with every key
+		return v.broadcastLines(w, p)
+	}
+	key := fmt.Sprintf("bcast|%d|%v", w, p.enabled)
+	return v.memo(key, func() []string { return v.broadcastLines(w, p) })
+}
+
+// The selected transcript is the expensive pane and the one that seldom changes, so it survives new
+// snapshots until its call's files move. A broadcast has no signature: it is rebuilt per snapshot.
+func (v *view) memoTranscript(w int, p palette) []string {
+	sc := v.selectedConversation()
+	if sc == nil || sc.sig == "" {
+		key := fmt.Sprintf("chat|%d|%d|%v", w, v.sel, p.enabled)
+		return v.memo(key, func() []string { return v.styledTranscript(w, p) })
+	}
+	key := fmt.Sprintf("%s|%s|%d|%d|%v", sc.call.ID, sc.sig, len(sc.entries), w, p.enabled)
+	if key != v.tcKey {
+		v.tcKey, v.tcLines = key, v.styledTranscript(w, p)
+	}
+	return v.tcLines
+}
 func (v *view) styledTranscript(w int, p palette) []string {
 	sc := v.selectedConversation()
 	if sc == nil {
 		return []string{"", p.text(p.cyan, "A quiet line."), "", p.text(p.muted, "Open a call to begin a conversation.")}
 	}
 	if sc.broadcast != nil {
-		return broadcastTranscript(sc.broadcast, w, p)
+		return broadcastTranscript(sc, w, p)
 	}
 	var out []string
 	for _, e := range sc.entries {
@@ -214,7 +268,7 @@ func (v *view) callRail(w int, p palette) []string {
 			out = append(out,
 				p.text(bg+p.violet, fitCells(marker+" BROADCAST / "+b.Kind, w, true)),
 				p.text(bg+p.ink, fitCells("  "+trunc(terminalText(firstLine(b.Body)), max(4, w-2)), w, true)),
-				p.text(bg+p.amber, fitCells("  "+broadcastProgress(b), w, true)))
+				p.text(bg+p.amber, fitCells("  "+c.progress(), w, true)))
 			continue
 		}
 		floor := "  → floor: " + c.floor
@@ -282,7 +336,7 @@ func (v *view) dashboard(w int, p palette) []string {
 	}
 	out = append(out, p.text(p.muted, "ON THE LINE"), "")
 	for _, a := range v.st.members {
-		if Retired(a) {
+		if v.st.retired[a] {
 			continue
 		}
 		pr, ok := v.st.presence[a]
@@ -297,6 +351,9 @@ func (v *view) dashboard(w int, p palette) []string {
 			glyph = v.activityGlyph()
 		}
 		out = append(out, p.text(color, glyph+" "+a)+p.text(p.muted, "  "+status))
+		if line := v.roadmapOneLine(a); line != "" {
+			out = append(out, "  "+p.text(p.amber, trunc(line, w-2)))
+		}
 		if ok {
 			out = append(out, "  "+p.text(p.muted, trunc(pr.Branch+" · "+pr.Tip, w-2)))
 			if pr.Busy != "" {

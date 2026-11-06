@@ -15,7 +15,8 @@ import termios
 import time
 import tomllib
 
-binary = os.environ.get("YIP_TEST_BIN", "/tmp/yiptest")
+# install records the resolved path, and on macOS /tmp is a symlink.
+binary = os.path.realpath(os.environ.get("YIP_TEST_BIN", "/tmp/yiptest"))
 thread = "00000000-0000-4000-8000-000000000001"
 with tempfile.TemporaryDirectory(prefix="yip-delivery-e2e-") as temp:
     root = pathlib.Path(temp)

@@ -83,7 +83,7 @@ func num(desc string) map[string]any   { return map[string]any{"type": "integer"
 func yesno(desc string) map[string]any { return map[string]any{"type": "boolean", "description": desc} }
 
 func tools() []toolDef {
-	return annotated(append(coordinationTools(), []toolDef{
+	return annotated(append(append(coordinationTools(), roadmapTools()...), []toolDef{
 		{
 			Name: "call",
 			Description: "Open a call to the other agent and speak the first turn. Rings them: " +

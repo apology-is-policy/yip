@@ -98,6 +98,7 @@ func TestBroadcastComposePreviewDraftAndReplies(t *testing.T) {
 		t.Fatal(bs, v.flash)
 	}
 	ReplyBroadcast(bs[0].ID, "b", "working on it")
+	v.refresh(loadState()) // a frame shows the snapshot; it never reads the disk itself
 	rendered := strings.Join(v.broadcastLines(65, palette{}), "\n")
 	if !strings.Contains(rendered, "working on it") || !strings.Contains(rendered, "response pending") || strings.Contains(rendered, "\x1b") {
 		t.Fatal(rendered)

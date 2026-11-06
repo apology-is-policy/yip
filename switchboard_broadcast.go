@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"sort"
 	"strings"
 )
@@ -103,24 +102,18 @@ func (v *view) submitBroadcast(text string) {
 }
 
 // Receipts summarize each recipient separately; a read does not imply a reply.
-func broadcastProgress(b *Broadcast) string {
-	read, replied := 0, 0
-	for _, a := range b.Recipients {
-		r, err := broadcastReceipt(b.ID, a)
-		if err == nil && r.ReadAt != "" {
-			read++
-		}
-		if err == nil && len(r.Replies) > 0 {
-			replied++
-		}
+func (c *sbCall) progress() string {
+	if c.bview == nil {
+		return ""
 	}
-	if b.Kind == "announcement" {
-		return fmt.Sprintf("%d/%d read", read, len(b.Recipients))
-	}
-	return fmt.Sprintf("%d/%d read · %d replied", read, len(b.Recipients), replied)
+	return c.bview.progress
 }
 
-func broadcastTranscript(b *Broadcast, w int, p palette) []string {
+func broadcastTranscript(sc *sbCall, w int, p palette) []string {
+	b, bv := sc.broadcast, sc.bview
+	if bv == nil {
+		bv = &sbBroadcast{}
+	}
 	out := []string{p.text(p.violet, "● "+b.By) + p.text(p.muted, "   "+shortTime(b.At)+"  BROADCAST / "+strings.ToUpper(b.Kind)), p.text(p.muted, "#"+b.ID)}
 	body := func(text string) {
 		for _, l := range wrap(terminalText(text), max(8, w-2)) {
@@ -134,9 +127,9 @@ func broadcastTranscript(b *Broadcast, w int, p palette) []string {
 	}
 	body(b.Body)
 	out = append(out, "")
-	label(p.violet, "RECIPIENTS · "+broadcastProgress(b))
+	label(p.violet, "RECIPIENTS · "+bv.progress)
 	for _, a := range b.Recipients {
-		r, err := broadcastReceipt(b.ID, a)
+		r := bv.receipts[a]
 		state, color := "unread", p.amber
 		if r.ReadAt != "" {
 			state, color = "read", p.green
@@ -145,28 +138,19 @@ func broadcastTranscript(b *Broadcast, w int, p palette) []string {
 			state += "; response pending"
 			color = p.amber
 		}
-		if err != nil {
+		if bv.bad[a] {
 			state, color = "receipt unreadable", p.red
 		}
 		label(color, "● "+a+" · "+state)
-		delivery := EndpointStatus(a)
-		if ep, e := readEndpoint(a); e == nil {
-			for _, d := range ep.Events {
-				if d.Source == "broadcast:"+b.ID {
-					delivery += "; " + d.Status
-				}
-			}
-		}
-		label(p.muted, "  "+delivery)
+		label(p.muted, "  "+bv.delivery[a])
 	}
 	out = append(out, "")
 	var replies []sbEntry
 	for _, a := range b.Recipients {
-		r, err := broadcastReceipt(b.ID, a)
-		if err != nil {
+		if bv.bad[a] {
 			continue
 		}
-		for _, reply := range r.Replies {
+		for _, reply := range bv.receipts[a].Replies {
 			replies = append(replies, sbEntry{from: a, at: reply.At, body: reply.Body})
 		}
 	}
@@ -191,21 +175,26 @@ func (v *view) broadcastLines(w int, p palette) []string {
 		add(p.violet, "DRAFT / "+d.Kind+" / attributed to "+v.by)
 		add(p.muted, "Recipients are fixed at send. Enabled dispatchers may wake them; inbox remains available.")
 		for _, a := range d.Recipients {
-			add(p.amber, a+": "+EndpointStatus(a))
+			add(p.amber, a+": "+v.st.endpoints[a])
 		}
 		add(p.ink, d.Body)
 		add(p.muted, "No resource transfer or worker cancellation. Attribution is not verified approval.")
 		add("", "")
 	}
 	add(p.violet, "BROADCASTS / b compose or resume draft")
-	bs, err := ListBroadcasts()
-	if err != nil {
-		add(p.red, err.Error())
-		return out
+	if v.st.err != "" {
+		add(p.red, v.st.err)
 	}
-	for i := len(bs) - 1; i >= 0; i-- {
+	var bs []*sbCall
+	for _, c := range v.st.calls {
+		if c.broadcast != nil {
+			bs = append(bs, c)
+		}
+	}
+	sort.SliceStable(bs, func(i, j int) bool { return bs[i].broadcast.At > bs[j].broadcast.At })
+	for _, c := range bs {
 		out = append(out, "")
-		out = append(out, broadcastTranscript(&bs[i], w, p)...)
+		out = append(out, broadcastTranscript(c, w, p)...)
 	}
 	return out
 }

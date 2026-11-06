@@ -192,6 +192,10 @@ func (v *view) mouse(m sbMouse) {
 		}
 		return
 	}
+	if button == 0 && pane == 2 && v.tab == 4 {
+		v.mapClick(m.y-l.top+v.scroll, m.x-l.centerX-2)
+		return
+	}
 	if button == 0 && list {
 		row := m.y - l.top + v.railScroll - 2
 		if row < 0 || row/3 >= len(v.st.calls) {

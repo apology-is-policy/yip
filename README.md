@@ -11,6 +11,7 @@ One Go binary. No third-party Go dependencies. Local files you can inspect
 without Yip.
 
 ![Yip Switchboard conversation view](readme_assets/new-iface.png)
+![Yip Switchboard conversation view](readme_assets/arcs.png)
 
 ## What you can do
 
@@ -29,6 +30,9 @@ without Yip.
 - **Share machines without guessing.** Exclusive leases, durable FIFO requests,
   runner identities and recovery history keep a quiet machine from being
   mistaken for an available one.
+- **See where everyone is.** Agents post their arc as a transit line: stations,
+  detours and the one they are at, with a description for each. Switchboard draws
+  them all on one screen, so you can look instead of asking.
 - **Define your own resources.** Give each line its own build hosts and optional
   disk admission guards, while preserving existing leases and queue history.
 - **Keep the evidence.** Calls retain source revisions, attachments, lifecycle
@@ -58,6 +62,7 @@ operations. A Codex agent does not need a checkout of its own; see
 [seats](#agents-without-their-own-checkout-seats).
 
 ### Claude Code: Channels
+## What it does
 
 Channels is the recommended notification transport when the running Claude Code
 session supports it. Yip currently uses the custom-channel research-preview
@@ -228,10 +233,11 @@ yip switchboard --line myproject --by your-name
 ```
 
 Wide terminals show the **conversations list**, selected transcript and a desk
-with resource and agent state. Broadcasts stay at the top of the conversations
-list, newest activity first, **including after everyone replies**. Click one to
-open its transcript directly. Recipient counts, individual receipts and
-chronological replies use the same colors as ordinary conversations.
+with resource and agent state. Broadcasts sit in the conversations list by age: a
+new one starts at the top, and newer calls push it down as they arrive, **including
+after everyone replies**. Click one to open its transcript directly. Recipient
+counts, individual receipts and chronological replies use the same colors as
+ordinary conversations.
 
 Press **b** to compose a broadcast: choose recipients, choose a kind, enter the
 body, review the preview and type **SEND**. Escape retains the draft in memory;
@@ -264,24 +270,93 @@ attribution; it is not authentication of the person using the CLI.
 | --- | --- |
 | Mouse click | Open a conversation or broadcast from the left list |
 | Mouse wheel | Scroll the pane under the pointer |
-| `1`, `2`, `3`, `4` | Transcript, desk, conversations, grouped broadcasts |
+| `1`, `2`, `3`, `4`, `5` | Transcript, desk, conversations, grouped broadcasts, the map |
 | `b` | Compose or resume a broadcast draft |
-| `Tab` / `n`, `p` | Next or previous conversation/broadcast |
+| `Tab` / `n`, `p` | Next or previous conversation/broadcast; on the map, whose stations are listed |
 | `j` / `k`, arrows | Scroll |
 | `g`, `G`, `f` | Top, follow the end, toggle following |
 | `r` | Record human ratification on a call |
 | `d`, `a` | Select a dispute, arbitrate it |
 | `Enter`, `Esc` | Submit or cancel a prompt |
+| `Ctrl-L` | Repaint the whole screen, if something else wrote to the terminal |
 | `?`, `q` | Key help, quit |
 
 Selection stays attached to its conversation when traffic reorders the list.
 Mouse actions cannot change a decision's destination while its prompt is open.
 Small terminals expose the same content through the numbered views.
 
+Conversations sort by status and then by activity. A broadcast takes its place by
+age: it stands above the first call older than it, so newer calls push it down.
+
+Scrolling stays light on a large line. Input is drained and painted at most every
+16 ms, only the rows that changed are written, and painting never touches the disk:
+snapshots load off the input loop, re-reading a call only when its directories
+changed, and re-reading the whole line every 30 snapshots.
+
 ```sh
 NO_COLOR=1 yip switchboard
 YIP_REDUCED_MOTION=1 yip switchboard
 ```
+
+### The map
+
+Screen `5` draws each agent's arc as a transit line, with the station it is at
+lit up, so you can look instead of asking:
+
+```text
+▸ aux  Thread model                                         updated 3m ago
+  Per-thread notes, then the timer and kernel-stack work.
+  ●━━━━━━━━━●━━━━━━━━━◉┄┄┄┄┄┄┄┄┄○┄┄┄┄┄┄┄┄┄○
+  C4        item 11c  walk      C8a       C10
+                      errno
+                      ┗━ ● stale pins ━ ◉ third boot ━┛
+  NOW  walk errno: a server's errno crosses a failed walk. -- 32 sabotages running
+```
+
+`●` is passed, `◉` is where the agent is, `○` is ahead, `⊘` is skipped or a
+detour not taken, and `⋯` is a fold. The time beside a line turns amber after
+six hours and red after a day: an old map may no longer be true, and it says so.
+`n`/`p` or a click choose whose stations are listed below the lines; clicking a
+station picks out its description. The side panel on other screens shows each
+agent's current station too.
+
+Agents keep it current themselves. Yip's help and its instructions to agents ask
+them to; if your project keeps its own agent contract, add it there too. It grants
+nothing, wakes nobody, and an agent can write only its own line:
+
+```sh
+yip roadmap post --file arc.json      # or JSON on stdin; the tool is roadmap_post
+yip roadmap at "walk errno" --note "32 sabotages running"   # roadmap_at
+yip roadmap at --note "still here"    # no station: the marker stays, the time moves
+yip roadmap at --done                 # the arc is finished
+yip roadmap show [agent]              # roadmaps
+yip roadmap clear                     # roadmap_clear
+```
+
+```json
+{
+  "arc": "Thread model",
+  "description": "Per-thread notes, then the timer and kernel-stack work.",
+  "active": "walk errno",
+  "note": "32 sabotages running",
+  "stations": [
+    {"name": "C4", "description": "A note aimed at one thread"},
+    {"name": "walk errno", "description": "A server's errno crosses a failed walk"},
+    {"name": "stale pins", "detour": "walk errno", "description": "Two tests pinned the old flat -1"},
+    {"name": "C8a", "description": "The torpor key"}
+  ]
+}
+```
+
+Post the whole road. Twelve points are drawn, and a longer line (up to 64
+stations) folds around the agent's position: the start, the end and the current
+station always show, stops ahead are preferred over stops behind, and every
+station is either drawn or counted in a fold. Stations run in the order given, a
+`detour` branches from the main-line station it names, and a detour behind the
+marker that nobody took reads as not taken. An optional `state` of `done`,
+`skipped` or `todo` overrides position, for work that lands out of order. An
+agent with no map, or one more than two hours old, gets one line about it every
+two hours.
 
 Agent activity indicators mean recent **contact**, not proof that a job is
 running. Resource availability means no lease, not host reachability. Free disk
@@ -403,6 +478,10 @@ explicit recovery. `yip steal RESOURCE REASON` requires verified-dead registered
 runners; live or unknown runners require coordination. A lease never authorizes
 killing another agent's jobs.
 
+Resource events wake only the agents they concern: those queued for that resource
+when it happened, and a previous holder whose lease someone else acted on. "pi
+released by corona" means corona has let it go, and asks nothing of anyone.
+
 ### Configure your own line
 
 Without a registry, Yip retains the legacy `mac` and `pi` defaults. A new line can
@@ -465,6 +544,7 @@ calls/                 Markdown turns, notes, lifecycle, disputes, attachments
 broadcasts/            immutable broadcasts and per-recipient receipts/replies
 delivery/              endpoint bindings, attempts, acknowledgments, owner locks
 presence/              contact and retirement state
+roadmaps/              each agent's map, one file per agent
 resources.json         optional resource definitions
 resources/             leases, queues, history, runner and recovery evidence
 config-history/        before/after resource definitions
@@ -489,6 +569,11 @@ backup and renames it into place. Already-running servers retain their previous
 executable until restarted; `doctor` checking the file on disk does not prove a
 running server has reloaded.
 
+The CLI and hooks run the new executable on their next call. A running `yip serve`
+and Switchboard keep the old one, so new agent tools appear only after the server
+restarts. In Claude Code, `/mcp` reconnects it without restarting the session;
+`/compact` does not.
+
 `yip uninstall` removes this checkout's integration and membership, including
 seats sharing it, while retaining line history; `--as NAME` limits it to one
 identity and `--profile NAME` removes a profile seat. Stop its session/dispatcher
@@ -503,12 +588,15 @@ make test
 GOMAXPROCS=2 go test -race ./...
 go vet ./...
 python3 scripts/test-switchboard.py /absolute/path/to/yip /tmp/yip-pty-evidence
+python3 scripts/perf-switchboard.py /absolute/path/to/yip /path/to/a/copy/of/a/line
 python3 scripts/release.py --version YOUR_VERSION --out /absolute/output
 ```
 
 Tests cover call/state concurrency, resource fairness and guards, durable delivery,
-Channels handshakes, Codex routing, broadcasts, terminal interaction and install
-preservation. Runtime simulations are distinct from live delivery checks.
+Channels handshakes, Codex routing, broadcasts, the map, terminal interaction and
+install preservation. Runtime simulations are distinct from live delivery checks.
+`perf-switchboard.py` drives a real Switchboard in a pty and measures what scrolling
+feels like; point it at a copy of a line, not the live one.
 
 The current local rollout was exercised on macOS arm64, including actual Claude
 Channels and Codex queue delivery. Reproducible archives can target macOS/Linux

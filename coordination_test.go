@@ -232,25 +232,105 @@ func TestRepeatedReleaseIsVisibleBetweenWatchPolls(t *testing.T) {
 	if err := EnsureRoot(); err != nil {
 		t.Fatal(err)
 	}
-	before := watchSnapshot("b")
-	for i := 0; i < 2; i++ {
-		if got, _, _, err := TryAcquire("mac", "a", "test", time.Minute, nil); !got || err != nil {
-			t.Fatal(got, err)
-		}
-		if _, err := Release("mac", "a"); err != nil {
+	for _, who := range []string{"a", "b", "c"} {
+		if _, _, _, err := Request("mac", who, "test", time.Minute, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
+	before := watchSnapshot("c")
+	if _, err := Release("mac", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _, err := Request("mac", "b", "test", time.Minute, nil); !got || err != nil {
+		t.Fatal(got, err)
+	}
+	if _, err := Release("mac", "b"); err != nil {
+		t.Fatal(err)
+	}
 	n := 0
-	for k := range watchSnapshot("b") {
+	for k, v := range watchSnapshot("c") {
 		if strings.HasPrefix(k, "resource-event:") {
 			if _, ok := before[k]; !ok {
 				n++
+				if !strings.Contains(v, " released by ") {
+					t.Fatalf("a holder's release must read as done, not as a request: %q", v)
+				}
 			}
 		}
 	}
 	if n != 2 {
 		t.Fatalf("missed a release between polls: %d", n)
+	}
+}
+
+func resourceEventKeys(me string) int {
+	n := 0
+	for k := range watchSnapshot(me) {
+		if strings.HasPrefix(k, "resource-event:") {
+			n++
+		}
+	}
+	return n
+}
+
+func TestReleaseReachesOnlyThoseQueuedForTheResource(t *testing.T) {
+	resTestRoot(t)
+	if err := EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	for _, who := range []string{"a", "b"} {
+		if _, _, _, err := Request("mac", who, "test", time.Minute, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Release("mac", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if n := resourceEventKeys("b"); n != 1 {
+		t.Fatalf("CONTROL: the agent queued for it should see the release: %d", n)
+	}
+	if n := resourceEventKeys("bystander"); n != 0 {
+		t.Fatalf("an agent not queued for it should not be woken: %d", n)
+	}
+	if n := resourceEventKeys("a"); n != 0 {
+		t.Fatalf("the agent that released it should not be told: %d", n)
+	}
+
+	// Joining the queue later must not replay what happened before it.
+	if _, _, _, err := Request("mac", "late", "test", time.Minute, nil); err != nil {
+		t.Fatal(err)
+	}
+	q, ok := loadRequest("mac", "late")
+	if !ok {
+		t.Fatal("no request for the late joiner")
+	}
+	q.Since = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	if err := saveRequest("mac", q); err != nil {
+		t.Fatal(err)
+	}
+	if n := resourceEventKeys("late"); n != 0 {
+		t.Fatalf("a late joiner should not see earlier events: %d", n)
+	}
+}
+
+func TestResourceEventConcerns(t *testing.T) {
+	e := ResourceEvent{By: "x", At: "2026-01-01T00:00:10Z", Previous: Lease{Holder: "a"}}
+	queue := []QueueEntry{
+		{Agent: "early", Since: "2026-01-01T00:00:09Z"},
+		{Agent: "same", Since: "2026-01-01T00:00:10Z"},
+		{Agent: "late", Since: "2026-01-01T00:00:11Z"},
+	}
+	for me, want := range map[string]bool{
+		"x": false, "a": true, "early": true, "same": true, "late": false, "other": false,
+	} {
+		if got := resourceEventConcerns(e, me, queue); got != want {
+			t.Errorf("%s: got %v, want %v", me, got, want)
+		}
+	}
+	// One's own act on one's own lease is still not news.
+	self := ResourceEvent{By: "a", At: e.At, Previous: Lease{Holder: "a"}}
+	if resourceEventConcerns(self, "a", nil) {
+		t.Error("an agent's own release concerns it")
 	}
 }
 

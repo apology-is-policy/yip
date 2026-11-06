@@ -3,11 +3,23 @@ package main
 import (
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Drop terminal control sequences from untrusted transcript/metadata text.
 // In particular OSC clipboard/title commands never reach the operator's tty.
 func terminalText(s string) string {
+	// Almost every string here is plain ASCII, and this runs on every line of every frame.
+	clean := true
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c != '\n' && (c < 0x20 || c >= 0x7f) {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return s
+	}
 	var b strings.Builder
 	r := []rune(s)
 	for i := 0; i < len(r); i++ {
@@ -50,6 +62,9 @@ func terminalText(s string) string {
 	return b.String()
 }
 func cellWidth(r rune) int {
+	if (r >= 0x20 && r < 0x7f) || (r >= 0x2500 && r <= 0x25ff) { // text and the box drawing the frame is made of
+		return 1
+	}
 	if unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) || r == 0x200d || r == 0xfe0f {
 		return 0
 	}
@@ -69,22 +84,27 @@ func fitCells(s string, w int, pad bool) string {
 		return ""
 	}
 	var b strings.Builder
+	b.Grow(len(s) + w)
 	used := 0
-	r := []rune(s)
 	clipped := false
-	for i := 0; i < len(r); i++ {
-		if r[i] == 27 && i+1 < len(r) && r[i+1] == '[' {
+	for i := 0; i < len(s); {
+		if s[i] == 27 && i+1 < len(s) && s[i+1] == '[' {
 			j := i + 2
-			for j < len(r) && ((r[j] >= '0' && r[j] <= '9') || r[j] == ';') {
+			for j < len(s) && ((s[j] >= '0' && s[j] <= '9') || s[j] == ';') {
 				j++
 			}
-			if j < len(r) && r[j] == 'm' {
-				b.WriteString(string(r[i : j+1]))
-				i = j
+			if j < len(s) && s[j] == 'm' {
+				b.WriteString(s[i : j+1])
+				i = j + 1
 				continue
 			}
 		}
-		n := cellWidth(r[i])
+		r, size := rune(s[i]), 1
+		if r >= utf8.RuneSelf {
+			r, size = utf8.DecodeRuneInString(s[i:])
+		}
+		i += size
+		n := cellWidth(r)
 		if used+n > w {
 			clipped = true
 			continue
@@ -92,7 +112,7 @@ func fitCells(s string, w int, pad bool) string {
 		if clipped {
 			continue
 		}
-		b.WriteRune(r[i])
+		b.WriteRune(r)
 		used += n
 	}
 	if pad && used < w {

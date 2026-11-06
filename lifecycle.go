@@ -37,9 +37,15 @@ func CallEvents(c *Call) []CallEvent {
 	return out
 }
 func CallStatus(c *Call, turns []Turn) string {
+	return callStatusFrom(c, turns, CallEvents(c), IsClosed(c))
+}
+
+// callStatusFrom is the status from what is already in hand: it goes stale with the clock, so a
+// snapshot that keeps a call's files must still ask this every time.
+func callStatusFrom(c *Call, turns []Turn, events []CallEvent, closed bool) string {
 	state := "open"
 	reopened := ""
-	for _, e := range CallEvents(c) {
+	for _, e := range events {
 		if e.State != "linked" {
 			state = e.State
 			if e.State == "open" {
@@ -50,7 +56,7 @@ func CallStatus(c *Call, turns []Turn) string {
 	if state != "open" {
 		return state
 	}
-	if IsClosed(c) {
+	if closed {
 		return "resolved"
 	}
 	at := c.Opened

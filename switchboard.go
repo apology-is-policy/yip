@@ -137,6 +137,8 @@ type sbDispute struct {
 
 type sbCall struct {
 	broadcast *Broadcast // display-only conversation; never a call mutation target
+	bview     *sbBroadcast
+	sig       string // changes when the call's files do; what a cached transcript is keyed on
 	call      *Call
 	entries   []sbEntry
 	floor     string
@@ -160,6 +162,9 @@ type sbState struct {
 	calls     []*sbCall
 	members   []string
 	presence  map[string]Presence
+	endpoints map[string]string // agent -> delivery status, read once per snapshot
+	roadmaps  []Roadmap
+	retired   map[string]bool
 	err       string
 }
 
@@ -197,99 +202,6 @@ func mergeEntries(turns []Turn, notes []Note) []sbEntry {
 	return out
 }
 
-func loadState() sbState {
-	st := sbState{presence: map[string]Presence{}}
-	st.members = LineNames()
-	for _, a := range st.members {
-		if p, ok := LoadPresence(a); ok {
-			st.presence[a] = p
-		}
-	}
-	calls, err := ListCalls()
-	if err != nil {
-		st.err = err.Error()
-		return st
-	}
-	for _, c := range calls {
-		sc := &sbCall{call: c, closed: IsClosed(c)}
-		turns, _ := Turns(c)
-		notes, _ := Notes(c)
-		sc.floor = FloorHolder(c, turns)
-		sc.status = CallStatus(c, turns)
-		sc.entries = mergeEntries(turns, notes)
-		for _, e := range CallEvents(c) {
-			sc.entries = append(sc.entries, sbEntry{kind: "STATE", from: e.By, at: e.At, body: e.State + ": " + e.Reason, n: 0})
-		}
-		sort.SliceStable(sc.entries, func(i, j int) bool { return sc.entries[i].at < sc.entries[j].at })
-		if n := len(sc.entries); n > 0 {
-			sc.lastAt = sc.entries[n-1].at
-		}
-		ds, _ := ListDisputes(c)
-		for _, d := range ds {
-			_, done := DisputeResolution(c, d)
-			sc.disputes = append(sc.disputes, &sbDispute{d: d, status: DisputeStatus(c, d), ms: Measurements(c, d), done: done})
-		}
-		st.calls = append(st.calls, sc)
-	}
-	bs, err := ListBroadcasts()
-	if err != nil {
-		st.err = err.Error()
-	}
-	for _, b := range bs {
-		sc := &sbCall{broadcast: &b, call: &Call{ID: "broadcast:" + b.ID, From: b.By, To: "broadcast", Subject: firstLine(b.Body)}, status: "resolved", lastAt: b.At}
-		for _, a := range b.Recipients {
-			r, e := broadcastReceipt(b.ID, a)
-			if e != nil || r.ReadAt == "" || (b.Kind != "announcement" && len(r.Replies) == 0) {
-				sc.status = "open"
-			}
-			for _, reply := range r.Replies {
-				if reply.At > sc.lastAt {
-					sc.lastAt = reply.At
-				}
-			}
-		}
-		st.calls = append(st.calls, sc)
-	}
-	// Broadcasts stay at the top, newest activity first, including after all
-	// recipients reply. Otherwise completed briefings disappear below the
-	// potentially long stale-call history just when the operator wants to read them.
-	// Ordinary calls retain their existing status/activity ordering.
-	sort.SliceStable(st.calls, func(i, j int) bool {
-		rank := func(c *sbCall) int {
-			if c.broadcast != nil {
-				return -1
-			}
-			switch c.status {
-			case "open":
-				return 0
-			case "deferred":
-				return 1
-			case "stale":
-				return 2
-			case "archived":
-				return 3
-			default:
-				return 4
-			}
-		}
-		if rank(st.calls[i]) != rank(st.calls[j]) {
-			return rank(st.calls[i]) < rank(st.calls[j])
-		}
-		return st.calls[i].lastAt > st.calls[j].lastAt
-	})
-	for _, r := range resourceList() {
-		l, held := LoadLease(r.Name)
-		sr := sbResource{name: r.Name, lease: l, held: held, queue: Queue(r.Name)}
-		for _, runner := range l.Runners {
-			sr.runners = append(sr.runners, fmt.Sprintf("pid %d %s", runner.PID, runnerStatus(runner)))
-		}
-		st.resources = append(st.resources, sr)
-	}
-	path, _ := os.Getwd()
-	st.disk = diskText(path)
-	return st
-}
-
 // -------------------------------------------------------------------- view
 
 type view struct {
@@ -311,6 +223,17 @@ type view struct {
 	quitting           bool
 	frame              int
 	tab                int
+
+	gen       int // bumped by every new snapshot
+	memoGen   int
+	memoLines map[string][]string
+	tcKey     string // the wrapped transcript outlives snapshots until its call changes
+	tcLines   []string
+	lastFrame []string // what the terminal shows, so a frame writes only the rows that differ
+	wantLoad  bool     // an action wrote state; do not wait for the tick to show it
+	mapFocus  string   // the agent whose stations are listed on the map screen
+	mapPicked int      // the clicked station in that agent's list, -1 for the active one
+	mapHits   []sbMapHit
 }
 
 func wrap(s string, w int) []string {
@@ -508,15 +431,29 @@ func (v *view) resourceLines(w int) []string {
 // render builds the WHOLE frame into one buffer and writes it once. Positioning
 // each row and clearing to end-of-line means there is never a clear-then-draw
 // gap, so no flicker and no partial frame.
+//
+// Only rows that changed are written. A scroll changes the panes, not the frame around them, and a
+// tick with nothing new changes one glyph; repainting 22 KB for that is what a terminal lags on.
 func (v *view) render() {
 	var b bytes.Buffer
-	for row, line := range v.frameLines(v.t.rows, v.t.cols) {
-		if !colors().enabled {
+	lines := v.frameLines(v.t.rows, v.t.cols)
+	if len(v.lastFrame) != len(lines) {
+		v.lastFrame = make([]string, len(lines))
+	}
+	plain := !colors().enabled
+	for row, line := range lines {
+		if plain {
 			line = stripSGR(line)
 		}
+		if v.lastFrame[row] == line {
+			continue
+		}
+		v.lastFrame[row] = line
 		fmt.Fprintf(&b, "\033[%d;1H%s%s", row+1, line, escClearLine)
 	}
-	fmt.Fprint(v.t.f, b.String())
+	if b.Len() > 0 {
+		fmt.Fprint(v.t.f, b.String())
+	}
 }
 
 func onOff(b bool) string {
@@ -549,6 +486,7 @@ func (v *view) selectedConversation() *sbCall {
 }
 
 func (v *view) submit() {
+	v.wantLoad = true
 	text := strings.TrimSpace(string(v.input))
 	if v.broadcastComposing {
 		v.submitBroadcast(text)
@@ -610,13 +548,19 @@ func (v *view) key(k rune) {
 	v.flash = ""
 	switch k {
 	case '?':
-		v.flash = "click a call · wheel over a pane · tab/n next · p prev · j/k scroll · g top G end · f follow · r ratify a arbitrate · 4 broadcasts · b compose"
+		v.flash = "click a call · wheel over a pane · tab/n next · p prev · j/k scroll · g top G end · f follow · r ratify a arbitrate · 4 broadcasts · b compose · 5 map · ^L repaint"
 	case 'b':
 		v.startBroadcast()
-	case '1', '2', '3', '4':
+	case '1', '2', '3', '4', '5':
 		v.tab = int(k - '1')
 		v.scroll = 0
+	case 12: // Ctrl-L: anything else that wrote to the terminal is ours to paint over
+		v.lastFrame = nil
 	case 'p':
+		if v.tab == 4 {
+			v.mapCycle(-1)
+			return
+		}
 		if len(v.st.calls) > 0 {
 			v.sel = (v.sel + len(v.st.calls) - 1) % len(v.st.calls)
 			v.scroll = 0
@@ -652,6 +596,10 @@ func (v *view) key(k rune) {
 	case 'f':
 		v.follow = !v.follow
 	case '\t', 'n':
+		if v.tab == 4 {
+			v.mapCycle(1)
+			return
+		}
 		if len(v.st.calls) > 0 {
 			v.sel = (v.sel + 1) % len(v.st.calls)
 			v.scroll, v.selD = 0, 0
@@ -703,7 +651,8 @@ func Switchboard(by string) error {
 
 	fmt.Fprint(t.f, escAltOn+escHideCursor+escMouseOn)
 
-	v := &view{t: t, by: by, follow: true, st: loadState()}
+	loader := &sbLoader{}
+	v := &view{t: t, by: by, follow: true, st: loader.load()}
 	v.render()
 
 	keys := make(chan rune, 64)
@@ -719,6 +668,18 @@ func Switchboard(by string) error {
 		}
 	}()
 
+	// The disk stays off this loop. A snapshot reads thousands of files and a terminal sends a wheel
+	// packet every few milliseconds; run them in one thread and each makes the other wait.
+	states := make(chan sbState, 1)
+	loading := false
+	startLoad := func() {
+		if loading {
+			return
+		}
+		loading = true
+		go func() { states <- loader.load() }()
+	}
+
 	tick := time.NewTicker(time.Second)
 	var decoder sbInputDecoder
 	escapeTimer := time.NewTimer(time.Hour)
@@ -726,15 +687,56 @@ func Switchboard(by string) error {
 	defer escapeTimer.Stop()
 	defer tick.Stop()
 
+	// Input paints at most this often. What arrives in between lands in one frame, so a burst of
+	// wheel packets costs a frame per interval and not a frame per packet, and nothing queues up to
+	// play back after the wheel has stopped.
+	const frameEvery = 16 * time.Millisecond
+	pace := time.NewTimer(time.Hour)
+	pace.Stop()
+	defer pace.Stop()
+	paced := false
+	var painted time.Time
+	paint := func() {
+		v.render()
+		painted = time.Now()
+	}
+	paintSoon := func() {
+		if paced {
+			return
+		}
+		if d := frameEvery - time.Since(painted); d > 0 {
+			paced = true
+			pace.Reset(d)
+			return
+		}
+		paint()
+	}
+
 	for !v.quitting {
 		select {
 		case k, ok := <-keys:
 			if !ok {
 				return nil
 			}
-			events := decoder.feed(k)
-			for _, event := range events {
-				v.handleInput(event)
+			changed := false
+			feed := func(k rune) {
+				for _, event := range decoder.feed(k) {
+					v.handleInput(event)
+					changed = true
+				}
+			}
+			feed(k)
+		drain:
+			for i := 0; i < 4096 && !v.quitting; i++ {
+				select {
+				case k, ok := <-keys:
+					if !ok {
+						return nil
+					}
+					feed(k)
+				default:
+					break drain
+				}
 			}
 			if !escapeTimer.Stop() {
 				select {
@@ -745,23 +747,35 @@ func Switchboard(by string) error {
 			if decoder.loneEscape() {
 				escapeTimer.Reset(100 * time.Millisecond)
 			}
-			if len(events) > 0 {
-				v.render()
+			if v.wantLoad {
+				v.wantLoad = false
+				startLoad()
 			}
+			if changed {
+				paintSoon()
+			}
+		case <-pace.C:
+			paced = false
+			paint()
 		case <-escapeTimer.C:
 			if decoder.loneEscape() {
 				decoder = sbInputDecoder{}
 				v.key(27)
-				v.render()
+				paint()
 			}
 		case <-tick.C:
-			v.refresh(loadState())
+			startLoad()
 			v.frame++
-			v.render()
+			paint()
+		case next := <-states:
+			loading = false
+			v.refresh(next)
+			paint()
 		case s := <-sigs:
 			if s == syscall.SIGWINCH {
 				t.readSize()
-				v.render()
+				v.lastFrame = nil
+				paint()
 				continue
 			}
 			return nil
@@ -785,6 +799,7 @@ func parseSwitchboardArgs(args []string) string {
 
 // Preserve the identity, including while a human is typing a decision.
 func (v *view) refresh(next sbState) {
+	v.gen++
 	id := ""
 	if sc := v.selectedConversation(); sc != nil {
 		id = sc.call.ID

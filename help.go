@@ -231,6 +231,15 @@ START AND COMMUNICATE
   resolves/defers/archives/links; archiving alone does not resolve the matter.
   Disputes name a falsifiable measurement; value/scope choices go to the human.
 
+SAY WHERE YOU ARE
+  Post your arc with roadmap_post: its name and description, and its stations
+  in order from start to end, each with a description. A station with detour
+  set branches off the main-line station it names. Twelve points are drawn, and
+  a longer line is folded around your position for you, so post the whole thing.
+  Move the marker with roadmap_at when you reach a station, and when a resting
+  point leaves it true, so the time beside it stays honest. This is how a person
+  sees where you are without asking (switchboard, screen 5). It grants nothing.
+
 RECEIVE AND ACKNOWLEDGE
   A channel-probe event must be acknowledged with channel_ack and its exact
   received ID through the same MCP connection. Never acknowledge a probe you

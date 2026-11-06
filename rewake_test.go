@@ -86,6 +86,15 @@ func TestPostToolUseIsQuietOnlyWhileAWaiterIsArmed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The roadmap nudge is not a delivered notice: it still speaks while armed.
+	v := hookPostToolUse("a", hookInput{})
+	if b, _ := json.Marshal(v); !strings.Contains(string(b), "roadmap") || strings.Contains(string(b), c.ID) {
+		t.Fatal("armed hook should carry only the roadmap nudge", string(b))
+	}
+	// With the nudge satisfied, it says nothing at all.
+	if _, err := PostRoadmap("a", Roadmap{Arc: "x", Stations: []RoadmapStation{{Name: "s"}}}); err != nil {
+		t.Fatal(err)
+	}
 	if v := hookPostToolUse("a", hookInput{}); v != nil {
 		t.Fatal("hook repeated what the armed waiter delivers", v)
 	}

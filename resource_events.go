@@ -37,6 +37,24 @@ func recordResourceEvent(name, by, action string, previous Lease, runners []Runn
 	return atomicCreate(filepath.Join(dir, e.ID+".json"), append(b, '\n'))
 }
 
+// resourceEventConcerns says whether an event should wake me: someone else acted
+// on a lease that was mine, or I am waiting for the resource and it happened since
+// I joined. Without the Since check, joining a queue would replay its history.
+func resourceEventConcerns(e ResourceEvent, me string, queue []QueueEntry) bool {
+	if e.By == me {
+		return false
+	}
+	if e.Previous.Holder == me {
+		return true
+	}
+	for _, q := range queue {
+		if q.Agent == me && e.At >= q.Since {
+			return true
+		}
+	}
+	return false
+}
+
 func ResourceEvents(name string) []ResourceEvent {
 	files, _ := filepath.Glob(filepath.Join(resourcesDir(), name+".events", "*.json"))
 	var out []ResourceEvent
