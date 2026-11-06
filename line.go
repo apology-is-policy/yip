@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // activeLine is resolved once at startup; Root() reads it.
@@ -189,6 +190,9 @@ type installResult struct {
 type InstallOptions struct {
 	Seat    bool   // share this checkout without becoming its path member
 	Profile string // write a Codex profile layer instead of this checkout's .codex/
+	// WakeWindow (claude-rewake): how long after starting or ending a turn an
+	// idle session stays wakeable. It becomes the hook's timeout. 0 = default.
+	WakeWindow time.Duration
 }
 
 func Install(cwd, lineOverride, asOverride string, local bool) (*installResult, error) {
@@ -206,8 +210,14 @@ func InstallRuntime(cwd, lineOverride, asOverride string, local bool, runtime st
 // take a SEAT -- automatically when the checkout already has a different
 // member, or on request with --seat / --profile.
 func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime string, opts InstallOptions) (*installResult, error) {
-	if runtime != "claude" && runtime != "claude-channels" && runtime != "codex" {
-		return nil, fmt.Errorf("runtime must be claude, claude-channels or codex")
+	if runtime != "claude" && runtime != "claude-channels" && runtime != "claude-rewake" && runtime != "codex" {
+		return nil, fmt.Errorf("runtime must be claude, claude-channels, claude-rewake or codex")
+	}
+	if opts.WakeWindow == 0 {
+		opts.WakeWindow = defaultWakeWindow
+	}
+	if opts.WakeWindow < 2*rewakeMargin || opts.WakeWindow > 24*time.Hour {
+		return nil, fmt.Errorf("--wake-window must be between %s and 24h", 2*rewakeMargin)
 	}
 	if (opts.Seat || opts.Profile != "") && runtime != "codex" {
 		return nil, fmt.Errorf("--seat and --profile are Codex installs: Claude's hooks identify an agent by its checkout, so a Claude agent needs a checkout of its own")
@@ -333,15 +343,27 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 			res.HookPath = filepath.Join(root, ".codex", "hooks.json")
 		}
 	} else {
-		if runtime == "claude-channels" {
+		switch runtime {
+		case "claude-channels":
 			if err := RegisterChannel(agent, false); err != nil {
 				return nil, err
 			}
 			if err := configureChannel(root, bin, activeLine, agent); err != nil {
 				return nil, err
 			}
-		} else if err := writeMCP(root, bin); err != nil {
-			return nil, err
+		case "claude-rewake":
+			warning, err := ensureEndpoint(agent, "claude-rewake")
+			if err != nil {
+				return nil, err
+			}
+			if warning != "" {
+				res.Notes = append(res.Notes, warning)
+			}
+			fallthrough
+		default:
+			if err := writeMCP(root, bin, activeLine, agent); err != nil {
+				return nil, err
+			}
 		}
 		res.McpPath = filepath.Join(root, ".mcp.json")
 
@@ -358,11 +380,14 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 		if err := stripHooks(root, other); err != nil {
 			return nil, err
 		}
-		if err := writeHooks(root, bin, hookFile); err != nil {
+		wake := time.Duration(0)
+		if runtime == "claude-rewake" {
+			wake = opts.WakeWindow
+		}
+		if err := writeClaudeHooks(root, bin, hookFile, activeLine, agent, wake); err != nil {
 			return nil, err
 		}
 		res.HookPath = filepath.Join(root, ".claude", hookFile)
-
 	}
 
 	m.Line = activeLine
@@ -516,7 +541,10 @@ func writeJSON(path string, m map[string]any) error {
 	return atomicReplace(path, append(b, '\n'))
 }
 
-func writeMCP(root, bin string) error {
+// writeMCP names the identity and line explicitly. Resolving them from the
+// session's directory at runtime silently picked a DIFFERENT line whenever the
+// install used --line: the folder's own derived line, which has no state.
+func writeMCP(root, bin, line, agent string) error {
 	path := filepath.Join(root, ".mcp.json")
 	m, err := readJSON(path)
 	if err != nil {
@@ -526,7 +554,7 @@ func writeMCP(root, bin string) error {
 	if servers == nil {
 		servers = map[string]any{}
 	}
-	servers["yip"] = map[string]any{"command": bin, "args": []any{"serve"}}
+	servers["yip"] = map[string]any{"command": bin, "args": []any{"serve", "--as", agent, "--line", line}}
 	m["mcpServers"] = servers
 	return writeJSON(path, m)
 }
@@ -555,6 +583,14 @@ func stripMCP(root string) error {
 // where yip is absent is unaffected rather than erroring on every tool call.
 func hookCommand(bin, event string) string {
 	return fmt.Sprintf("[ ! -x %s ] || %s hook %s  %s", bin, bin, event, hookMarker)
+}
+
+// claudeHookCommand is hookCommand with the identity and line named. The
+// unnamed form resolves the line from the session's directory, which is a
+// different (empty) line whenever install used --line: every hook then
+// silently did nothing, including the Stop hook that holds an owed reply.
+func claudeHookCommand(bin, event, line, agent string) string {
+	return fmt.Sprintf("[ ! -x %s ] || %s hook %s --line %s --as %s  %s", bin, bin, event, shellQuote(line), shellQuote(agent), hookMarker)
 }
 
 // binFromHookCmd is hookCommand's inverse. The two are COUPLED BY FORMAT and
@@ -661,6 +697,19 @@ func BinVersion(bin string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// isRewakeGroup: a Yip group holding the claude-rewake background waiter.
+func isRewakeGroup(group any) bool {
+	g, _ := group.(map[string]any)
+	hooks, _ := g["hooks"].([]any)
+	for _, h := range hooks {
+		hm, _ := h.(map[string]any)
+		if cmd, _ := hm["command"].(string); strings.Contains(cmd, hookMarker) && strings.Contains(cmd, " hook rewake ") {
+			return true
+		}
+	}
+	return false
+}
+
 func isYipGroup(group any) bool {
 	g, _ := group.(map[string]any)
 	hooks, _ := g["hooks"].([]any)
@@ -686,7 +735,10 @@ func dropYipGroups(existing any) []any {
 	return out
 }
 
-func writeHooks(root, bin, file string) error {
+// writeClaudeHooks replaces this file's Yip hook groups. wake > 0 adds the
+// claude-rewake background waiter to SessionStart and Stop, as its own group
+// so that its asyncRewake handler never shares a group with a blocking one.
+func writeClaudeHooks(root, bin, file, line, agent string, wake time.Duration) error {
 	path := filepath.Join(root, ".claude", file)
 	m, err := readJSON(path)
 	if err != nil {
@@ -698,12 +750,16 @@ func writeHooks(root, bin, file string) error {
 	}
 	add := func(event, hookEvent string, matcher string) {
 		group := map[string]any{
-			"hooks": []any{map[string]any{"type": "command", "command": hookCommand(bin, hookEvent)}},
+			"hooks": []any{map[string]any{"type": "command", "command": claudeHookCommand(bin, hookEvent, line, agent)}},
 		}
 		if matcher != "" {
 			group["matcher"] = matcher
 		}
-		hooks[event] = append(dropYipGroups(hooks[event]), group)
+		groups := append(dropYipGroups(hooks[event]), group)
+		if wake > 0 && (event == "Stop" || event == "SessionStart") {
+			groups = append(groups, map[string]any{"hooks": []any{rewakeHookEntry(bin, line, agent, wake)}})
+		}
+		hooks[event] = groups
 	}
 	add("PostToolUse", "posttooluse", "")
 	add("Stop", "stop", "")
@@ -762,17 +818,24 @@ func hookInstalled(root string) (mcp bool, hooksIn []string) {
 			continue
 		}
 		hooks, _ := m["hooks"].(map[string]any)
-		n := 0
+		n, wake := 0, 0
 		for _, ev := range []string{"PostToolUse", "Stop", "SessionStart"} {
 			arr, _ := hooks[ev].([]any)
 			for _, g := range arr {
-				if isYipGroup(g) {
+				switch {
+				case isRewakeGroup(g):
+					wake++
+				case isYipGroup(g):
 					n++
 				}
 			}
 		}
-		if n > 0 {
-			hooksIn = append(hooksIn, fmt.Sprintf("%s (%d/3)", f, n))
+		if n > 0 || wake > 0 {
+			desc := fmt.Sprintf("%s (%d/3)", f, n)
+			if wake > 0 {
+				desc += fmt.Sprintf(" + rewake (%d/2)", wake)
+			}
+			hooksIn = append(hooksIn, desc)
 		}
 	}
 	return

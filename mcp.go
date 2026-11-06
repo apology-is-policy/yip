@@ -123,8 +123,9 @@ func tools() []toolDef {
 		{
 			Name: "wait",
 			Description: "Block until the peer replies, the call closes, or the timeout expires. " +
-				"Returns at once if the peer is not in a live session -- your words are already queued and will " +
-				"ring at their next session start, so there is nothing to wait for. Bounded: default 60s, max 600s.",
+				"Returns at once if the peer is neither active nor reachable by push delivery -- your words are already queued and will " +
+				"ring at their next session start, so there is nothing to wait for. An idle peer whose session Yip can wake " +
+				"(a connected Codex chat, Channels, an armed rewake) is worth waiting for. Bounded: default 60s, max 600s; re-issue to keep waiting.",
 			InputSchema: obj(map[string]any{
 				"call":      str("Call id. Omit when only one call is open."),
 				"timeout_s": num("Seconds to wait. Default 60, capped at 600."),
@@ -663,8 +664,11 @@ func (s *server) doCall(a map[string]any) (string, error) {
 	MarkSeen(c, s.me, n)
 	p, _ := LoadPresence(peer)
 	live := "not in a live session -- it will ring at their next session start"
-	if p.Live() {
+	switch {
+	case p.Live():
 		live = "live now -- they will see it on their next tool call"
+	case pushReachable(peer):
+		live = "idle, but its session is connected -- Yip is delivering this to it now"
 	}
 	return fmt.Sprintf("call %s opened, turn %d sent (%d bytes).\n%s is %s.\nFloor is now theirs; use wait to block for the reply.",
 		c.ID, n, len(text), peer, live), nil
@@ -792,7 +796,10 @@ func (s *server) doWait(a map[string]any) (string, error) {
 	if FloorHolder(c, turns) == s.me && start > 0 {
 		return fmt.Sprintf("nothing to wait for -- the floor is already yours on %s (turn %d). Read it.", c.ID, start), nil
 	}
-	if p, _ := LoadPresence(peer); !p.Live() {
+	// An idle peer is still worth waiting for when push delivery reaches its
+	// session (a bound Codex chat, verified Channels, an armed rewake).
+	if !peerReachable(peer) {
+		p, _ := LoadPresence(peer)
 		return fmt.Sprintf("not waiting: %s last contact %s, so current activity is unknown. "+
 			"Turn %d is queued and will ring at their next session start. Carry on with something else.",
 			peer, describeAge(p.Age()), start), nil

@@ -358,3 +358,57 @@ checkout. `yip line` lists seats with their delivery state.
 binding. Tools that only inspect the line carry `readOnlyHint`, so Codex's
 `writes` approval mode can skip prompts for them; Yip does not change approval
 settings.
+
+## Claude rewake hooks (November 6 follow-up)
+
+For Claude sessions that cannot load the development channel, the
+`claude-rewake` runtime wakes an idle session with hooks alone. Claude Code
+documents `asyncRewake` command hooks: they run in the background, an exit code
+of 2 "wakes Claude immediately even when the session is idle", and stderr (or
+stdout) is shown to Claude as a system reminder. Claude enforces `timeout` on
+these hooks, unlike plain `async` ones. See the
+[hook reference](https://code.claude.com/docs/en/hooks).
+
+```sh
+yip install --runtime claude-rewake --as main --line project --local [--wake-window 4h]
+yip doctor --runtime claude-rewake
+```
+
+Installation creates a `claude-rewake` delivery record (the install baseline)
+and adds, beside the usual three hooks, a background handler on SessionStart and
+Stop: `exec yip hook rewake ... --for WINDOW-1m`, with `asyncRewake: true` and
+`timeout` equal to the window. `exec` makes the waiter the session's direct
+child. The waiter:
+
+- holds `delivery/NAME.rewake.lock`; a second waiter exits 0 at once, so each
+  turn's Stop does not stack processes;
+- dispatches through the same durable records, IDs and attempts as Codex and
+  Channels, marking a batch `sent`, printing it to stderr and exiting 2;
+- exits 0 at its deadline, one minute before Claude's timeout, so a window
+  never ends with a killed sender;
+- exits 0 without sending as soon as its parent process changes, so a waiter
+  outliving its session cannot mark notices sent into nowhere.
+
+This is not a subscription. Between a quiet window's end and the next turn the
+session is unarmed; `yip line` and `doctor` say which. PostToolUse notices are
+suppressed while a waiter is armed, without advancing hook cursors, exactly as
+for verified Channels. SessionStart and Stop keep their roles. An identity whose
+retained endpoint belongs to another transport keeps it; install warns.
+
+`wait` and `call` now treat a peer as reachable when push delivery reaches its
+session (a live Codex binding, verified Channels or an armed rewake waiter), not
+only when it was active in the last three minutes. Previously, `wait` returned
+at once for an idle Codex reviewer that Yip was about to wake.
+
+Every Claude runtime now names `--as` and `--line` in its hook commands and in
+`.mcp.json`. Previously, hooks resolved the line from the session's directory:
+after an install with `--line`, that is a different line with no state, so
+every hook silently did nothing, including the Stop hook that holds an owed
+reply. Reinstall affected checkouts.
+
+Verified with fixtures only: unit tests, and the generated hook commands run
+through a real shell against the built binary (one waiter armed, a second
+refused, a Codex call waking it with exit 2, the notice on stderr). Not yet
+measured against a real Claude session: idle wake from the SessionStart and
+Stop entries, a timeout beyond the 600-second default, and process cleanup when
+Claude exits.

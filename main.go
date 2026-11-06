@@ -31,6 +31,8 @@ SETTING UP A LINE
 
 DELIVERY AND BROADCASTS
 
+  yip install --runtime claude-rewake   Claude woken by hooks, no Channels needed
+      --wake-window 4h          how long an idle session stays wakeable per turn
   yip install --runtime codex    Codex MCP + hooks; the chat binds delivery itself
       --seat | --profile NAME   share a checkout, or no checkout (codex -p NAME)
   yip delivery register UUID    manual fallback: one exact Codex chat
@@ -174,9 +176,17 @@ func main() {
 	var runtime, profile string
 	args, runtime = takeFlag(args, "--runtime", "claude")
 	var seat bool
+	var wakeWindow time.Duration
 	if cmd == "install" || cmd == "uninstall" || cmd == "doctor" {
 		args, profile = takeFlag(args, "--profile", "")
 		seat = hasFlag(args, "--seat")
+		var ww string
+		args, ww = takeFlag(args, "--wake-window", "")
+		if ww != "" {
+			d, err := time.ParseDuration(ww)
+			check(err)
+			wakeWindow = d
+		}
 	}
 
 	// Every command but install needs to know which line it is on before it
@@ -259,7 +269,7 @@ func main() {
 		check(Retire(me, first(args) != "--undo"))
 		fmt.Println("retirement updated")
 	case "install":
-		res, err := InstallWith("", line, as, local, runtime, InstallOptions{Seat: seat, Profile: profile})
+		res, err := InstallWith("", line, as, local, runtime, InstallOptions{Seat: seat, Profile: profile, WakeWindow: wakeWindow})
 		check(err)
 		verb := "joined"
 		if res.Reinstall {
@@ -285,6 +295,14 @@ func main() {
 		case runtime == "claude-channels":
 			fmt.Println("\nStart Claude here with: claude --dangerously-load-development-channels server:yip")
 			fmt.Println("Accept the preview warning yourself; organization policy still applies. After Claude acknowledges the probe, run yip doctor --runtime claude-channels.")
+		case runtime == "claude-rewake":
+			window := wakeWindow
+			if window == 0 {
+				window = defaultWakeWindow
+			}
+			fmt.Printf("\nRestart Claude here. Each time a turn starts or ends, a background hook stays armed for %s:\n", window)
+			fmt.Println("a Yip notice then wakes the idle session (no Channels or tmux). Review new hooks in /hooks if asked.")
+			fmt.Println("Then: yip doctor --runtime claude-rewake")
 		case runtime == "codex":
 			start, doc := "codex", "yip doctor --runtime codex"
 			if profile != "" {
@@ -310,7 +328,11 @@ func main() {
 		}
 		fmt.Println("members:")
 		for _, name := range m.Names() {
-			fmt.Printf("  %-16s %s\n", name, m.PathOf(name))
+			delivery := ""
+			if endpointExists(name) {
+				delivery = " -- " + EndpointStatus(name)
+			}
+			fmt.Printf("  %-16s %s%s\n", name, m.PathOf(name), delivery)
 		}
 		if len(seats.Seats) > 0 {
 			fmt.Println("seats:")
@@ -339,6 +361,12 @@ func main() {
 	case "hook":
 		if len(args) < 1 {
 			os.Exit(0) // a malformed hook invocation must not break a session
+		}
+		if args[0] == "rewake" {
+			// Exit 2 is the wake; anything unexpected is a quiet 0.
+			_, forS := takeFlag(args[1:], "--for", "")
+			wait, _ := time.ParseDuration(forS)
+			os.Exit(RunRewakeHook(as, wait))
 		}
 		RunHookRuntime(args[0], as, runtime)
 	case "ring":
@@ -613,6 +641,16 @@ func main() {
 			check(CodexDoctor("", profile))
 			return
 		}
+		if runtime == "claude-rewake" {
+			me := must(WhoAmI(as, ""))
+			_, hooksIn := hookInstalled(checkoutRoot(""))
+			if !strings.Contains(strings.Join(hooksIn, " "), "rewake (2/2)") {
+				check(fmt.Errorf("claude-rewake hooks missing for %s (found: %s); re-run yip install --runtime claude-rewake", me, orDash(strings.Join(hooksIn, ", "))))
+			}
+			fmt.Printf("hooks: %s\ndelivery: %s\n", strings.Join(hooksIn, ", "), EndpointStatus(me))
+			fmt.Println("Armed means a background waiter is running; it re-arms each time a turn starts or ends. This does not prove Claude woke: verify a notice is received and acknowledged.")
+			return
+		}
 		doctor(as)
 	case "version":
 		fmt.Println(serverVersion)
@@ -701,16 +739,15 @@ func printSetup(me string) {
 	fmt.Printf("## .mcp.json\n\n")
 	fmt.Printf(`{
   "mcpServers": {
-    "yip": { "command": %q, "args": ["serve"] }
+    "yip": { "command": %q, "args": ["serve", "--as", %q, "--line", %q] }
   }
 }
-`, bin)
+`, bin, me, activeLine)
 	fmt.Printf("\n## .claude/settings.json  (merge the hooks block into what is there)\n\n")
 	// Guarded so the config is harmless where the binary is absent: a missing
 	// yip means the hook does nothing, rather than erroring every tool call.
-	g := func(event string) string {
-		return fmt.Sprintf("[ ! -x %s ] || %s hook %s", bin, bin, event)
-	}
+	// Identity and line are named so the hooks cannot resolve another line.
+	g := func(event string) string { return claudeHookCommand(bin, event, activeLine, me) }
 	fmt.Printf(`{
   "hooks": {
     "PostToolUse": [

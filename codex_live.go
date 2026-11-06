@@ -110,41 +110,45 @@ func bindingPredates(boundAt string, started time.Time) bool {
 	return err != nil || t.Before(started)
 }
 
-func newCodexEndpoint(agent string) Endpoint {
-	ep := Endpoint{Version: 1, Agent: agent, Runtime: "codex", Known: map[string]bool{}}
+func newEndpoint(agent, runtime string) Endpoint {
+	ep := Endpoint{Version: 1, Agent: agent, Runtime: runtime, Known: map[string]bool{}}
 	for k := range deliverySnapshot(agent) {
 		ep.Known[k] = true
 	}
 	return ep
 }
 
-// ensureCodexEndpoint runs at install, so the install is the opt-in point:
-// records written after it are delivered once a session binds, even if that
-// session's first tool call comes much later. Reinstalling never unpauses,
-// rebinds or rewinds an existing endpoint.
+func newCodexEndpoint(agent string) Endpoint { return newEndpoint(agent, "codex") }
+
+// ensureEndpoint runs at install, so the install is the opt-in point: records
+// written after it are delivered once the session can be reached, even if
+// that is much later. Reinstalling never unpauses, rebinds or rewinds an
+// existing endpoint.
 //
 // An identity whose retained endpoint belongs to another transport keeps it:
 // receipts are never converted. That is a warning (the MCP tools and hooks
 // still work; only push delivery is unavailable), whereas corruption fails.
-func ensureCodexEndpoint(agent string) (warning string, err error) {
+func ensureEndpoint(agent, runtime string) (warning string, err error) {
 	if !validComponent(agent) {
 		return "", fmt.Errorf("invalid agent")
 	}
 	err = updateJSON(endpointPath(agent), func(ep *Endpoint) error {
 		if ep.Version == 0 {
-			*ep = newCodexEndpoint(agent)
+			*ep = newEndpoint(agent, runtime)
 			return nil
 		}
 		if ep.Version != 1 || ep.Agent != agent || ep.Known == nil {
 			return fmt.Errorf("existing endpoint for %s is invalid; inspect it before reinstalling", agent)
 		}
-		if ep.Runtime != "codex" {
-			warning = fmt.Sprintf("%s keeps its %s delivery record, so Codex push delivery is unavailable under this name; install with a distinct --as for it", agent, ep.Runtime)
+		if ep.Runtime != runtime {
+			warning = fmt.Sprintf("%s keeps its %s delivery record, so %s push delivery is unavailable under this name; install with a distinct --as for it", agent, ep.Runtime, runtime)
 		}
 		return nil
 	})
 	return warning, err
 }
+
+func ensureCodexEndpoint(agent string) (string, error) { return ensureEndpoint(agent, "codex") }
 
 type codexBind struct {
 	Bound    bool   // this thread now holds the binding

@@ -113,7 +113,9 @@ func withContext(result any, event, line string) any {
 // new turn, not one per tool call until the agent reads.
 func hookPostToolUse(me string, in hookInput) any {
 	_ = Beat(me, in.ToolName)
-	if channelPreferred(me) {
+	// A live push path delivers these already; repeating them per tool call is
+	// noise. Cursors are not advanced, so the hook resumes when push lapses.
+	if channelPreferred(me) || rewakeArmed(me) {
 		return nil
 	}
 

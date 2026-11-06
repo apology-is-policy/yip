@@ -304,7 +304,7 @@ func dispatchEndpoint(agent, runtime, session string, send deliverySender) (int,
 	for _, i := range batch {
 		ep.Events[i].Status = "accepted"
 		ep.Events[i].Detail = "queue accepted; awaiting recipient acknowledgment"
-		if runtime == "claude-channels" || runtime == "tmux" {
+		if runtime == "claude-channels" || runtime == "tmux" || runtime == "claude-rewake" {
 			ep.Events[i].Status = "sent"
 			ep.Events[i].Detail = "transport written; receipt unknown until acknowledgment"
 		}
@@ -355,6 +355,9 @@ func EndpointStatus(agent string) string {
 	}
 	if ep.Runtime == "tmux" {
 		return "tmux opt-in; dispatch requires confirmed idle pane"
+	}
+	if ep.Runtime == "claude-rewake" {
+		return rewakeStatus(agent)
 	}
 	return codexEndpointStatus(ep)
 }

@@ -74,6 +74,17 @@ TRANSPORT SETUP AND DIAGNOSTICS
   normal notices stay durable and hooks continue. Each restart requires a new
   probe. A second Channels server for the same identity is refused.
 
+  Claude without Channels (hooks only; e.g. where policy disables the flag):
+    yip install --runtime claude-rewake --as main --line myproject [--wake-window 4h]
+    yip doctor --runtime claude-rewake
+  A background asyncRewake hook on SessionStart and Stop arms one waiter per
+  identity for the wake window (the hook's timeout). A Yip notice makes it exit
+  2, which Claude documents as waking even an idle session; the notice arrives
+  as a system reminder. After a quiet window the session is unarmed until its
+  next turn. A waiter whose session exited sends nothing. PostToolUse notices
+  are suppressed while a waiter is armed. Every Claude runtime names --as and
+  --line in its hooks and .mcp.json; reinstall checkouts installed with --line.
+
   Existing manual MCP integration:
     yip delivery register-channel [--replay]
     Configure its command as: /absolute/path/yip serve --channels --as NAME
@@ -251,7 +262,10 @@ RESOURCES AND WAITING
 
 RUNTIME AND MAINTENANCE
   Channels require an enabled, open Claude session; busy messages queue rather
-  than guarantee tool interruption. In Codex, call ring early: delivery binds
+  than guarantee tool interruption. A rewake notice arrives as a system
+  reminder: handle it like any other notice. wait holds for an idle peer that
+  Yip can wake (bound Codex chat, Channels, armed rewake); re-issue it to keep
+  waiting rather than polling. In Codex, call ring early: delivery binds
   to your chat at your first Yip tool call. If you use the CLI in a checkout
   you share as a seat, pass --as. The human sets up transports with --help.
   Do not change trust, start duplicate dispatchers, overwrite endpoint bindings,

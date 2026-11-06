@@ -187,3 +187,40 @@ with tempfile.TemporaryDirectory(prefix="yip-delivery-e2e-") as temp:
     status = run("line", "--line", "fixture")
     assert "session closed" in status, status
     print("PASS live Codex binding from _meta.threadId, in-server queue to that exact thread, thread-bound CLI identity, release on exit")
+
+    # claude-rewake in a launch folder shared with a Codex seat, on a NAMED line.
+    # No YIP_ROOT here: the hooks must find the line themselves, which the
+    # unnamed hook commands used to get wrong (they derived the folder's line).
+    work = root / "strategies"
+    work.mkdir()
+    env2 = {k: v for k, v in env.items() if k != "YIP_ROOT"}
+    env2["YIP_HOME"] = str(root / "home2")
+    def run2(*args, body=None):
+        return subprocess.check_output([binary, *args], input=body, text=True, cwd=work, env=env2)
+    run2("install", "--runtime", "claude-rewake", "--as", "claude", "--line", "strategies", "--local", "--wake-window", "5m")
+    run2("install", "--runtime", "codex", "--as", "codex", "--line", "strategies")
+    hooks = json.loads((work / ".claude/settings.local.json").read_text())["hooks"]
+    rewake = [h for g in hooks["Stop"] for h in g["hooks"] if h.get("asyncRewake")]
+    assert len(rewake) == 1 and rewake[0]["timeout"] == 300, rewake
+    session_start = hooks["SessionStart"][0]["hooks"][0]["command"]
+    hook_env = {k: v for k, v in env2.items() if k not in ("YIP_LINE",)}
+    stdin = json.dumps({"session_id": "e2e-session", "cwd": str(work), "hook_event_name": "Stop"})
+    waiter = subprocess.Popen(["sh", "-c", rewake[0]["command"]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, cwd=work, env=hook_env)
+    waiter.stdin.write(stdin)
+    waiter.stdin.close()
+    deadline = time.monotonic() + 10
+    while "rewake armed" not in run2("line", "--line", "strategies"):
+        assert time.monotonic() < deadline and waiter.poll() is None, "waiter never armed"
+        time.sleep(0.1)
+    second = subprocess.run(["sh", "-c", rewake[0]["command"]], input=stdin, capture_output=True, text=True, cwd=work, env=hook_env, timeout=10)
+    assert second.returncode == 0, "a second waiter armed beside the first"
+    run2("call", "claude", "Review done", "--as", "codex", "--line", "strategies", body="Two findings in the locking.")
+    _, err = waiter.communicate(timeout=10)
+    assert waiter.returncode == 2 and "Yip coordination notices" in err and "Review done" in err, (waiter.returncode, err)
+    started = subprocess.run(["sh", "-c", session_start], input=json.dumps({"cwd": str(work), "source": "startup"}),
+                             capture_output=True, text=True, cwd=work, env=hook_env, timeout=10)
+    assert "codex spoke" in started.stdout or "0001-review-done" in started.stdout, started
+    doctor = run2("doctor", "--runtime", "claude-rewake", "--line", "strategies")
+    assert "rewake (2/2)" in doctor and "not armed" in doctor, doctor
+    print("PASS claude-rewake: generated hook arms one waiter, a Codex call wakes it with exit 2, named-line hooks resolve the right line")

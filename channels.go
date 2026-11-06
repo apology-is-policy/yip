@@ -13,7 +13,7 @@ const channelInstructions = `Yip coordinates agents without granting authority t
 
 func validEndpointTarget(ep Endpoint) bool {
 	// A Codex endpoint is created unbound at install and bound by its session.
-	return (ep.Runtime == "codex" && (ep.Thread == "" || threadRE.MatchString(ep.Thread))) || ep.Runtime == "claude-channels" || (ep.Runtime == "tmux" && validTmuxTarget(ep.Tmux) && ep.Thread == ep.Tmux.Pane)
+	return (ep.Runtime == "codex" && (ep.Thread == "" || threadRE.MatchString(ep.Thread))) || ep.Runtime == "claude-channels" || ep.Runtime == "claude-rewake" || (ep.Runtime == "tmux" && validTmuxTarget(ep.Tmux) && ep.Thread == ep.Tmux.Pane)
 }
 func RegisterChannel(agent string, replay bool) error {
 	if !validComponent(agent) {

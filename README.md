@@ -18,10 +18,11 @@ without Yip.
   notes carry information without creating a reply obligation.
 - **Regroup from Switchboard.** Send announcements, briefings or regroup requests
   to a chosen audience. Track each recipient's read receipt and replies.
-- **Notify an idle session.** Claude Code can receive MCP Channels events; a
-  Codex chat binds itself at its first Yip tool call and receives queued
-  messages, with no UUID or separate dispatcher. Hooks and the inbox remain
-  available. An optional tmux transport supports controlled terminal setups.
+- **Notify an idle session.** Claude Code can receive MCP Channels events, or
+  be woken by a background rewake hook where Channels is unavailable; a Codex
+  chat binds itself at its first Yip tool call and receives queued messages,
+  with no UUID or separate dispatcher. Hooks and the inbox remain available. An
+  optional tmux transport supports controlled terminal setups.
 - **Join without a checkout of your own.** A Codex agent can take a *seat*
   beside another agent's checkout, or run from a Codex profile anywhere, e.g.
   as a reviewer that a Claude Code agent calls.
@@ -89,14 +90,43 @@ guarantee interruption of an executing tool, and cannot launch a closed Claude
 session. Startup and Stop hooks remain; ordinary hook notifications provide a
 fallback when Channels is not live and verified.
 
-For hook-based Claude integration without Channels:
+### Claude Code without Channels: rewake hooks
+
+Where the development channel is unavailable (organization policy, say), a
+Claude session can still be woken with hooks alone:
+
+```sh
+cd /path/to/checkout
+yip install --runtime claude-rewake --as main --line myproject --local
+claude
+yip doctor --runtime claude-rewake
+```
+
+This adds a background `asyncRewake` hook to SessionStart and Stop. Claude Code
+documents that such a hook exiting with code 2 wakes Claude "even when the
+session is idle", with its stderr shown as a system reminder. Each time a turn
+starts or ends, one waiter per identity is armed. When a Yip notice arrives, it
+marks it sent, prints it and exits 2. There's no Channels flag, tmux or
+keystroke injection involved.
+
+The waiter is armed for a **wake window** after each turn (default 4h, set with
+`--wake-window 8h`), which becomes the hook's timeout: Claude enforces timeouts
+on rewake hooks. After a quiet window, the idle session is not woken until its
+next turn, when the ordinary hooks report what arrived. Busy sessions get the
+notice at their next safe point. A waiter whose session has exited sends
+nothing. `yip line` shows whether the waiter is armed.
+
+For plain hook-based Claude integration (notices at hook boundaries only):
 
 ```sh
 yip install --runtime claude --as main --line myproject --local
 yip doctor
 ```
 
-Plain `yip install` retains this hook-based setup for compatibility.
+Plain `yip install` retains this hook-based setup for compatibility. Every
+Claude runtime now writes `--as` and `--line` into its hooks and `.mcp.json`;
+reinstall older checkouts installed with `--line`, whose hooks resolved a
+different line from the session's directory and silently did nothing.
 
 ### Codex: live delivery to the chat that called
 
@@ -142,7 +172,7 @@ names its identity explicitly, can instead take a **seat**:
 ```sh
 # Beside a Claude agent, in the same checkout (a seat automatically):
 cd /path/to/checkout
-yip install --runtime claude-channels --as main --line myproject --local
+yip install --runtime claude-rewake --as main --line myproject --local   # or claude-channels
 yip install --runtime codex --as reviewer --line myproject
 
 # Or with no checkout at all, via a Codex profile you start anywhere:
@@ -168,7 +198,8 @@ printf '%s\n' 'Please review the diff on HEAD; focus on the locking.' |
 
 The notice arrives in the Codex chat. It reads the call, reviews the code at the
 caller's checkout, and replies with `say`. Claude is woken by Channels or its
-hooks. Turns carry both checkouts' revisions, so a review of an older HEAD is
+rewake hook, or can block on `wait`: a peer that Yip can wake counts as
+reachable even when it has been idle for hours. Turns carry both checkouts' revisions, so a review of an older HEAD is
 flagged as stale. Read-only Yip tools carry `readOnlyHint`, so Codex's `writes`
 approval mode can skip prompts for them; Yip does not change approval settings.
 
