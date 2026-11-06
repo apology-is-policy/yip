@@ -183,6 +183,78 @@ func TestClaudeInstallMovesACodexOwnerToASeat(t *testing.T) {
 	}
 }
 
+// A registration left in another folder is removed by name from anywhere,
+// including when that folder is gone; then the intended install succeeds.
+func TestUninstallByNameRemovesALeftoverElsewhere(t *testing.T) {
+	launch := seatFixture(t)
+	old, _ := filepath.EvalSymlinks(t.TempDir())
+	if _, err := InstallWith(old, "t", "claude", true, "claude-rewake", InstallOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := InstallWith(launch, "t", "claude", true, "claude-rewake", InstallOptions{})
+	if err == nil || !strings.Contains(err.Error(), "yip uninstall --as claude --line t") {
+		t.Fatal("error does not say how to recover:", err)
+	}
+	where, err := UninstallFrom(launch, "claude", "")
+	if err != nil || where != checkoutRoot(old) {
+		t.Fatal(where, err)
+	}
+	if fileExists(filepath.Join(old, ".mcp.json")) {
+		t.Fatal("left the old folder's config")
+	}
+	if _, err := InstallWith(launch, "t", "claude", true, "claude-rewake", InstallOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// A registration whose folder no longer exists can be removed too.
+	gone := filepath.Join(t.TempDir(), "deleted")
+	os.MkdirAll(gone, 0o755)
+	if _, err := InstallWith(gone, "t", "ghost", true, "claude", InstallOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	os.RemoveAll(gone)
+	if _, err := UninstallFrom(launch, "ghost", ""); err != nil {
+		t.Fatal(err)
+	}
+	if fileExists(gone) || contains(LineNames(), "ghost") {
+		t.Fatal("ghost kept, or its folder recreated")
+	}
+	if !contains(LineNames(), "claude") {
+		t.Fatal("removing ghost touched claude")
+	}
+	if _, err := UninstallFrom(launch, "nobody", ""); err == nil {
+		t.Fatal("removed an identity that is not on the line")
+	}
+}
+
+// One folder reached under two spellings is one checkout.
+func TestAnotherSpellingOfTheSameFolderIsTheSameCheckout(t *testing.T) {
+	dir := seatFixture(t)
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(dir, alias); err != nil {
+		t.Skip("cannot create a symlink here:", err)
+	}
+	// Record the folder under a spelling EvalSymlinks will not produce, as a
+	// case variant on a case-insensitive disk would be.
+	if _, err := InstallWith(dir, "t", "claude", true, "claude-rewake", InstallOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	m := LoadMembers()
+	m.Members = map[string]string{alias: "claude"}
+	SaveMembers(m)
+	if _, err := InstallWith(dir, "t", "claude", true, "claude-rewake", InstallOptions{}); err != nil {
+		t.Fatal("same folder under another spelling treated as a second checkout:", err)
+	}
+	if got := LoadMembers().Members; len(got) != 1 || got[alias] != "claude" {
+		t.Fatal("registration duplicated instead of reused", got)
+	}
+	if me, err := WhoAmI("", dir); err != nil || me != "claude" {
+		t.Fatal(me, err)
+	}
+	if err := UninstallWith(dir, "", ""); err != nil || len(LoadMembers().Members) != 0 {
+		t.Fatal("uninstall missed the other spelling", err, LoadMembers().Members)
+	}
+}
+
 // Uninstall must leave the line the folder joined, not the one derived from it.
 func TestLinesHostingFindsTheJoinedLine(t *testing.T) {
 	dir := seatFixture(t)

@@ -72,15 +72,17 @@ func WhoAmI(override, cwd string) (string, error) {
 	// path: the checkout may belong to a different agent this seat shares it
 	// with. (MEASURED on codex-cli 0.162.0: CODEX_THREAD_ID equals the UUID
 	// the same thread's MCP server sees as _meta.threadId.)
+	m, seats := LoadMembers(), LoadSeats()
+	root = recordedRoot(root, m, seats) // the spelling it was installed under
 	if thread := os.Getenv("CODEX_THREAD_ID"); threadRE.MatchString(thread) {
 		if a := agentBoundToThread(thread); a != "" {
 			return a, nil
 		}
-		if here := LoadSeats().At(root); len(here) > 0 {
+		if here := seats.At(root); len(here) > 0 {
 			return "", fmt.Errorf("this Codex chat is not bound to a Yip identity yet, and %s is shared by seat(s) %s -- use the Yip MCP tools (which binds this chat) or pass --as NAME", root, strings.Join(here, ", "))
 		}
 	}
-	if a := LoadMembers().AgentAt(root); a != "" {
+	if a := m.AgentAt(root); a != "" {
 		return a, nil
 	}
 	return "", fmt.Errorf("%s is not on line %s -- run `yip install` here (or pass --as)", root, activeLine)

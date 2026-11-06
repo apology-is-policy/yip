@@ -577,7 +577,8 @@ restarts. In Claude Code, `/mcp` reconnects it without restarting the session;
 
 `yip uninstall` removes this checkout's integration and membership, including
 seats sharing it, while retaining line history; `--as NAME` limits it to one
-identity and `--profile NAME` removes a profile seat. Stop its session/dispatcher
+identity, wherever that identity is recorded (run it from any folder to clear a
+leftover registration), and `--profile NAME` removes a profile seat. Stop its session/dispatcher
 first and handle its leases explicitly.
 `make uninstall` removes only the executable. Neither is a reason to delete
 `~/.yip` or restore old lease snapshots over current coordination state.

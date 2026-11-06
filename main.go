@@ -326,14 +326,19 @@ func main() {
 		}
 		for _, l := range lines {
 			activeLine = l
-			if err := UninstallWith("", as, profile); err != nil {
+			where, err := UninstallFrom("", as, profile)
+			if err != nil {
 				// --as narrows to one identity: skip lines it is not on.
-				if as != "" && len(lines) > 1 && strings.Contains(err.Error(), "is not a member or seat") {
+				if as != "" && len(lines) > 1 && strings.Contains(err.Error(), "is not on line") {
 					continue
 				}
 				check(err)
 			}
-			fmt.Printf("left line %q; config removed\n", l)
+			who := "this checkout"
+			if as != "" {
+				who = as
+			}
+			fmt.Printf("removed %s from line %q (%s); history kept\n", who, l, where)
 		}
 	case "line":
 		fmt.Printf("line:     %s\n", activeLine)

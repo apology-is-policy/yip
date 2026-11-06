@@ -260,6 +260,7 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 	if err != nil {
 		return nil, err
 	}
+	root = recordedRoot(root, m, seats)
 	owner := m.AgentAt(root)
 	seatMode := opts.Seat || opts.Profile != ""
 	if agent == "" {
@@ -301,9 +302,9 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 	if p := m.PathOf(agent); p != "" {
 		switch {
 		case !seatMode && p != root:
-			return nil, fmt.Errorf("the name %q on line %s already belongs to %s -- pass --as <other-name>", agent, activeLine, p)
+			return nil, fmt.Errorf("the name %q on line %s already belongs to %s. If that registration is left over, remove it (from any folder): yip uninstall --as %s --line %s -- otherwise pass --as <other-name>", agent, activeLine, p, agent, activeLine)
 		case seatMode && (p != root || opts.Profile != ""):
-			return nil, fmt.Errorf("the name %q on line %s is the checkout member at %s -- uninstall it there, or pass --as <other-name>", agent, activeLine, p)
+			return nil, fmt.Errorf("the name %q on line %s is the checkout member at %s. If that is left over, remove it (from any folder): yip uninstall --as %s --line %s -- otherwise pass --as <other-name>", agent, activeLine, p, agent, activeLine)
 		case seatMode:
 			converting = true // this checkout's member becomes a seat here
 		}
@@ -312,9 +313,9 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 	if hadSeat {
 		switch {
 		case !seatMode:
-			return nil, fmt.Errorf("the name %q on line %s is a %s -- pass --as <other-name>", agent, activeLine, seatDescription(prior))
+			return nil, fmt.Errorf("the name %q on line %s is a %s. If that is left over, remove it (from any folder): yip uninstall --as %s --line %s -- otherwise pass --as <other-name>", agent, activeLine, seatDescription(prior), agent, activeLine)
 		case prior.Profile != opts.Profile || (opts.Profile == "" && prior.Workdir != root):
-			return nil, fmt.Errorf("the name %q on line %s is already a %s -- uninstall it there, or pass --as <other-name>", agent, activeLine, seatDescription(prior))
+			return nil, fmt.Errorf("the name %q on line %s is already a %s. If that is left over, remove it (from any folder): yip uninstall --as %s --line %s -- otherwise pass --as <other-name>", agent, activeLine, seatDescription(prior), agent, activeLine)
 		}
 	}
 
@@ -441,6 +442,38 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 	return res, nil
 }
 
+// sameDir: two spellings of one directory -- letter case on a case-insensitive
+// disk (macOS), a hard link, a bind mount. EvalSymlinks normalises symlinks
+// but not case, so `cd ~/Strategies` and `cd ~/strategies` gave two "checkouts"
+// and the first registration blocked the second as a different folder.
+func sameDir(a, b string) bool {
+	if a == b {
+		return true
+	}
+	fa, ea := os.Stat(a)
+	fb, eb := os.Stat(b)
+	return ea == nil && eb == nil && os.SameFile(fa, fb)
+}
+
+// recordedRoot is the spelling under which this checkout is recorded on the
+// line, as a member path or a seat's workdir; root itself if it is not.
+func recordedRoot(root string, m Members, s Seats) string {
+	if _, ok := m.Members[root]; ok {
+		return root
+	}
+	for p := range m.Members {
+		if sameDir(p, root) {
+			return p
+		}
+	}
+	for _, seat := range s.Seats {
+		if seat.Workdir != "" && sameDir(seat.Workdir, root) {
+			return seat.Workdir
+		}
+	}
+	return root
+}
+
 // isCodexIdentity: is this agent demonstrably a Codex agent -- by its delivery
 // record, or by this checkout's .codex/ config naming it? Anything less leaves
 // it a path member, because moving a Claude identity would break its hooks.
@@ -469,18 +502,12 @@ func linesHosting(root string) []string {
 		}
 		dir := filepath.Join(yipHome(), "lines", e.Name())
 		var m Members
-		if readState(filepath.Join(dir, "members.json"), &m) == nil && m.Members[root] != "" {
-			out = append(out, e.Name())
-			continue
-		}
 		var s Seats
-		if readState(filepath.Join(dir, "seats.json"), &s) == nil {
-			for _, seat := range s.Seats {
-				if seat.Workdir == root {
-					out = append(out, e.Name())
-					break
-				}
-			}
+		_ = readState(filepath.Join(dir, "members.json"), &m)
+		_ = readState(filepath.Join(dir, "seats.json"), &s)
+		r := recordedRoot(root, m, s)
+		if m.Members[r] != "" || len(s.At(r)) > 0 {
+			out = append(out, e.Name())
 		}
 	}
 	sort.Strings(out)
@@ -494,20 +521,51 @@ func linesHosting(root string) []string {
 // profile removes a profile seat and touches no checkout.
 func Uninstall(cwd string) error { return UninstallWith(cwd, "", "") }
 func UninstallWith(cwd, agent, profile string) error {
+	_, err := UninstallFrom(cwd, agent, profile)
+	return err
+}
+
+// UninstallFrom is UninstallWith reporting where the integration was removed.
+// An identity named with --as that is recorded somewhere else on the line is
+// removed THERE: a registration left by an earlier attempt in another folder
+// (or one that no longer exists) must not need a cd into it to clean up.
+func UninstallFrom(cwd, agent, profile string) (string, error) {
 	root := checkoutRoot(cwd)
 	unlock, err := fileGuard(membersPath())
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer unlock()
 	m := Members{Members: map[string]string{}}
 	if err := readState(membersPath(), &m); err != nil {
-		return err
+		return "", err
 	}
 	seats, err := loadSeatsStrict()
 	if err != nil {
-		return err
+		return "", err
 	}
+	root = recordedRoot(root, m, seats)
+	if profile == "" && agent != "" && agent != m.AgentAt(root) && !contains(seats.At(root), agent) {
+		seat, isSeat := seats.Seats[agent]
+		switch {
+		case m.PathOf(agent) != "":
+			root = m.PathOf(agent)
+		case isSeat && seat.Profile != "":
+			profile = seat.Profile
+		case isSeat && seat.Workdir != "":
+			root = seat.Workdir
+		default:
+			return "", fmt.Errorf("%q is not on line %s", agent, activeLine)
+		}
+	}
+	where := root
+	if profile != "" {
+		where = codexProfilePath(profile)
+	}
+	return where, uninstallLocked(root, agent, profile, m, seats)
+}
+
+func uninstallLocked(root, agent, profile string, m Members, seats Seats) error {
 	if profile != "" {
 		if err := codexProfileFiles(profile, "", "", agent, true); err != nil {
 			return err

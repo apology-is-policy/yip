@@ -141,7 +141,10 @@ TRANSPORT SETUP AND DIAGNOSTICS
   writes only $CODEX_HOME/NAME.config.toml (MCP plus inline hooks). Inside a
   Codex shell, yip answers as the identity bound to CODEX_THREAD_ID, not the
   path owner. A second Claude identity needs its own worktree. yip line lists
-  seats. Without --line, uninstall leaves every line the checkout joined.
+  seats. Without --line, uninstall leaves every line the checkout joined;
+  uninstall --as NAME --line L removes NAME wherever it is recorded, even from
+  another (or deleted) folder. A folder reached by another spelling (letter
+  case, hard link) is the same checkout.
 
   Delivery states: pending -> sending -> accepted (Codex) or sent (Channels).
   accepted/sent do not mean read. A crash/error can leave unknown delivery.
