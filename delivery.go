@@ -39,17 +39,22 @@ type Delivery struct {
 	Detail   string            `json:"detail,omitempty"`
 }
 type Endpoint struct {
-	Tmux             *TmuxTarget     `json:"tmux,omitempty"`
-	ChannelReady     bool            `json:"channel_ready,omitempty"`
-	ChannelProbe     string          `json:"channel_probe,omitempty"`
-	ChannelConnected bool            `json:"channel_connected,omitempty"`
-	Version          int             `json:"version"`
-	Agent            string          `json:"agent"`
-	Runtime          string          `json:"runtime"`
-	Thread           string          `json:"thread"`
-	Paused           bool            `json:"paused"`
-	Known            map[string]bool `json:"known"`
-	Events           []Delivery      `json:"events"`
+	Tmux             *TmuxTarget `json:"tmux,omitempty"`
+	ChannelReady     bool        `json:"channel_ready,omitempty"`
+	ChannelProbe     string      `json:"channel_probe,omitempty"`
+	ChannelConnected bool        `json:"channel_connected,omitempty"`
+	Version          int         `json:"version"`
+	Agent            string      `json:"agent"`
+	Runtime          string      `json:"runtime"`
+	Thread           string      `json:"thread"`
+	// Codex only: who bound Thread ("session" = that chat's own MCP server,
+	// "manual" = delivery register), when, and the session's working directory.
+	Binding string          `json:"binding,omitempty"`
+	BoundAt string          `json:"bound_at,omitempty"`
+	Cwd     string          `json:"cwd,omitempty"`
+	Paused  bool            `json:"paused"`
+	Known   map[string]bool `json:"known"`
+	Events  []Delivery      `json:"events"`
 }
 
 func endpointPath(agent string) string { return filepath.Join(Root(), "delivery", agent+".json") }
@@ -126,12 +131,27 @@ func RegisterEndpoint(agent, thread string, replay bool) error {
 	}
 	return updateJSON(endpointPath(agent), func(ep *Endpoint) error {
 		if ep.Version != 0 {
-			if ep.Version != 1 || ep.Agent != agent || ep.Thread != thread || ep.Runtime != "codex" {
+			if ep.Version != 1 || ep.Agent != agent || ep.Runtime != "codex" || ep.Known == nil {
 				return fmt.Errorf("existing endpoint differs; preserve its receipts and register a distinct agent identity")
 			}
-			return nil // reinstall never unpauses or rewinds receipts
+			if ep.Thread == thread {
+				return nil // reinstall never unpauses or rewinds receipts
+			}
+			// Moving a binding is allowed only away from a chat nobody can
+			// demonstrably deliver to. Receipts and attempts are retained.
+			if ep.Thread != "" && codexBindingAlive(*ep) {
+				return fmt.Errorf("%s is bound to live Codex chat %s; a newer session rebinds itself at its first Yip tool call", agent, ep.Thread)
+			}
+			// Install created this endpoint unbound; --replay still means
+			// "include history" when nothing was ever delivered from it.
+			if replay && ep.Thread == "" && len(ep.Events) == 0 {
+				ep.Known = map[string]bool{}
+				reconcileEndpoint(ep)
+			}
+			ep.Thread, ep.Binding, ep.BoundAt, ep.Cwd = thread, "manual", nowNano(), ""
+			return nil
 		}
-		*ep = Endpoint{Version: 1, Agent: agent, Runtime: "codex", Thread: thread, Known: map[string]bool{}}
+		*ep = Endpoint{Version: 1, Agent: agent, Runtime: "codex", Thread: thread, Binding: "manual", BoundAt: nowNano(), Known: map[string]bool{}}
 		if replay {
 			reconcileEndpoint(ep)
 		} else {
@@ -223,8 +243,11 @@ func dispatchEndpoint(agent, runtime, session string, send deliverySender) (int,
 	if err != nil {
 		return 0, err
 	}
-	if ep.Runtime != runtime || (runtime == "claude-channels" && ep.Thread != session) {
-		return 0, fmt.Errorf("dispatcher does not own this endpoint")
+	// A session-scoped dispatcher (Channels, or a live Codex chat's own server)
+	// owns the endpoint only while it is the bound session. An external Codex
+	// dispatcher passes no session and follows the current binding.
+	if ep.Runtime != runtime || ((runtime == "claude-channels" || (runtime == "codex" && session != "")) && ep.Thread != session) {
+		return 0, errNotOwner
 	}
 	reconcileEndpoint(&ep)
 	// A previous sender died with the write-ahead attempt in place. Never resend
@@ -242,7 +265,8 @@ func dispatchEndpoint(agent, runtime, session string, send deliverySender) (int,
 	if err = writeState(endpointPath(agent), ep); err != nil {
 		return 0, err
 	}
-	if ep.Paused || Retired(agent) {
+	// An unbound Codex endpoint has nowhere to send: events wait as pending.
+	if ep.Paused || Retired(agent) || (runtime == "codex" && ep.Thread == "") {
 		return 0, nil
 	}
 	var batch []int
@@ -332,10 +356,7 @@ func EndpointStatus(agent string) string {
 	if ep.Runtime == "tmux" {
 		return "tmux opt-in; dispatch requires confirmed idle pane"
 	}
-	if dispatchWatchAlive(agent) {
-		return "Codex dispatcher running"
-	}
-	return "Codex registered; dispatcher stopped (no automatic wake)"
+	return codexEndpointStatus(ep)
 }
 func DeliveryCLI(args []string, agent string) error {
 	if len(args) == 0 {

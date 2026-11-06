@@ -42,20 +42,23 @@ not forwarded. Doctor checks registrations, the wired binary/version and whether
 the local `codex queue` command is available. It cannot certify runtime delivery.
 See the [official hook contract](https://learn.chatgpt.com/docs/hooks).
 
-Register an exact existing chat UUID explicitly:
+Since the November 6 follow-up, a Codex session binds itself and its own MCP
+server dispatches; see [Codex live delivery and seats](#codex-live-delivery-and-seats-november-6-follow-up).
+The manual route below remains as a fallback. Register an exact existing chat
+UUID explicitly:
 
 ```sh
 yip delivery register 00000000-0000-4000-8000-000000000001
 yip delivery dispatch --watch 1h
 ```
 
-Replace the illustrative UUID with the intended chat. The first command binds
-one agent to one local Codex endpoint. It records a baseline and delivers future
-observed events. Add `--replay` on first registration to include existing source
-records. Re-registration is idempotent and does not unpause or rewind an endpoint.
-A different UUID is rejected rather than silently redirecting pending messages.
-This version supports one immutable endpoint binding per agent; changing chats
-requires a distinct registered agent identity.
+Replace the illustrative UUID with the intended chat. Installation records the
+baseline; registration delivers events observed after it. Add `--replay` on the
+first registration of a never-bound endpoint to include existing source records.
+Re-registration is idempotent and does not unpause or rewind an endpoint. A
+different UUID is rejected while the current binding is live (its session's
+server holds the binding or a watch runs); otherwise the binding moves, keeping
+every receipt and attempt.
 
 Dispatch runs once without `--watch`; a watch is bounded to at most 24 hours and
 checks every two seconds. Nothing launches a dispatcher automatically. It invokes
@@ -268,3 +271,90 @@ MCP environment and hook commands. A shared daemon need not inherit the calling
 terminal environment. Reinstall and review hooks normally when relocating that
 state; changing the terminal variables alone does not redirect an installed
 client. No credentials or unrelated environment variables are copied.
+
+## Codex live delivery and seats (November 6 follow-up)
+
+This section supersedes the manual-only Codex binding above as the default.
+
+### What Codex provides
+
+Measured against `codex-cli 0.162.0` with an isolated `CODEX_HOME` and no
+model request:
+
+- Codex has no MCP notification that injects text into a conversation, and a
+  background (`async`) hook cannot start a turn. The wake path is
+  `codex queue --thread UUID`, delivered by the shared local daemon.
+- The daemon starts one MCP server process per thread. Its environment is
+  stripped to `HOME LANG LOGNAME PATH SHELL TERM TMPDIR USER`; `initialize`
+  names no thread. Every `tools/call` carries `params._meta.threadId`.
+- Shell commands Codex runs see `CODEX_THREAD_ID`, equal to that same UUID.
+- `env_vars = ["CODEX_HOME"]` forwards a custom Codex home to the server; an
+  unset name is skipped.
+- A profile layer (`codex -p NAME`, file `$CODEX_HOME/NAME.config.toml`)
+  contributes both MCP servers and inline `[[hooks.*]]` to a runtime session.
+  Project `.codex/` config loads only for trusted projects.
+
+### Live delivery
+
+`yip install --runtime codex` writes `serve --codex` and creates an unbound
+endpoint, so the install is the delivery baseline. At the session's first Yip
+tool call, its server records `_meta.threadId` as the binding, holds a kernel
+lock for that thread while it runs, and dispatches every two seconds with
+`codex queue`. No UUID, registration or external dispatcher is required. The
+tool result says once that delivery connected. Codex's MCP instructions and the
+SessionStart hook ask the agent to make that first call (`ring`) early.
+
+Until a session makes a Yip tool call, nothing can name its chat: notices stay
+pending, and inbox/hooks still show them. The newest session to bind wins. A
+superseded session's server goes passive and takes over again only if the
+newer session ends. Rebinding never resends: notices accepted by an earlier
+chat stay `accepted` until acknowledged, and the new chat is told how many.
+Stopping the session releases the lock; status reports the binding as closed.
+An identity whose retained endpoint belongs to Channels or tmux keeps it, and
+Codex push stays off under that name (install says so).
+
+The checked path: a real 0.162.0 daemon in an isolated home loaded a trusted
+checkout's `.codex/config.toml`, started Yip for a new thread, and bound it at
+an app-server-initiated tool call. A `yip call` from the checkout's Claude member
+then made Yip's own server queue to exactly that thread. The daemon started a
+turn there with the notice as its user message; with no credentials, the model
+request failed with 401 as intended. A model-initiated tool call and an
+interactive TUI were not driven by this check.
+
+### Seats: agents without their own checkout
+
+A checkout has one *path member*: the identity Claude's hooks and a human's CLI
+resolve there. Installation never replaces it any more. Previously, installing
+a second agent in the same checkout silently re-pointed the first agent's
+path-resolved hooks to the new name. A Codex install whose config names its
+identity explicitly takes a *seat* instead:
+
+```sh
+# beside the checkout's Claude member (automatic when the checkout is owned)
+yip install --runtime codex --as reviewer --line project
+# convert an existing Codex path member into a seat, freeing the path
+yip install --runtime codex --as reviewer --line project --seat
+# no checkout at all: a Codex profile layer, started from any directory
+yip install --runtime codex --as reviewer --line project --profile yip-reviewer
+codex -p yip-reviewer -C /path/to/checkout -s read-only
+```
+
+Seats are recorded in `seats.json` beside `members.json`, so older binaries that
+rewrite `members.json` cannot drop them. Names are unique across both. A second
+Claude identity in an owned checkout is refused: Claude's hooks identify an
+agent by checkout path. One `.codex/` layer or profile serves one identity.
+A profile that already defines hooks is refused rather than merged.
+
+Inside a Codex shell, `yip` resolves `CODEX_THREAD_ID` through the binding
+before the path. An unbound chat in a checkout shared with seats is refused
+(use the MCP tools or `--as`) rather than answering as the path member.
+Revision stamps for a seat use the checkout it shares, or else the bound
+session's working directory.
+
+`yip uninstall` removes the checkout's member and its seats; `--as NAME` limits
+it to one identity; `--profile NAME` removes a profile seat without touching any
+checkout. `yip line` lists seats with their delivery state.
+`yip doctor --runtime codex [--profile NAME]` checks the layer and reports the
+binding. Tools that only inspect the line carry `readOnlyHint`, so Codex's
+`writes` approval mode can skip prompts for them; Yip does not change approval
+settings.

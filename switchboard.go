@@ -199,8 +199,7 @@ func mergeEntries(turns []Turn, notes []Note) []sbEntry {
 
 func loadState() sbState {
 	st := sbState{presence: map[string]Presence{}}
-	m := LoadMembers()
-	st.members = m.Names()
+	st.members = LineNames()
 	for _, a := range st.members {
 		if p, ok := LoadPresence(a); ok {
 			st.presence[a] = p

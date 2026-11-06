@@ -49,6 +49,25 @@ type toolDef struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	InputSchema map[string]any `json:"inputSchema"`
+	Annotations map[string]any `json:"annotations,omitempty"`
+}
+
+// readOnlyTools only inspect the line. Their sole writes are the caller's own
+// bookkeeping (presence contact, its own read cursor), never an assertion or
+// receipt another participant relies on. Runtimes such as Codex can use the
+// hint to skip approval prompts for them; it is a hint, not a security claim.
+var readOnlyTools = map[string]bool{
+	"ring": true, "presence": true, "resources": true, "read": true, "wait": true,
+	"inbox": true, "deliveries": true, "broadcasts": true, "queue_history": true,
+}
+
+func annotated(defs []toolDef) []toolDef {
+	for i := range defs {
+		if readOnlyTools[defs[i].Name] {
+			defs[i].Annotations = map[string]any{"readOnlyHint": true}
+		}
+	}
+	return defs
 }
 
 func obj(props map[string]any, required ...string) map[string]any {
@@ -64,7 +83,7 @@ func num(desc string) map[string]any   { return map[string]any{"type": "integer"
 func yesno(desc string) map[string]any { return map[string]any{"type": "boolean", "description": desc} }
 
 func tools() []toolDef {
-	return append(coordinationTools(), []toolDef{
+	return annotated(append(coordinationTools(), []toolDef{
 		{
 			Name: "call",
 			Description: "Open a call to the other agent and speak the first turn. Rings them: " +
@@ -227,7 +246,7 @@ func tools() []toolDef {
 				"resource": str("Which machine to release."),
 			}, "resource"),
 		},
-	}...)
+	}...))
 }
 
 // ---------------------------------------------------------------- dispatch
@@ -241,15 +260,35 @@ type server struct {
 	initialized  bool
 	negotiated   bool
 	startChannel func() error
+
+	// Codex live delivery (serve --codex); see codex_live.go.
+	codexMode    bool
+	codexMu      sync.Mutex
+	codexThread  string // fixed by the first tools/call _meta.threadId
+	codexFailed  bool
+	codexRelease func()
+	codexSend    deliverySender // nil = codex queue; injectable for tests
+	startCodex   func()
+	started      time.Time
+	cwd          string
 }
 
-func Serve(me string) error         { return serveIO(me, false, os.Stdin, os.Stdout) }
-func ServeChannels(me string) error { return serveIO(me, true, os.Stdin, os.Stdout) }
-func serveIO(me string, channels bool, input io.Reader, output io.Writer) error {
+const (
+	serveClaude   = "claude"
+	serveChannels = "channels"
+	serveCodex    = "codex"
+)
+
+func Serve(me string) error         { return serveIO(me, serveClaude, os.Stdin, os.Stdout) }
+func ServeChannels(me string) error { return serveIO(me, serveChannels, os.Stdin, os.Stdout) }
+func ServeCodex(me string) error    { return serveIO(me, serveCodex, os.Stdin, os.Stdout) }
+func serveIO(me, mode string, input io.Reader, output io.Writer) error {
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
-	s := &server{me: me, enc: json.NewEncoder(output), channelMode: channels}
+	channels := mode == serveChannels
+	s := &server{me: me, enc: json.NewEncoder(output), channelMode: channels, codexMode: mode == serveCodex, started: time.Now()}
+	s.cwd, _ = os.Getwd()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var wg sync.WaitGroup
@@ -261,7 +300,22 @@ func serveIO(me string, channels bool, input io.Reader, output io.Writer) error 
 			endChannel(me, s.channel)
 			release()
 		}
+		// The thread lock is liveness; dropping it marks the session gone.
+		// The binding itself stays, so a later session or watch can take over.
+		s.codexMu.Lock()
+		if s.codexRelease != nil {
+			s.codexRelease()
+			s.codexRelease = nil
+		}
+		s.codexMu.Unlock()
 	}()
+	if s.codexMode {
+		// Started once, by the first tools/call that names this thread.
+		s.startCodex = func() {
+			wg.Add(1)
+			go func() { defer wg.Done(); s.codexLoop(ctx) }()
+		}
+	}
 	if channels {
 		unlock, err := channelOwner(me)
 		if err != nil {
@@ -323,11 +377,15 @@ func (s *server) handle(req *rpcReq) {
 		if s.channelMode {
 			caps["experimental"] = map[string]any{"claude/channel": map[string]any{}}
 		}
+		instructions := channelInstructions
+		if s.codexMode {
+			instructions = codexInstructions(s.me)
+		}
 		s.reply(req.ID, map[string]any{
 			"protocolVersion": "2024-11-05",
 			"capabilities":    caps,
 			"serverInfo":      map[string]any{"name": "yip", "version": serverVersion},
-			"instructions":    channelInstructions,
+			"instructions":    instructions,
 		})
 	case "notifications/initialized":
 		if s.negotiated && !s.initialized {
@@ -349,21 +407,27 @@ func (s *server) handle(req *rpcReq) {
 		var p struct {
 			Name      string         `json:"name"`
 			Arguments map[string]any `json:"arguments"`
+			Meta      struct {
+				ThreadID string `json:"threadId"`
+			} `json:"_meta"`
 		}
 		if err := json.Unmarshal(req.Params, &p); err != nil {
 			s.fail(req.ID, -32602, "bad params: "+err.Error())
 			return
 		}
+		// Codex names the calling thread on every tools/call. The first one
+		// binds delivery; the note tells the model once that it happened.
+		bindNote := s.observeCodexThread(p.Meta.ThreadID)
 		text, err := s.call(p.Name, p.Arguments)
 		if err != nil {
 			s.reply(req.ID, map[string]any{
-				"content": []any{map[string]any{"type": "text", "text": err.Error()}},
+				"content": []any{map[string]any{"type": "text", "text": err.Error() + bindNote}},
 				"isError": true,
 			})
 			return
 		}
 		s.reply(req.ID, map[string]any{
-			"content": []any{map[string]any{"type": "text", "text": text}},
+			"content": []any{map[string]any{"type": "text", "text": text + bindNote}},
 		})
 	default:
 		s.fail(req.ID, -32601, "unknown method "+req.Method)

@@ -181,14 +181,42 @@ type installResult struct {
 	HookPath  string
 	Peers     []string
 	Reinstall bool
+	Seat      string   // non-empty when installed as a seat: its description
+	Notes     []string // anything the operator should know about the result
+}
+
+// InstallOptions select a seat instead of path membership (codex only).
+type InstallOptions struct {
+	Seat    bool   // share this checkout without becoming its path member
+	Profile string // write a Codex profile layer instead of this checkout's .codex/
 }
 
 func Install(cwd, lineOverride, asOverride string, local bool) (*installResult, error) {
 	return InstallRuntime(cwd, lineOverride, asOverride, local, "claude")
 }
 func InstallRuntime(cwd, lineOverride, asOverride string, local bool, runtime string) (*installResult, error) {
+	return InstallWith(cwd, lineOverride, asOverride, local, runtime, InstallOptions{})
+}
+
+// InstallWith joins this checkout (or a Codex profile) to a line.
+//
+// A checkout has at most ONE path member: the identity a path-resolved runtime
+// (Claude's hooks, a human's CLI) answers to there. Installing never replaces
+// it. A Codex install whose config names its identity explicitly can instead
+// take a SEAT -- automatically when the checkout already has a different
+// member, or on request with --seat / --profile.
+func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime string, opts InstallOptions) (*installResult, error) {
 	if runtime != "claude" && runtime != "claude-channels" && runtime != "codex" {
 		return nil, fmt.Errorf("runtime must be claude, claude-channels or codex")
+	}
+	if (opts.Seat || opts.Profile != "") && runtime != "codex" {
+		return nil, fmt.Errorf("--seat and --profile are Codex installs: Claude's hooks identify an agent by its checkout, so a Claude agent needs a checkout of its own")
+	}
+	if opts.Profile != "" && !validComponent(opts.Profile) {
+		return nil, fmt.Errorf("profile name must be letters, digits, - or _")
+	}
+	if opts.Profile != "" && asOverride == "" {
+		return nil, fmt.Errorf("--profile needs an explicit --as NAME: a profile seat has no checkout to name it after")
 	}
 	root := checkoutRoot(cwd)
 
@@ -218,17 +246,56 @@ func InstallRuntime(cwd, lineOverride, asOverride string, local bool, runtime st
 	if m.Members == nil {
 		return nil, fmt.Errorf("members map is null")
 	}
+	seats, err := loadSeatsStrict()
+	if err != nil {
+		return nil, err
+	}
+	owner := m.AgentAt(root)
+	seatMode := opts.Seat || opts.Profile != ""
 	if agent == "" {
-		if a := m.AgentAt(root); a != "" {
-			agent = a // already a member; keep the name
-		} else {
+		switch {
+		case owner != "" && !seatMode:
+			agent = owner // already a member; keep the name
+		case seatMode:
+			return nil, fmt.Errorf("a seat needs an explicit --as NAME")
+		default:
 			agent = slugify(filepath.Base(root))
 		}
 	}
-	// A name is one checkout's. Claiming another's would make two sessions
+	if !validComponent(agent) {
+		return nil, fmt.Errorf("invalid agent name %q", agent)
+	}
+	// One checkout, one path member. Replacing it used to be silent: the
+	// previous agent vanished from the line while its hooks -- which resolve
+	// identity by path -- started answering to the new name.
+	if owner != "" && owner != agent && !seatMode {
+		if runtime != "codex" {
+			return nil, fmt.Errorf("%s already belongs to %q on line %s. Claude's hooks identify an agent by its checkout, so a second Claude identity needs its own worktree. "+
+				"(If %q is a Codex agent, move it to a seat first: yip install --runtime codex --as %s --seat)", root, owner, activeLine, owner, owner)
+		}
+		seatMode = true // a Codex config names its identity; share the checkout
+	}
+	// A name is one identity's. Claiming another's would make two sessions
 	// answer to it, which is the thing membership exists to prevent.
-	if p := m.PathOf(agent); p != "" && p != root {
-		return nil, fmt.Errorf("the name %q on line %s already belongs to %s -- pass --as <other-name>", agent, activeLine, p)
+	converting := false
+	if p := m.PathOf(agent); p != "" {
+		switch {
+		case !seatMode && p != root:
+			return nil, fmt.Errorf("the name %q on line %s already belongs to %s -- pass --as <other-name>", agent, activeLine, p)
+		case seatMode && (p != root || opts.Profile != ""):
+			return nil, fmt.Errorf("the name %q on line %s is the checkout member at %s -- uninstall it there, or pass --as <other-name>", agent, activeLine, p)
+		case seatMode:
+			converting = true // this checkout's member becomes a seat here
+		}
+	}
+	prior, hadSeat := seats.Seats[agent]
+	if hadSeat {
+		switch {
+		case !seatMode:
+			return nil, fmt.Errorf("the name %q on line %s is a %s -- pass --as <other-name>", agent, activeLine, seatDescription(prior))
+		case prior.Profile != opts.Profile || (opts.Profile == "" && prior.Workdir != root):
+			return nil, fmt.Errorf("the name %q on line %s is already a %s -- uninstall it there, or pass --as <other-name>", agent, activeLine, seatDescription(prior))
+		}
 	}
 
 	bin, err := os.Executable()
@@ -241,15 +308,30 @@ func InstallRuntime(cwd, lineOverride, asOverride string, local bool, runtime st
 
 	res := &installResult{
 		Line: activeLine, Agent: agent, LineDir: Root(), Bin: bin,
-		Reinstall: m.AgentAt(root) != "",
+		Reinstall: (!seatMode && owner == agent) || hadSeat,
 	}
 
 	if runtime == "codex" {
-		if err := codexFiles(root, bin, activeLine, agent, false); err != nil {
+		warning, err := ensureCodexEndpoint(agent)
+		if err != nil {
 			return nil, err
 		}
-		res.McpPath = filepath.Join(root, ".codex", "config.toml")
-		res.HookPath = filepath.Join(root, ".codex", "hooks.json")
+		if warning != "" {
+			res.Notes = append(res.Notes, warning)
+		}
+		if opts.Profile != "" {
+			if err := codexProfileFiles(opts.Profile, bin, activeLine, agent, false); err != nil {
+				return nil, err
+			}
+			res.McpPath = codexProfilePath(opts.Profile)
+			res.HookPath = res.McpPath + " (inline hooks)"
+		} else {
+			if err := codexFiles(root, bin, activeLine, agent, false); err != nil {
+				return nil, err
+			}
+			res.McpPath = filepath.Join(root, ".codex", "config.toml")
+			res.HookPath = filepath.Join(root, ".codex", "hooks.json")
+		}
 	} else {
 		if runtime == "claude-channels" {
 			if err := RegisterChannel(agent, false); err != nil {
@@ -284,11 +366,32 @@ func InstallRuntime(cwd, lineOverride, asOverride string, local bool, runtime st
 	}
 
 	m.Line = activeLine
-	m.Members[root] = agent
+	if seatMode {
+		seat := Seat{Agent: agent, Runtime: runtime, Profile: opts.Profile, Created: now()}
+		if hadSeat {
+			seat.Created = prior.Created
+		}
+		if opts.Profile == "" {
+			seat.Workdir = root
+		}
+		seats.Seats[agent] = seat
+		if err := saveSeats(seats); err != nil {
+			return nil, err
+		}
+		if converting {
+			delete(m.Members, root)
+			res.Notes = append(res.Notes, fmt.Sprintf("%s no longer owns %s by path; it is now a seat there.", agent, root))
+		} else if owner != "" && owner != agent && !opts.Seat && opts.Profile == "" {
+			res.Notes = append(res.Notes, fmt.Sprintf("%s belongs to %s; %s joined as a Codex seat beside it, so %s is unaffected.", root, owner, agent, owner))
+		}
+		res.Seat = seatDescription(seat)
+	} else {
+		m.Members[root] = agent
+	}
 	if err := SaveMembers(m); err != nil {
 		return nil, err
 	}
-	for _, n := range m.Names() {
+	for _, n := range LineNames() {
 		if n != agent {
 			res.Peers = append(res.Peers, n)
 		}
@@ -296,32 +399,83 @@ func InstallRuntime(cwd, lineOverride, asOverride string, local bool, runtime st
 	return res, nil
 }
 
-func Uninstall(cwd string) error {
+// Uninstall removes integrations and line membership, never history.
+//
+// With neither agent nor profile it removes everything this checkout hosts:
+// its path member and any seat sharing it. agent narrows that to one identity;
+// profile removes a profile seat and touches no checkout.
+func Uninstall(cwd string) error { return UninstallWith(cwd, "", "") }
+func UninstallWith(cwd, agent, profile string) error {
 	root := checkoutRoot(cwd)
 	unlock, err := fileGuard(membersPath())
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	if err := stripMCP(root); err != nil {
-		return err
-	}
-	for _, f := range []string{"settings.json", "settings.local.json"} {
-		if err := stripHooks(root, f); err != nil {
-			return err
-		}
-	}
-	if _, err := os.Stat(filepath.Join(root, ".codex", "config.toml")); err == nil {
-		if err := codexFiles(root, "", "", "", true); err != nil {
-			return err
-		}
-	}
 	m := Members{Members: map[string]string{}}
 	if err := readState(membersPath(), &m); err != nil {
 		return err
 	}
-	delete(m.Members, root)
+	seats, err := loadSeatsStrict()
+	if err != nil {
+		return err
+	}
+	if profile != "" {
+		if err := codexProfileFiles(profile, "", "", agent, true); err != nil {
+			return err
+		}
+		for name, s := range seats.Seats {
+			if s.Profile == profile && (agent == "" || agent == name) {
+				delete(seats.Seats, name)
+			}
+		}
+		return saveSeats(seats)
+	}
+	owner := m.AgentAt(root)
+	here := seats.At(root)
+	if agent != "" && agent != owner && !contains(here, agent) {
+		return fmt.Errorf("%q is not a member or seat of %s", agent, root)
+	}
+	if agent == "" || agent == owner {
+		if err := stripMCP(root); err != nil {
+			return err
+		}
+		for _, f := range []string{"settings.json", "settings.local.json"} {
+			if err := stripHooks(root, f); err != nil {
+				return err
+			}
+		}
+	}
+	// .codex/ serves exactly one identity: the member or a seat sharing root.
+	if b, err := os.ReadFile(filepath.Join(root, ".codex", "config.toml")); err == nil {
+		block, _, _ := codexManagedBlock(string(b))
+		if agent == "" || codexBlockAgent(block) == agent {
+			if err := codexFiles(root, "", "", "", true); err != nil {
+				return err
+			}
+		}
+	}
+	for _, name := range here {
+		if agent == "" || agent == name {
+			delete(seats.Seats, name)
+		}
+	}
+	if err := saveSeats(seats); err != nil {
+		return err
+	}
+	if agent == "" || agent == owner {
+		delete(m.Members, root)
+	}
 	return SaveMembers(m)
+}
+
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // ------------------------------------------------- config file merging

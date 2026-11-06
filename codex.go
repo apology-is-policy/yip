@@ -28,29 +28,98 @@ func codexStatePaths() (string, string) {
 	}
 	return root, home
 }
-func codexConfig(existing, bin, line, agent string, remove bool) (string, error) {
-	start := strings.Index(existing, codexBegin)
-	if start >= 0 {
-		end := strings.Index(existing[start:], codexEnd)
+
+var codexHookEvents = []string{"SessionStart", "PostToolUse", "Stop"}
+
+func codexHookCommand(bin, line, agent, event string) string {
+	stateRoot, stateHome := codexStatePaths()
+	return "env " + shellQuote("YIP_ROOT="+stateRoot) + " " + shellQuote("YIP_HOME="+stateHome) + " " + shellQuote(bin) + " hook " + strings.ToLower(event) + " --runtime codex --line " + shellQuote(line) + " --as " + shellQuote(agent) + " " + hookMarker
+}
+
+// codexManagedBlock splits a config into its managed Yip block and the rest.
+func codexManagedBlock(content string) (block, rest string, err error) {
+	start := strings.Index(content, codexBegin)
+	if start < 0 {
+		rest = content
+	} else {
+		end := strings.Index(content[start:], codexEnd)
 		if end < 0 {
-			return "", fmt.Errorf("incomplete Yip config block; refusing to overwrite")
+			return "", "", fmt.Errorf("incomplete Yip config block; refusing to overwrite")
 		}
-		existing = existing[:start] + existing[start+end+len(codexEnd):]
+		block = content[start+len(codexBegin) : start+end]
+		rest = content[:start] + content[start+end+len(codexEnd):]
 	}
-	if strings.Contains(existing, codexBegin) || strings.Contains(existing, codexEnd) {
-		return "", fmt.Errorf("duplicate or incomplete Yip config blocks")
+	if strings.Contains(rest, codexBegin) || strings.Contains(rest, codexEnd) {
+		return "", "", fmt.Errorf("duplicate or incomplete Yip config blocks")
+	}
+	return block, rest, nil
+}
+
+// codexBlockAgent reads back the identity a managed block serves ("" if none).
+func codexBlockAgent(block string) string {
+	for _, line := range strings.Split(block, "\n") {
+		list, ok := strings.CutPrefix(line, "args = [")
+		if !ok {
+			continue
+		}
+		var args []string
+		for list = strings.TrimSpace(list); strings.HasPrefix(list, `"`); {
+			q, err := strconv.QuotedPrefix(list)
+			if err != nil {
+				return ""
+			}
+			v, _ := strconv.Unquote(q)
+			args = append(args, v)
+			list = strings.TrimLeft(list[len(q):], ", ")
+		}
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] == "--as" {
+				return args[i+1]
+			}
+		}
+	}
+	return ""
+}
+
+// codexConfig merges the managed block. inlineHooks puts the lifecycle hooks
+// in the same block -- needed for a profile layer, which has no hooks.json of
+// its own (the one beside it belongs to the user layer and every session).
+func codexConfig(existing, bin, line, agent string, remove bool, inlineHooks ...bool) (string, error) {
+	old, rest, err := codexManagedBlock(existing)
+	if err != nil {
+		return "", err
 	}
 	// Without a TOML parser, conservatively refuse any unmanaged Yip reference,
 	// including quoted/dotted or inline tables. Never append a conflicting table.
-	if !remove && strings.Contains(strings.ToLower(existing), "yip") {
+	if !remove && strings.Contains(strings.ToLower(rest), "yip") {
 		return "", fmt.Errorf("unmanaged Yip reference in Codex config; reconcile it explicitly first")
 	}
 	if remove {
-		return existing, nil
+		return rest, nil
+	}
+	// One config layer serves one identity. Replacing another agent's block
+	// would silently move that agent's session onto this name.
+	if owner := codexBlockAgent(old); owner != "" && owner != agent {
+		return "", fmt.Errorf("this Codex config already serves %q; give %q its own profile (--profile NAME) or uninstall %q first", owner, agent, owner)
+	}
+	hooks := len(inlineHooks) > 0 && inlineHooks[0]
+	if hooks && strings.Contains(strings.ToLower(rest), "hooks") {
+		return "", fmt.Errorf("this Codex profile already defines hooks; use a dedicated profile for the Yip seat")
 	}
 	stateRoot, stateHome := codexStatePaths()
-	block := fmt.Sprintf("%s[mcp_servers.yip]\ncommand = %s\nargs = [\"serve\", \"--line\", %s, \"--as\", %s]\nenv = { YIP_ROOT = %s, YIP_HOME = %s }\n%s", codexBegin, strconv.Quote(bin), strconv.Quote(line), strconv.Quote(agent), strconv.Quote(stateRoot), strconv.Quote(stateHome), codexEnd)
-	return strings.TrimRight(existing, "\n") + "\n\n" + block, nil
+	var b strings.Builder
+	b.WriteString(codexBegin)
+	fmt.Fprintf(&b, "[mcp_servers.yip]\ncommand = %s\nargs = [\"serve\", \"--codex\", \"--line\", %s, \"--as\", %s]\nenv = { YIP_ROOT = %s, YIP_HOME = %s }\n", strconv.Quote(bin), strconv.Quote(line), strconv.Quote(agent), strconv.Quote(stateRoot), strconv.Quote(stateHome))
+	// The daemon spawns this server with a stripped environment. Forward a
+	// custom CODEX_HOME so `codex queue` reaches the same daemon as the session.
+	b.WriteString("env_vars = [\"CODEX_HOME\"]\n")
+	if hooks {
+		for _, event := range codexHookEvents {
+			fmt.Fprintf(&b, "\n[[hooks.%s]]\n[[hooks.%s.hooks]]\ntype = \"command\"\ncommand = %s\n", event, event, strconv.Quote(codexHookCommand(bin, line, agent, event)))
+		}
+	}
+	b.WriteString(codexEnd)
+	return strings.TrimRight(rest, "\n") + "\n\n" + b.String(), nil
 }
 func codexFiles(root, bin, line, agent string, remove bool) error {
 	dir := filepath.Join(root, ".codex")
@@ -67,6 +136,13 @@ func codexFiles(root, bin, line, agent string, remove bool) error {
 	if remove && !strings.Contains(string(old), codexBegin) {
 		return nil
 	}
+	if remove && agent != "" {
+		if block, _, e := codexManagedBlock(string(old)); e == nil {
+			if owner := codexBlockAgent(block); owner != "" && owner != agent {
+				return fmt.Errorf("%s serves %q, not %q", configPath, owner, agent)
+			}
+		}
+	}
 	config, err := codexConfig(string(old), bin, line, agent, remove)
 	if err != nil {
 		return err
@@ -82,12 +158,10 @@ func codexFiles(root, bin, line, agent string, remove bool) error {
 	if hooks == nil {
 		hooks = map[string]any{}
 	}
-	for _, event := range []string{"SessionStart", "PostToolUse", "Stop"} {
+	for _, event := range codexHookEvents {
 		groups := dropYipHandlers(hooks[event])
 		if !remove {
-			stateRoot, stateHome := codexStatePaths()
-			command := "env " + shellQuote("YIP_ROOT="+stateRoot) + " " + shellQuote("YIP_HOME="+stateHome) + " " + shellQuote(bin) + " hook " + strings.ToLower(event) + " --runtime codex --line " + shellQuote(line) + " --as " + shellQuote(agent) + " " + hookMarker
-			groups = append(groups, map[string]any{"hooks": []any{map[string]any{"type": "command", "command": command}}})
+			groups = append(groups, map[string]any{"hooks": []any{map[string]any{"type": "command", "command": codexHookCommand(bin, line, agent, event)}}})
 		}
 		if len(groups) > 0 {
 			hooks[event] = groups
@@ -138,27 +212,89 @@ func codexHookOutput(event string, output any) any {
 	}
 	return map[string]any{"hookSpecificOutput": map[string]any{"hookEventName": h["hookEventName"], "additionalContext": h["additionalContext"]}}
 }
-func CodexDoctor(root string) error {
-	root = checkoutRoot(root)
-	config, err := os.ReadFile(filepath.Join(root, ".codex", "config.toml"))
+
+// codexHome is where Codex keeps user config and profile layers.
+func codexHome() string {
+	if v := os.Getenv("CODEX_HOME"); v != "" {
+		return v
+	}
+	return filepath.Join(homeDir(), ".codex")
+}
+
+func codexProfilePath(profile string) string {
+	return filepath.Join(codexHome(), profile+".config.toml")
+}
+
+// codexProfileFiles writes a seat into a Codex profile layer
+// ($CODEX_HOME/NAME.config.toml), loaded by `codex -p NAME` from any
+// directory. MEASURED on codex-cli 0.162.0: a profile layer contributes both
+// its [mcp_servers] and inline [[hooks.*]] to a runtime session.
+func codexProfileFiles(profile, bin, line, agent string, remove bool) error {
+	if !validComponent(profile) {
+		return fmt.Errorf("profile name must be letters, digits, - or _")
+	}
+	unlock, err := fileGuard(filepath.Join(codexHome(), "yip-install"))
 	if err != nil {
 		return err
 	}
-	if !strings.Contains(string(config), codexBegin) || !strings.Contains(string(config), codexEnd) {
-		return fmt.Errorf("Yip Codex MCP block missing")
+	defer unlock()
+	path := codexProfilePath(profile)
+	old, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
 	}
-	start := strings.Index(string(config), codexBegin) + len(codexBegin)
-	end := strings.Index(string(config)[start:], codexEnd)
-	if end < 0 {
-		return fmt.Errorf("incomplete Yip Codex block")
+	if remove && !strings.Contains(string(old), codexBegin) {
+		return nil
+	}
+	if remove && agent != "" {
+		if block, _, e := codexManagedBlock(string(old)); e == nil {
+			if owner := codexBlockAgent(block); owner != "" && owner != agent {
+				return fmt.Errorf("profile %s serves %q, not %q", profile, owner, agent)
+			}
+		}
+	}
+	config, err := codexConfig(string(old), bin, line, agent, remove, true)
+	if err != nil {
+		return err
+	}
+	if len(old) > 0 {
+		if e := atomicCreate(path+".yip-backup", old); e != nil && !os.IsExist(e) {
+			return e
+		}
+	}
+	if remove && strings.TrimSpace(config) == "" {
+		return os.Remove(path)
+	}
+	return atomicReplace(path, []byte(config))
+}
+
+// CodexDoctor checks one Codex config layer: a checkout's .codex/ (hooks in
+// hooks.json) or, with profile set, $CODEX_HOME/PROFILE.config.toml (hooks
+// inline). It reports the identity's delivery state; it cannot prove receipt.
+func CodexDoctor(root, profile string) error {
+	configPath, inline := filepath.Join(checkoutRoot(root), ".codex", "config.toml"), false
+	if profile != "" {
+		configPath, inline = codexProfilePath(profile), true
+	}
+	config, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	block, _, err := codexManagedBlock(string(config))
+	if err != nil {
+		return err
+	}
+	if block == "" {
+		return fmt.Errorf("Yip Codex MCP block missing from %s", configPath)
 	}
 	var bin string
-	for _, line := range strings.Split(string(config)[start:start+end], "\n") {
+	for _, line := range strings.Split(block, "\n") {
 		if strings.HasPrefix(line, "command = ") {
 			bin, err = strconv.Unquote(strings.TrimPrefix(line, "command = "))
 			if err != nil {
 				return err
 			}
+			break
 		}
 	}
 	if bin == "" {
@@ -170,17 +306,24 @@ func CodexDoctor(root string) error {
 	if version := BinVersion(bin); version != serverVersion {
 		return fmt.Errorf("wired Yip version %q differs from this binary %q", version, serverVersion)
 	}
-	m, err := readJSON(filepath.Join(root, ".codex", "hooks.json"))
-	if err != nil {
-		return err
+	if !strings.Contains(block, `"serve", "--codex"`) {
+		return fmt.Errorf("Codex block predates live delivery; re-run yip install --runtime codex, then restart Codex")
 	}
-	hooks, _ := m["hooks"].(map[string]any)
-	for _, ev := range []string{"SessionStart", "PostToolUse", "Stop"} {
-		groups, _ := hooks[ev].([]any)
+	for _, ev := range codexHookEvents {
 		n := 0
-		for _, g := range groups {
-			if isYipGroup(g) {
-				n++
+		if inline {
+			n = strings.Count(block, "[[hooks."+ev+".hooks]]")
+		} else {
+			m, err := readJSON(filepath.Join(filepath.Dir(configPath), "hooks.json"))
+			if err != nil {
+				return err
+			}
+			hooks, _ := m["hooks"].(map[string]any)
+			groups, _ := hooks[ev].([]any)
+			for _, g := range groups {
+				if isYipGroup(g) {
+					n++
+				}
 			}
 		}
 		if n != 1 {
@@ -192,7 +335,10 @@ func CodexDoctor(root string) error {
 	if err = exec.CommandContext(ctx, "codex", "queue", "--help").Run(); err != nil {
 		return fmt.Errorf("Codex queue unavailable: %w", err)
 	}
-	fmt.Println("Codex MCP and hook registrations present; queue command available. Review hook trust in /hooks. This does not prove runtime delivery or receipt.")
+	agent := codexBlockAgent(block)
+	fmt.Printf("Codex MCP and hook registrations present for %s in %s; queue command available.\n", agent, configPath)
+	fmt.Printf("delivery: %s\n", EndpointStatus(agent))
+	fmt.Println("Review hook trust in /hooks. This does not prove runtime delivery or receipt: verify that the intended chat receives and acknowledges a notice.")
 	return nil
 }
 

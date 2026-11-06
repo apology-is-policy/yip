@@ -99,19 +99,36 @@ TRANSPORT SETUP AND DIAGNOSTICS
   SessionStart and Stop hooks remain. One active session per agent identity is
   required; different concurrent sessions must use different identities.
 
-  Codex:
+  Codex (live delivery; project config loads only in a trusted project):
     yip install --runtime codex --as reviewer --line myproject
     yip doctor --runtime codex
-    Restart Codex and review/trust the generated hooks normally.
+    Restart Codex and review/trust the generated hooks in /hooks.
+  The session's own Yip MCP server binds delivery to that exact chat at its
+  first Yip tool call (Codex sends _meta.threadId) and runs codex queue while
+  the session lives: no UUID, registration or dispatcher. Before that call the
+  chat cannot be named and notices stay pending. The newest session to bind
+  wins; an older one goes passive. Rebinding never resends.
+  Manual fallback (one exact chat, external dispatcher):
     yip delivery register EXACT-CHAT-UUID [--replay]
     yip delivery dispatch --watch 1h
-  Without --watch, dispatch runs once. Watch is bounded to 24h; nothing starts a
-  dispatcher automatically. Status distinguishes registered/stopped from a live
-  dispatcher; only one watch may own an endpoint. Registration is one immutable
-  local chat per agent.
-  Installation binds absolute Yip state paths for the shared Codex daemon.
-  Reinstall/review hooks if those paths change. No remote routing, sandbox
-  bypass or automatic runtime trust is configured.
+  Without --watch, dispatch runs once. Watch is bounded to 24h. Registration
+  cannot move a binding that is live.
+  Installation binds absolute Yip state paths for the shared Codex daemon and
+  forwards CODEX_HOME. Reinstall/review hooks if those paths change. No remote
+  routing, sandbox bypass, approval or automatic runtime trust is configured.
+
+  Seats (Codex agents without a checkout of their own):
+    yip install --runtime codex --as reviewer       beside another member
+    yip install --runtime codex --as reviewer --seat    free this checkout
+    yip install --runtime codex --as reviewer --profile yip-reviewer
+    codex -p yip-reviewer -C /path/to/checkout -s read-only
+    yip doctor --runtime codex --profile yip-reviewer
+    yip uninstall [--as NAME | --profile NAME]
+  A checkout has one path member, which install never replaces. A Codex install
+  into an owned checkout becomes a seat; --profile writes only
+  $CODEX_HOME/NAME.config.toml (MCP plus inline hooks). Inside a Codex shell,
+  yip answers as the identity bound to CODEX_THREAD_ID, not the path owner. A
+  second Claude identity needs its own worktree. yip line lists seats.
 
   Delivery states: pending -> sending -> accepted (Codex) or sent (Channels).
   accepted/sent do not mean read. A crash/error can leave unknown delivery.
@@ -234,8 +251,9 @@ RESOURCES AND WAITING
 
 RUNTIME AND MAINTENANCE
   Channels require an enabled, open Claude session; busy messages queue rather
-  than guarantee tool interruption. Codex uses a separately registered exact
-  chat and bounded dispatcher. The human sets up transports with --help.
+  than guarantee tool interruption. In Codex, call ring early: delivery binds
+  to your chat at your first Yip tool call. If you use the CLI in a checkout
+  you share as a seat, pass --as. The human sets up transports with --help.
   Do not change trust, start duplicate dispatchers, overwrite endpoint bindings,
   erase state or install/restart live clients just to clear a notice. Retiring
   suppresses push but does not release held resources or delete history.

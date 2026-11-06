@@ -31,9 +31,10 @@ SETTING UP A LINE
 
 DELIVERY AND BROADCASTS
 
-  yip install --runtime codex    configure Codex MCP and lifecycle hooks
-  yip delivery register UUID    opt this agent into one exact Codex chat
-  yip delivery dispatch --watch 1h   bounded dispatcher; no automatic install
+  yip install --runtime codex    Codex MCP + hooks; the chat binds delivery itself
+      --seat | --profile NAME   share a checkout, or no checkout (codex -p NAME)
+  yip delivery register UUID    manual fallback: one exact Codex chat
+  yip delivery dispatch --watch 1h   bounded external dispatcher for that
   yip delivery pause|resume|status   control/inspect the registered endpoint
   yip delivery ack ID            acknowledge read (also MCP delivery_ack)
   yip delivery retry ID          explicit retry; duplicate delivery possible
@@ -170,8 +171,13 @@ func main() {
 		os.Exit(2)
 	}
 	cmd, args := rest[0], rest[1:]
-	var runtime string
+	var runtime, profile string
 	args, runtime = takeFlag(args, "--runtime", "claude")
+	var seat bool
+	if cmd == "install" || cmd == "uninstall" || cmd == "doctor" {
+		args, profile = takeFlag(args, "--profile", "")
+		seat = hasFlag(args, "--seat")
+	}
 
 	// Every command but install needs to know which line it is on before it
 	// can find anything; install resolves its own.
@@ -253,13 +259,16 @@ func main() {
 		check(Retire(me, first(args) != "--undo"))
 		fmt.Println("retirement updated")
 	case "install":
-		res, err := InstallRuntime("", line, as, local, runtime)
+		res, err := InstallWith("", line, as, local, runtime, InstallOptions{Seat: seat, Profile: profile})
 		check(err)
 		verb := "joined"
 		if res.Reinstall {
 			verb = "rejoined"
 		}
 		fmt.Printf("%s line %q as %q\n", verb, res.Line, res.Agent)
+		if res.Seat != "" {
+			fmt.Printf("  seat:     %s\n", res.Seat)
+		}
 		fmt.Printf("  line dir: %s\n", res.LineDir)
 		fmt.Printf("  binary:   %s\n", res.Bin)
 		fmt.Printf("  wrote:    %s\n", res.McpPath)
@@ -269,20 +278,33 @@ func main() {
 		} else {
 			fmt.Printf("  peers:    none yet -- run `yip install` in another checkout\n")
 		}
-		if runtime == "claude-channels" {
+		for _, note := range res.Notes {
+			fmt.Printf("  note:     %s\n", note)
+		}
+		switch {
+		case runtime == "claude-channels":
 			fmt.Println("\nStart Claude here with: claude --dangerously-load-development-channels server:yip")
 			fmt.Println("Accept the preview warning yourself; organization policy still applies. After Claude acknowledges the probe, run yip doctor --runtime claude-channels.")
-		} else {
+		case runtime == "codex":
+			start, doc := "codex", "yip doctor --runtime codex"
+			if profile != "" {
+				start, doc = "codex -p "+profile+" -C /path/to/the/code", doc+" --profile "+profile
+			}
+			fmt.Printf("\nStart Codex with: %s   (restart an already-open session)\n", start)
+			fmt.Println("Review and trust the Yip hooks in /hooks. Delivery binds to the chat at its first Yip tool call;")
+			fmt.Printf("no UUID or separate dispatcher is needed. Then: %s\n", doc)
+		default:
 			fmt.Printf("\nRestart %s here, then yip doctor --runtime %s. Review and trust new hooks in the runtime.\n", runtime, runtime)
 		}
 	case "uninstall":
-		check(Uninstall(""))
+		check(UninstallWith("", as, profile))
 		fmt.Println("left the line; config removed")
 	case "line":
 		fmt.Printf("line:     %s\n", activeLine)
 		fmt.Printf("line dir: %s\n", Root())
 		m := LoadMembers()
-		if len(m.Members) == 0 {
+		seats := LoadSeats()
+		if len(m.Members) == 0 && len(seats.Seats) == 0 {
 			fmt.Println("members:  none -- run `yip install`")
 			return
 		}
@@ -290,15 +312,25 @@ func main() {
 		for _, name := range m.Names() {
 			fmt.Printf("  %-16s %s\n", name, m.PathOf(name))
 		}
+		if len(seats.Seats) > 0 {
+			fmt.Println("seats:")
+			for _, name := range LineNames() {
+				if s, ok := seats.Seats[name]; ok {
+					fmt.Printf("  %-16s %s -- %s\n", name, seatDescription(s), EndpointStatus(name))
+				}
+			}
+		}
 	case "serve":
 		me := must(WhoAmI(as, ""))
 		var err error
 		if len(args) == 1 && args[0] == "--channels" {
 			err = ServeChannels(me)
+		} else if len(args) == 1 && args[0] == "--codex" {
+			err = ServeCodex(me)
 		} else if len(args) == 0 {
 			err = Serve(me)
 		} else {
-			err = fmt.Errorf("serve [--channels]")
+			err = fmt.Errorf("serve [--channels | --codex]")
 		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -578,7 +610,7 @@ func main() {
 			return
 		}
 		if runtime == "codex" {
-			check(CodexDoctor(""))
+			check(CodexDoctor("", profile))
 			return
 		}
 		doctor(as)
@@ -776,7 +808,13 @@ func doctor(as string) {
 			say(true, "peer %s: %s %s -- %s", peer, br, sha, state)
 		}
 	}
-	if len(m.Members) < 2 {
+	seats := LoadSeats()
+	for _, peer := range LineNames() {
+		if s, ok := seats.Seats[peer]; ok && peer != me {
+			say(true, "peer %s: %s -- %s", peer, seatDescription(s), EndpointStatus(peer))
+		}
+	}
+	if len(LineNames()) < 2 {
 		say(true, "peers: none yet -- run `yip install` in another checkout")
 	}
 	if err == nil {

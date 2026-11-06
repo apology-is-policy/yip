@@ -18,10 +18,13 @@ without Yip.
   notes carry information without creating a reply obligation.
 - **Regroup from Switchboard.** Send announcements, briefings or regroup requests
   to a chosen audience. Track each recipient's read receipt and replies.
-- **Notify an idle session.** Claude Code can receive MCP Channels events;
-  Codex can receive queued messages in one explicitly registered chat. Hooks
-  and the inbox remain available. An optional tmux transport supports controlled
-  terminal setups.
+- **Notify an idle session.** Claude Code can receive MCP Channels events; a
+  Codex chat binds itself at its first Yip tool call and receives queued
+  messages, with no UUID or separate dispatcher. Hooks and the inbox remain
+  available. An optional tmux transport supports controlled terminal setups.
+- **Join without a checkout of your own.** A Codex agent can take a *seat*
+  beside another agent's checkout, or run from a Codex profile anywhere, e.g.
+  as a reviewer that a Claude Code agent calls.
 - **Share machines without guessing.** Exclusive leases, durable FIFO requests,
   runner identities and recovery history keep a quiet machine from being
   mistaken for an available one.
@@ -50,7 +53,8 @@ yip --help-agents                    # agent protocol and MCP/API schemas
 Run setup inside **each participating checkout**, using a different agent name
 for each one. Git worktrees share a line automatically. For separate clones or
 repositories, pass the same `--line NAME` in their setup commands and subsequent
-operations.
+operations. A Codex agent does not need a checkout of its own; see
+[seats](#agents-without-their-own-checkout-seats).
 
 ### Claude Code: Channels
 
@@ -94,35 +98,79 @@ yip doctor
 
 Plain `yip install` retains this hook-based setup for compatibility.
 
-### Codex: an exact chat and a running dispatcher
+### Codex: live delivery to the chat that called
 
 ```sh
 cd /path/to/checkout
 yip install --runtime codex --as reviewer --line myproject
+codex                                  # restart an already-open session
+yip doctor --runtime codex --line myproject
 ```
 
 This writes project-local `.codex/config.toml` and `.codex/hooks.json`, merging
 with existing configuration and binding the line's absolute storage paths.
-Reload Codex from that checkout and review the generated hooks through the
-runtime's normal trust flow.
+Codex loads project config only in a **trusted** project; review the generated
+hooks through its normal `/hooks` trust flow.
+
+Codex has no Channels equivalent: an MCP server cannot push text into a
+conversation. It does have `codex queue --thread UUID`, and it tells each MCP
+server which thread is calling (`_meta.threadId` on every tool call). So the
+Yip server inside a Codex session **binds delivery to that exact chat at its
+first Yip tool call** and runs `codex queue` itself for as long as the session
+lives. No UUID, registration or separate dispatcher is needed. The agent is
+told to call `ring` early; the tool result confirms "Delivery connected".
+
+- Before that first Yip call nothing can name the chat; notices wait as pending
+  and inbox/hooks still show them.
+- The newest session to bind wins. An older one goes passive and takes over
+  again only if the newer one ends. Nothing is resent on a rebind.
+- Idle chats start a turn; busy ones get the notice on their next turn. It
+  does not interrupt tools or open a closed session.
+- `codex queue` success means `accepted`, not read: the agent records `read`
+  with `delivery_ack`.
+
+The previous manual route still works as a fallback:
+`yip delivery register EXACT-CHAT-UUID` plus
+`yip delivery dispatch --watch 1h` in a supervised terminal.
+
+### Agents without their own checkout (seats)
+
+A checkout has one **path member**: the identity Claude's hooks and your CLI
+answer to there. Installing never replaces it. A Codex agent, whose config
+names its identity explicitly, can instead take a **seat**:
 
 ```sh
-yip doctor --runtime codex --line myproject
-# Use the verified UUID of the intended local chat:
-yip delivery register EXACT-CHAT-UUID --line myproject
-# Keep this process running in a separate terminal or your supervisor:
-yip delivery dispatch --watch 1h --line myproject
+# Beside a Claude agent, in the same checkout (a seat automatically):
+cd /path/to/checkout
+yip install --runtime claude-channels --as main --line myproject --local
+yip install --runtime codex --as reviewer --line myproject
+
+# Or with no checkout at all, via a Codex profile you start anywhere:
+yip install --runtime codex --as reviewer --line myproject --profile yip-reviewer
+codex -p yip-reviewer -C /path/to/checkout -s read-only
+yip doctor --runtime codex --profile yip-reviewer --line myproject
 ```
 
-**Registration alone does not wake Codex.** Installation starts no dispatcher.
-`dispatch` without `--watch` runs once; a watch is bounded to at most 24 hours.
-Only one watch can own an endpoint. Switchboard distinguishes a registered but
-stopped endpoint from a running dispatcher.
+The profile seat writes only `~/.codex/yip-reviewer.config.toml` (MCP server and
+inline hooks); nothing goes into the repository. Inside a Codex shell, `yip`
+identifies the seat by its bound chat, never by the checkout path it shares.
+Use `--seat` to convert an existing Codex path member into a seat. A second
+*Claude* identity still needs its own worktree, because Claude's hooks identify
+an agent by its checkout.
 
-The adapter requires a Codex client with `codex queue --thread ... --message ...`.
-It targets the registered UUID, never a session-name guess. Setup checks do not
-prove delivery: verify that the intended chat receives and acknowledges a notice.
-It does not configure remote routing or promise to interrupt tools.
+**Example: Claude asks a Codex reviewer for a review.** With either setup above
+and the Codex TUI open as `reviewer`:
+
+```sh
+printf '%s\n' 'Please review the diff on HEAD; focus on the locking.' |
+  yip call reviewer 'Review request'    # or the Claude agent's `call` tool
+```
+
+The notice arrives in the Codex chat. It reads the call, reviews the code at the
+caller's checkout, and replies with `say`. Claude is woken by Channels or its
+hooks. Turns carry both checkouts' revisions, so a review of an older HEAD is
+flagged as stale. Read-only Yip tools carry `readOnlyHint`, so Codex's `writes`
+approval mode can skip prompts for them; Yip does not change approval settings.
 
 ### Optional tmux: the “Stallman channel”
 
@@ -372,14 +420,16 @@ yip presence
 yip busy 'Reviewing the change'
 ```
 
-Identity is registered against an absolute checkout path. `--as NAME` explicitly
-overrides identity; it does not create a second registration. One active session
-per identity keeps delivery and ownership unambiguous.
+Identity is registered against an absolute checkout path, or as a seat whose
+runtime config names it. `--as NAME` explicitly overrides identity; it does not
+create a second registration. One active session per identity keeps delivery
+and ownership unambiguous. `yip line` lists members and seats.
 
 A line lives outside the checkouts in `~/.yip/lines/<line-id>/`:
 
 ```text
 members.json           checkout membership
+seats.json             identities without a checkout of their own
 calls/                 Markdown turns, notes, lifecycle, disputes, attachments
 broadcasts/            immutable broadcasts and per-recipient receipts/replies
 delivery/              endpoint bindings, attempts, acknowledgments, owner locks
@@ -408,8 +458,10 @@ backup and renames it into place. Already-running servers retain their previous
 executable until restarted; `doctor` checking the file on disk does not prove a
 running server has reloaded.
 
-`yip uninstall` removes this checkout's integration and membership while retaining
-line history. Stop its session/dispatcher first and handle its leases explicitly.
+`yip uninstall` removes this checkout's integration and membership, including
+seats sharing it, while retaining line history; `--as NAME` limits it to one
+identity and `--profile NAME` removes a profile seat. Stop its session/dispatcher
+first and handle its leases explicitly.
 `make uninstall` removes only the executable. Neither is a reason to delete
 `~/.yip` or restore old lease snapshots over current coordination state.
 
