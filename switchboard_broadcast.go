@@ -32,7 +32,7 @@ func (v *view) submitBroadcast(text string) {
 	switch d.Stage {
 	case "recipients":
 		names := strings.Split(text, ",")
-		known := LoadMembers().Names()
+		known := LineNames()
 		seen := map[string]bool{}
 		var recipients []string
 		for _, name := range names {

@@ -74,6 +74,17 @@ TRANSPORT SETUP AND DIAGNOSTICS
   normal notices stay durable and hooks continue. Each restart requires a new
   probe. A second Channels server for the same identity is refused.
 
+  Claude without Channels (hooks only; e.g. where policy disables the flag):
+    yip install --runtime claude-rewake --as main --line myproject [--wake-window 4h]
+    yip doctor --runtime claude-rewake
+  A background asyncRewake hook on SessionStart and Stop arms one waiter per
+  identity for the wake window (the hook's timeout). A Yip notice makes it exit
+  2, which Claude documents as waking even an idle session; the notice arrives
+  as a system reminder. After a quiet window the session is unarmed until its
+  next turn. A waiter whose session exited sends nothing. PostToolUse notices
+  are suppressed while a waiter is armed. Every Claude runtime names --as and
+  --line in its hooks and .mcp.json; reinstall checkouts installed with --line.
+
   Existing manual MCP integration:
     yip delivery register-channel [--replay]
     Configure its command as: /absolute/path/yip serve --channels --as NAME
@@ -99,19 +110,41 @@ TRANSPORT SETUP AND DIAGNOSTICS
   SessionStart and Stop hooks remain. One active session per agent identity is
   required; different concurrent sessions must use different identities.
 
-  Codex:
+  Codex (live delivery; project config loads only in a trusted project):
     yip install --runtime codex --as reviewer --line myproject
     yip doctor --runtime codex
-    Restart Codex and review/trust the generated hooks normally.
+    Restart Codex and review/trust the generated hooks in /hooks.
+  The session's own Yip MCP server binds delivery to that exact chat at its
+  first Yip tool call (Codex sends _meta.threadId) and runs codex queue while
+  the session lives: no UUID, registration or dispatcher. Before that call the
+  chat cannot be named and notices stay pending. The newest session to bind
+  wins; an older one goes passive. Rebinding never resends.
+  Manual fallback (one exact chat, external dispatcher):
     yip delivery register EXACT-CHAT-UUID [--replay]
     yip delivery dispatch --watch 1h
-  Without --watch, dispatch runs once. Watch is bounded to 24h; nothing starts a
-  dispatcher automatically. Status distinguishes registered/stopped from a live
-  dispatcher; only one watch may own an endpoint. Registration is one immutable
-  local chat per agent.
-  Installation binds absolute Yip state paths for the shared Codex daemon.
-  Reinstall/review hooks if those paths change. No remote routing, sandbox
-  bypass or automatic runtime trust is configured.
+  Without --watch, dispatch runs once. Watch is bounded to 24h. Registration
+  cannot move a binding that is live.
+  Installation binds absolute Yip state paths for the shared Codex daemon and
+  forwards CODEX_HOME. Reinstall/review hooks if those paths change. No remote
+  routing, sandbox bypass, approval or automatic runtime trust is configured.
+
+  Seats (Codex agents without a checkout of their own):
+    yip install --runtime codex --as reviewer       beside another member
+    yip install --runtime codex --as reviewer --seat    free this checkout
+    yip install --runtime codex --as reviewer --profile yip-reviewer
+    codex -p yip-reviewer -C /path/to/checkout -s read-only
+    yip doctor --runtime codex --profile yip-reviewer
+    yip uninstall [--as NAME | --profile NAME]
+  A checkout has one path member, which install never replaces. A Codex install
+  into an owned checkout becomes a seat, and a Claude install into a checkout
+  owned by a Codex agent seats that agent, so order does not matter. --profile
+  writes only $CODEX_HOME/NAME.config.toml (MCP plus inline hooks). Inside a
+  Codex shell, yip answers as the identity bound to CODEX_THREAD_ID, not the
+  path owner. A second Claude identity needs its own worktree. yip line lists
+  seats. Without --line, uninstall leaves every line the checkout joined;
+  uninstall --as NAME --line L removes NAME wherever it is recorded, even from
+  another (or deleted) folder. A folder reached by another spelling (letter
+  case, hard link) is the same checkout.
 
   Delivery states: pending -> sending -> accepted (Codex) or sent (Channels).
   accepted/sent do not mean read. A crash/error can leave unknown delivery.
@@ -243,8 +276,12 @@ RESOURCES AND WAITING
 
 RUNTIME AND MAINTENANCE
   Channels require an enabled, open Claude session; busy messages queue rather
-  than guarantee tool interruption. Codex uses a separately registered exact
-  chat and bounded dispatcher. The human sets up transports with --help.
+  than guarantee tool interruption. A rewake notice arrives as a system
+  reminder: handle it like any other notice. wait holds for an idle peer that
+  Yip can wake (bound Codex chat, Channels, armed rewake); re-issue it to keep
+  waiting rather than polling. In Codex, call ring early: delivery binds
+  to your chat at your first Yip tool call. If you use the CLI in a checkout
+  you share as a seat, pass --as. The human sets up transports with --help.
   Do not change trust, start duplicate dispatchers, overwrite endpoint bindings,
   erase state or install/restart live clients just to clear a notice. Retiring
   suppresses push but does not release held resources or delete history.

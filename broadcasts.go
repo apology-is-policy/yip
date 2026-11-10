@@ -38,7 +38,7 @@ func (b Broadcast) hasRecipient(agent string) bool {
 }
 func BroadcastRecipients() []string {
 	var out []string
-	for _, a := range LoadMembers().Names() {
+	for _, a := range LineNames() {
 		if Retired(a) {
 			continue
 		}
@@ -59,7 +59,7 @@ func CreateBroadcast(by, kind, body string, recipients []string) (*Broadcast, er
 	if strings.TrimSpace(by) == "" || strings.TrimSpace(body) == "" || len(body) > 64*1024 {
 		return nil, fmt.Errorf("sender and body required (body limit 64 KiB)")
 	}
-	known := LoadMembers().Names()
+	known := LineNames()
 	set := map[string]bool{}
 	for _, a := range recipients {
 		if !validComponent(a) {

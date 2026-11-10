@@ -31,9 +31,12 @@ SETTING UP A LINE
 
 DELIVERY AND BROADCASTS
 
-  yip install --runtime codex    configure Codex MCP and lifecycle hooks
-  yip delivery register UUID    opt this agent into one exact Codex chat
-  yip delivery dispatch --watch 1h   bounded dispatcher; no automatic install
+  yip install --runtime claude-rewake   Claude woken by hooks, no Channels needed
+      --wake-window 4h          how long an idle session stays wakeable per turn
+  yip install --runtime codex    Codex MCP + hooks; the chat binds delivery itself
+      --seat | --profile NAME   share a checkout, or no checkout (codex -p NAME)
+  yip delivery register UUID    manual fallback: one exact Codex chat
+  yip delivery dispatch --watch 1h   bounded external dispatcher for that
   yip delivery pause|resume|status   control/inspect the registered endpoint
   yip delivery ack ID            acknowledge read (also MCP delivery_ack)
   yip delivery retry ID          explicit retry; duplicate delivery possible
@@ -170,8 +173,21 @@ func main() {
 		os.Exit(2)
 	}
 	cmd, args := rest[0], rest[1:]
-	var runtime string
+	var runtime, profile string
 	args, runtime = takeFlag(args, "--runtime", "claude")
+	var seat bool
+	var wakeWindow time.Duration
+	if cmd == "install" || cmd == "uninstall" || cmd == "doctor" {
+		args, profile = takeFlag(args, "--profile", "")
+		seat = hasFlag(args, "--seat")
+		var ww string
+		args, ww = takeFlag(args, "--wake-window", "")
+		if ww != "" {
+			d, err := time.ParseDuration(ww)
+			check(err)
+			wakeWindow = d
+		}
+	}
 
 	// Every command but install needs to know which line it is on before it
 	// can find anything; install resolves its own.
@@ -253,13 +269,16 @@ func main() {
 		check(Retire(me, first(args) != "--undo"))
 		fmt.Println("retirement updated")
 	case "install":
-		res, err := InstallRuntime("", line, as, local, runtime)
+		res, err := InstallWith("", line, as, local, runtime, InstallOptions{Seat: seat, Profile: profile, WakeWindow: wakeWindow})
 		check(err)
 		verb := "joined"
 		if res.Reinstall {
 			verb = "rejoined"
 		}
 		fmt.Printf("%s line %q as %q\n", verb, res.Line, res.Agent)
+		if res.Seat != "" {
+			fmt.Printf("  seat:     %s\n", res.Seat)
+		}
 		fmt.Printf("  line dir: %s\n", res.LineDir)
 		fmt.Printf("  binary:   %s\n", res.Bin)
 		fmt.Printf("  wrote:    %s\n", res.McpPath)
@@ -269,36 +288,94 @@ func main() {
 		} else {
 			fmt.Printf("  peers:    none yet -- run `yip install` in another checkout\n")
 		}
-		if runtime == "claude-channels" {
+		for _, note := range res.Notes {
+			fmt.Printf("  note:     %s\n", note)
+		}
+		switch {
+		case runtime == "claude-channels":
 			fmt.Println("\nStart Claude here with: claude --dangerously-load-development-channels server:yip")
 			fmt.Println("Accept the preview warning yourself; organization policy still applies. After Claude acknowledges the probe, run yip doctor --runtime claude-channels.")
-		} else {
+		case runtime == "claude-rewake":
+			window := wakeWindow
+			if window == 0 {
+				window = defaultWakeWindow
+			}
+			fmt.Printf("\nRestart Claude here. Each time a turn starts or ends, a background hook stays armed for %s:\n", window)
+			fmt.Println("a Yip notice then wakes the idle session (no Channels or tmux). Review new hooks in /hooks if asked.")
+			fmt.Println("Then: yip doctor --runtime claude-rewake")
+		case runtime == "codex":
+			start, doc := "codex", "yip doctor --runtime codex"
+			if profile != "" {
+				start, doc = "codex -p "+profile+" -C /path/to/the/code", doc+" --profile "+profile
+			}
+			fmt.Printf("\nStart Codex with: %s   (restart an already-open session)\n", start)
+			fmt.Println("Review and trust the Yip hooks in /hooks. Delivery binds to the chat at its first Yip tool call;")
+			fmt.Printf("no UUID or separate dispatcher is needed. Then: %s\n", doc)
+		default:
 			fmt.Printf("\nRestart %s here, then yip doctor --runtime %s. Review and trust new hooks in the runtime.\n", runtime, runtime)
 		}
 	case "uninstall":
-		check(Uninstall(""))
-		fmt.Println("left the line; config removed")
+		// Without an explicit line, leave the lines this checkout actually
+		// joined -- not the one derived from its folder, which differs after
+		// an install with --line and used to leave the membership behind.
+		lines := []string{activeLine}
+		if line == "" && os.Getenv("YIP_LINE") == "" && os.Getenv("YIP_ROOT") == "" && profile == "" {
+			if hosting := linesHosting(checkoutRoot("")); len(hosting) > 0 {
+				lines = hosting
+			}
+		}
+		for _, l := range lines {
+			activeLine = l
+			where, err := UninstallFrom("", as, profile)
+			if err != nil {
+				// --as narrows to one identity: skip lines it is not on.
+				if as != "" && len(lines) > 1 && strings.Contains(err.Error(), "is not on line") {
+					continue
+				}
+				check(err)
+			}
+			who := "this checkout"
+			if as != "" {
+				who = as
+			}
+			fmt.Printf("removed %s from line %q (%s); history kept\n", who, l, where)
+		}
 	case "line":
 		fmt.Printf("line:     %s\n", activeLine)
 		fmt.Printf("line dir: %s\n", Root())
 		m := LoadMembers()
-		if len(m.Members) == 0 {
+		seats := LoadSeats()
+		if len(m.Members) == 0 && len(seats.Seats) == 0 {
 			fmt.Println("members:  none -- run `yip install`")
 			return
 		}
 		fmt.Println("members:")
 		for _, name := range m.Names() {
-			fmt.Printf("  %-16s %s\n", name, m.PathOf(name))
+			delivery := ""
+			if endpointExists(name) {
+				delivery = " -- " + EndpointStatus(name)
+			}
+			fmt.Printf("  %-16s %s%s\n", name, m.PathOf(name), delivery)
+		}
+		if len(seats.Seats) > 0 {
+			fmt.Println("seats:")
+			for _, name := range LineNames() {
+				if s, ok := seats.Seats[name]; ok {
+					fmt.Printf("  %-16s %s -- %s\n", name, seatDescription(s), EndpointStatus(name))
+				}
+			}
 		}
 	case "serve":
 		me := must(WhoAmI(as, ""))
 		var err error
 		if len(args) == 1 && args[0] == "--channels" {
 			err = ServeChannels(me)
+		} else if len(args) == 1 && args[0] == "--codex" {
+			err = ServeCodex(me)
 		} else if len(args) == 0 {
 			err = Serve(me)
 		} else {
-			err = fmt.Errorf("serve [--channels]")
+			err = fmt.Errorf("serve [--channels | --codex]")
 		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -307,6 +384,12 @@ func main() {
 	case "hook":
 		if len(args) < 1 {
 			os.Exit(0) // a malformed hook invocation must not break a session
+		}
+		if args[0] == "rewake" {
+			// Exit 2 is the wake; anything unexpected is a quiet 0.
+			_, forS := takeFlag(args[1:], "--for", "")
+			wait, _ := time.ParseDuration(forS)
+			os.Exit(RunRewakeHook(as, wait))
 		}
 		RunHookRuntime(args[0], as, runtime)
 	case "ring":
@@ -581,7 +664,17 @@ func main() {
 			return
 		}
 		if runtime == "codex" {
-			check(CodexDoctor(""))
+			check(CodexDoctor("", profile))
+			return
+		}
+		if runtime == "claude-rewake" {
+			me := must(WhoAmI(as, ""))
+			_, hooksIn := hookInstalled(checkoutRoot(""))
+			if !strings.Contains(strings.Join(hooksIn, " "), "rewake (2/2)") {
+				check(fmt.Errorf("claude-rewake hooks missing for %s (found: %s); re-run yip install --runtime claude-rewake", me, orDash(strings.Join(hooksIn, ", "))))
+			}
+			fmt.Printf("hooks: %s\ndelivery: %s\n", strings.Join(hooksIn, ", "), EndpointStatus(me))
+			fmt.Println("Armed means a background waiter is running; it re-arms each time a turn starts or ends. This does not prove Claude woke: verify a notice is received and acknowledged.")
 			return
 		}
 		doctor(as)
@@ -672,16 +765,15 @@ func printSetup(me string) {
 	fmt.Printf("## .mcp.json\n\n")
 	fmt.Printf(`{
   "mcpServers": {
-    "yip": { "command": %q, "args": ["serve"] }
+    "yip": { "command": %q, "args": ["serve", "--as", %q, "--line", %q] }
   }
 }
-`, bin)
+`, bin, me, activeLine)
 	fmt.Printf("\n## .claude/settings.json  (merge the hooks block into what is there)\n\n")
 	// Guarded so the config is harmless where the binary is absent: a missing
 	// yip means the hook does nothing, rather than erroring every tool call.
-	g := func(event string) string {
-		return fmt.Sprintf("[ ! -x %s ] || %s hook %s", bin, bin, event)
-	}
+	// Identity and line are named so the hooks cannot resolve another line.
+	g := func(event string) string { return claudeHookCommand(bin, event, activeLine, me) }
 	fmt.Printf(`{
   "hooks": {
     "PostToolUse": [
@@ -779,7 +871,13 @@ func doctor(as string) {
 			say(true, "peer %s: %s %s -- %s", peer, br, sha, state)
 		}
 	}
-	if len(m.Members) < 2 {
+	seats := LoadSeats()
+	for _, peer := range LineNames() {
+		if s, ok := seats.Seats[peer]; ok && peer != me {
+			say(true, "peer %s: %s -- %s", peer, seatDescription(s), EndpointStatus(peer))
+		}
+	}
+	if len(LineNames()) < 2 {
 		say(true, "peers: none yet -- run `yip install` in another checkout")
 	}
 	if err == nil {

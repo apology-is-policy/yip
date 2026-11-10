@@ -21,6 +21,7 @@ type hookInput struct {
 	ToolName      string `json:"tool_name"`
 	HookEventName string `json:"hook_event_name"`
 	Source        string `json:"source"`
+	SessionID     string `json:"session_id"`
 }
 
 func readHookInput() hookInput {
@@ -60,11 +61,49 @@ func RunHookRuntime(event string, override string, runtime string) {
 		result = hookStop(me)
 	case "sessionstart":
 		result = hookSessionStart(me)
+		if runtime == "codex" {
+			result = withContext(result, "SessionStart", codexBindNudge(me, in.SessionID))
+		}
 	}
 	if runtime == "codex" {
 		result = codexHookOutput(event, result)
 	}
 	emit(result)
+}
+
+// codexBindNudge: a Codex chat binds delivery at its first Yip tool call, and
+// a new chat has made none. Say so once, at session start, unless this exact
+// session already holds a live binding. The hook names the session but does
+// not bind it: only the session's own MCP server can prove it serves it.
+func codexBindNudge(me, session string) string {
+	ep, err := readEndpoint(me)
+	if err != nil || ep.Runtime != "codex" || ep.Paused || Retired(me) {
+		return ""
+	}
+	if session != "" && ep.Thread == session && codexSessionAlive(me, session) {
+		return ""
+	}
+	return "[yip] You are " + me + ". Call the Yip ring tool now so Yip notices for " + me + " are delivered to this chat."
+}
+
+func withContext(result any, event, line string) any {
+	if line == "" {
+		return result
+	}
+	m, _ := result.(map[string]any)
+	if m == nil {
+		return map[string]any{"hookSpecificOutput": map[string]any{"hookEventName": event, "additionalContext": line}}
+	}
+	h, _ := m["hookSpecificOutput"].(map[string]any)
+	if h == nil {
+		h = map[string]any{"hookEventName": event}
+		m["hookSpecificOutput"] = h
+	}
+	if prev, _ := h["additionalContext"].(string); prev != "" {
+		line = prev + "\n" + line
+	}
+	h["additionalContext"] = line
+	return m
 }
 
 // ------------------------------------------------------------ PostToolUse
@@ -75,7 +114,10 @@ func RunHookRuntime(event string, override string, runtime string) {
 func hookPostToolUse(me string, in hookInput) any {
 	_ = Beat(me, in.ToolName)
 	nudge := roadmapNudge(me)
-	if channelPreferred(me) {
+	// A live push path delivers these already; repeating them per tool call is
+	// noise. Cursors are not advanced, so the hook resumes when push lapses.
+	// The roadmap nudge is not a delivered notice, so it still speaks.
+	if channelPreferred(me) || rewakeArmed(me) {
 		if nudge == "" {
 			return nil
 		}

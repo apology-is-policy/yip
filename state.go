@@ -67,15 +67,49 @@ func WhoAmI(override, cwd string) (string, error) {
 		return v, nil
 	}
 	root := checkoutRoot(cwd)
-	if a := LoadMembers().AgentAt(root); a != "" {
+	// Codex sets CODEX_THREAD_ID in the shell of every command it runs. A
+	// binding for that exact thread is a recorded fact, and it outranks the
+	// path: the checkout may belong to a different agent this seat shares it
+	// with. (MEASURED on codex-cli 0.162.0: CODEX_THREAD_ID equals the UUID
+	// the same thread's MCP server sees as _meta.threadId.)
+	m, seats := LoadMembers(), LoadSeats()
+	root = recordedRoot(root, m, seats) // the spelling it was installed under
+	if thread := os.Getenv("CODEX_THREAD_ID"); threadRE.MatchString(thread) {
+		if a := agentBoundToThread(thread); a != "" {
+			return a, nil
+		}
+		if here := seats.At(root); len(here) > 0 {
+			return "", fmt.Errorf("this Codex chat is not bound to a Yip identity yet, and %s is shared by seat(s) %s -- use the Yip MCP tools (which binds this chat) or pass --as NAME", root, strings.Join(here, ", "))
+		}
+		// A Codex chat is never the folder's Claude member, whatever the
+		// path says -- e.g. a profile seat started in a Claude-owned folder.
+		if owner := m.AgentAt(root); owner != "" && !isCodexIdentity(owner, root) {
+			return "", fmt.Errorf("this Codex chat is not bound to a Yip identity yet, and %s belongs to %q, which is not a Codex agent -- use the Yip MCP tools (which binds this chat) or pass --as NAME", root, owner)
+		}
+	}
+	if a := m.AgentAt(root); a != "" {
 		return a, nil
 	}
 	return "", fmt.Errorf("%s is not on line %s -- run `yip install` here (or pass --as)", root, activeLine)
 }
 
-// worktreeFor is a lookup, not a guess: a peer's checkout is a fact recorded
-// when it joined.
-func worktreeFor(agent string) string { return LoadMembers().PathOf(agent) }
+// worktreeFor is a lookup, not a guess: a member's checkout is a fact recorded
+// when it joined; a seat's is the checkout it shares, or else the working
+// directory its live Codex session reported when it bound.
+func worktreeFor(agent string) string {
+	if p := LoadMembers().PathOf(agent); p != "" {
+		return p
+	}
+	if s, ok := LoadSeats().Seats[agent]; ok {
+		if s.Workdir != "" {
+			return s.Workdir
+		}
+		if ep, err := readEndpoint(agent); err == nil && ep.Runtime == "codex" {
+			return ep.Cwd
+		}
+	}
+	return ""
+}
 
 func gitTopLevel(dir string) (string, error) {
 	out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output()

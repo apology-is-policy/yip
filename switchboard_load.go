@@ -216,8 +216,8 @@ func (l *sbLoader) load() sbState {
 	full := l.loads%sbFullReloadEvery == 0
 
 	st := sbState{presence: map[string]Presence{}, endpoints: map[string]string{}, retired: map[string]bool{}}
-	m := LoadMembers()
-	st.members = m.Names()
+	// Members and seats: a seat has no checkout of its own but is on the line.
+	st.members = LineNames()
 	for _, a := range st.members {
 		st.retired[a] = Retired(a)
 		if p, ok := LoadPresence(a); ok {

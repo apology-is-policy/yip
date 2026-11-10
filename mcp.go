@@ -49,6 +49,25 @@ type toolDef struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	InputSchema map[string]any `json:"inputSchema"`
+	Annotations map[string]any `json:"annotations,omitempty"`
+}
+
+// readOnlyTools only inspect the line. Their sole writes are the caller's own
+// bookkeeping (presence contact, its own read cursor), never an assertion or
+// receipt another participant relies on. Runtimes such as Codex can use the
+// hint to skip approval prompts for them; it is a hint, not a security claim.
+var readOnlyTools = map[string]bool{
+	"ring": true, "presence": true, "resources": true, "read": true, "wait": true,
+	"inbox": true, "deliveries": true, "broadcasts": true, "queue_history": true,
+}
+
+func annotated(defs []toolDef) []toolDef {
+	for i := range defs {
+		if readOnlyTools[defs[i].Name] {
+			defs[i].Annotations = map[string]any{"readOnlyHint": true}
+		}
+	}
+	return defs
 }
 
 func obj(props map[string]any, required ...string) map[string]any {
@@ -64,7 +83,7 @@ func num(desc string) map[string]any   { return map[string]any{"type": "integer"
 func yesno(desc string) map[string]any { return map[string]any{"type": "boolean", "description": desc} }
 
 func tools() []toolDef {
-	return append(append(coordinationTools(), roadmapTools()...), []toolDef{
+	return annotated(append(append(coordinationTools(), roadmapTools()...), []toolDef{
 		{
 			Name: "call",
 			Description: "Open a call to the other agent and speak the first turn. Rings them: " +
@@ -104,8 +123,9 @@ func tools() []toolDef {
 		{
 			Name: "wait",
 			Description: "Block until the peer replies, the call closes, or the timeout expires. " +
-				"Returns at once if the peer is not in a live session -- your words are already queued and will " +
-				"ring at their next session start, so there is nothing to wait for. Bounded: default 60s, max 600s.",
+				"Returns at once if the peer is neither active nor reachable by push delivery -- your words are already queued and will " +
+				"ring at their next session start, so there is nothing to wait for. An idle peer whose session Yip can wake " +
+				"(a connected Codex chat, Channels, an armed rewake) is worth waiting for. Bounded: default 60s, max 600s; re-issue to keep waiting.",
 			InputSchema: obj(map[string]any{
 				"call":      str("Call id. Omit when only one call is open."),
 				"timeout_s": num("Seconds to wait. Default 60, capped at 600."),
@@ -227,7 +247,7 @@ func tools() []toolDef {
 				"resource": str("Which machine to release."),
 			}, "resource"),
 		},
-	}...)
+	}...))
 }
 
 // ---------------------------------------------------------------- dispatch
@@ -241,15 +261,35 @@ type server struct {
 	initialized  bool
 	negotiated   bool
 	startChannel func() error
+
+	// Codex live delivery (serve --codex); see codex_live.go.
+	codexMode    bool
+	codexMu      sync.Mutex
+	codexThread  string // fixed by the first tools/call _meta.threadId
+	codexFailed  bool
+	codexRelease func()
+	codexSend    deliverySender // nil = codex queue; injectable for tests
+	startCodex   func()
+	started      time.Time
+	cwd          string
 }
 
-func Serve(me string) error         { return serveIO(me, false, os.Stdin, os.Stdout) }
-func ServeChannels(me string) error { return serveIO(me, true, os.Stdin, os.Stdout) }
-func serveIO(me string, channels bool, input io.Reader, output io.Writer) error {
+const (
+	serveClaude   = "claude"
+	serveChannels = "channels"
+	serveCodex    = "codex"
+)
+
+func Serve(me string) error         { return serveIO(me, serveClaude, os.Stdin, os.Stdout) }
+func ServeChannels(me string) error { return serveIO(me, serveChannels, os.Stdin, os.Stdout) }
+func ServeCodex(me string) error    { return serveIO(me, serveCodex, os.Stdin, os.Stdout) }
+func serveIO(me, mode string, input io.Reader, output io.Writer) error {
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
-	s := &server{me: me, enc: json.NewEncoder(output), channelMode: channels}
+	channels := mode == serveChannels
+	s := &server{me: me, enc: json.NewEncoder(output), channelMode: channels, codexMode: mode == serveCodex, started: time.Now()}
+	s.cwd, _ = os.Getwd()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var wg sync.WaitGroup
@@ -261,7 +301,22 @@ func serveIO(me string, channels bool, input io.Reader, output io.Writer) error 
 			endChannel(me, s.channel)
 			release()
 		}
+		// The thread lock is liveness; dropping it marks the session gone.
+		// The binding itself stays, so a later session or watch can take over.
+		s.codexMu.Lock()
+		if s.codexRelease != nil {
+			s.codexRelease()
+			s.codexRelease = nil
+		}
+		s.codexMu.Unlock()
 	}()
+	if s.codexMode {
+		// Started once, by the first tools/call that names this thread.
+		s.startCodex = func() {
+			wg.Add(1)
+			go func() { defer wg.Done(); s.codexLoop(ctx) }()
+		}
+	}
 	if channels {
 		unlock, err := channelOwner(me)
 		if err != nil {
@@ -323,11 +378,15 @@ func (s *server) handle(req *rpcReq) {
 		if s.channelMode {
 			caps["experimental"] = map[string]any{"claude/channel": map[string]any{}}
 		}
+		instructions := channelInstructions
+		if s.codexMode {
+			instructions = codexInstructions(s.me)
+		}
 		s.reply(req.ID, map[string]any{
 			"protocolVersion": "2024-11-05",
 			"capabilities":    caps,
 			"serverInfo":      map[string]any{"name": "yip", "version": serverVersion},
-			"instructions":    channelInstructions,
+			"instructions":    instructions,
 		})
 	case "notifications/initialized":
 		if s.negotiated && !s.initialized {
@@ -349,21 +408,27 @@ func (s *server) handle(req *rpcReq) {
 		var p struct {
 			Name      string         `json:"name"`
 			Arguments map[string]any `json:"arguments"`
+			Meta      struct {
+				ThreadID string `json:"threadId"`
+			} `json:"_meta"`
 		}
 		if err := json.Unmarshal(req.Params, &p); err != nil {
 			s.fail(req.ID, -32602, "bad params: "+err.Error())
 			return
 		}
+		// Codex names the calling thread on every tools/call. The first one
+		// binds delivery; the note tells the model once that it happened.
+		bindNote := s.observeCodexThread(p.Meta.ThreadID)
 		text, err := s.call(p.Name, p.Arguments)
 		if err != nil {
 			s.reply(req.ID, map[string]any{
-				"content": []any{map[string]any{"type": "text", "text": err.Error()}},
+				"content": []any{map[string]any{"type": "text", "text": err.Error() + bindNote}},
 				"isError": true,
 			})
 			return
 		}
 		s.reply(req.ID, map[string]any{
-			"content": []any{map[string]any{"type": "text", "text": text}},
+			"content": []any{map[string]any{"type": "text", "text": text + bindNote}},
 		})
 	default:
 		s.fail(req.ID, -32601, "unknown method "+req.Method)
@@ -599,8 +664,11 @@ func (s *server) doCall(a map[string]any) (string, error) {
 	MarkSeen(c, s.me, n)
 	p, _ := LoadPresence(peer)
 	live := "not in a live session -- it will ring at their next session start"
-	if p.Live() {
+	switch {
+	case p.Live():
 		live = "live now -- they will see it on their next tool call"
+	case pushReachable(peer):
+		live = "idle, but its session is connected -- Yip is delivering this to it now"
 	}
 	return fmt.Sprintf("call %s opened, turn %d sent (%d bytes).\n%s is %s.\nFloor is now theirs; use wait to block for the reply.",
 		c.ID, n, len(text), peer, live), nil
@@ -728,7 +796,10 @@ func (s *server) doWait(a map[string]any) (string, error) {
 	if FloorHolder(c, turns) == s.me && start > 0 {
 		return fmt.Sprintf("nothing to wait for -- the floor is already yours on %s (turn %d). Read it.", c.ID, start), nil
 	}
-	if p, _ := LoadPresence(peer); !p.Live() {
+	// An idle peer is still worth waiting for when push delivery reaches its
+	// session (a bound Codex chat, verified Channels, an armed rewake).
+	if !peerReachable(peer) {
+		p, _ := LoadPresence(peer)
 		return fmt.Sprintf("not waiting: %s last contact %s, so current activity is unknown. "+
 			"Turn %d is queued and will ring at their next session start. Carry on with something else.",
 			peer, describeAge(p.Age()), start), nil
