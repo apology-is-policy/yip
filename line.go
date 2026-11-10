@@ -524,6 +524,24 @@ func linesHosting(root string) []string {
 	return out
 }
 
+// joinedLine picks the line a checkout is recorded on, for commands given no
+// line. The derived line wins when the checkout is on it (worktrees of one
+// repository); otherwise a single recorded line is used. Several recorded
+// lines, none of them derived, is ambiguous: "" leaves the derived default,
+// and the caller's --line or YIP_LINE has to say which.
+func joinedLine(root, derived string) string {
+	hosting := linesHosting(root)
+	for _, l := range hosting {
+		if l == derived {
+			return derived
+		}
+	}
+	if len(hosting) == 1 {
+		return hosting[0]
+	}
+	return ""
+}
+
 // Uninstall removes integrations and line membership, never history.
 //
 // With neither agent nor profile it removes everything this checkout hosts:

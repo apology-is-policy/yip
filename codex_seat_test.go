@@ -698,3 +698,38 @@ func TestUnboundCodexShellNeverAnswersAsTheClaudeMember(t *testing.T) {
 		t.Fatal(me)
 	}
 }
+
+// A bare CLI command in a checkout that joined a named line uses that line.
+func TestJoinedLineFindsANamedLineButPrefersTheDerivedOne(t *testing.T) {
+	dir := seatFixture(t)
+	t.Setenv("YIP_ROOT", "")
+	root := checkoutRoot(dir)
+	derived, _ := resolveLine(root)
+	if got := joinedLine(root, derived); got != "" {
+		t.Fatal("unjoined checkout resolved to", got)
+	}
+	if _, err := InstallWith(dir, "cannae", "paullus", true, "claude", InstallOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := joinedLine(root, derived); got != "cannae" {
+		t.Fatal("named line not found:", got)
+	}
+	// Also on the derived line (worktree sharing): derived wins.
+	activeLine = derived
+	if err := EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	SaveMembers(Members{Line: derived, Members: map[string]string{root: "paullus"}})
+	if got := joinedLine(root, derived); got != derived {
+		t.Fatal("derived line not preferred:", got)
+	}
+	// Two named lines and not the derived one: ambiguous, keep the default.
+	activeLine = derived
+	SaveMembers(Members{Line: derived, Members: map[string]string{}})
+	activeLine = "other"
+	EnsureRoot()
+	SaveMembers(Members{Line: "other", Members: map[string]string{root: "paullus"}})
+	if got := joinedLine(root, derived); got != "" {
+		t.Fatal("ambiguous lines resolved to", got)
+	}
+}

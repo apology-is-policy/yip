@@ -202,6 +202,15 @@ func main() {
 			if err == nil {
 				activeLine = id
 			}
+			// The folder's derived line is only a default. A checkout that
+			// joined a named line (install --line) is RECORDED on it, so a bare
+			// `yip line` / `yip call` -- including from an agent's Bash tool --
+			// uses that line instead of an empty derived one.
+			if os.Getenv("YIP_ROOT") == "" { // an explicit state dir needs no line
+				if l := joinedLine(checkoutRoot(""), activeLine); l != "" {
+					activeLine = l
+				}
+			}
 		}
 	}
 
