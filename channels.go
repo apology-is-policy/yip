@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -75,11 +76,73 @@ func channelOwnerAlive(agent string) bool {
 	}
 	return err == syscall.EWOULDBLOCK || err == syscall.EAGAIN
 }
-func addChannelProbe(ep *Endpoint) {
+
+// A probe's source names the connection it was written to, so a probe can only
+// ever verify that connection.
+func probePrefix(session string) string { return "channel-probe:" + session + ":" }
+
+// why is empty for the first probe of a connection, and says who sent a later one.
+func addChannelProbe(ep *Endpoint, why string) {
 	ep.ChannelReady = false
-	key := "channel-probe:" + ep.Thread + ":" + requestID()
+	key := probePrefix(ep.Thread) + requestID()
 	ep.ChannelProbe = deliveryID(ep.Agent, key)
-	ep.Events = append(ep.Events, Delivery{ID: ep.ChannelProbe, Source: key, Text: "Channel diagnostic: call channel_ack with probe ID " + ep.ChannelProbe + " through this receiving MCP connection. No work requested.", Created: now(), Status: "pending"})
+	text := "Channel diagnostic"
+	if why != "" {
+		text += " (" + why + ")"
+	}
+	ep.Events = append(ep.Events, Delivery{ID: ep.ChannelProbe, Source: key, Text: text + ": call channel_ack with probe ID " + ep.ChannelProbe + " through this receiving MCP connection. No work requested.", Created: now(), Status: "pending"})
+}
+
+// The first probe is written the instant the handshake ends. A client that is
+// not yet turning channel notifications into session input drops it without a
+// trace: the write succeeds, the probe reads "sent", and nothing else goes out
+// until a probe is acknowledged. MEASURED on Claude Code 2.1.322 (2026-11-11):
+// both `claude --resume` launches of one agent with Channels on lost their probe
+// and left the session deaf, every notice held as pending, while a probe issued
+// by hand minutes later reached the same connection at once. Four other launches
+// that day kept theirs, so it is a matter of timing and not of configuration.
+//
+// So an unanswered probe is followed by a fresh one after each of these waits,
+// and then no more: each one that does arrive costs the session a turn. Past
+// the last, only a person re-probes (`yip delivery probe`, P on the switchboard).
+// A probe whose write is in doubt is never followed up here.
+var reprobeAfter = []time.Duration{15 * time.Second, 30 * time.Second, time.Minute, 2 * time.Minute, 5 * time.Minute}
+
+// When the connection's newest probe was written to the transport. ok is false
+// while it is unsent, and when its write is in doubt.
+func probeWritten(ep *Endpoint) (at time.Time, ok bool) {
+	for i := len(ep.Events) - 1; i >= 0; i-- {
+		d := &ep.Events[i]
+		if d.ID != ep.ChannelProbe {
+			continue
+		}
+		if d.Status != "sent" || len(d.Attempts) == 0 {
+			return time.Time{}, false
+		}
+		at, err := time.Parse(time.RFC3339, d.Attempts[len(d.Attempts)-1].At)
+		return at, err == nil
+	}
+	return time.Time{}, false
+}
+func reprobeUnanswered(ep *Endpoint, at time.Time) bool {
+	if ep.Runtime != "claude-channels" || !ep.ChannelConnected || ep.ChannelReady {
+		return false
+	}
+	written, ok := probeWritten(ep)
+	if !ok {
+		return false
+	}
+	n := 0 // probes this connection has had, whoever asked for them
+	for _, d := range ep.Events {
+		if strings.HasPrefix(d.Source, probePrefix(ep.Thread)) {
+			n++
+		}
+	}
+	if n < 1 || n > len(reprobeAfter) || at.Sub(written) < reprobeAfter[n-1] {
+		return false
+	}
+	addChannelProbe(ep, "sent again: no probe of this connection has been acknowledged")
+	return true
 }
 func beginChannel(agent, session string) error {
 	return editEndpoint(agent, func(ep *Endpoint) error {
@@ -88,7 +151,7 @@ func beginChannel(agent, session string) error {
 		}
 		ep.Thread = session
 		ep.ChannelConnected = true
-		addChannelProbe(ep)
+		addChannelProbe(ep, "")
 		return nil
 	})
 }
@@ -109,24 +172,86 @@ func NewChannelProbe(agent string) error {
 		if ep.Runtime != "claude-channels" || !ep.ChannelConnected {
 			return fmt.Errorf("no active Channels connection")
 		}
-		addChannelProbe(ep)
+		addChannelProbe(ep, "")
 		return nil
 	})
 }
+
+// How long a written probe may go unanswered before a view calls the channel
+// stuck, and how soon after one a person may ask for the next.
+var probeOverdue = 30 * time.Second
+
+// channelWaiting reports a Channels endpoint whose server is connected and whose
+// newest probe was written and not acknowledged: when it was written, and how
+// many notices wait behind it. A lost probe and a session that has not answered
+// yet look the same from here; the age tells them apart well enough.
+func channelWaiting(agent string, ep Endpoint) (since time.Time, held int, ok bool) {
+	if ep.Runtime != "claude-channels" || !ep.ChannelConnected || ep.ChannelReady || ep.Paused || Retired(agent) || !channelOwnerAlive(agent) {
+		return time.Time{}, 0, false
+	}
+	if since, ok = probeWritten(&ep); !ok {
+		return time.Time{}, 0, false
+	}
+	for _, d := range ep.Events {
+		if d.Status == "pending" && !strings.HasPrefix(d.Source, "channel-probe:") {
+			held++
+		}
+	}
+	return since, held, true
+}
+
+// ReprobeUnverified writes a fresh probe to a connection whose probe is overdue,
+// and reports whether it did. Unlike NewChannelProbe it never takes readiness
+// away from a verified connection, and it will not stack probes: a second call
+// before the first probe is overdue does nothing.
+func ReprobeUnverified(agent, why string) (bool, error) {
+	if !channelOwnerAlive(agent) {
+		return false, fmt.Errorf("no connected Channels server; start Claude with Yip enabled first")
+	}
+	sent := false
+	err := editEndpoint(agent, func(ep *Endpoint) error {
+		if ep.Runtime != "claude-channels" || !ep.ChannelConnected {
+			return fmt.Errorf("no active Channels connection")
+		}
+		if ep.ChannelReady || ep.Paused {
+			return nil
+		}
+		if written, ok := probeWritten(ep); !ok || time.Since(written) < probeOverdue {
+			return nil
+		}
+		addChannelProbe(ep, why)
+		sent = true
+		return nil
+	})
+	return sent && err == nil, err
+}
 func acknowledgeChannel(agent, session, id string) error {
 	return editEndpoint(agent, func(ep *Endpoint) error {
-		if ep.Runtime != "claude-channels" || !ep.ChannelConnected || ep.Thread != session || ep.ChannelProbe != id {
+		if ep.Runtime != "claude-channels" || !ep.ChannelConnected || ep.Thread != session {
 			return fmt.Errorf("probe does not belong to this active connection")
 		}
+		// Any probe written to THIS connection proves it carries channel input.
+		// An earlier one may be answered after a later one was issued; refusing
+		// it would leave a working channel unverified.
 		for i := range ep.Events {
 			d := &ep.Events[i]
-			if d.ID == id && (d.Status == "sent" || d.Status == "unknown" || d.Status == "read") {
-				d.Status = "read"
-				ep.ChannelReady = true
-				return nil
+			if d.ID != id || !strings.HasPrefix(d.Source, probePrefix(session)) {
+				continue
 			}
+			if d.Status != "sent" && d.Status != "unknown" && d.Status != "read" {
+				return fmt.Errorf("probe has not been sent")
+			}
+			d.Status = "read"
+			ep.ChannelReady = true
+			// A probe still waiting to go out has nothing left to prove.
+			for j := range ep.Events {
+				if o := &ep.Events[j]; o.Status == "pending" && strings.HasPrefix(o.Source, probePrefix(session)) {
+					o.Status, o.Detail = "read", "not sent: another probe of this connection was acknowledged"
+				}
+			}
+			return nil
 		}
-		return fmt.Errorf("probe has not been sent")
+		return fmt.Errorf("probe does not belong to this active connection")
 	})
 }
 

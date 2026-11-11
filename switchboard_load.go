@@ -215,7 +215,7 @@ func (l *sbLoader) load() sbState {
 	l.loads++
 	full := l.loads%sbFullReloadEvery == 0
 
-	st := sbState{presence: map[string]Presence{}, endpoints: map[string]string{}, retired: map[string]bool{}}
+	st := sbState{presence: map[string]Presence{}, endpoints: map[string]string{}, waiting: map[string]sbWaiting{}, retired: map[string]bool{}}
 	// Members and seats: a seat has no checkout of its own but is on the line.
 	st.members = LineNames()
 	for _, a := range st.members {
@@ -225,6 +225,11 @@ func (l *sbLoader) load() sbState {
 		}
 		ep := l.endpoint(a)
 		st.endpoints[a] = endpointStatusFrom(a, ep.ep, ep.err)
+		if ep.err == nil {
+			if since, held, ok := channelWaiting(a, ep.ep); ok {
+				st.waiting[a] = sbWaiting{since: since, held: held}
+			}
+		}
 	}
 	ents, err := os.ReadDir(callsDir())
 	if err != nil && !os.IsNotExist(err) {

@@ -31,7 +31,7 @@ with tempfile.TemporaryDirectory(prefix="yip-channels-e2e-") as tmp:
     assert config["mcpServers"]["yip"]["args"][:2] == ["serve", "--channels"]
     assert run("doctor", "--runtime", "claude-channels", ok=False).returncode == 1
     handles = []
-    def start():
+    def start(answer=True):
         proc = subprocess.Popen([binary, "serve", "--channels", "--as", "a"],
                                 cwd=root, env=env, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -69,6 +69,8 @@ with tempfile.TemporaryDirectory(prefix="yip-channels-e2e-") as tmp:
         assert probe["method"] == "notifications/claude/channel"
         # IDs are extracted from received content, not from endpoint state.
         probe_id = probe["params"]["content"].splitlines()[1].split()[0]
+        if not answer:
+            return proc, send, receive, frames, probe_id
         send("tools/call", {"name": "channel_ack", "arguments": {"id": probe_id}}, 2)
         ack = receive()
         assert ack["id"] == 2 and not ack["result"].get("isError"), ack
@@ -110,7 +112,28 @@ with tempfile.TemporaryDirectory(prefix="yip-channels-e2e-") as tmp:
         status = json.loads(run("delivery", "status").stdout)
         assert not status.get("channel_connected") and not status.get("channel_ready")
         assert run("doctor", "--runtime", "claude-channels", ok=False).returncode == 1
-        print("PASS: help has no writes; install; handshake; acknowledged probe; owner fencing; pause/resume; broadcast; dedup; crash/reconnect; backlog; stale-probe rejection; clean disconnect")
+        # A client that drops the first probe, as Claude Code does when the probe
+        # arrives before it takes channel input. Nothing else may leave; a fresh
+        # probe follows by itself; and the first one, answered late, verifies.
+        run("broadcast", "announcement", "--to", "a", body="Held behind an unanswered probe.")
+        proc, send, receive, frames, lost_probe = start(answer=False)
+        time.sleep(1.3)
+        assert frames.empty(), "a notice left before any probe was acknowledged"
+        again = frames.get(timeout=20)
+        assert isinstance(again, dict) and again["method"] == "notifications/claude/channel", again
+        content = again["params"]["content"]
+        assert content.splitlines()[1].split()[0] != lost_probe and "sent again" in content, content
+        assert "Held behind" not in content, "a notice rode along with the second probe"
+        assert run("doctor", "--runtime", "claude-channels", ok=False).returncode == 1
+        send("tools/call", {"name": "channel_ack", "arguments": {"id": lost_probe}}, 6)
+        late = receive()
+        assert late["id"] == 6 and not late["result"].get("isError"), late
+        assert run("doctor", "--runtime", "claude-channels").returncode == 0
+        held = receive()
+        assert "announcement" in held["params"]["content"].lower(), held
+        proc.stdin.close()
+        assert proc.wait(timeout=5) == 0
+        print("PASS: help has no writes; install; handshake; acknowledged probe; owner fencing; pause/resume; broadcast; dedup; crash/reconnect; backlog; stale-probe rejection; clean disconnect; lost first probe followed by a fresh one, either verifies")
     finally:
         for proc in handles:
             if proc.poll() is None:

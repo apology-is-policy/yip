@@ -156,6 +156,12 @@ type sbResource struct {
 	runners []string
 }
 
+// A connected channel whose probe was written and has not been acknowledged.
+type sbWaiting struct {
+	since time.Time // when the newest probe was written
+	held  int       // notices that wait behind it
+}
+
 type sbState struct {
 	resources []sbResource
 	disk      string
@@ -163,6 +169,7 @@ type sbState struct {
 	members   []string
 	presence  map[string]Presence
 	endpoints map[string]string // agent -> delivery status, read once per snapshot
+	waiting   map[string]sbWaiting
 	roadmaps  []Roadmap
 	retired   map[string]bool
 	err       string
@@ -526,6 +533,34 @@ func (v *view) submit() {
 	}
 }
 
+// reprobe writes a fresh probe to every session whose channel is connected and
+// whose probe is overdue. It is the one repair the switchboard makes by itself,
+// and it stays inside the rule that no key speaks as an agent: a probe asks for
+// no work, carries no words of anyone's, and says in its text who sent it.
+func (v *view) reprobe() {
+	var done, failed []string
+	for _, a := range v.st.members {
+		if w, ok := v.st.waiting[a]; !ok || time.Since(w.since) < probeOverdue {
+			continue
+		}
+		sent, err := ReprobeUnverified(a, "sent again from the switchboard by "+v.by)
+		if err != nil {
+			failed = append(failed, a+": "+err.Error())
+		} else if sent {
+			done = append(done, a)
+		}
+	}
+	switch {
+	case len(failed) > 0:
+		v.flash = "re-probe FAILED: " + strings.Join(failed, "; ")
+	case len(done) == 0:
+		v.flash = "no connected channel is waiting on an overdue probe"
+	default:
+		v.flash = "re-probed " + strings.Join(done, ", ") + " -- if it stays unverified, that session is not taking channel input"
+	}
+	v.wantLoad = true
+}
+
 func (v *view) key(k rune) {
 	if v.prompt != "" {
 		switch k {
@@ -548,9 +583,11 @@ func (v *view) key(k rune) {
 	v.flash = ""
 	switch k {
 	case '?':
-		v.flash = "click a call · wheel over a pane · tab/n next · p prev · j/k scroll · g top G end · f follow · r ratify a arbitrate · 4 broadcasts · b compose · 5 map · ^L repaint"
+		v.flash = "click a call · wheel over a pane · tab/n next · p prev · j/k scroll · g top G end · f follow · r ratify a arbitrate · 4 broadcasts · b compose · 5 map · P re-probe a stuck channel · ^L repaint"
 	case 'b':
 		v.startBroadcast()
+	case 'P':
+		v.reprobe()
 	case '1', '2', '3', '4', '5':
 		v.tab = int(k - '1')
 		v.scroll = 0

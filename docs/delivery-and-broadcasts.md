@@ -212,7 +212,7 @@ line before installation. Re-registration is idempotent and never unpauses,
 rewinds receipts or replaces a Codex binding. Use distinct identities for
 concurrent sessions or different runtime bindings.
 
-After MCP initialization, Yip sends one diagnostic probe. The receiving agent
+After MCP initialization, Yip sends a diagnostic probe. The receiving agent
 must call `channel_ack` with the exact ID from the received event, on that same
 MCP connection. Discovering an ID in `delivery status` and acknowledging it does
 not establish delivery and is explicitly forbidden by the tool instructions.
@@ -221,11 +221,32 @@ pending until this acknowledgment. `doctor --runtime claude-channels` exits zero
 only while this identity has a connected, verified, unpaused, nonretired channel.
 This confirms the probe path, not completion of any work.
 
+The first probe can be lost. It is written the instant the handshake ends, and
+a client that is not yet turning channel notifications into session input drops
+it without an error: the write succeeds and the probe reads `sent`. Measured on
+Claude Code 2.1.322 (2026-11-11): both `claude --resume` launches of one agent
+with Channels on lost theirs and left the session deaf, with every notice
+pending, while a probe issued by hand minutes later reached the same connection
+at once; four other launches that day kept theirs. So:
+
+- An unanswered probe is followed by a fresh one after 15 s, 30 s, 1, 2 and 5
+  minutes, then no more. Each probe that does arrive costs the session a turn,
+  which is why the list ends. A probe whose write is in doubt is not followed up.
+- Any probe written to the current connection verifies it, whichever is
+  answered. A probe of an earlier connection never does.
+- The switchboard's desk marks a connected session whose probe has gone
+  unanswered for 30 seconds: `channel unverified 7m · 21 held`. `P` there sends
+  a fresh probe to each such session, as `yip delivery probe` does from a
+  checkout. Neither takes readiness from a verified connection or stacks a
+  probe on one that is not yet overdue. If the mark stays after a re-probe, the
+  session is not taking channel input at all (it was started without Channels).
+
 One OS lock fences simultaneous Channels servers for an identity. Each connection
 gets a new session token and probe. A crash releases the OS lock; status and hooks
 check it rather than trusting a stale on-disk readiness bit. Each restart must
 qualify again. Old probe and delivery attempts remain in the audit history;
-old probes are never automatically resent. Use `delivery probe` to diagnose an
+old probes are never automatically resent: an unanswered probe is followed by
+a new one with a new ID, as above. Use `delivery probe` to diagnose an
 existing connection again. It resets readiness and sends a new probe unless
 paused/retired. `delivery pause`, `resume`, `retry ID`, and ordinary `ack ID`
 otherwise work as documented above. A probe requires `channel_ack`, not `ack`.

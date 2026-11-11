@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func channelFixture(t *testing.T) (string, func()) {
@@ -315,5 +316,189 @@ func TestChannelPreferredDoesNotConsumeHookCursors(t *testing.T) {
 	}
 	if v := hookPostToolUse("a", hookInput{}); v == nil {
 		t.Fatal("hook fallback lost pending call")
+	}
+}
+
+func pendingNotice(t *testing.T) {
+	t.Helper()
+	if e := editEndpoint("a", func(ep *Endpoint) error {
+		ep.Events = append(ep.Events, Delivery{ID: "notice", Source: "fixture", Text: "hello", Status: "pending"})
+		return nil
+	}); e != nil {
+		t.Fatal(e)
+	}
+}
+
+// The first probe can be written before the client takes channel input, and is
+// then lost with no error. Without a second one the session stays deaf and every
+// notice stays pending -- which is what happened, for whole sessions.
+func TestChannelUnansweredProbeIsSentAgainAndAnyOfThemVerifies(t *testing.T) {
+	session, _ := channelFixture(t)
+	pendingNotice(t)
+	if n, e := channelSend("a", session, false); n != 1 || e != nil {
+		t.Fatal(n, e)
+	}
+	first, _ := readEndpoint("a")
+	if n, e := channelSend("a", session, false); n != 0 || e != nil {
+		t.Fatal("sent again before the first wait was over", n, e)
+	}
+	saved := reprobeAfter
+	reprobeAfter = []time.Duration{0, 0}
+	t.Cleanup(func() { reprobeAfter = saved })
+	for i := 0; i < 2; i++ {
+		if n, e := channelSend("a", session, false); n != 1 || e != nil {
+			t.Fatal("resend", i, n, e)
+		}
+	}
+	if n, e := channelSend("a", session, false); n != 0 || e != nil {
+		t.Fatal("sent again past the last wait", n, e)
+	}
+	ep, _ := readEndpoint("a")
+	probes := 0
+	for _, d := range ep.Events {
+		if strings.HasPrefix(d.Source, probePrefix(session)) {
+			probes++
+			if d.Status != "sent" {
+				t.Fatal(d)
+			}
+		} else if d.Status != "pending" {
+			t.Fatal("a notice left before any probe was acknowledged", d)
+		}
+	}
+	last := ep.Events[len(ep.Events)-1]
+	if probes != 3 || ep.ChannelProbe == first.ChannelProbe || last.ID != ep.ChannelProbe || !strings.Contains(last.Text, "sent again") || ep.ChannelReady {
+		t.Fatal(probes, ep)
+	}
+	// The first probe, answered late, still proves the connection.
+	if e := acknowledgeChannel("a", session, first.ChannelProbe); e != nil {
+		t.Fatal(e)
+	}
+	if !channelPreferred("a") {
+		t.Fatal("an earlier probe of this connection did not verify it")
+	}
+	if n, e := channelSend("a", session, false); n != 1 || e != nil {
+		t.Fatal("the held notice did not leave", n, e)
+	}
+	if e := acknowledgeChannel("a", session, ep.ChannelProbe); e != nil {
+		t.Fatal("answering a later probe afterwards is an error", e)
+	}
+}
+
+func TestChannelProbeOfAnotherConnectionNeverVerifies(t *testing.T) {
+	session, _ := channelFixture(t)
+	channelSend("a", session, false)
+	old, _ := readEndpoint("a")
+	if e := beginChannel("a", "session-two"); e != nil {
+		t.Fatal(e)
+	}
+	channelSend("a", "session-two", false)
+	if e := acknowledgeChannel("a", "session-two", old.ChannelProbe); e == nil {
+		t.Fatal("a probe of the old connection verified the new one")
+	}
+	ep, _ := readEndpoint("a")
+	if ep.ChannelReady {
+		t.Fatal(ep)
+	}
+	saved := reprobeAfter
+	reprobeAfter = []time.Duration{0}
+	t.Cleanup(func() { reprobeAfter = saved })
+	channelSend("a", "session-two", false)
+	now, _ := readEndpoint("a")
+	if now.ChannelProbe == ep.ChannelProbe {
+		t.Fatal("no second probe")
+	}
+	if e := AckDelivery("a", ep.ChannelProbe); e == nil {
+		t.Fatal("an ordinary ack closed a probe of the live connection")
+	}
+	if e := AckDelivery("a", old.ChannelProbe); e != nil {
+		t.Fatal("a dead connection's probe is history and may be closed", e)
+	}
+}
+
+func TestChannelWaitingAndThePersonsReprobe(t *testing.T) {
+	session, _ := channelFixture(t)
+	pendingNotice(t)
+	ep, _ := readEndpoint("a")
+	if _, _, ok := channelWaiting("a", ep); ok {
+		t.Fatal("waiting on a probe that was never written")
+	}
+	channelSend("a", session, false)
+	ep, _ = readEndpoint("a")
+	first := ep.ChannelProbe
+	since, held, ok := channelWaiting("a", ep)
+	if !ok || held != 1 || time.Since(since) > time.Minute || time.Since(since) < 0 {
+		t.Fatal(since, held, ok)
+	}
+	if sent, e := ReprobeUnverified("a", "too soon"); sent || e != nil {
+		t.Fatal("stacked a probe on one that is not overdue", sent, e)
+	}
+	saved := probeOverdue
+	probeOverdue = 0
+	t.Cleanup(func() { probeOverdue = saved })
+	if sent, e := ReprobeUnverified("a", "sent again from the switchboard by michal"); !sent || e != nil {
+		t.Fatal(sent, e)
+	}
+	if sent, e := ReprobeUnverified("a", "pressed twice"); sent || e != nil {
+		t.Fatal("stacked a probe on one that is not written yet", sent, e)
+	}
+	if n, e := channelSend("a", session, false); n != 1 || e != nil {
+		t.Fatal(n, e)
+	}
+	ep, _ = readEndpoint("a")
+	if last := ep.Events[len(ep.Events)-1]; last.ID != ep.ChannelProbe || !strings.Contains(last.Text, "switchboard by michal") {
+		t.Fatal(last)
+	}
+	// The session answers the FIRST probe. The newest one still reads "sent",
+	// and that must not make the connection look stuck or open it to a re-probe.
+	if e := acknowledgeChannel("a", session, first); e != nil {
+		t.Fatal(e)
+	}
+	ep, _ = readEndpoint("a")
+	if _, _, ok := channelWaiting("a", ep); ok {
+		t.Fatal("a verified channel is not waiting")
+	}
+	if sent, e := ReprobeUnverified("a", "verified"); sent || e != nil || !channelPreferred("a") {
+		t.Fatal("a re-probe took readiness from a verified connection", sent, e)
+	}
+}
+
+func TestSwitchboardShowsADeafSessionAndReprobesIt(t *testing.T) {
+	session, _ := channelFixture(t)
+	pendingNotice(t)
+	channelSend("a", session, false)
+	v := &view{by: "michal", st: loadState(), follow: true}
+	if board := strings.Join(v.dashboard(80, palette{}), "\n"); strings.Contains(board, "channel unverified") {
+		t.Fatal("a probe written a moment ago is not overdue:\n" + board)
+	}
+	saved := probeOverdue
+	probeOverdue = 0
+	t.Cleanup(func() { probeOverdue = saved })
+	board := strings.Join(v.dashboard(80, palette{}), "\n")
+	for _, want := range []string{"channel unverified", "1 held", "P re-probes"} {
+		if !strings.Contains(board, want) {
+			t.Fatalf("no %q on the board:\n%s", want, board)
+		}
+	}
+	v.key('P')
+	if !strings.HasPrefix(v.flash, "re-probed a ") || !v.wantLoad {
+		t.Fatal(v.flash)
+	}
+	if n, e := channelSend("a", session, false); n != 1 || e != nil {
+		t.Fatal(n, e)
+	}
+	ep, _ := readEndpoint("a")
+	if !strings.Contains(ep.Events[len(ep.Events)-1].Text, "sent again from the switchboard by michal") {
+		t.Fatal(ep.Events[len(ep.Events)-1])
+	}
+	if e := acknowledgeChannel("a", session, ep.ChannelProbe); e != nil {
+		t.Fatal(e)
+	}
+	v.st = loadState()
+	if board = strings.Join(v.dashboard(80, palette{}), "\n"); strings.Contains(board, "channel unverified") {
+		t.Fatal("still shown after the probe was acknowledged:\n" + board)
+	}
+	v.key('P')
+	if v.flash != "no connected channel is waiting on an overdue probe" {
+		t.Fatal(v.flash)
 	}
 }

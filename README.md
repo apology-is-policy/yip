@@ -84,6 +84,14 @@ received probe through that connection before Channels becomes the preferred
 notification path. Each session needs its own probe; only one Channels server
 may own an agent identity at a time.
 
+The first probe is written the moment the connection opens, and a client that
+is not yet taking channel input drops it silently. Until a probe is
+acknowledged every notice is held, so an unanswered probe is followed by a
+fresh one a few times (after 15 s, 30 s, 1, 2 and 5 minutes). Any probe of the
+connection verifies it. If a session stays deaf, the switchboard says so on its
+desk ("channel unverified", with how long and how many notices are held), and
+`P` there, or `yip delivery probe` in the checkout, sends another.
+
 ```sh
 yip doctor --runtime claude-channels
 yip delivery status
@@ -278,6 +286,7 @@ attribution; it is not authentication of the person using the CLI.
 | `g`, `G`, `f` | Top, follow the end, toggle following |
 | `r` | Record human ratification on a call |
 | `d`, `a` | Select a dispute, arbitrate it |
+| `P` | Send a fresh probe to every session whose channel is connected but unverified |
 | `Enter`, `Esc` | Submit or cancel a prompt |
 | `Ctrl-L` | Repaint the whole screen, if something else wrote to the terminal |
 | `?`, `q` | Key help, quit |

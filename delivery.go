@@ -187,7 +187,7 @@ func AckDelivery(agent, id string) error {
 	return editEndpoint(agent, func(ep *Endpoint) error {
 		for i := range ep.Events {
 			if ep.Events[i].ID == id {
-				if ep.Runtime == "claude-channels" && ep.Events[i].ID == ep.ChannelProbe {
+				if ep.Runtime == "claude-channels" && (ep.Events[i].ID == ep.ChannelProbe || strings.HasPrefix(ep.Events[i].Source, probePrefix(ep.Thread))) {
 					return fmt.Errorf("use channel_ack through the receiving MCP session for the probe")
 				}
 				ep.Events[i].Status = "read"
@@ -268,6 +268,10 @@ func dispatchEndpoint(agent, runtime, session string, send deliverySender) (int,
 	// An unbound Codex endpoint has nowhere to send: events wait as pending.
 	if ep.Paused || Retired(agent) || (runtime == "codex" && ep.Thread == "") {
 		return 0, nil
+	}
+	// A fresh probe, if the last one went unanswered, leaves in this same pass.
+	if runtime == "claude-channels" {
+		reprobeUnanswered(&ep, time.Now())
 	}
 	var batch []int
 	var lines []string

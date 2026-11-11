@@ -351,6 +351,15 @@ func (v *view) dashboard(w int, p palette) []string {
 			glyph = v.activityGlyph()
 		}
 		out = append(out, p.text(color, glyph+" "+a)+p.text(p.muted, "  "+status))
+		// The session is connected and deaf: its probe was written and never
+		// answered, so every notice to it is held. Said here, where a person looks.
+		if wt, ok := v.st.waiting[a]; ok && time.Since(wt.since) >= probeOverdue {
+			line := "channel unverified " + span(time.Since(wt.since))
+			if wt.held > 0 {
+				line += fmt.Sprintf(" · %d held", wt.held)
+			}
+			out = append(out, "  "+p.text(p.red, trunc(line+" · P re-probes", w-2)))
+		}
 		if line := v.roadmapOneLine(a); line != "" {
 			out = append(out, "  "+p.text(p.amber, trunc(line, w-2)))
 		}
