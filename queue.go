@@ -103,9 +103,16 @@ func QueueHistory(name string) (string, error) {
 
 // Called only under resourceGuard. Offer expiry relinquishes queued interest,
 // never a lease. Reads do not renew requests or manufacture agent activity.
+// An expired lease that is offerable is offered like an unheld resource.
 func advanceOffers(name string) error {
-	if _, held := LoadLease(name); held {
+	l, held, err := readLease(name)
+	if err != nil {
 		return nil
+	}
+	if held {
+		if _, ok := l.offerable(); !ok {
+			return nil
+		}
 	}
 	for {
 		q := Queue(name)
@@ -128,6 +135,24 @@ func advanceOffers(name string) error {
 			return e
 		}
 	}
+}
+
+// withdrawOffers voids every standing offer. Called under resourceGuard when
+// an offer stops being true (the holder of an offerable lease came back) and
+// before a release offers the resource afresh: an offer overtaken by a held
+// lease would otherwise meet the release with its window long gone, and the
+// waiter would lose its place for a claim it was never able to make.
+func withdrawOffers(name string) error {
+	for _, q := range Queue(name) {
+		if q.Offered == "" {
+			continue
+		}
+		q.Offered = ""
+		if e := saveRequest(name, q); e != nil {
+			return e
+		}
+	}
+	return nil
 }
 func Request(name, agent, reason string, ttl time.Duration, pids []int) (bool, Lease, int, error) {
 	if err := validatePids(pids); err != nil {

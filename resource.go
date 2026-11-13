@@ -30,9 +30,17 @@ package main
 //     only, from a TTL the holder chooses, and it is a backstop against a dead
 //     agent rather than a normal path.
 //
-//  2. AN EXPIRED LEASE IS NOT AN OPEN ONE. It has to be taken deliberately, by
-//     `steal`, which records who did it and why. A lease that silently evaporates
-//     recreates the original bug with a timer attached.
+//  2. AN EXPIRED LEASE IS NOT AN OPEN ONE. It stays its holder's until one of
+//     two recorded things happens: someone takes it deliberately, by `steal`,
+//     or it has been expired for expiredGrace and the head of the queue asks
+//     (Lease.offerable). Both need every registered runner VERIFIED dead --
+//     alive or unknown keeps the lease -- and both write an event carrying
+//     that evidence, mark the new lease as taken from the old holder, and
+//     tell the old holder. A lease that silently evaporates recreates the
+//     original bug with a timer attached; this one does not evaporate, it
+//     changes hands on the record. The second path exists because an expired
+//     lease whose holder had gone stopped the whole queue until somebody
+//     noticed (operator's decision, 2026-11-13).
 //
 // WHAT THIS DELIBERATELY DOES NOT DO: it grants no licence to kill a peer's
 // processes. Holding a resource means nobody else STARTS; it does not mean
@@ -55,6 +63,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -158,6 +167,12 @@ const (
 	// Since (so re-issuing a bounded wait KEEPS your position), while Seen
 	// prunes agents that walked away -- two fields because one cannot do both.
 	queueStaleAfter = 15 * time.Minute
+	// How long past its TTL a lease stays out of the queue's reach. The TTL is
+	// the holder's own estimate, so the grace is what a holder who is alive and
+	// merely late has to renew in.
+	expiredGrace = 10 * time.Minute
+	// A lease refused for a live runner is not probed again for this long.
+	offerProbeEvery = 5 * time.Second
 )
 
 // Observation fails closed: an unreadable lease is never rendered FREE.
@@ -207,8 +222,75 @@ func (l Lease) Remaining() time.Duration {
 }
 
 // Expired means the TTL ran out. It does NOT mean the resource is free: see
-// the file header. Only Steal converts an expired lease into a held one.
+// the file header. Steal converts an expired lease into a held one, and so
+// does the head of the queue once the lease is offerable.
 func (l Lease) Expired() bool { return l.Remaining() <= 0 }
+
+// runnersDead is the evidence both recoveries need: every registered pid has
+// a recorded identity and every one of them is verified dead. Alive and
+// unknown both refuse -- failing to observe a runner is not observing its death.
+func (l Lease) runnersDead() error {
+	if len(l.Pids) > len(l.Runners) {
+		return fmt.Errorf("legacy runner identities unknown")
+	}
+	for _, r := range l.Runners {
+		if !strings.HasPrefix(runnerStatus(r), "dead") {
+			return fmt.Errorf("runner %d alive or unknown", r.PID)
+		}
+	}
+	return nil
+}
+
+// A waiter polls four times a second and every probe of a live runner is a
+// `ps`. Only the refusal is remembered, so a stale entry can delay an offer
+// and can never make one.
+var (
+	offerMu      sync.Mutex
+	offerRefused = map[string]time.Time{}
+)
+
+// offerable says whether an expired lease may pass to the head of the queue
+// without a steal, and gives the reason that is recorded when it does.
+func (l Lease) offerable() (string, bool) {
+	over := -l.Remaining()
+	if l.Holder == "" || over < expiredGrace {
+		return "", false
+	}
+	key := fmt.Sprintf("%s|%s|%s|%s|%v", l.Resource, l.Holder, l.Since, l.Renewed, l.Pids)
+	offerMu.Lock()
+	at, refused := offerRefused[key]
+	offerMu.Unlock()
+	if refused && time.Since(at) < offerProbeEvery {
+		return "", false
+	}
+	if l.runnersDead() != nil {
+		offerMu.Lock()
+		for k, t := range offerRefused {
+			if time.Since(t) >= offerProbeEvery {
+				delete(offerRefused, k)
+			}
+		}
+		offerRefused[key] = time.Now()
+		offerMu.Unlock()
+		return "", false
+	}
+	what := "none was registered"
+	if n := len(l.Runners); n > 0 {
+		what = fmt.Sprintf("all %d registered are verified dead", n)
+	}
+	return fmt.Sprintf("TTL ran out %s ago and no runner is alive (%s)", span(over), what), true
+}
+
+// expiryOutlook says what happens next to an expired lease.
+func (l Lease) expiryOutlook() string {
+	if e := l.runnersDead(); e != nil {
+		return fmt.Sprintf("%v, so it is not passed on -- ask them, or the operator", e)
+	}
+	if over := -l.Remaining(); over < expiredGrace {
+		return fmt.Sprintf("no registered runner is alive, so it passes to the head of the queue in %s unless they renew -- or `steal` it with a reason now", span(expiredGrace-over))
+	}
+	return "no registered runner is alive, so it passes to the head of the queue when the head next asks"
+}
 
 // ------------------------------------------------------------------- queue
 
@@ -375,12 +457,35 @@ func TryAcquire(name, agent, reason string, ttl time.Duration, pids []int) (got 
 				return false, l, 0, e
 			}
 			dropQueue(name, agent)
+			if e := withdrawOffers(name); e != nil {
+				fmt.Fprintf(os.Stderr, "yip: lease renewed; withdrawing a standing offer failed: %v\n", e)
+			}
 			return true, l, 0, nil
 		}
 		if err := touchQueue(name, agent, reason); err != nil {
 			return false, Lease{}, 0, err
 		}
-		return false, l, queuePosition(name, agent), nil
+		if q := Queue(name); len(q) == 0 || q[0].Agent != agent {
+			return false, l, queuePosition(name, agent), nil
+		}
+		why, ok := l.offerable()
+		if !ok {
+			return false, l, queuePosition(name, agent), nil
+		}
+		if err := checkResourceAdmission(name); err != nil {
+			return false, Lease{}, 0, err
+		}
+		if err := recordResourceEvent(name, agent, "expired lease passed to the queue: "+why, l, l.Runners); err != nil {
+			return false, Lease{}, 0, err
+		}
+		nl := Lease{Resource: name, Holder: agent, Reason: reason, Since: now(), TTLSecs: int(ttl / time.Second),
+			Pids: pids, Runners: captureRunners(pids), StolenFrom: l.Holder, StealWhy: why}
+		b, _ := json.MarshalIndent(nl, "", "  ")
+		if err := atomicReplace(leasePath(name), append(b, '\n')); err != nil {
+			return false, l, 0, err
+		}
+		dropQueue(name, agent)
+		return true, nl, 0, nil
 	}
 
 	if err := checkResourceAdmission(name); err != nil {
@@ -454,7 +559,11 @@ func Release(name, agent string) (Lease, error) {
 		return l, err
 	}
 	dropQueue(name, agent)
-	if err := advanceOffers(name); err != nil {
+	err := withdrawOffers(name)
+	if err == nil {
+		err = advanceOffers(name)
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "yip: resource released; offering queue failed: %v\n", err)
 	}
 	return l, nil
@@ -485,13 +594,8 @@ func Steal(name, agent, why string) (Lease, error) {
 		return l, fmt.Errorf("%s is held by %s with %s still to run -- not stealable. Ask them, or wait",
 			name, l.Holder, span(l.Remaining()))
 	}
-	if len(l.Pids) > len(l.Runners) {
-		return l, fmt.Errorf("legacy runner identities unknown; coordinate with holder/operator")
-	}
-	for _, r := range l.Runners {
-		if !strings.HasPrefix(runnerStatus(r), "dead") {
-			return l, fmt.Errorf("runner %d alive or unknown; coordinate with holder/operator", r.PID)
-		}
+	if e := l.runnersDead(); e != nil {
+		return l, fmt.Errorf("%v; coordinate with holder/operator", e)
 	}
 	if err := recordResourceEvent(name, agent, "recovery requested: "+why, l, l.Runners); err != nil {
 		return l, err
@@ -548,8 +652,8 @@ func ResourcesText(me string) string {
 		case !held:
 			fmt.Fprintf(&b, "%-5s FREE\n", r.Name)
 		case l.Expired():
-			fmt.Fprintf(&b, "%-5s EXPIRED -- %s held it %s, TTL ran out %s ago. Not free: `steal` it with a reason, or ask them.\n",
-				r.Name, l.Holder, span(l.Age()), span(-l.Remaining()))
+			fmt.Fprintf(&b, "%-5s EXPIRED -- %s held it %s, TTL ran out %s ago. Not free: %s.\n",
+				r.Name, l.Holder, span(l.Age()), span(-l.Remaining()), l.expiryOutlook())
 		default:
 			who := l.Holder
 			if who == me {
@@ -592,16 +696,21 @@ func ResourcesText(me string) string {
 // working elsewhere, and asking.
 func HoldText(name, me string, got bool, cur Lease, pos int, waited time.Duration) string {
 	if got {
-		return fmt.Sprintf("HELD: %s is yours for %s.\n"+
+		s := fmt.Sprintf("HELD: %s is yours for %s.\n"+
 			"Release it the moment the RESOURCE frees, not when your workflow finishes -- "+
 			"pushing and writing up need no cores, and a peer idles the whole time.\n"+
 			"  yip release %s", name, span(cur.Remaining()), name)
+		if cur.StolenFrom != "" && cur.Renewed == "" {
+			s += fmt.Sprintf("\nIt came from %s's expired lease: %s. They are told. Only registered runners were "+
+				"checked, so look for work of theirs still running before you start.", cur.StolenFrom, cur.StealWhy)
+		}
+		return s
 	}
 	if cur.Holder != "" && cur.Expired() {
 		return fmt.Sprintf("NOT HELD: %s's lease on %s EXPIRED %s ago (%s).\n"+
 			"An expired lease is not an open one -- they may be alive and quiet, since a heartbeat "+
-			"tracks turns, not work.\nAsk them first; if there is no answer: yip steal %s \"<why>\"",
-			cur.Holder, name, span(-cur.Remaining()), cur.Reason, name)
+			"tracks turns, not work.\nWhat happens next: %s. You are #%d in the queue.",
+			cur.Holder, name, span(-cur.Remaining()), cur.Reason, cur.expiryOutlook(), pos)
 	}
 	if cur.Holder != "" {
 		return fmt.Sprintf("WAITING: %s is held by %s (%s), about %s left. You are #%d in the queue after %s.\n"+

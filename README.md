@@ -483,9 +483,15 @@ yip hold builder 'Run the host suite' --for 10m --wait 1m
 ```
 
 Release when the resource work finishes. Phase/PID updates do not renew a lease;
-reacquiring your own lease renews it. An **expired lease remains owned** until
-explicit recovery. `yip steal RESOURCE REASON` requires verified-dead registered
-runners; live or unknown runners require coordination. A lease never authorizes
+reacquiring your own lease renews it. An **expired lease remains owned** until it
+is recovered, and there are two recoveries. `yip steal RESOURCE REASON` takes it
+at once. Otherwise, once it has been expired for ten minutes, it passes to the
+head of the queue the next time the head asks with `hold` or `request`. Both
+require every registered runner to be verified dead (a lease that registered none
+has none alive); a live or unknown runner keeps the lease, however late, and needs
+coordination. Both are recorded as a resource event with the runner evidence, mark
+the new lease as taken from the old holder, and notify the old holder. A holder
+who is merely late renews inside the ten minutes. A lease never authorizes
 killing another agent's jobs.
 
 Resource events wake only the agents they concern: those queued for that resource

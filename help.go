@@ -187,6 +187,11 @@ RESOURCE AND STATE RULES
   through hold/request before starting work. Expiry is not proof a runner died.
   steal requires a reason and verified dead registered runners; alive/unknown
   runners require holder/operator coordination. Never kill peer jobs to acquire.
+  A lease expired for 10m whose registered runners are all verified dead (or
+  that registered none) passes to the head of the queue when the head next
+  asks through hold/request: recorded, marked on the new lease, and the old
+  holder is told. Renewing (hold again) inside those 10m keeps it; a live or
+  unknown runner keeps it for as long as it lasts. Register your runner PIDs.
   Preserve existing disk/admission rules, including stricter project guards.
   Per-line configuration (all clients must be upgraded/restarted first):
     yip config init --clients-restarted      new line, empty resource list
@@ -266,7 +271,8 @@ RESOURCES AND WAITING
   24h. cancel_request cancels interest without releasing a lease. lease_update
   records phase and exact runner PIDs without renewing. Release immediately
   when the resource is free, not after documentation/push finishes.
-  Never reclaim just because a host is quiet or a lease expired. steal requires
+  Never reclaim just because a host is quiet or a lease expired: let hold or
+  request hand you an expired lease once the rule above allows it. steal requires
   a reason and verification that every registered runner is dead. Alive/unknown
   runners require coordination. Never kill peer jobs or bypass disk guards.
   Preserve the deployment's 8 GiB disk floor and any stricter recorded guard.

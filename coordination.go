@@ -16,7 +16,7 @@ import (
 // New agent operations use the same dispatch from MCP and `yip api`.
 func coordinationTools() []toolDef {
 	return append(deliveryTools(), []toolDef{
-		{Name: "steal", Description: "Explicit expired-lease recovery. Requires a recorded reason, all registered runners verified dead, and peer notification. Alive or unknown runners require holder/operator coordination. Never kills jobs.", InputSchema: obj(map[string]any{"resource": str("Resource"), "reason": str("Recovery evidence and reason")}, "resource", "reason")},
+		{Name: "steal", Description: "Explicit expired-lease recovery. Requires a recorded reason, all registered runners verified dead, and peer notification. Alive or unknown runners require holder/operator coordination. Never kills jobs. Seldom needed: a lease expired for 10m with no registered runner alive passes to the head of the queue when the head next asks, recorded the same way.", InputSchema: obj(map[string]any{"resource": str("Resource"), "reason": str("Recovery evidence and reason")}, "resource", "reason")},
 		{Name: "inbox", Description: "Compact call/notes digest; stale calls stay unresolved without blocking. all includes history.", InputSchema: obj(map[string]any{"all": yesno("Include stale and resolved history")})},
 		{Name: "call_status", Description: "Explicitly resolve, defer, archive, reopen (open) or link a call. Reason is durable; archive does not resolve. Notes are FYIs and never need this just to avoid a reply.", InputSchema: obj(map[string]any{"call": str("Call id"), "state": str("open, resolved, deferred, archived, linked"), "reason": str("Why"), "related": str("Other call for linked")}, "call", "state", "reason")},
 		{Name: "request", Description: "Nonblocking durable resource request; returns HELD only after acquisition, otherwise queues for 24h. Watch for changes, then call again to claim. An available queue head has a 2m offer window. No permission to work while queued. Requires upgraded resource clients.", InputSchema: obj(map[string]any{"resource": str("Configured resource name; use resources to list"), "reason": str("Purpose"), "ttl_s": num("Lease duration, default 2h"), "pids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}}, "resource", "reason")},
@@ -93,8 +93,17 @@ func coordinationCall(me, name string, a map[string]any) (string, bool, error) {
 		l.Pids = argInts(a, "pids")
 		l.Runners = captureRunners(l.Pids)
 		b, _ := json.MarshalIndent(l, "", "  ")
-		e = atomicReplace(leasePath(n), append(b, '\n'))
-		return "phase and runners updated", true, e
+		if e = atomicReplace(leasePath(n), append(b, '\n')); e != nil {
+			return "", true, e
+		}
+		out := "phase and runners updated"
+		if l.Expired() {
+			out += fmt.Sprintf("\nNOT RENEWED, and this lease's TTL ran out %s ago: %s. Hold %s again to renew it.", span(-l.Remaining()), l.expiryOutlook(), n)
+			if _, ok := l.offerable(); !ok {
+				e = withdrawOffers(n)
+			}
+		}
+		return out, true, e
 	}
 	return "", false, nil
 }
