@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -118,7 +119,13 @@ func TestLifecycleDoesNotResolveByAge(t *testing.T) {
 	AppendTurn(c, "a", "please decide", false)
 	files, _ := filepath.Glob(filepath.Join(c.Dir(), "turns", "*.md"))
 	b, _ := os.ReadFile(files[0])
-	b = []byte(strings.ReplaceAll(string(b), now(), time.Now().Add(-72*time.Hour).UTC().Format(time.RFC3339)))
+	// Backdate the stamp the turn carries. Matching it against now() instead
+	// misses whenever the second turned over since the turn was written.
+	stamp := regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z`)
+	if !stamp.Match(b) {
+		t.Fatalf("the turn carries no time stamp: %s", b)
+	}
+	b = stamp.ReplaceAll(b, []byte(time.Now().Add(-72*time.Hour).UTC().Format(time.RFC3339)))
 	os.WriteFile(files[0], b, 0600)
 	turns, _ := Turns(c)
 	if CallStatus(c, turns) != "stale" || IsClosed(c) {
