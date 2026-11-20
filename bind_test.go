@@ -342,7 +342,11 @@ func TestBindCannotLandBetweenAWaitersCheckAndItsDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	var checked atomic.Bool
-	alive := func() bool { me, err := boundIdentity("claude"); checked.Store(true); return err == nil && me == "claude" }
+	alive := func() bool {
+		me, err := boundIdentity("claude")
+		checked.Store(true)
+		return err == nil && me == "claude"
+	}
 	done := make(chan int, 1)
 	go func() { done <- RunRewake("claude", 5*time.Second, "", &bytes.Buffer{}, alive, 10*time.Millisecond) }()
 	waitFor(t, "waiter past its identity check", checked.Load)
