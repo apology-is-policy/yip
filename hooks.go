@@ -46,11 +46,20 @@ func emit(v any) {
 func RunHook(event string, override string) { RunHookRuntime(event, override, "claude") }
 func RunHookRuntime(event string, override string, runtime string) {
 	in := readHookInput()
-	me, err := WhoAmI(override, in.Cwd)
-	if err != nil {
+	if _, err := os.Stat(Root()); err != nil {
 		return
 	}
-	if _, err := os.Stat(Root()); err != nil {
+	// A Claude session's boundary is recorded before anything resolves an
+	// identity for it, or a session started inside a bound one would be told
+	// that session's business at its first SessionStart.
+	if runtime != "codex" && strings.EqualFold(event, "sessionstart") {
+		launch, err := launchIdentity(override, in.Cwd)
+		if err != nil || registerSession(hookSession(), launch) != nil {
+			return
+		}
+	}
+	me, err := WhoAmI(override, in.Cwd)
+	if err != nil {
 		return
 	}
 	var result any

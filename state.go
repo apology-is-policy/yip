@@ -66,10 +66,14 @@ func WhoAmI(override, cwd string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// By path, a bound worktree's folder names the identity another live
-	// session speaks for; a shell there that is not that session is not it.
+	// By path, a bound worktree's folder names the identity a live session
+	// speaks for; a process there whose nearest session is not that one --
+	// another session's shell, a session started inside it -- is not it.
 	if me == launch && override == "" && os.Getenv("YIP_AGENT") == "" {
-		if bd, ok := liveBinding(launch); ok && !descendsFrom(bd.Session) {
+		if bd, ok := liveBinding(launch); ok {
+			if ns, found := nearestSession(); found && ns == bd.Session {
+				return me, nil
+			}
 			return "", fmt.Errorf("%s is bound by another live Claude session (pid %d); this process is not that session -- pass --as NAME", launch, bd.Session.PID)
 		}
 	}

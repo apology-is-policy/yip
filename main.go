@@ -221,8 +221,7 @@ func main() {
 	case "delivery":
 		check(DeliveryCLI(args, must(WhoAmI(as, ""))))
 	case "api":
-		launch := must(launchIdentity(as, ""))
-		me := must(boundIdentity(launch))
+		me := must(WhoAmI(as, ""))
 		if len(args) == 0 {
 			check(fmt.Errorf("usage: yip api TOOL [JSON]; api list lists agent tools"))
 		}
@@ -242,7 +241,7 @@ func main() {
 			raw = []byte("{}")
 		}
 		check(json.Unmarshal(raw, &a))
-		out, err := (&server{me: me, launch: launch, cli: true}).call(args[0], a)
+		out, err := (&server{me: me, cli: true}).call(args[0], a)
 		result := map[string]any{"ok": err == nil, "result": out}
 		if err != nil {
 			result["error"] = err.Error()

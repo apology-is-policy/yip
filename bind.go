@@ -109,12 +109,32 @@ var procAlive = func(p procID) bool {
 }
 
 // parentSession is the Claude session of a process Claude started directly
-// -- the MCP server, an exec'd rewake hook: its parent. Zero without /proc.
+// -- the MCP server: its parent. Zero without /proc.
 func parentSession() procID {
 	if anc := processAncestors(); len(anc) > 0 {
 		return anc[0]
 	}
 	return procID{}
+}
+
+var procCmdline = func(pid int) string {
+	b, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline")
+	return string(b)
+}
+
+// hookSession is the Claude session a hook runs for. Claude runs the hook
+// command in a shell: if the command exec'd yip, the parent is Claude; if
+// not, the parent is that shell -- its command line carries the hook marker
+// -- and Claude is the shell's parent.
+func hookSession() procID {
+	anc := processAncestors()
+	if len(anc) == 0 {
+		return procID{}
+	}
+	if len(anc) > 1 && strings.Contains(procCmdline(anc[0].PID), hookMarker) {
+		return anc[1]
+	}
+	return anc[0]
 }
 
 func sessionsDir() string { return filepath.Join(Root(), "sessions") }
@@ -131,7 +151,9 @@ type sessionRecord struct {
 }
 
 // registerSession records p as a Claude session, and forgets sessions that
-// have exited. Idempotent: the MCP server and every rewake hook re-register.
+// have exited -- under one guard, so a prune cannot remove a record that a
+// registrar has just replaced. Idempotent: the MCP server, the SessionStart
+// hook and every rewake hook register.
 func registerSession(p procID, launch string) error {
 	if p.PID <= 1 {
 		return nil
@@ -139,11 +161,16 @@ func registerSession(p procID, launch string) error {
 	if err := os.MkdirAll(sessionsDir(), 0o755); err != nil {
 		return err
 	}
+	unlock, err := fileGuard(filepath.Join(sessionsDir(), "registry"))
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if entries, err := os.ReadDir(sessionsDir()); err == nil {
 		for _, e := range entries {
 			var r sessionRecord
 			path := filepath.Join(sessionsDir(), e.Name())
-			if readState(path, &r) == nil && (r.Boot != bootID() || !procAlive(r.Session)) {
+			if strings.HasSuffix(e.Name(), ".json") && readState(path, &r) == nil && (r.Boot != bootID() || !procAlive(r.Session)) {
 				_ = os.Remove(path)
 			}
 		}
@@ -154,9 +181,28 @@ func registerSession(p procID, launch string) error {
 	return writeState(sessionPath(p), sessionRecord{Session: p, Boot: bootID(), Launch: launch, Registered: now()})
 }
 
+// isRegistered: p is a Claude session boundary. A record that exists but
+// cannot be read still marks one -- crossing it could inherit an outer
+// binding -- unless it reads as another boot's.
 func isRegistered(p procID) bool {
+	if _, err := os.Stat(sessionPath(p)); err != nil {
+		return false
+	}
 	var r sessionRecord
-	return readState(sessionPath(p), &r) == nil && r.Session == p && r.Boot == bootID()
+	if readState(sessionPath(p), &r) != nil {
+		return true
+	}
+	return r.Session == p && r.Boot == bootID()
+}
+
+// nearestSession is the closest registered Claude session above this process.
+func nearestSession() (procID, bool) {
+	for _, a := range processAncestors() {
+		if isRegistered(a) {
+			return a, true
+		}
+	}
+	return procID{}, false
 }
 
 func loadBindingsStrict() (Bindings, error) {
@@ -201,15 +247,6 @@ func boundIdentity(launch string) (string, error) {
 		}
 	}
 	return launch, nil
-}
-
-func descendsFrom(p procID) bool {
-	for _, a := range processAncestors() {
-		if a == p {
-			return true
-		}
-	}
-	return false
 }
 
 // liveBinding: the session currently speaking for name, if any.

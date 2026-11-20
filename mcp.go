@@ -266,6 +266,7 @@ type server struct {
 	me           string
 	launch       string // a Claude connection: the identity it started as, which bind can replace
 	session      procID // a Claude connection: the session (its parent) when the server started
+	regErr       error  // registering that session failed: refuse to act rather than guess
 	cli          bool   // yip api: resolves a binding but cannot make one
 	enc          *json.Encoder
 	writeMu      sync.Mutex
@@ -303,9 +304,7 @@ func serveIO(me, mode string, input io.Reader, output io.Writer) error {
 	channels := mode == serveChannels
 	s := &server{me: me, enc: json.NewEncoder(output), channelMode: channels, codexMode: mode == serveCodex, started: time.Now()}
 	if mode == serveClaude {
-		s.launch = me // each tool call resolves what this session answers to now
-		s.session = parentSession()
-		_ = registerSession(s.session, me)
+		s.startClaude(me)
 	}
 	s.cwd, _ = os.Getwd()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -515,7 +514,18 @@ func body(a map[string]any) (string, error) {
 
 // ----------------------------------------------------------------- actions
 
+// startClaude: a Claude connection resolves its identity per call, and
+// registers its session -- its parent -- as a boundary for that resolution.
+func (s *server) startClaude(launch string) {
+	s.launch = launch
+	s.session = parentSession()
+	s.regErr = registerSession(s.session, launch)
+}
+
 func (s *server) call(name string, a map[string]any) (string, error) {
+	if s.regErr != nil {
+		return "", fmt.Errorf("yip could not register this Claude session (%v), so it cannot tell which name it answers to; restart the session once that is fixed", s.regErr)
+	}
 	if s.launch != "" {
 		me, err := boundIdentity(s.launch)
 		if err != nil {

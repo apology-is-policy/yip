@@ -7,6 +7,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -701,6 +702,7 @@ func TestAContenderReadsTheCurrentHoldersOwner(t *testing.T) {
 func TestAShellInAnotherSessionsBoundFolderIsRefused(t *testing.T) {
 	_, wt := seedSharedLaunch(t, "wt-one")
 	t.Setenv("YIP_AGENT", "")
+	t.Setenv("CODEX_THREAD_ID", "") // run from inside Codex, it would name a Codex chat
 	fakeProcs(t, []procID{sessionA}, sessionA, sessionB)
 	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
 		t.Fatal(err)
@@ -711,6 +713,11 @@ func TestAShellInAnotherSessionsBoundFolderIsRefused(t *testing.T) {
 	processAncestors = func() []procID { return []procID{sessionB} }
 	if me, err := WhoAmI("", wt); err == nil {
 		t.Fatal("another session's shell in the bound folder answered as", me)
+	}
+	// B started inside A: A is an ancestor, but B is the nearest session.
+	processAncestors = func() []procID { return []procID{{PID: 9, Start: "1"}, sessionB, sessionA} }
+	if me, err := WhoAmI("", wt); err == nil {
+		t.Fatal("a session nested in the binder answered as its worktree:", me)
 	}
 	if me, err := WhoAmI("wt-one", wt); err != nil || me != "wt-one" {
 		t.Fatal("an explicit --as is still honoured:", me, err)
@@ -734,5 +741,127 @@ func TestWatchStopsWhenItsSessionRebinds(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("watch kept streaming the name its session left")
+	}
+}
+
+// Review round 4 (Codex call 0007): one regression each.
+
+func TestHookSessionFindsClaudeThroughTheHookShell(t *testing.T) {
+	seedSharedLaunch(t, "wt")
+	shell := procID{PID: 50, Start: "3"}
+	fakeProcs(t, []procID{shell, sessionB, sessionA}, sessionA, sessionB)
+	old := procCmdline
+	t.Cleanup(func() { procCmdline = old })
+	procCmdline = func(pid int) string {
+		if pid == shell.PID {
+			return "/bin/sh\x00-c\x00[ ! -x yip ] || yip hook sessionstart --as claude  # yip-line-hook"
+		}
+		return "claude"
+	}
+	if p := hookSession(); p != sessionB {
+		t.Fatal("hook through its shell:", p)
+	}
+	processAncestors = func() []procID { return []procID{sessionB, sessionA} } // exec'd
+	if p := hookSession(); p != sessionB {
+		t.Fatal("exec'd hook:", p)
+	}
+}
+
+// runHook runs a hook as Claude would: input on stdin, output from stdout.
+func runHook(t *testing.T, event string, in string) string {
+	t.Helper()
+	inR, inW, _ := os.Pipe()
+	outR, outW, _ := os.Pipe()
+	oldIn, oldOut := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = inR, outW
+	_, _ = inW.WriteString(in)
+	inW.Close()
+	RunHookRuntime(event, "claude", "claude")
+	os.Stdin, os.Stdout = oldIn, oldOut
+	outW.Close()
+	b, _ := io.ReadAll(outR)
+	return string(b)
+}
+
+func TestSessionStartRegistersItsSessionBeforeResolving(t *testing.T) {
+	launchDir, wt := seedSharedLaunch(t, "outer-wt")
+	shell := procID{PID: 50, Start: "3"}
+	fakeProcs(t, []procID{sessionA}, sessionA, sessionB)
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := NewCall("b", "outer-wt", "for A")
+	AppendTurn(c, "b", "your turn", false)
+	// B starts inside A; its MCP server has not registered it yet.
+	if err := os.Remove(sessionPath(sessionB)); err != nil {
+		t.Fatal(err)
+	}
+	processAncestors = func() []procID { return []procID{shell, sessionB, sessionA} }
+	old := procCmdline
+	t.Cleanup(func() { procCmdline = old })
+	procCmdline = func(pid int) string {
+		if pid == shell.PID {
+			return "sh -c yip hook sessionstart  # yip-line-hook"
+		}
+		return "claude"
+	}
+	out := runHook(t, "sessionstart", `{"cwd":"`+launchDir+`","hook_event_name":"SessionStart","source":"startup"}`)
+	if strings.Contains(out, c.ID) {
+		t.Fatal("a nested session was told the outer session's business:", out)
+	}
+	if !isRegistered(sessionB) {
+		t.Fatal("SessionStart did not register its session")
+	}
+}
+
+func TestAFailedRegistrationRefusesToActAndABadRecordIsABoundary(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "outer-wt")
+	fakeProcs(t, []procID{sessionA}, sessionA, sessionB)
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	// An unreadable record still marks B as a session: do not cross it.
+	if err := os.WriteFile(sessionPath(sessionB), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	processAncestors = func() []procID { return []procID{sessionB, sessionA} }
+	if me := whoami(t, "claude"); me != "claude" {
+		t.Fatal("crossed an unreadable session record into", me)
+	}
+	// A server that could not register refuses to act at all.
+	if err := os.Remove(sessionPath(sessionB)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sessionsDir(), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sessionsDir(), 0o755) })
+	s := &server{me: "claude"}
+	s.startClaude("claude")
+	if s.regErr == nil {
+		t.Skip("registry directory still writable (running as root?)")
+	}
+	if out, err := s.call("busy", map[string]any{"text": "inner B's work"}); err == nil {
+		t.Fatal("an unregistered session acted:", out)
+	}
+}
+
+func TestPruningAndRegistrationAreSerialised(t *testing.T) {
+	seedSharedLaunch(t, "wt")
+	fakeProcs(t, nil, sessionA, sessionB)
+	guard, err := fileGuard(filepath.Join(sessionsDir(), "registry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- registerSession(procID{PID: 4600, Start: "22"}, "claude") }()
+	select {
+	case <-done:
+		t.Fatal("registered while another registrar held the registry")
+	case <-time.After(100 * time.Millisecond):
+	}
+	guard()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

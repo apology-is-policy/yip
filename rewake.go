@@ -164,7 +164,9 @@ func RunRewakeHook(override string, wait time.Duration) int {
 	if _, err := os.Stat(Root()); err != nil {
 		return 0
 	}
-	_ = registerSession(parentSession(), launch) // exec'd: the parent is the session
+	if registerSession(hookSession(), launch) != nil {
+		return 0
+	}
 	me, err := boundIdentity(launch)
 	if err != nil {
 		return 0
