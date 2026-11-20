@@ -22,6 +22,7 @@ package main
 // worse than useless -- it trains you to ignore the stream.
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -158,7 +159,11 @@ func firstLine(s string) string {
 // Exit codes are load-bearing for the --once shape: 0 means an event arrived,
 // 3 means the deadline passed with nothing. A caller that cannot tell those
 // apart will read silence as success.
-func Watch(me string, interval, deadline time.Duration, once, replay bool) error {
+// errWatchIdentity: the session this watch speaks for now answers to another
+// name -- it bound or unbound -- so these events are no longer its own.
+var errWatchIdentity = errors.New("this session now answers to another name; restart the watch")
+
+func Watch(me string, still func() bool, interval, deadline time.Duration, once, replay bool) error {
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
@@ -173,6 +178,9 @@ func Watch(me string, interval, deadline time.Duration, once, replay bool) error
 		until = time.Now().Add(deadline)
 	}
 	for {
+		if !still() {
+			return errWatchIdentity
+		}
 		var fresh []watchEvent
 		for k, line := range watchSnapshot(me) {
 			if !seen[k] {

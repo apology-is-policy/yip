@@ -265,6 +265,7 @@ func tools() []toolDef {
 type server struct {
 	me           string
 	launch       string // a Claude connection: the identity it started as, which bind can replace
+	session      procID // a Claude connection: the session (its parent) when the server started
 	cli          bool   // yip api: resolves a binding but cannot make one
 	enc          *json.Encoder
 	writeMu      sync.Mutex
@@ -303,6 +304,8 @@ func serveIO(me, mode string, input io.Reader, output io.Writer) error {
 	s := &server{me: me, enc: json.NewEncoder(output), channelMode: channels, codexMode: mode == serveCodex, started: time.Now()}
 	if mode == serveClaude {
 		s.launch = me // each tool call resolves what this session answers to now
+		s.session = parentSession()
+		_ = registerSession(s.session, me)
 	}
 	s.cwd, _ = os.Getwd()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -657,11 +660,12 @@ func (s *server) doBind(a map[string]any) (string, error) {
 	if s.launch == "" || s.cli {
 		return "", fmt.Errorf("bind is the Yip MCP tool of a Claude session (claude-rewake runtime or plain hooks); it is not available from Channels, Codex or the CLI")
 	}
-	session, err := claudeSession()
-	if err != nil {
-		return "", err
+	// The session that started this server -- not whatever is its parent now:
+	// a server orphaned by a dead session must not bind its new parent.
+	if s.session.PID <= 1 || !procAlive(s.session) {
+		return "", fmt.Errorf("bind needs the Claude session that started this server, and it has exited (or /proc is unavailable)")
 	}
-	res, err := Bind(s.launch, session, argStr(a, "worktree"), argStr(a, "as"))
+	res, err := Bind(s.launch, s.session, argStr(a, "worktree"), argStr(a, "as"))
 	if err != nil {
 		return "", err
 	}

@@ -62,7 +62,18 @@ func WhoAmI(override, cwd string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return boundIdentity(launch)
+	me, err := boundIdentity(launch)
+	if err != nil {
+		return "", err
+	}
+	// By path, a bound worktree's folder names the identity another live
+	// session speaks for; a shell there that is not that session is not it.
+	if me == launch && override == "" && os.Getenv("YIP_AGENT") == "" {
+		if bd, ok := liveBinding(launch); ok && !descendsFrom(bd.Session) {
+			return "", fmt.Errorf("%s is bound by another live Claude session (pid %d); this process is not that session -- pass --as NAME", launch, bd.Session.PID)
+		}
+	}
+	return me, nil
 }
 
 // launchIdentity resolves the calling agent from RECORDED membership keyed by
@@ -595,6 +606,9 @@ type Presence struct {
 	Busy     string `json:"busy,omitempty"`
 	Pids     []int  `json:"pids,omitempty"`
 	LastTool string `json:"last_tool,omitempty"`
+	// TipAt is when Tip and Branch were last measured -- not Beat, which
+	// every heartbeat renews whether or not it measured.
+	TipAt string `json:"tip_at,omitempty"`
 }
 
 func presencePath(agent string) string {
@@ -627,12 +641,17 @@ func Beat(agent, lastTool string) error {
 		return err
 	}
 	p, _ := LoadPresence(agent)
-	tip, branch := p.Tip, p.Branch
-	if p.Agent != agent || p.Age() >= presenceTipReuse {
+	measured, err := time.Parse(time.RFC3339, p.TipAt)
+	fresh := p.Agent != agent || err != nil || time.Since(measured) >= presenceTipReuse
+	var tip, branch string
+	if fresh {
 		tip, branch = GitTip(agent)
 	}
 	return updateJSON(presencePath(agent), func(p *Presence) error {
-		p.Agent, p.Tip, p.Branch, p.Beat = agent, tip, branch, now()
+		p.Agent, p.Beat = agent, now()
+		if fresh {
+			p.Tip, p.Branch, p.TipAt = tip, branch, p.Beat
+		}
 		if lastTool != "" {
 			p.LastTool = lastTool
 		}
@@ -647,6 +666,7 @@ func SetBusy(agent, text string, pids []int) error {
 	tip, branch := GitTip(agent)
 	return updateJSON(presencePath(agent), func(p *Presence) error {
 		p.Agent, p.Tip, p.Branch, p.Beat = agent, tip, branch, now()
+		p.TipAt = p.Beat
 		p.Busy, p.Pids = text, pids
 		return nil
 	})

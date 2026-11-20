@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -90,7 +91,8 @@ WAITING WITHOUT POLLING
   yip watch --timeout 30s   give up waiting (default 10m with --once, else never)
 
   Exit 0 = an event arrived. Exit 3 = the deadline passed with nothing, which
-  is NOT the same as success and must not be read as it.
+  is NOT the same as success and must not be read as it. Exit 4 = the session
+  now answers to another name (it bound or unbound): restart the watch.
 
   Nobody should poll in a shell. Arm it and be woken:
 
@@ -567,6 +569,8 @@ func main() {
 		fmt.Printf("ratification %d recorded on %s as %s (human)\n", n, c.ID, by)
 	case "watch":
 		me := must(WhoAmI(as, ""))
+		launch := must(launchIdentity(as, ""))
+		still := func() bool { cur, err := boundIdentity(launch); return err == nil && cur == me }
 		var ivs, dls string
 		args, ivs = takeFlag(args, "--interval", "2s")
 		once := hasFlag(args, "--once")
@@ -581,10 +585,13 @@ func main() {
 		check(err)
 		dl, err := time.ParseDuration(dls)
 		check(err)
-		if err := Watch(me, iv, dl, once, hasFlag(args, "--replay")); err != nil {
+		if err := Watch(me, still, iv, dl, once, hasFlag(args, "--replay")); err != nil {
+			fmt.Fprintln(os.Stderr, "yip:", err)
+			if errors.Is(err, errWatchIdentity) {
+				os.Exit(4)
+			}
 			// 3 = nothing happened, which is not the same as a failure and
 			// must not read as success either.
-			fmt.Fprintln(os.Stderr, "yip:", err)
 			os.Exit(3)
 		}
 	case "dispute":
@@ -810,7 +817,7 @@ func doctor(as string) {
 	root := checkoutRoot("")
 	me, err := WhoAmI(as, "")
 	say(err == nil, "identity: %v", orErr(me, err))
-	if launch, lerr := launchIdentity(as, ""); lerr == nil && launch != me {
+	if launch, lerr := launchIdentity(as, ""); err == nil && lerr == nil && launch != me {
 		say(true, "bound: this Claude session answers as %s in place of %s", me, launch)
 	}
 	say(true, "line: %s", activeLine)

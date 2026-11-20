@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -21,21 +22,13 @@ var (
 )
 
 // fakeProcs stands in for the process table: caller is the calling process's
-// ancestry, live the processes that exist -- Claude sessions, all of them;
-// any other ancestor is a shell.
+// ancestry, live the processes that exist -- Claude sessions, all of them,
+// registered as their Yip MCP server would; any other ancestor is a shell.
 func fakeProcs(t *testing.T, caller []procID, live ...procID) {
 	t.Helper()
-	oldAnc, oldAlive, oldExe := processAncestors, procAlive, procExe
-	t.Cleanup(func() { processAncestors, procAlive, procExe = oldAnc, oldAlive, oldExe })
+	oldAnc, oldAlive := processAncestors, procAlive
+	t.Cleanup(func() { processAncestors, procAlive = oldAnc, oldAlive })
 	processAncestors = func() []procID { return caller }
-	procExe = func(pid int) string {
-		for _, l := range live {
-			if l.PID == pid {
-				return "/opt/claude/bin/claude"
-			}
-		}
-		return "/bin/sh"
-	}
 	procAlive = func(p procID) bool {
 		for _, l := range live {
 			if l == p {
@@ -43,6 +36,11 @@ func fakeProcs(t *testing.T, caller []procID, live ...procID) {
 			}
 		}
 		return false
+	}
+	for _, l := range live {
+		if err := registerSession(l, "claude"); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -215,7 +213,7 @@ func TestBindAcceptsAWindowsPathUnderWSL(t *testing.T) {
 func TestServerBindSwitchesItsIdentity(t *testing.T) {
 	_, wt := seedSharedLaunch(t, "wt")
 	fakeProcs(t, []procID{sessionA}, sessionA)
-	s := &server{me: "claude", launch: "claude"}
+	s := &server{me: "claude", launch: "claude", session: sessionA}
 	out, err := s.call("bind", map[string]any{"worktree": wt})
 	if err != nil || s.me != "wt" || !strings.Contains(out, "You are now wt") {
 		t.Fatal(out, err, s.me)
@@ -510,6 +508,20 @@ func TestPresenceReusesARecentHEAD(t *testing.T) {
 	if sha, _ := GitTip("wt"); sha != "2222222" {
 		t.Fatal("stamps must still measure:", sha)
 	}
+	// Beating keeps the heartbeat fresh, not the measurement: once the tip
+	// is a minute old, the next beat measures, however busy the agent is.
+	if err := updateJSON(presencePath("wt"), func(p *Presence) error {
+		p.TipAt = time.Now().Add(-61 * time.Second).UTC().Format(time.RFC3339)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Beat("wt", "z"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := LoadPresence("wt"); p.Tip != "2222222" {
+		t.Fatal("an active agent's presence never re-measured HEAD", p)
+	}
 }
 
 func TestTheNearestBoundSessionWins(t *testing.T) {
@@ -539,16 +551,51 @@ func TestTheNearestBoundSessionWins(t *testing.T) {
 	}
 }
 
-func TestOnlyTheMCPToolBindsAndItBindsItsParent(t *testing.T) {
+func TestOnlyTheMCPToolBindsAndOnlyForTheSessionThatStartedIt(t *testing.T) {
 	_, wt := seedSharedLaunch(t, "wt")
 	fakeProcs(t, []procID{sessionB, sessionA}, sessionA, sessionB)
 	t.Setenv("CLAUDE_PID", "4100") // inherited from outer session A: ignored
-	if s, err := claudeSession(); err != nil || s != sessionB {
-		t.Fatal("server bound", s, err)
+	if p := parentSession(); p != sessionB {
+		t.Fatal("server's session", p)
 	}
 	// A shell command cannot tell which name its session started as.
 	if _, err := (&server{me: "claude", launch: "claude", cli: true}).call("bind", map[string]any{"worktree": wt}); err == nil {
 		t.Fatal("yip api bound")
+	}
+	// A server orphaned by its session must not bind whatever adopted it.
+	orphan := &server{me: "claude", launch: "claude", session: procID{PID: 4400, Start: "20"}}
+	if _, err := orphan.call("bind", map[string]any{"worktree": wt}); err == nil || !strings.Contains(err.Error(), "has exited") {
+		t.Fatal("an orphaned server bound:", err)
+	}
+}
+
+func TestTheWalkStopsAtTheNearestRegisteredSession(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	inner := procID{PID: 4300, Start: "19"}
+	node := procID{PID: 77, Start: "5"} // any other program, e.g. an interpreter
+	fakeProcs(t, []procID{sessionA}, sessionA, inner)
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	processAncestors = func() []procID { return []procID{{PID: 9, Start: "1"}, node, sessionA} }
+	if me := whoami(t, "claude"); me != "wt" {
+		t.Fatal("an unregistered ancestor stopped the walk:", me)
+	}
+	processAncestors = func() []procID { return []procID{{PID: 9, Start: "1"}, inner, node, sessionA} }
+	if me := whoami(t, "claude"); me != "claude" {
+		t.Fatal("a registered session inside A answered as A's name:", me)
+	}
+	// Sessions that exited, or ran in another boot, are forgotten.
+	procAlive = func(p procID) bool { return p == sessionA }
+	stale := sessionRecord{Session: procID{PID: 4500, Start: "21"}, Boot: "an-earlier-boot", Launch: "claude"}
+	if err := writeState(sessionPath(stale.Session), stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := registerSession(sessionA, "claude"); err != nil {
+		t.Fatal(err)
+	}
+	if isRegistered(inner) || fileExists(sessionPath(stale.Session)) || !isRegistered(sessionA) {
+		t.Fatal("registry kept exited or earlier-boot sessions")
 	}
 }
 
@@ -583,5 +630,109 @@ func TestBindingsFromAnEarlierBootBindNobody(t *testing.T) {
 	}
 	if _, err := Bind("claude", sessionB, wt, ""); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Review round 3 (Codex call 0006, prosecutor run 2): one regression each.
+
+func TestRebindSaysWhatItLeavesWithTheNameItLeaves(t *testing.T) {
+	launchDir, wt1 := seedSharedLaunch(t, "wt-one")
+	wt2 := filepath.Join(filepath.Dir(wt1), "wt-two")
+	if err := os.Mkdir(wt2, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeProcs(t, []procID{sessionA}, sessionA)
+	if _, err := Bind("claude", sessionA, wt1, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _, err := TryAcquire("mac", "wt-one", "a build", time.Hour, nil); err != nil || !got {
+		t.Fatal(got, err)
+	}
+	c, _ := NewCall("b", "wt-one", "question")
+	AppendTurn(c, "b", "still there?", false)
+	res, err := Bind("claude", sessionA, wt2, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := res.text("claude")
+	if !strings.Contains(out, "wt-one holds mac") || !strings.Contains(out, "bind "+wt1+" again") || !strings.Contains(out, "wt-one owes a reply on "+c.ID) {
+		t.Fatal("rebind was silent about what wt-one keeps:", out)
+	}
+	c2, _ := NewCall("b", "wt-two", "another")
+	AppendTurn(c2, "b", "and you?", false)
+	res, err = Bind("claude", sessionA, launchDir, "")
+	if err != nil || !strings.Contains(res.text("claude"), "wt-two owes a reply on "+c2.ID) {
+		t.Fatal("unbind was silent about what wt-two keeps:", res, err)
+	}
+}
+
+func TestAContenderReadsTheCurrentHoldersOwner(t *testing.T) {
+	seedSharedLaunch(t, "wt")
+	// A stale owner record names the contender; a new holder is mid-claim:
+	// it has the lock and has not yet recorded itself.
+	if err := writeState(rewakeOwnerPath("claude"), sessionA); err != nil {
+		t.Fatal(err)
+	}
+	guard, err := fileGuard(rewakeOwnerPath("claude"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := holdLock(rewakeLockPath("claude"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	got := make(chan procID, 1)
+	go func() { _, held, _ := claimRewake("claude", sessionA); got <- held }()
+	select {
+	case held := <-got:
+		t.Fatal("contender read the owner while a claim was in progress:", held)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := writeState(rewakeOwnerPath("claude"), sessionB); err != nil {
+		t.Fatal(err)
+	}
+	guard()
+	if held := <-got; held != sessionB {
+		t.Fatal("contender saw a stale owner:", held)
+	}
+}
+
+func TestAShellInAnotherSessionsBoundFolderIsRefused(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt-one")
+	t.Setenv("YIP_AGENT", "")
+	fakeProcs(t, []procID{sessionA}, sessionA, sessionB)
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	if me, err := WhoAmI("", wt); err != nil || me != "wt-one" {
+		t.Fatal("the bound session's own shell:", me, err)
+	}
+	processAncestors = func() []procID { return []procID{sessionB} }
+	if me, err := WhoAmI("", wt); err == nil {
+		t.Fatal("another session's shell in the bound folder answered as", me)
+	}
+	if me, err := WhoAmI("wt-one", wt); err != nil || me != "wt-one" {
+		t.Fatal("an explicit --as is still honoured:", me, err)
+	}
+}
+
+func TestWatchStopsWhenItsSessionRebinds(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	fakeProcs(t, []procID{sessionA}, sessionA)
+	still := func() bool { cur, err := boundIdentity("claude"); return err == nil && cur == "claude" }
+	done := make(chan error, 1)
+	go func() { done <- Watch("claude", still, 10*time.Millisecond, 5*time.Second, false, false) }()
+	time.Sleep(30 * time.Millisecond)
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, errWatchIdentity) {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("watch kept streaming the name its session left")
 	}
 }

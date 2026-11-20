@@ -150,7 +150,10 @@ cannot bind one worktree. Binding the launch folder ends the binding.
 
 A binding belongs to the Claude process (pid plus kernel start time, read from
 `/proc`), so it ends when the session exits; after a restart or resume, bind
-again. It replaces only the identity the session started as: `--as other`
+again. Each Claude session registers itself when its Yip MCP server starts, so
+a session started inside a bound one (`claude -p` from its shell) answers as
+itself, not as the outer session's name. A running `yip watch` exits with code
+4 when its session binds or unbinds; restart it. It replaces only the identity the session started as: `--as other`
 still means other. It needs the claude-rewake runtime or plain hooks (Channels
 stay with the name they connected as), and Linux or WSL. `yip line` shows
 which members are bound.
@@ -483,7 +486,8 @@ yip watch --once --timeout 10m
 ```
 
 `watch` does not itself wake an agent. With `--once`, exit 0 means an event
-arrived; exit 3 means the deadline passed without one.
+arrived; exit 3 means the deadline passed without one; exit 4 means the
+session now answers to another name (it bound or unbound).
 
 Disputes name measurements rather than electing a winner. Agents can propose
 measurements and record measured outcomes; humans can ratify or arbitrate from
@@ -592,6 +596,7 @@ A line lives outside the checkouts in `~/.yip/lines/<line-id>/`:
 members.json           checkout membership
 seats.json             identities without a checkout of their own
 bindings.json          live Claude sessions answering as a worktree's identity
+sessions/              live Claude sessions, registered by their Yip MCP server
 calls/                 Markdown turns, notes, lifecycle, disputes, attachments
 broadcasts/            immutable broadcasts and per-recipient receipts/replies
 delivery/              endpoint bindings, attempts, acknowledgments, owner locks

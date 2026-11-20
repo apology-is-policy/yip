@@ -19,8 +19,10 @@ package main
 // A session is its Claude process: pid plus kernel start time, so a reused
 // pid is not mistaken for it. The MCP server is that process's child, and
 // hooks and shell commands are its descendants, so each finds its binding by
-// walking its own ancestry -- up to the nearest Claude process, so a session
-// started inside a bound one is not mistaken for it. A binding ends with the
+// walking its own ancestry -- up to the nearest REGISTERED Claude session, so
+// a session started inside a bound one is not mistaken for it. A Claude
+// session registers itself when its Yip MCP server (or rewake hook) starts:
+// both are started by the Claude process directly, so each knows it. A binding ends with the
 // process; a restarted or resumed session starts as its launch identity again
 // and binds again.
 //
@@ -35,6 +37,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type procID struct {
@@ -43,10 +46,7 @@ type procID struct {
 }
 
 type Binding struct {
-	Session procID `json:"session"`
-	// Exe is the session's executable: an ancestor running it is a Claude
-	// session, which ends the search for a binding.
-	Exe      string `json:"exe"`
+	Session  procID `json:"session"`
 	Launch   string `json:"launch"`
 	Worktree string `json:"worktree"`
 	Bound    string `json:"bound"`
@@ -98,31 +98,65 @@ var processAncestors = func() []procID {
 	return out
 }
 
-func bootID() string {
+var bootID = sync.OnceValue(func() string {
 	b, _ := os.ReadFile("/proc/sys/kernel/random/boot_id")
 	return strings.TrimSpace(string(b))
-}
-
-// procExe is a process's executable. A binary replaced on disk while it runs
-// (an update) reads as "path (deleted)"; it is still the same program.
-var procExe = func(pid int) string {
-	exe, _ := os.Readlink("/proc/" + strconv.Itoa(pid) + "/exe")
-	return strings.TrimSuffix(exe, " (deleted)")
-}
+})
 
 var procAlive = func(p procID) bool {
 	_, start, ok := procStat(p.PID)
 	return ok && start == p.Start
 }
 
-// claudeSession is the Claude process a bind speaks for: the MCP server's
-// parent, since Claude starts the server directly. Only the MCP tool binds;
-// a command in a shell cannot tell which identity its session started as.
-func claudeSession() (procID, error) {
+// parentSession is the Claude session of a process Claude started directly
+// -- the MCP server, an exec'd rewake hook: its parent. Zero without /proc.
+func parentSession() procID {
 	if anc := processAncestors(); len(anc) > 0 {
-		return anc[0], nil
+		return anc[0]
 	}
-	return procID{}, fmt.Errorf("bind needs /proc to identify its Claude session")
+	return procID{}
+}
+
+func sessionsDir() string { return filepath.Join(Root(), "sessions") }
+
+func sessionPath(p procID) string {
+	return filepath.Join(sessionsDir(), strconv.Itoa(p.PID)+"-"+p.Start+".json")
+}
+
+type sessionRecord struct {
+	Session    procID `json:"session"`
+	Boot       string `json:"boot"`
+	Launch     string `json:"launch"`
+	Registered string `json:"registered"`
+}
+
+// registerSession records p as a Claude session, and forgets sessions that
+// have exited. Idempotent: the MCP server and every rewake hook re-register.
+func registerSession(p procID, launch string) error {
+	if p.PID <= 1 {
+		return nil
+	}
+	if err := os.MkdirAll(sessionsDir(), 0o755); err != nil {
+		return err
+	}
+	if entries, err := os.ReadDir(sessionsDir()); err == nil {
+		for _, e := range entries {
+			var r sessionRecord
+			path := filepath.Join(sessionsDir(), e.Name())
+			if readState(path, &r) == nil && (r.Boot != bootID() || !procAlive(r.Session)) {
+				_ = os.Remove(path)
+			}
+		}
+	}
+	if isRegistered(p) {
+		return nil
+	}
+	return writeState(sessionPath(p), sessionRecord{Session: p, Boot: bootID(), Launch: launch, Registered: now()})
+}
+
+func isRegistered(p procID) bool {
+	var r sessionRecord
+	return readState(sessionPath(p), &r) == nil && r.Session == p && r.Boot == bootID()
 }
 
 func loadBindingsStrict() (Bindings, error) {
@@ -140,8 +174,8 @@ func loadBindingsStrict() (Bindings, error) {
 }
 
 // boundIdentity is what a process that started as launch answers to: the
-// identity its Claude session bound, if its nearest Claude ancestor is that
-// session, else launch. A descendant of the session proves the session is
+// identity its Claude session bound, if its nearest registered session is
+// that session, else launch. A descendant of the session proves the session is
 // alive. A session started inside a bound one is its own -- bound or not.
 // An unreadable bindings file is an error, not "unbound": a writer acting
 // under the wrong name is worse than one that stops.
@@ -156,23 +190,26 @@ func boundIdentity(launch string) (string, error) {
 	if len(b.Bindings) == 0 {
 		return launch, nil
 	}
-	claude := map[string]bool{}
-	for _, bd := range b.Bindings {
-		if bd.Exe != "" {
-			claude[bd.Exe] = true
-		}
-	}
 	for _, a := range processAncestors() {
 		for name, bd := range b.Bindings {
 			if bd.Session == a && bd.Launch == launch {
 				return name, nil
 			}
 		}
-		if claude[procExe(a.PID)] {
+		if isRegistered(a) {
 			return launch, nil
 		}
 	}
 	return launch, nil
+}
+
+func descendsFrom(p procID) bool {
+	for _, a := range processAncestors() {
+		if a == p {
+			return true
+		}
+	}
+	return false
 }
 
 // liveBinding: the session currently speaking for name, if any.
@@ -235,6 +272,9 @@ func Bind(launch string, session procID, worktree, as string) (*bindResult, erro
 		return nil, fmt.Errorf("invalid launch identity %q", launch)
 	}
 	ep, epErr := readEndpoint(launch)
+	if epErr != nil && endpointExists(launch) {
+		return nil, epErr
+	}
 	if epErr == nil && ep.Runtime != "claude-rewake" {
 		return nil, fmt.Errorf("%s is delivered through %s, which stays with the name the session started as; bind needs the claude-rewake runtime (yip install --runtime claude-rewake)", launch, ep.Runtime)
 	}
@@ -312,13 +352,21 @@ func Bind(launch string, session procID, worktree, as string) (*bindResult, erro
 			return nil, err
 		}
 	}
+	// What the session answers to until this commit, and where it lives.
+	prev, prevWT := launch, m.PathOf(launch)
+	for n, bd := range b.Bindings {
+		if bd.Session == session {
+			prev, prevWT = n, bd.Worktree
+		}
+	}
+	res.Notes = append(res.Notes, leftBehind(prev, prevWT, name)...)
 	for n, bd := range b.Bindings {
 		if bd.Session == session || !procAlive(bd.Session) {
 			delete(b.Bindings, n)
 		}
 	}
 	if name != launch {
-		b.Bindings[name] = Binding{Session: session, Exe: procExe(session.PID), Launch: launch, Worktree: root, Bound: now()}
+		b.Bindings[name] = Binding{Session: session, Launch: launch, Worktree: root, Bound: now()}
 	}
 	b.Version, b.Boot = 1, bootID()
 	// The commit, the last step. A rewake waiter checks its identity and
@@ -332,26 +380,30 @@ func Bind(launch string, session procID, worktree, as string) (*bindResult, erro
 	if err := writeState(bindingsPath(), b); err != nil {
 		return nil, err
 	}
-	res.Notes = append(res.Notes, leftBehind(launch, name)...)
 	return res, nil
 }
 
-// leftBehind: what the session leaves with the name it stops answering to.
-// It cannot act as that name any more, and other sessions may share it.
-func leftBehind(launch, name string) []string {
-	if name == launch {
+// leftBehind: what the session leaves with prev, the name it stops answering
+// to. It can no longer act as prev; a launch name may be shared by others.
+func leftBehind(prev, prevWT, name string) []string {
+	if name == prev {
 		return nil
 	}
 	var out []string
 	for _, r := range ResourceNames() {
-		if l, held := LoadLease(r); held && l.Holder == launch {
-			out = append(out, fmt.Sprintf("%s holds %s; if that was you, bind back to your start folder to release it.", launch, r))
+		if l, held := LoadLease(r); held && l.Holder == prev {
+			out = append(out, fmt.Sprintf("%s holds %s; if that was this session, bind %s again to release it.", prev, r, prevWT))
+		}
+		for _, q := range Queue(r) {
+			if q.Agent == prev {
+				out = append(out, fmt.Sprintf("%s is queued for %s; that place stays with %s.", prev, r, prev))
+			}
 		}
 	}
-	if rings, err := RingFor(launch); err == nil {
+	if rings, err := RingFor(prev); err == nil {
 		for _, r := range rings {
 			if r.HaveFloor {
-				out = append(out, fmt.Sprintf("%s owes a reply on %s; it stays with %s.", launch, r.Call.ID, launch))
+				out = append(out, fmt.Sprintf("%s owes a reply on %s; it stays with %s.", prev, r.Call.ID, prev))
 			}
 		}
 	}

@@ -86,22 +86,18 @@ func RunRewake(agent string, wait time.Duration, session string, stderr io.Write
 	if anc := processAncestors(); len(anc) > 0 {
 		owner = anc[0]
 	}
-	unlock, err := holdLock(rewakeLockPath(agent))
+	unlock, held, err := claimRewake(agent, owner)
 	// Armed already. By this process (every Stop re-arms): nothing to do. By
 	// another, which may be leaving this name -- it rebound, unbound or exited
 	// -- and steps aside within a poll: wait a few polls to take over, or this
 	// session would sit unarmed until its next turn.
-	for retry := time.Now().Add(3 * interval); err != nil; unlock, err = holdLock(rewakeLockPath(agent)) {
-		var held procID
-		if rerr := readState(rewakeOwnerPath(agent), &held); rerr != nil || held == owner || !time.Now().Before(retry) {
+	for retry := time.Now().Add(3 * interval); err != nil; unlock, held, err = claimRewake(agent, owner) {
+		if held == owner || !time.Now().Before(retry) {
 			return 0
 		}
 		time.Sleep(interval / 4)
 	}
 	defer unlock()
-	if err := writeState(rewakeOwnerPath(agent), owner); err != nil {
-		return 0
-	}
 	if session != "" && session != ep.Thread {
 		_ = editEndpoint(agent, func(ep *Endpoint) error { ep.Thread = session; return nil })
 	}
@@ -137,6 +133,26 @@ func RunRewake(agent string, wait time.Duration, session string, stderr io.Write
 	}
 }
 
+// claimRewake takes the identity's waiter lock and records owner as its
+// holder, or reports the holder -- under one guard, so an owner read while
+// the lock is held always names the process holding it.
+func claimRewake(agent string, owner procID) (unlock func(), held procID, err error) {
+	guard, err := fileGuard(rewakeOwnerPath(agent))
+	if err != nil {
+		return nil, procID{}, err
+	}
+	defer guard()
+	if unlock, err = holdLock(rewakeLockPath(agent)); err != nil {
+		_ = readState(rewakeOwnerPath(agent), &held)
+		return nil, held, err
+	}
+	if err = writeState(rewakeOwnerPath(agent), owner); err != nil {
+		unlock()
+		return nil, procID{}, err
+	}
+	return unlock, owner, nil
+}
+
 // RunRewakeHook wires RunRewake to the process: stdin carries Claude's hook
 // input, stderr becomes the system reminder, and the parent is the session.
 func RunRewakeHook(override string, wait time.Duration) int {
@@ -145,11 +161,12 @@ func RunRewakeHook(override string, wait time.Duration) int {
 	if err != nil {
 		return 0
 	}
-	me, err := boundIdentity(launch)
-	if err != nil {
+	if _, err := os.Stat(Root()); err != nil {
 		return 0
 	}
-	if _, err := os.Stat(Root()); err != nil {
+	_ = registerSession(parentSession(), launch) // exec'd: the parent is the session
+	me, err := boundIdentity(launch)
+	if err != nil {
 		return 0
 	}
 	if wait <= 0 || wait > 24*time.Hour {
