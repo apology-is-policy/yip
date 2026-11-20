@@ -112,19 +112,26 @@ func RunRewake(agent string, wait time.Duration, session string, stderr io.Write
 // input, stderr becomes the system reminder, and the parent is the session.
 func RunRewakeHook(override string, wait time.Duration) int {
 	in := readHookInput()
-	me, err := WhoAmI(override, in.Cwd)
+	launch, err := launchIdentity(override, in.Cwd)
 	if err != nil {
 		return 0
 	}
+	me := boundIdentity(launch)
 	if _, err := os.Stat(Root()); err != nil {
 		return 0
 	}
 	if wait <= 0 || wait > 24*time.Hour {
 		wait = defaultWakeWindow - rewakeMargin
 	}
-	ppid := os.Getppid()
-	alive := func() bool { return ppid > 1 && os.Getppid() == ppid }
-	return RunRewake(me, wait, in.SessionID, os.Stderr, alive, 2*time.Second)
+	return RunRewake(me, wait, in.SessionID, os.Stderr, rewakeAlive(os.Getppid(), launch, me), 2*time.Second)
+}
+
+// rewakeAlive: the session that started the waiter still runs AND still
+// answers as me. One that binds (or unbinds) mid-window has stopped being me:
+// the waiter steps aside, leaving notices pending, so the session's next turn
+// arms a waiter for the identity it answers to now.
+func rewakeAlive(ppid int, launch, me string) func() bool {
+	return func() bool { return ppid > 1 && os.Getppid() == ppid && boundIdentity(launch) == me }
 }
 
 // pushReachable: would a notice for agent reach a running session now?

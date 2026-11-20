@@ -189,6 +189,16 @@ func tools() []toolDef {
 			}, "path"),
 		},
 		{
+			Name: "bind",
+			Description: "Answer as the worktree you work in. For sessions started from one shared folder that each work in a worktree of their own: " +
+				"after bind, calls to that worktree's identity reach THIS session, and the name you started as no longer does. " +
+				"Call it once your worktree exists, and again after a restart or resume. Returns your new name -- give it to peers.",
+			InputSchema: obj(map[string]any{
+				"worktree": str("Absolute path of your worktree's top folder. Under WSL a Windows path (C:\\src\\repo-wt) is accepted. The folder you started in ends the binding."),
+				"as":       str("Name to join the line under, if the worktree is not on it yet. Default: the folder's name."),
+			}, "worktree"),
+		},
+		{
 			Name:        "ring",
 			Description: "What is waiting for you: unread turns, and calls where the floor is yours.",
 			InputSchema: obj(map[string]any{}),
@@ -254,6 +264,8 @@ func tools() []toolDef {
 
 type server struct {
 	me           string
+	launch       string // a Claude connection: the identity it started as, which bind can replace
+	cli          bool   // yip api: the session is found by CLAUDE_PID, not as the parent
 	enc          *json.Encoder
 	writeMu      sync.Mutex
 	channelMode  bool
@@ -289,6 +301,10 @@ func serveIO(me, mode string, input io.Reader, output io.Writer) error {
 	}
 	channels := mode == serveChannels
 	s := &server{me: me, enc: json.NewEncoder(output), channelMode: channels, codexMode: mode == serveCodex, started: time.Now()}
+	if mode == serveClaude {
+		s.launch = me
+		s.me = boundIdentity(me)
+	}
 	s.cwd, _ = os.Getwd()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -498,6 +514,12 @@ func body(a map[string]any) (string, error) {
 // ----------------------------------------------------------------- actions
 
 func (s *server) call(name string, a map[string]any) (string, error) {
+	if s.launch != "" {
+		s.me = boundIdentity(s.launch)
+	}
+	if name == "bind" {
+		return s.doBind(a)
+	}
 	_ = Beat(s.me, name)
 	if name == "channel_ack" {
 		if !s.channelMode || !s.initialized || s.channel == "" {
@@ -626,6 +648,23 @@ func (s *server) doMeasure(a map[string]any) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("recorded for %s.\n%s", d.ID, DisputeStatus(c, d)), nil
+}
+
+func (s *server) doBind(a map[string]any) (string, error) {
+	if s.launch == "" {
+		return "", fmt.Errorf("bind is for Claude sessions on the claude-rewake runtime; this connection serves %s through Channels or Codex", s.me)
+	}
+	session, err := claudeSession(!s.cli)
+	if err != nil {
+		return "", err
+	}
+	res, err := Bind(s.launch, session, argStr(a, "worktree"), argStr(a, "as"))
+	if err != nil {
+		return "", err
+	}
+	s.me = res.Name
+	_ = Beat(s.me, "bind")
+	return res.text(s.launch), nil
 }
 
 func (s *server) doAttach(a map[string]any) (string, error) {

@@ -219,7 +219,8 @@ func main() {
 	case "delivery":
 		check(DeliveryCLI(args, must(WhoAmI(as, ""))))
 	case "api":
-		me := must(WhoAmI(as, ""))
+		launch := must(launchIdentity(as, ""))
+		me := boundIdentity(launch)
 		if len(args) == 0 {
 			check(fmt.Errorf("usage: yip api TOOL [JSON]; api list lists agent tools"))
 		}
@@ -239,7 +240,7 @@ func main() {
 			raw = []byte("{}")
 		}
 		check(json.Unmarshal(raw, &a))
-		out, err := (&server{me: me}).call(args[0], a)
+		out, err := (&server{me: me, launch: launch, cli: true}).call(args[0], a)
 		result := map[string]any{"ok": err == nil, "result": out}
 		if err != nil {
 			result["error"] = err.Error()
@@ -355,6 +356,9 @@ func main() {
 			if endpointExists(name) {
 				delivery = " -- " + EndpointStatus(name)
 			}
+			if b, ok := liveBinding(name); ok {
+				delivery += fmt.Sprintf(" -- bound by the Claude session (pid %d) launched as %s", b.Session.PID, b.Launch)
+			}
 			fmt.Printf("  %-16s %s%s\n", name, m.PathOf(name), delivery)
 		}
 		if len(seats.Seats) > 0 {
@@ -366,7 +370,7 @@ func main() {
 			}
 		}
 	case "serve":
-		me := must(WhoAmI(as, ""))
+		me := must(launchIdentity(as, ""))
 		var err error
 		if len(args) == 1 && args[0] == "--channels" {
 			err = ServeChannels(me)
@@ -806,6 +810,9 @@ func doctor(as string) {
 	root := checkoutRoot("")
 	me, err := WhoAmI(as, "")
 	say(err == nil, "identity: %v", orErr(me, err))
+	if launch, lerr := launchIdentity(as, ""); lerr == nil && launch != me {
+		say(true, "bound: this Claude session answers as %s in place of %s", me, launch)
+	}
 	say(true, "line: %s", activeLine)
 	say(fileExists(Root()), "line dir: %s", Root())
 

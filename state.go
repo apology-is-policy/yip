@@ -55,11 +55,21 @@ func EnsureRoot() error {
 
 // ---------------------------------------------------------------- identity
 
-// WhoAmI resolves the calling agent from RECORDED membership keyed by the
-// checkout's path -- not from a naming convention, and not from a name the
+// WhoAmI is the identity the caller answers to: its launch identity, or the
+// worktree identity its Claude session bound in place of it (bind.go).
+func WhoAmI(override, cwd string) (string, error) {
+	launch, err := launchIdentity(override, cwd)
+	if err != nil {
+		return "", err
+	}
+	return boundIdentity(launch), nil
+}
+
+// launchIdentity resolves the calling agent from RECORDED membership keyed by
+// the checkout's path -- not from a naming convention, and not from a name the
 // session chooses for itself. Two sessions therefore cannot answer to one
 // name, and the answer does not depend on how anybody named a directory.
-func WhoAmI(override, cwd string) (string, error) {
+func launchIdentity(override, cwd string) (string, error) {
 	if override != "" {
 		return override, nil
 	}
