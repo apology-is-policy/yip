@@ -155,11 +155,13 @@ still means other. It needs the claude-rewake runtime or plain hooks (Channels
 stay with the name they connected as), and Linux or WSL. `yip line` shows
 which members are bound.
 
-Bind refuses a worktree that a session started *inside* it already answers to
-(its waiter is armed with no binding behind it). The reverse is not fenced: a
-session started inside a worktree after another has bound it answers to the
-name too, because its configuration names it. Start sessions from the shared
-folder and bind, or start them in their worktree, not both.
+Bind is for worktrees that have no Yip install of their own. A session
+started *inside* a worktree answers to its name by path, and bind does not
+fence it in either direction: binding a worktree such a session uses, or
+starting one in a bound worktree, leaves two sessions answering to one name.
+Start sessions from the shared folder and bind, or start them in their
+worktree -- not both. Bind is an MCP tool only: a command in a shell cannot
+tell which name its session started as.
 
 For plain hook-based Claude integration (notices at hook boundaries only):
 

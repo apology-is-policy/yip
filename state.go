@@ -62,7 +62,7 @@ func WhoAmI(override, cwd string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return boundIdentity(launch), nil
+	return boundIdentity(launch)
 }
 
 // launchIdentity resolves the calling agent from RECORDED membership keyed by
@@ -613,13 +613,24 @@ func LoadPresence(agent string) (Presence, bool) {
 	return p, true
 }
 
+// presenceTipReuse: a beat re-measures HEAD at most this often. Beats run in
+// hooks Claude waits for, on every tool call, and measuring costs git execs
+// -- tens of milliseconds for a worktree on a Windows drive. Presence may lag
+// a commit by this much; turn stamps, which say what a reply was computed
+// against, still measure every time.
+const presenceTipReuse = time.Minute
+
 // Beat proves the agent is alive; Busy says what it is doing. The hook does
 // the first automatically, the agent declares the second.
 func Beat(agent, lastTool string) error {
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
-	tip, branch := GitTip(agent)
+	p, _ := LoadPresence(agent)
+	tip, branch := p.Tip, p.Branch
+	if p.Agent != agent || p.Age() >= presenceTipReuse {
+		tip, branch = GitTip(agent)
+	}
 	return updateJSON(presencePath(agent), func(p *Presence) error {
 		p.Agent, p.Tip, p.Branch, p.Beat = agent, tip, branch, now()
 		if lastTool != "" {

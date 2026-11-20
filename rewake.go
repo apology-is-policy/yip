@@ -42,6 +42,10 @@ func rewakeLockPath(agent string) string {
 	return filepath.Join(Root(), "delivery", agent+".rewake.lock")
 }
 
+func rewakeOwnerPath(agent string) string {
+	return filepath.Join(Root(), "delivery", agent+".rewake.owner")
+}
+
 func rewakeArmed(agent string) bool {
 	return validComponent(agent) && lockHeld(rewakeLockPath(agent))
 }
@@ -76,18 +80,28 @@ func RunRewake(agent string, wait time.Duration, session string, stderr io.Write
 	if err != nil || ep.Runtime != "claude-rewake" {
 		return 0
 	}
+	// The waiter's owner is the Claude process that ran the hook -- not the
+	// conversation, which a resumed session (a new process) shares.
+	var owner procID
+	if anc := processAncestors(); len(anc) > 0 {
+		owner = anc[0]
+	}
 	unlock, err := holdLock(rewakeLockPath(agent))
-	// Armed already. By this session (every Stop re-arms): nothing to do. By
+	// Armed already. By this process (every Stop re-arms): nothing to do. By
 	// another, which may be leaving this name -- it rebound, unbound or exited
 	// -- and steps aside within a poll: wait a few polls to take over, or this
 	// session would sit unarmed until its next turn.
 	for retry := time.Now().Add(3 * interval); err != nil; unlock, err = holdLock(rewakeLockPath(agent)) {
-		if cur, rerr := readEndpoint(agent); rerr != nil || (session != "" && cur.Thread == session) || !time.Now().Before(retry) {
+		var held procID
+		if rerr := readState(rewakeOwnerPath(agent), &held); rerr != nil || held == owner || !time.Now().Before(retry) {
 			return 0
 		}
 		time.Sleep(interval / 4)
 	}
 	defer unlock()
+	if err := writeState(rewakeOwnerPath(agent), owner); err != nil {
+		return 0
+	}
 	if session != "" && session != ep.Thread {
 		_ = editEndpoint(agent, func(ep *Endpoint) error { ep.Thread = session; return nil })
 	}
@@ -131,7 +145,10 @@ func RunRewakeHook(override string, wait time.Duration) int {
 	if err != nil {
 		return 0
 	}
-	me := boundIdentity(launch)
+	me, err := boundIdentity(launch)
+	if err != nil {
+		return 0
+	}
 	if _, err := os.Stat(Root()); err != nil {
 		return 0
 	}
@@ -146,7 +163,10 @@ func RunRewakeHook(override string, wait time.Duration) int {
 // the waiter steps aside, leaving notices pending, so the session's next turn
 // arms a waiter for the identity it answers to now.
 func rewakeAlive(ppid int, launch, me string) func() bool {
-	return func() bool { return ppid > 1 && os.Getppid() == ppid && boundIdentity(launch) == me }
+	return func() bool {
+		cur, err := boundIdentity(launch)
+		return ppid > 1 && os.Getppid() == ppid && err == nil && cur == me
+	}
 }
 
 // pushReachable: would a notice for agent reach a running session now?

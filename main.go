@@ -220,7 +220,7 @@ func main() {
 		check(DeliveryCLI(args, must(WhoAmI(as, ""))))
 	case "api":
 		launch := must(launchIdentity(as, ""))
-		me := boundIdentity(launch)
+		me := must(boundIdentity(launch))
 		if len(args) == 0 {
 			check(fmt.Errorf("usage: yip api TOOL [JSON]; api list lists agent tools"))
 		}

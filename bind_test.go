@@ -21,12 +21,21 @@ var (
 )
 
 // fakeProcs stands in for the process table: caller is the calling process's
-// ancestry, live the processes that exist.
+// ancestry, live the processes that exist -- Claude sessions, all of them;
+// any other ancestor is a shell.
 func fakeProcs(t *testing.T, caller []procID, live ...procID) {
 	t.Helper()
-	oldAnc, oldAlive := processAncestors, procAlive
-	t.Cleanup(func() { processAncestors, procAlive = oldAnc, oldAlive })
+	oldAnc, oldAlive, oldExe := processAncestors, procAlive, procExe
+	t.Cleanup(func() { processAncestors, procAlive, procExe = oldAnc, oldAlive, oldExe })
 	processAncestors = func() []procID { return caller }
+	procExe = func(pid int) string {
+		for _, l := range live {
+			if l.PID == pid {
+				return "/opt/claude/bin/claude"
+			}
+		}
+		return "/bin/sh"
+	}
 	procAlive = func(p procID) bool {
 		for _, l := range live {
 			if l == p {
@@ -333,7 +342,7 @@ func TestBindCannotLandBetweenAWaitersCheckAndItsDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	var checked atomic.Bool
-	alive := func() bool { ok := boundIdentity("claude") == "claude"; checked.Store(true); return ok }
+	alive := func() bool { me, err := boundIdentity("claude"); checked.Store(true); return err == nil && me == "claude" }
 	done := make(chan int, 1)
 	go func() { done <- RunRewake("claude", 5*time.Second, "", &bytes.Buffer{}, alive, 10*time.Millisecond) }()
 	waitFor(t, "waiter past its identity check", checked.Load)
@@ -359,8 +368,12 @@ func TestAWaiterTakesOverFromOneLeavingTheName(t *testing.T) {
 	if _, err := Bind("claude", sessionB, wt, ""); err != nil {
 		t.Fatal(err)
 	}
-	// The previous binder's waiter still holds the name for up to one poll.
-	if err := editEndpoint("wt", func(ep *Endpoint) error { ep.Thread = "session-A"; return nil }); err != nil {
+	// The previous binder's waiter still holds the name for up to one poll --
+	// even one from the same conversation, resumed in a new process.
+	if err := writeState(rewakeOwnerPath("wt"), sessionA); err != nil {
+		t.Fatal(err)
+	}
+	if err := editEndpoint("wt", func(ep *Endpoint) error { ep.Thread = "session-B"; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	stale, err := holdLock(rewakeLockPath("wt"))
@@ -373,8 +386,8 @@ func TestAWaiterTakesOverFromOneLeavingTheName(t *testing.T) {
 	time.Sleep(60 * time.Millisecond)
 	stale()
 	waitFor(t, "new waiter armed", func() bool {
-		ep, _ := readEndpoint("wt")
-		return rewakeArmed("wt") && ep.Thread == "session-B"
+		var held procID
+		return rewakeArmed("wt") && readState(rewakeOwnerPath("wt"), &held) == nil && held == sessionB
 	})
 	c, _ := NewCall("b", "wt", "review please")
 	AppendTurn(c, "b", "the diff", false)
@@ -383,24 +396,115 @@ func TestAWaiterTakesOverFromOneLeavingTheName(t *testing.T) {
 	}
 }
 
-func TestBindRefusesAWorktreeASessionStartedThereAnswersTo(t *testing.T) {
-	_, wt := seedSharedLaunch(t, "wt")
-	fakeProcs(t, nil, sessionA)
-	m := LoadMembers()
-	m.Members[wt] = "wt"
-	if err := SaveMembers(m); err != nil {
+func TestAHandOffIsNotRefusedWhileTheOldWaiterLingers(t *testing.T) {
+	launchDir, wt := seedSharedLaunch(t, "wt")
+	fakeProcs(t, nil, sessionA, sessionB)
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
 		t.Fatal(err)
 	}
-	native, err := holdLock(rewakeLockPath("wt"))
+	lingering, err := holdLock(rewakeLockPath("wt")) // A's waiter, up to a poll
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Bind("claude", sessionA, wt, ""); err == nil || !strings.Contains(err.Error(), "no bound session") {
-		t.Fatal("bound over a native session:", err)
+	defer lingering()
+	if _, err := Bind("claude", sessionA, launchDir, ""); err != nil {
+		t.Fatal(err)
 	}
-	native()
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal("own rebind refused:", err)
+	}
+	if _, err := Bind("claude", sessionA, launchDir, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind("claude", sessionB, wt, ""); err != nil {
+		t.Fatal("hand-off to another session refused:", err)
+	}
+}
+
+func TestAnUnboundSessionStartedInsideABoundOneIsItsOwn(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt-outer")
+	inner := procID{PID: 4300, Start: "19"}
+	fakeProcs(t, []procID{sessionA}, sessionA, inner)
 	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
 		t.Fatal(err)
+	}
+	// `claude -p` run from A's shell: its hooks and server see A above it.
+	processAncestors = func() []procID { return []procID{{PID: 9, Start: "1"}, inner, {PID: 8, Start: "1"}, sessionA} }
+	if me := whoami(t, "claude"); me != "claude" {
+		t.Fatal("unbound inner session answered as", me)
+	}
+	processAncestors = func() []procID { return []procID{{PID: 9, Start: "1"}, sessionA} }
+	if me := whoami(t, "claude"); me != "wt-outer" {
+		t.Fatal("A's own shell answered as", me)
+	}
+}
+
+func TestAnUnreadableBindingsFileFailsClosed(t *testing.T) {
+	seedSharedLaunch(t, "wt")
+	fakeProcs(t, []procID{sessionA}, sessionA)
+	if err := os.WriteFile(bindingsPath(), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if me, err := WhoAmI("claude", ""); err == nil {
+		t.Fatal("resolved an identity past a corrupt bindings file:", me)
+	}
+	if _, err := (&server{me: "claude", launch: "claude"}).call("busy", map[string]any{"text": "x"}); err == nil {
+		t.Fatal("a tool acted under the launch name past a corrupt bindings file")
+	}
+	if rewakeAlive(os.Getppid(), "claude", "claude")() {
+		t.Fatal("a waiter kept dispatching past a corrupt bindings file")
+	}
+}
+
+func TestBindSaysWhatItLeavesBehind(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	fakeProcs(t, []procID{sessionA}, sessionA)
+	if got, _, _, err := TryAcquire("mac", "claude", "a build", time.Hour, nil); err != nil || !got {
+		t.Fatal(got, err)
+	}
+	c, _ := NewCall("b", "claude", "question")
+	AppendTurn(c, "b", "are you there?", false)
+	res, err := Bind("claude", sessionA, wt, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := res.text("claude")
+	if !strings.Contains(out, "claude holds mac") || !strings.Contains(out, "owes a reply on "+c.ID) {
+		t.Fatal(out)
+	}
+}
+
+func TestPresenceReusesARecentHEAD(t *testing.T) {
+	tmpLine(t)
+	wt := t.TempDir()
+	write := func(head string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: "+filepath.Join(wt, "g")+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(wt, "g"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(wt, "g", "HEAD"), []byte(head+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := SaveMembers(Members{Members: map[string]string{wt: "wt"}}); err != nil {
+		t.Fatal(err)
+	}
+	write("1111111111111111111111111111111111111111")
+	if err := Beat("wt", "x"); err != nil {
+		t.Fatal(err)
+	}
+	write("2222222222222222222222222222222222222222")
+	if err := Beat("wt", "y"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := LoadPresence("wt"); p.Tip != "1111111" || p.LastTool != "y" {
+		t.Fatal("beat re-measured HEAD within the reuse window", p)
+	}
+	if sha, _ := GitTip("wt"); sha != "2222222" {
+		t.Fatal("stamps must still measure:", sha)
 	}
 }
 
@@ -431,18 +535,16 @@ func TestTheNearestBoundSessionWins(t *testing.T) {
 	}
 }
 
-func TestTheMCPServerBindsItsParentNotAnInheritedClaudePID(t *testing.T) {
+func TestOnlyTheMCPToolBindsAndItBindsItsParent(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
 	fakeProcs(t, []procID{sessionB, sessionA}, sessionA, sessionB)
-	t.Setenv("CLAUDE_PID", "4100") // inherited from outer session A
-	if s, err := claudeSession(true); err != nil || s != sessionB {
+	t.Setenv("CLAUDE_PID", "4100") // inherited from outer session A: ignored
+	if s, err := claudeSession(); err != nil || s != sessionB {
 		t.Fatal("server bound", s, err)
 	}
-	if s, err := claudeSession(false); err != nil || s != sessionA {
-		t.Fatal("shell command bound", s, err)
-	}
-	t.Setenv("CLAUDE_PID", "")
-	if _, err := claudeSession(false); err == nil {
-		t.Fatal("a shell outside Claude bound")
+	// A shell command cannot tell which name its session started as.
+	if _, err := (&server{me: "claude", launch: "claude", cli: true}).call("bind", map[string]any{"worktree": wt}); err == nil {
+		t.Fatal("yip api bound")
 	}
 }
 

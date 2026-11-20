@@ -265,7 +265,7 @@ func tools() []toolDef {
 type server struct {
 	me           string
 	launch       string // a Claude connection: the identity it started as, which bind can replace
-	cli          bool   // yip api: the session is found by CLAUDE_PID, not as the parent
+	cli          bool   // yip api: resolves a binding but cannot make one
 	enc          *json.Encoder
 	writeMu      sync.Mutex
 	channelMode  bool
@@ -302,8 +302,7 @@ func serveIO(me, mode string, input io.Reader, output io.Writer) error {
 	channels := mode == serveChannels
 	s := &server{me: me, enc: json.NewEncoder(output), channelMode: channels, codexMode: mode == serveCodex, started: time.Now()}
 	if mode == serveClaude {
-		s.launch = me
-		s.me = boundIdentity(me)
+		s.launch = me // each tool call resolves what this session answers to now
 	}
 	s.cwd, _ = os.Getwd()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -515,7 +514,11 @@ func body(a map[string]any) (string, error) {
 
 func (s *server) call(name string, a map[string]any) (string, error) {
 	if s.launch != "" {
-		s.me = boundIdentity(s.launch)
+		me, err := boundIdentity(s.launch)
+		if err != nil {
+			return "", err
+		}
+		s.me = me
 	}
 	if name == "bind" {
 		return s.doBind(a)
@@ -651,10 +654,10 @@ func (s *server) doMeasure(a map[string]any) (string, error) {
 }
 
 func (s *server) doBind(a map[string]any) (string, error) {
-	if s.launch == "" {
-		return "", fmt.Errorf("bind is for Claude sessions on the claude-rewake runtime; this connection serves %s through Channels or Codex", s.me)
+	if s.launch == "" || s.cli {
+		return "", fmt.Errorf("bind is the Yip MCP tool of a Claude session (claude-rewake runtime or plain hooks); it is not available from Channels, Codex or the CLI")
 	}
-	session, err := claudeSession(!s.cli)
+	session, err := claudeSession()
 	if err != nil {
 		return "", err
 	}

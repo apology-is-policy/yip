@@ -19,8 +19,13 @@ package main
 // A session is its Claude process: pid plus kernel start time, so a reused
 // pid is not mistaken for it. The MCP server is that process's child, and
 // hooks and shell commands are its descendants, so each finds its binding by
-// walking its own ancestry. A binding ends with the process; a restarted or
-// resumed session starts as its launch identity again and binds again.
+// walking its own ancestry -- up to the nearest Claude process, so a session
+// started inside a bound one is not mistaken for it. A binding ends with the
+// process; a restarted or resumed session starts as its launch identity again
+// and binds again.
+//
+// Sessions started INSIDE a worktree answer to its name by path and are
+// outside this contract: bind does not fence them, in either direction.
 
 import (
 	"fmt"
@@ -38,7 +43,10 @@ type procID struct {
 }
 
 type Binding struct {
-	Session  procID `json:"session"`
+	Session procID `json:"session"`
+	// Exe is the session's executable: an ancestor running it is a Claude
+	// session, which ends the search for a binding.
+	Exe      string `json:"exe"`
 	Launch   string `json:"launch"`
 	Worktree string `json:"worktree"`
 	Bound    string `json:"bound"`
@@ -95,29 +103,26 @@ func bootID() string {
 	return strings.TrimSpace(string(b))
 }
 
+// procExe is a process's executable. A binary replaced on disk while it runs
+// (an update) reads as "path (deleted)"; it is still the same program.
+var procExe = func(pid int) string {
+	exe, _ := os.Readlink("/proc/" + strconv.Itoa(pid) + "/exe")
+	return strings.TrimSuffix(exe, " (deleted)")
+}
+
 var procAlive = func(p procID) bool {
 	_, start, ok := procStat(p.PID)
 	return ok && start == p.Start
 }
 
-// claudeSession is the Claude process a bind speaks for. The MCP server is
-// started by Claude directly, so it is the server's parent -- never an
-// inherited CLAUDE_PID, which in a session started from inside another names
-// the outer one. A command in the session's shell has CLAUDE_PID, which Claude
-// Code sets for the commands it runs.
-func claudeSession(serving bool) (procID, error) {
-	anc := processAncestors()
-	if serving && len(anc) > 0 {
+// claudeSession is the Claude process a bind speaks for: the MCP server's
+// parent, since Claude starts the server directly. Only the MCP tool binds;
+// a command in a shell cannot tell which identity its session started as.
+func claudeSession() (procID, error) {
+	if anc := processAncestors(); len(anc) > 0 {
 		return anc[0], nil
 	}
-	if pid, err := strconv.Atoi(os.Getenv("CLAUDE_PID")); err == nil && !serving {
-		for _, a := range anc {
-			if a.PID == pid {
-				return a, nil
-			}
-		}
-	}
-	return procID{}, fmt.Errorf("bind needs a running Claude Code session (with /proc): use the Yip MCP tool from that session")
+	return procID{}, fmt.Errorf("bind needs /proc to identify its Claude session")
 }
 
 func loadBindingsStrict() (Bindings, error) {
@@ -135,25 +140,39 @@ func loadBindingsStrict() (Bindings, error) {
 }
 
 // boundIdentity is what a process that started as launch answers to: the
-// identity its Claude session bound, if one of its ancestors is that session,
-// else launch. A descendant of the session proves the session is alive. The
-// nearest bound ancestor wins: a session started inside another is its own.
-func boundIdentity(launch string) string {
-	if _, err := os.Stat(bindingsPath()); err != nil {
-		return launch
+// identity its Claude session bound, if its nearest Claude ancestor is that
+// session, else launch. A descendant of the session proves the session is
+// alive. A session started inside a bound one is its own -- bound or not.
+// An unreadable bindings file is an error, not "unbound": a writer acting
+// under the wrong name is worse than one that stops.
+func boundIdentity(launch string) (string, error) {
+	if _, err := os.Stat(bindingsPath()); os.IsNotExist(err) {
+		return launch, nil
 	}
 	b, err := loadBindingsStrict()
-	if err != nil || len(b.Bindings) == 0 {
-		return launch
+	if err != nil {
+		return "", err
+	}
+	if len(b.Bindings) == 0 {
+		return launch, nil
+	}
+	claude := map[string]bool{}
+	for _, bd := range b.Bindings {
+		if bd.Exe != "" {
+			claude[bd.Exe] = true
+		}
 	}
 	for _, a := range processAncestors() {
 		for name, bd := range b.Bindings {
 			if bd.Session == a && bd.Launch == launch {
-				return name
+				return name, nil
 			}
 		}
+		if claude[procExe(a.PID)] {
+			return launch, nil
+		}
 	}
-	return launch
+	return launch, nil
 }
 
 // liveBinding: the session currently speaking for name, if any.
@@ -273,15 +292,8 @@ func Bind(launch string, session procID, worktree, as string) (*bindResult, erro
 	} else if name != launch && isCodexIdentity(name, root) {
 		return nil, fmt.Errorf("%s is %s's checkout, and %s is a Codex identity", root, name, name)
 	}
-	cur, wasBound := b.Bindings[name]
-	if wasBound && cur.Session != session && procAlive(cur.Session) {
+	if cur, ok := b.Bindings[name]; ok && cur.Session != session && procAlive(cur.Session) {
 		return nil, fmt.Errorf("%s is bound to another live Claude session (pid %d, since %s); two sessions cannot answer to one name", name, cur.Session.PID, cur.Bound)
-	}
-	// A session started inside that checkout answers to its name by path and
-	// holds no binding; its armed waiter is the evidence. (Recent contact is
-	// not: a binder that just left or crashed leaves the same trace.)
-	if !wasBound && name != launch && rewakeArmed(name) {
-		return nil, fmt.Errorf("%s has an armed waiter but no bound session: a session started in %s answers to it; bind a worktree of your own", name, root)
 	}
 	res.Name = name
 	// Prepare before committing, so a failure leaves the identity unchanged.
@@ -306,12 +318,12 @@ func Bind(launch string, session procID, worktree, as string) (*bindResult, erro
 		}
 	}
 	if name != launch {
-		b.Bindings[name] = Binding{Session: session, Launch: launch, Worktree: root, Bound: now()}
+		b.Bindings[name] = Binding{Session: session, Exe: procExe(session.PID), Launch: launch, Worktree: root, Bound: now()}
 	}
 	b.Version, b.Boot = 1, bootID()
-	// The commit. A rewake waiter checks its identity and dispatches under this
-	// same guard, so it never hands the old name's notices to a session that
-	// has just stopped answering to it.
+	// The commit, the last step. A rewake waiter checks its identity and
+	// dispatches under this same guard, so it never hands the old name's
+	// notices to a session that has just stopped answering to it.
 	unlockB, err := fileGuard(bindingsPath())
 	if err != nil {
 		return nil, err
@@ -320,7 +332,30 @@ func Bind(launch string, session procID, worktree, as string) (*bindResult, erro
 	if err := writeState(bindingsPath(), b); err != nil {
 		return nil, err
 	}
+	res.Notes = append(res.Notes, leftBehind(launch, name)...)
 	return res, nil
+}
+
+// leftBehind: what the session leaves with the name it stops answering to.
+// It cannot act as that name any more, and other sessions may share it.
+func leftBehind(launch, name string) []string {
+	if name == launch {
+		return nil
+	}
+	var out []string
+	for _, r := range ResourceNames() {
+		if l, held := LoadLease(r); held && l.Holder == launch {
+			out = append(out, fmt.Sprintf("%s holds %s; if that was you, bind back to your start folder to release it.", launch, r))
+		}
+	}
+	if rings, err := RingFor(launch); err == nil {
+		for _, r := range rings {
+			if r.HaveFloor {
+				out = append(out, fmt.Sprintf("%s owes a reply on %s; it stays with %s.", launch, r.Call.ID, launch))
+			}
+		}
+	}
+	return out
 }
 
 func (r *bindResult) text(launch string) string {
