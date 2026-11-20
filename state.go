@@ -136,13 +136,67 @@ func GitTip(agent string) (sha, branch string) {
 	if dir == "" {
 		return "", ""
 	}
-	if out, err := exec.Command("git", "-C", dir, "rev-parse", "--short", "HEAD").Output(); err == nil {
-		sha = strings.TrimSpace(string(out))
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "--short", "HEAD").Output()
+	if err != nil {
+		return headFromFiles(dir)
 	}
+	sha = strings.TrimSpace(string(out))
 	if out, err := exec.Command("git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD").Output(); err == nil {
 		branch = strings.TrimSpace(string(out))
 	}
 	return
+}
+
+// headFromFiles reads HEAD without git, for a worktree this host's git cannot
+// open: one Windows git created, seen from WSL, whose .git file names a
+// C:/... gitdir. Loose ref first, then packed-refs; nothing found is "".
+func headFromFiles(dir string) (sha, branch string) {
+	resolve := func(base, p string) string {
+		p = hostPath(strings.TrimSpace(p))
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(base, p)
+		}
+		return p
+	}
+	gitdir := filepath.Join(dir, ".git")
+	if b, err := os.ReadFile(gitdir); err == nil {
+		p, ok := strings.CutPrefix(strings.TrimSpace(string(b)), "gitdir:")
+		if !ok {
+			return "", ""
+		}
+		gitdir = resolve(dir, p)
+	}
+	head, err := os.ReadFile(filepath.Join(gitdir, "HEAD"))
+	if err != nil {
+		return "", ""
+	}
+	ref, isRef := strings.CutPrefix(strings.TrimSpace(string(head)), "ref: ")
+	if !isRef {
+		return shortSHA(ref), "HEAD"
+	}
+	common := gitdir
+	if b, err := os.ReadFile(filepath.Join(gitdir, "commondir")); err == nil {
+		common = resolve(gitdir, string(b))
+	}
+	branch = strings.TrimPrefix(ref, "refs/heads/")
+	if b, err := os.ReadFile(filepath.Join(common, filepath.FromSlash(ref))); err == nil {
+		return shortSHA(strings.TrimSpace(string(b))), branch
+	}
+	if b, err := os.ReadFile(filepath.Join(common, "packed-refs")); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			if f := strings.Fields(line); len(f) == 2 && f[1] == ref {
+				return shortSHA(f[0]), branch
+			}
+		}
+	}
+	return "", branch
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }

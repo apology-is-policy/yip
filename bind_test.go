@@ -270,3 +270,51 @@ func TestProcStatReadsTheRealProcessTree(t *testing.T) {
 		t.Fatal("a reused pid passed for the original process")
 	}
 }
+
+func TestGitTipReadsAWorktreeThisHostsGitCannotOpen(t *testing.T) {
+	tmpLine(t)
+	base := t.TempDir()
+	common := filepath.Join(base, "repo", ".git")
+	gitdir := filepath.Join(common, "worktrees", "wt")
+	wt := filepath.Join(base, "wt")
+	for _, d := range []string{gitdir, filepath.Join(common, "refs", "heads", "feature"), wt} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write := func(p, body string) {
+		t.Helper()
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// What Windows git writes, as WSL sees it: a C:/ gitdir Linux git rejects.
+	write(filepath.Join(wt, ".git"), "gitdir: C:/repo/.git/worktrees/wt\n")
+	write(filepath.Join(gitdir, "HEAD"), "ref: refs/heads/feature/x\n")
+	write(filepath.Join(gitdir, "commondir"), "../..\n")
+	old := wslPath
+	t.Cleanup(func() { wslPath = old })
+	wslPath = func(p string) (string, error) {
+		return filepath.Join(base, strings.TrimPrefix(filepath.ToSlash(p), "C:/")), nil
+	}
+	if err := SaveMembers(Members{Members: map[string]string{wt: "wt"}}); err != nil {
+		t.Fatal(err)
+	}
+	const sha = "60e708c47c6d1f0a2b3c4d5e6f708192a3b4c5d6"
+	loose := filepath.Join(common, "refs", "heads", "feature", "x")
+	write(loose, sha+"\n")
+	if got, br := GitTip("wt"); got != "60e708c" || br != "feature/x" {
+		t.Fatal("loose ref:", got, br)
+	}
+	if err := os.Remove(loose); err != nil {
+		t.Fatal(err)
+	}
+	write(filepath.Join(common, "packed-refs"), "# pack-refs with: peeled fully-peeled sorted\n"+sha+" refs/heads/feature/x\n")
+	if got, br := GitTip("wt"); got != "60e708c" || br != "feature/x" {
+		t.Fatal("packed ref:", got, br)
+	}
+	write(filepath.Join(gitdir, "HEAD"), sha+"\n")
+	if got, br := GitTip("wt"); got != "60e708c" || br != "HEAD" {
+		t.Fatal("detached:", got, br)
+	}
+}
