@@ -77,8 +77,15 @@ func RunRewake(agent string, wait time.Duration, session string, stderr io.Write
 		return 0
 	}
 	unlock, err := holdLock(rewakeLockPath(agent))
-	if err != nil {
-		return 0 // another waiter is armed for this identity
+	// Armed already. By this session (every Stop re-arms): nothing to do. By
+	// another, which may be leaving this name -- it rebound, unbound or exited
+	// -- and steps aside within a poll: wait a few polls to take over, or this
+	// session would sit unarmed until its next turn.
+	for retry := time.Now().Add(3 * interval); err != nil; unlock, err = holdLock(rewakeLockPath(agent)) {
+		if cur, rerr := readEndpoint(agent); rerr != nil || (session != "" && cur.Thread == session) || !time.Now().Before(retry) {
+			return 0
+		}
+		time.Sleep(interval / 4)
 	}
 	defer unlock()
 	if session != "" && session != ep.Thread {
@@ -86,7 +93,14 @@ func RunRewake(agent string, wait time.Duration, session string, stderr io.Write
 	}
 	deadline := time.Now().Add(wait)
 	for {
+		// Checked and dispatched under the bindings guard: a bind cannot land
+		// between "still this session's identity" and "notices marked sent".
+		unlockB, err := fileGuard(bindingsPath())
+		if err != nil {
+			return 0
+		}
 		if !parentAlive() {
+			unlockB()
 			return 0 // nobody to wake: leave notices pending
 		}
 		var message string
@@ -94,6 +108,7 @@ func RunRewake(agent string, wait time.Duration, session string, stderr io.Write
 			message = text
 			return nil
 		})
+		unlockB()
 		if err != nil {
 			return 0
 		}

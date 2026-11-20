@@ -45,7 +45,10 @@ type Binding struct {
 }
 
 type Bindings struct {
-	Version  int                `json:"version"`
+	Version int `json:"version"`
+	// Boot is the kernel boot the sessions below ran in: pid and start time
+	// repeat across reboots, so a file from an earlier boot binds nobody.
+	Boot     string             `json:"boot"`
 	Bindings map[string]Binding `json:"bindings"`
 }
 
@@ -87,25 +90,31 @@ var processAncestors = func() []procID {
 	return out
 }
 
+func bootID() string {
+	b, _ := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	return strings.TrimSpace(string(b))
+}
+
 var procAlive = func(p procID) bool {
 	_, start, ok := procStat(p.PID)
 	return ok && start == p.Start
 }
 
-// claudeSession is the Claude process a bind speaks for. Claude Code exports
-// CLAUDE_PID to the commands it runs; the MCP server, started by Claude
-// directly, falls back to its parent.
+// claudeSession is the Claude process a bind speaks for. The MCP server is
+// started by Claude directly, so it is the server's parent -- never an
+// inherited CLAUDE_PID, which in a session started from inside another names
+// the outer one. A command in the session's shell has CLAUDE_PID, which Claude
+// Code sets for the commands it runs.
 func claudeSession(serving bool) (procID, error) {
-	if pid, err := strconv.Atoi(os.Getenv("CLAUDE_PID")); err == nil {
-		for _, a := range processAncestors() {
+	anc := processAncestors()
+	if serving && len(anc) > 0 {
+		return anc[0], nil
+	}
+	if pid, err := strconv.Atoi(os.Getenv("CLAUDE_PID")); err == nil && !serving {
+		for _, a := range anc {
 			if a.PID == pid {
 				return a, nil
 			}
-		}
-	}
-	if serving {
-		if anc := processAncestors(); len(anc) > 0 {
-			return anc[0], nil
 		}
 	}
 	return procID{}, fmt.Errorf("bind needs a running Claude Code session (with /proc): use the Yip MCP tool from that session")
@@ -119,7 +128,7 @@ func loadBindingsStrict() (Bindings, error) {
 	if b.Version != 1 {
 		return b, fmt.Errorf("%s: unsupported bindings version %d", bindingsPath(), b.Version)
 	}
-	if b.Bindings == nil {
+	if b.Bindings == nil || b.Boot != bootID() {
 		b.Bindings = map[string]Binding{}
 	}
 	return b, nil
@@ -127,7 +136,8 @@ func loadBindingsStrict() (Bindings, error) {
 
 // boundIdentity is what a process that started as launch answers to: the
 // identity its Claude session bound, if one of its ancestors is that session,
-// else launch. A descendant of the session proves the session is alive.
+// else launch. A descendant of the session proves the session is alive. The
+// nearest bound ancestor wins: a session started inside another is its own.
 func boundIdentity(launch string) string {
 	if _, err := os.Stat(bindingsPath()); err != nil {
 		return launch
@@ -136,13 +146,9 @@ func boundIdentity(launch string) string {
 	if err != nil || len(b.Bindings) == 0 {
 		return launch
 	}
-	anc := processAncestors()
-	for name, bd := range b.Bindings {
-		if bd.Launch != launch {
-			continue
-		}
-		for _, a := range anc {
-			if a == bd.Session {
+	for _, a := range processAncestors() {
+		for name, bd := range b.Bindings {
+			if bd.Session == a && bd.Launch == launch {
 				return name
 			}
 		}
@@ -267,28 +273,18 @@ func Bind(launch string, session procID, worktree, as string) (*bindResult, erro
 	} else if name != launch && isCodexIdentity(name, root) {
 		return nil, fmt.Errorf("%s is %s's checkout, and %s is a Codex identity", root, name, name)
 	}
-	if cur, ok := b.Bindings[name]; ok && cur.Session != session && procAlive(cur.Session) {
+	cur, wasBound := b.Bindings[name]
+	if wasBound && cur.Session != session && procAlive(cur.Session) {
 		return nil, fmt.Errorf("%s is bound to another live Claude session (pid %d, since %s); two sessions cannot answer to one name", name, cur.Session.PID, cur.Bound)
 	}
-	for n, bd := range b.Bindings {
-		if bd.Session == session || !procAlive(bd.Session) {
-			delete(b.Bindings, n)
-		}
+	// A session started inside that checkout answers to its name by path and
+	// holds no binding; its armed waiter is the evidence. (Recent contact is
+	// not: a binder that just left or crashed leaves the same trace.)
+	if !wasBound && name != launch && rewakeArmed(name) {
+		return nil, fmt.Errorf("%s has an armed waiter but no bound session: a session started in %s answers to it; bind a worktree of your own", name, root)
 	}
 	res.Name = name
-	if name != launch {
-		b.Bindings[name] = Binding{Session: session, Launch: launch, Worktree: root, Bound: now()}
-	}
-	if res.Joined {
-		m.Members[root] = name
-		if err := SaveMembers(m); err != nil {
-			return nil, err
-		}
-	}
-	b.Version = 1
-	if err := writeState(bindingsPath(), b); err != nil {
-		return nil, err
-	}
+	// Prepare before committing, so a failure leaves the identity unchanged.
 	if name != launch && epErr == nil {
 		warning, err := ensureEndpoint(name, ep.Runtime)
 		if err != nil {
@@ -297,6 +293,32 @@ func Bind(launch string, session procID, worktree, as string) (*bindResult, erro
 		if warning != "" {
 			res.Notes = append(res.Notes, warning)
 		}
+	}
+	if res.Joined {
+		m.Members[root] = name
+		if err := SaveMembers(m); err != nil {
+			return nil, err
+		}
+	}
+	for n, bd := range b.Bindings {
+		if bd.Session == session || !procAlive(bd.Session) {
+			delete(b.Bindings, n)
+		}
+	}
+	if name != launch {
+		b.Bindings[name] = Binding{Session: session, Launch: launch, Worktree: root, Bound: now()}
+	}
+	b.Version, b.Boot = 1, bootID()
+	// The commit. A rewake waiter checks its identity and dispatches under this
+	// same guard, so it never hands the old name's notices to a session that
+	// has just stopped answering to it.
+	unlockB, err := fileGuard(bindingsPath())
+	if err != nil {
+		return nil, err
+	}
+	defer unlockB()
+	if err := writeState(bindingsPath(), b); err != nil {
+		return nil, err
 	}
 	return res, nil
 }

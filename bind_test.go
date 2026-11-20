@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -316,5 +317,165 @@ func TestGitTipReadsAWorktreeThisHostsGitCannotOpen(t *testing.T) {
 	write(filepath.Join(gitdir, "HEAD"), sha+"\n")
 	if got, br := GitTip("wt"); got != "60e708c" || br != "HEAD" {
 		t.Fatal("detached:", got, br)
+	}
+}
+
+// Review findings (cross-provider review, 2026-11-20): one regression each.
+
+func TestBindCannotLandBetweenAWaitersCheckAndItsDispatch(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	fakeProcs(t, []procID{sessionA}, sessionA)
+	c, _ := NewCall("b", "claude", "for the folder")
+	AppendTurn(c, "b", "hello", false)
+	// Hold the endpoint so the waiter stops inside dispatch, past its check.
+	unlockEP, err := fileGuard(endpointPath("claude"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var checked atomic.Bool
+	alive := func() bool { ok := boundIdentity("claude") == "claude"; checked.Store(true); return ok }
+	done := make(chan int, 1)
+	go func() { done <- RunRewake("claude", 5*time.Second, "", &bytes.Buffer{}, alive, 10*time.Millisecond) }()
+	waitFor(t, "waiter past its identity check", checked.Load)
+	bound := make(chan error, 1)
+	go func() { _, err := Bind("claude", sessionA, wt, ""); bound <- err }()
+	select {
+	case err := <-bound:
+		t.Fatal("bind committed while a waiter was between its check and its dispatch", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	unlockEP()
+	if code := <-done; code != 2 {
+		t.Fatal("the waiter checked first, so it delivers to the session it checked", code)
+	}
+	if err := <-bound; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAWaiterTakesOverFromOneLeavingTheName(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	fakeProcs(t, []procID{sessionB}, sessionB)
+	if _, err := Bind("claude", sessionB, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	// The previous binder's waiter still holds the name for up to one poll.
+	if err := editEndpoint("wt", func(ep *Endpoint) error { ep.Thread = "session-A"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := holdLock(rewakeLockPath("wt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() { done <- RunRewake("wt", 5*time.Second, "session-B", &stderr, always, 40*time.Millisecond) }()
+	time.Sleep(60 * time.Millisecond)
+	stale()
+	waitFor(t, "new waiter armed", func() bool {
+		ep, _ := readEndpoint("wt")
+		return rewakeArmed("wt") && ep.Thread == "session-B"
+	})
+	c, _ := NewCall("b", "wt", "review please")
+	AppendTurn(c, "b", "the diff", false)
+	if code := <-done; code != 2 || !strings.Contains(stderr.String(), c.ID) {
+		t.Fatal("the session that took the name was not armed", code, stderr.String())
+	}
+}
+
+func TestBindRefusesAWorktreeASessionStartedThereAnswersTo(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	fakeProcs(t, nil, sessionA)
+	m := LoadMembers()
+	m.Members[wt] = "wt"
+	if err := SaveMembers(m); err != nil {
+		t.Fatal(err)
+	}
+	native, err := holdLock(rewakeLockPath("wt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind("claude", sessionA, wt, ""); err == nil || !strings.Contains(err.Error(), "no bound session") {
+		t.Fatal("bound over a native session:", err)
+	}
+	native()
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTheNearestBoundSessionWins(t *testing.T) {
+	launchDir, wt1 := seedSharedLaunch(t, "wt-one")
+	_ = launchDir
+	wt2 := filepath.Join(filepath.Dir(wt1), "wt-two")
+	if err := os.Mkdir(wt2, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeProcs(t, nil, sessionA, sessionB)
+	if _, err := Bind("claude", sessionA, wt1, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind("claude", sessionB, wt2, ""); err != nil {
+		t.Fatal(err)
+	}
+	// B was started from inside A: B's processes have both as ancestors.
+	processAncestors = func() []procID { return []procID{{PID: 9, Start: "1"}, sessionB, sessionA} }
+	for i := 0; i < 50; i++ {
+		if me := whoami(t, "claude"); me != "wt-two" {
+			t.Fatal("inner session answered as", me)
+		}
+	}
+	processAncestors = func() []procID { return []procID{sessionA} }
+	if me := whoami(t, "claude"); me != "wt-one" {
+		t.Fatal(me)
+	}
+}
+
+func TestTheMCPServerBindsItsParentNotAnInheritedClaudePID(t *testing.T) {
+	fakeProcs(t, []procID{sessionB, sessionA}, sessionA, sessionB)
+	t.Setenv("CLAUDE_PID", "4100") // inherited from outer session A
+	if s, err := claudeSession(true); err != nil || s != sessionB {
+		t.Fatal("server bound", s, err)
+	}
+	if s, err := claudeSession(false); err != nil || s != sessionA {
+		t.Fatal("shell command bound", s, err)
+	}
+	t.Setenv("CLAUDE_PID", "")
+	if _, err := claudeSession(false); err == nil {
+		t.Fatal("a shell outside Claude bound")
+	}
+}
+
+func TestAFailedBindLeavesTheIdentityUnchanged(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	fakeProcs(t, []procID{sessionA}, sessionA)
+	if err := os.MkdirAll(filepath.Dir(endpointPath("wt")), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(endpointPath("wt"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind("claude", sessionA, wt, ""); err == nil {
+		t.Fatal("bind over a corrupt endpoint succeeded")
+	}
+	if me := whoami(t, "claude"); me != "claude" || LoadMembers().AgentAt(wt) != "" {
+		t.Fatal("a failed bind committed:", me, LoadMembers())
+	}
+}
+
+func TestBindingsFromAnEarlierBootBindNobody(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	fakeProcs(t, []procID{sessionA}, sessionA, sessionB)
+	stale := Bindings{Version: 1, Boot: "an-earlier-boot", Bindings: map[string]Binding{
+		"wt": {Session: sessionA, Launch: "claude", Worktree: wt, Bound: now()},
+	}}
+	if err := writeState(bindingsPath(), stale); err != nil {
+		t.Fatal(err)
+	}
+	if me := whoami(t, "claude"); me != "claude" {
+		t.Fatal("a reused pid and start time from an earlier boot answered as", me)
+	}
+	if _, err := Bind("claude", sessionB, wt, ""); err != nil {
+		t.Fatal(err)
 	}
 }
