@@ -682,7 +682,8 @@ var tipFunc = GitTip // injectable for tests
 func measureTip(agent string) (tip, branch string, ok bool) {
 	type result struct{ tip, branch string }
 	done := make(chan result, 1)
-	go func() { t, b := tipFunc(agent); done <- result{t, b} }()
+	measure := tipFunc // read once: an abandoned measurement may still be running
+	go func() { t, b := measure(agent); done <- result{t, b} }()
 	select {
 	case r := <-done:
 		return r.tip, r.branch, r.tip != "" || r.branch != ""
