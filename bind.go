@@ -199,13 +199,14 @@ func registerSession(p procID, launch string) error {
 		return err
 	}
 	// Bounded: this runs before the MCP server answers initialize and in the
-	// synchronous SessionStart hook. A stalled holder costs a second, and then
-	// the record is written without pruning, which is only housekeeping.
+	// synchronous hooks. A stalled holder costs a second and a retryable
+	// error -- never an unguarded write, which a concurrent prune could undo.
 	unlock, err := tryGuard(filepath.Join(sessionsDir(), "registry"), time.Second)
-	if err == nil {
-		defer unlock()
+	if err != nil {
+		return fmt.Errorf("session registry busy: %w", err)
 	}
-	if entries, rerr := os.ReadDir(sessionsDir()); err == nil && rerr == nil {
+	defer unlock()
+	if entries, rerr := os.ReadDir(sessionsDir()); rerr == nil {
 		for _, e := range entries {
 			var r sessionRecord
 			path := filepath.Join(sessionsDir(), e.Name())

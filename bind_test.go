@@ -1248,8 +1248,9 @@ func TestRegistrationRecoversAndIsNotHeldHostage(t *testing.T) {
 	late := procID{PID: 5100, Start: "27"}
 	procAlive = func(p procID) bool { return p == sessionA || p == late }
 	start := time.Now()
-	if err := registerSession(late, "claude"); err != nil || !isRegistered(late) {
-		t.Fatal(err)
+	// Retryable failure, never an unguarded write a concurrent prune could undo.
+	if err := registerSession(late, "claude"); err == nil || isRegistered(late) {
+		t.Fatal("registered around a held registry lock:", err)
 	}
 	if took := time.Since(start); took > 3*time.Second {
 		t.Fatal("registration waited on a stuck registry lock:", took)
@@ -1269,5 +1270,48 @@ func TestTakingOverANameReportsItsUnacknowledgedNotices(t *testing.T) {
 	res, err := Bind("claude", sessionB, wt, "")
 	if err != nil || !strings.Contains(res.text("claude"), "never acknowledged") {
 		t.Fatal("takeover was silent about the earlier session's notices:", res, err)
+	}
+}
+
+// Review round 8 (Codex call 0009 on 15ed0fe): one regression each.
+
+func TestStalledPresenceWorkDoesNotPileUp(t *testing.T) {
+	seedSharedLaunch(t, "wt")
+	oldF, oldB := tipFunc, tipBudget
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release); tipFunc, tipBudget = oldF, oldB })
+	tipBudget = 30 * time.Millisecond
+	var running atomic.Int32
+	tipFunc = func(string) (string, string) { running.Add(1); <-release; running.Add(-1); return "", "" }
+	for i := 0; i < 5; i++ {
+		if _, _, ok := measureTip("claude"); ok {
+			t.Fatal("a stalled measurement reported success")
+		}
+	}
+	if n := running.Load(); n != 1 {
+		t.Fatal("stalled measurements piled up:", n)
+	}
+}
+
+func TestStopDecidesWithinBudgetEvenWhenPresenceIsLocked(t *testing.T) {
+	seedSharedLaunch(t, "wt")
+	oldF, oldB := tipFunc, tipBudget
+	t.Cleanup(func() { tipFunc, tipBudget = oldF, oldB })
+	tipBudget = 100 * time.Millisecond
+	tipFunc = func(string) (string, string) { return "1111111", "main" }
+	c, _ := NewCall("b", "claude", "owed")
+	AppendTurn(c, "b", "reply please", false)
+	held, err := fileGuard(presencePath("claude"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held()
+	start := time.Now()
+	decision := hookStop("claude")
+	if took := time.Since(start); took > tipBudget+500*time.Millisecond {
+		t.Fatal("Stop waited on the presence lock:", took)
+	}
+	if b, _ := json.Marshal(decision); !strings.Contains(string(b), "block") {
+		t.Fatal("Stop lost its block decision:", string(b))
 	}
 }

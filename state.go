@@ -12,6 +12,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -655,11 +657,20 @@ func Beat(agent, lastTool string) error {
 // calls it once per turn, so the last commit of a burst shows while the
 // session idles instead of hiding behind a reused tip.
 func MeasureTip(agent string) error {
+	measure, budget := tipFunc, tipBudget // read here: the run may outlive this call
+	j, ok := inFlight(Root()+"|publish:"+agent, budget, func(j *tipJob) { j.err = measureAndPublish(agent, measure, budget) })
+	if !ok {
+		return errTipBudget
+	}
+	return j.err
+}
+
+func measureAndPublish(agent string, measure func(string) (string, string), budget time.Duration) error {
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
 	at := time.Now()
-	tip, branch, ok := measureTip(agent)
+	tip, branch, ok := measureTipWith(agent, measure, budget)
 	if !ok {
 		return nil
 	}
@@ -670,26 +681,55 @@ func MeasureTip(agent string) error {
 	})
 }
 
-// tipBudget bounds a presence measurement. Presence is telemetry, but the
-// hooks that take it gate the session -- Stop decides whether a turn may end
-// -- so a stalled filesystem (9P to a Windows drive) costs them this, no more.
-const tipBudget = time.Second
+// tipBudget bounds presence work -- measuring HEAD, publishing it. Presence
+// is telemetry, but the hooks that do it gate the session (Stop decides
+// whether a turn may end), so a stalled filesystem (9P to a Windows drive, a
+// held presence lock) costs them this, no more. A variable for tests.
+var tipBudget = time.Second
+
+var errTipBudget = errors.New("presence work exceeded its time budget")
 
 var tipFunc = GitTip // injectable for tests
+
+type tipJob struct {
+	done        chan struct{}
+	tip, branch string
+	err         error
+}
+
+var tipJobs sync.Map // key -> *tipJob
+
+// inFlight runs work for key unless a run is already in flight, and waits
+// for it at most tipBudget. Callers that time out leave the run going and
+// later callers share it, so a stalled filesystem holds one run per key --
+// however long the server lives and however often it is asked.
+func inFlight(key string, budget time.Duration, work func(*tipJob)) (*tipJob, bool) {
+	j := &tipJob{done: make(chan struct{})}
+	if v, loaded := tipJobs.LoadOrStore(key, j); loaded {
+		j = v.(*tipJob)
+	} else {
+		go func() { work(j); tipJobs.Delete(key); close(j.done) }()
+	}
+	select {
+	case <-j.done:
+		return j, true
+	case <-time.After(budget):
+		return nil, false
+	}
+}
 
 // measureTip is a HEAD measurement within tipBudget. ok is false when it ran
 // out or found nothing; such a result is never published over a real one.
 func measureTip(agent string) (tip, branch string, ok bool) {
-	type result struct{ tip, branch string }
-	done := make(chan result, 1)
-	measure := tipFunc // read once: an abandoned measurement may still be running
-	go func() { t, b := measure(agent); done <- result{t, b} }()
-	select {
-	case r := <-done:
-		return r.tip, r.branch, r.tip != "" || r.branch != ""
-	case <-time.After(tipBudget):
+	return measureTipWith(agent, tipFunc, tipBudget)
+}
+
+func measureTipWith(agent string, measure func(string) (string, string), budget time.Duration) (tip, branch string, ok bool) {
+	j, done := inFlight(Root()+"|tip:"+agent, budget, func(j *tipJob) { j.tip, j.branch = measure(agent) })
+	if !done {
 		return "", "", false
 	}
+	return j.tip, j.branch, j.tip != "" || j.branch != ""
 }
 
 // setTip publishes a HEAD measured at at, unless presence already holds a
