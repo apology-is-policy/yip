@@ -1090,11 +1090,16 @@ func TestPresenceMeasurementIsBoundedAndNeverEmpty(t *testing.T) {
 	if err := MeasureTip("claude"); err != nil {
 		t.Fatal(err)
 	}
+	tipFunc = func(string) (string, string) { return "", "main" } // a branch, no SHA
+	_ = MeasureTip("claude")
+	if p, _ := LoadPresence("claude"); p.Tip != "1111111" {
+		t.Fatal("a branch without a SHA replaced the last good HEAD:", p.Tip)
+	}
+	c, _ := NewCall("b", "claude", "owed")
+	AppendTurn(c, "b", "reply please", false)
 	// A stalled filesystem: the Stop hook still decides within the budget,
 	// and the last good HEAD stays.
 	tipFunc = func(string) (string, string) { time.Sleep(3 * time.Second); return "2222222", "main" }
-	c, _ := NewCall("b", "claude", "owed")
-	AppendTurn(c, "b", "reply please", false)
 	start := time.Now()
 	decision := hookStop("claude")
 	if took := time.Since(start); took > tipBudget+500*time.Millisecond {
@@ -1347,5 +1352,120 @@ func TestAJoinedMeasurementKeepsItsOwnTime(t *testing.T) {
 	}
 	if p, _ := LoadPresence("claude"); p.Tip != "2222222" {
 		t.Fatal("a joined older sample overwrote a newer HEAD:", p.Tip)
+	}
+}
+
+// Review round 10 (prosecutor run 5 on 15ed0fe): one regression each.
+
+func TestAFailedMeasurementWaitsOutTheReuseWindow(t *testing.T) {
+	seedSharedLaunch(t, "wt")
+	old := tipFunc
+	t.Cleanup(func() { tipFunc = old })
+	var calls atomic.Int32
+	tipFunc = func(string) (string, string) { calls.Add(1); return "", "" } // ran out, or found nothing
+	for i := 0; i < 3; i++ {
+		if err := Beat("claude", "tool"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatal("every beat measured again after a failed measurement:", n)
+	}
+	if err := updateJSON(presencePath("claude"), func(p *Presence) error {
+		p.TipTried = time.Now().Add(-2 * presenceTipReuse).UTC().Format(time.RFC3339Nano)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = Beat("claude", "tool")
+	if n := calls.Load(); n != 2 {
+		t.Fatal("never measured again once the window passed:", n)
+	}
+}
+
+func TestChannelsAndCodexConnectionsAreRefusedABoundName(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	t.Setenv("YIP_HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", t.TempDir())
+	prev := activeLine
+	t.Cleanup(func() { activeLine = prev })
+	fakeProcs(t, []procID{sessionA}, sessionA) // plain hooks: no launch endpoint
+	if err := os.Remove(endpointPath("claude")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InstallWith(wt, activeLine, "", true, "claude-channels", InstallOptions{}); err == nil || !strings.Contains(err.Error(), "could not be fenced") {
+		t.Fatal("installed Channels under a bound name:", err)
+	}
+	if err := serveIO("wt", serveChannels, strings.NewReader(""), io.Discard); err == nil || !strings.Contains(err.Error(), "bound by another") {
+		t.Fatal("a Channels server started under a bound name:", err)
+	}
+	s := &server{me: "wt", codexMode: true}
+	if out, err := s.call("presence", map[string]any{}); err == nil {
+		t.Fatal("a Codex connection acted as a bound name:", out)
+	}
+}
+
+func TestABrokenRegistryDoesNotSilenceALineWithoutBindings(t *testing.T) {
+	seedSharedLaunch(t, "wt")
+	fakeProcs(t, []procID{sessionA}, sessionA)
+	if err := os.RemoveAll(sessionsDir()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sessionsDir(), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := NewCall("b", "claude", "owed")
+	AppendTurn(c, "b", "reply please", false)
+	if out := runHook(t, "stop", `{"session_id":"s"}`); !strings.Contains(out, "block") {
+		t.Fatal("Stop stopped enforcing an owed reply:", out)
+	}
+	s := &server{me: "claude"}
+	s.startClaude("claude")
+	if s.regErr == nil {
+		t.Fatal("fixture: registration did not fail")
+	}
+	if out, err := s.call("presence", map[string]any{}); err != nil {
+		t.Fatal("every tool refused on a line nobody bound:", err, out)
+	}
+	inR, inW, _ := os.Pipe()
+	oldIn, oldErr := os.Stdin, os.Stderr
+	t.Cleanup(func() { os.Stdin, os.Stderr = oldIn, oldErr })
+	os.Stdin, os.Stderr = inR, nil
+	_, _ = inW.WriteString(`{"session_id":"s"}`)
+	inW.Close()
+	if code := RunRewakeHook("claude", time.Second); code != 2 {
+		t.Fatal("the rewake waiter did not arm on a line nobody bound:", code)
+	}
+}
+
+func TestAStampIsBoundedAndNeverAnOlderRunsSample(t *testing.T) {
+	seedSharedLaunch(t, "wt")
+	oldF, oldB := tipFunc, tipBudget
+	t.Cleanup(func() { tipFunc, tipBudget = oldF, oldB })
+	release := make(chan struct{})
+	tipFunc = func(string) (string, string) { <-release; return "1111111", "main" }
+	tipFunc = func(string) (string, string) { return "1111111", "main" }
+	if turn := renderTurn(1, "claude", "b", "x", false); !strings.Contains(turn, "\ntip: 1111111") || !strings.Contains(turn, "\npeer-tip: 1111111") {
+		t.Fatal("a turn was stamped outside the bounded measurement:", turn)
+	}
+	tipFunc = func(string) (string, string) { <-release; return "1111111", "main" }
+	tipBudget = 50 * time.Millisecond
+	start := time.Now()
+	if sha, _ := stampTip("claude"); sha != "" {
+		t.Fatal("a timed-out stamp reported a HEAD:", sha)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatal("a stamp waited on a stalled measurement:", took)
+	}
+	tipBudget = 2 * time.Second
+	done := make(chan string, 1)
+	go func() { sha, _ := stampTip("claude"); done <- sha }()
+	time.Sleep(50 * time.Millisecond) // joins the stalled run, begun before it asked
+	close(release)
+	if sha := <-done; sha != "" {
+		t.Fatal("stamped with a sample begun before the message:", sha)
 	}
 }

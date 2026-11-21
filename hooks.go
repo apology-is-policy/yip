@@ -57,7 +57,7 @@ func RunHookRuntime(event string, override string, runtime string) {
 		if err != nil {
 			return
 		}
-		if s := hookSession(); !isRegistered(s) && registerSession(s, launch) != nil {
+		if s := hookSession(); !isRegistered(s) && registerSession(s, launch) != nil && anyLiveBinding() {
 			return
 		}
 	}

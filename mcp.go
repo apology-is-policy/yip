@@ -306,6 +306,10 @@ func serveIO(me, mode string, input io.Reader, output io.Writer) error {
 	s := &server{me: me, enc: json.NewEncoder(output), channelMode: channels, codexMode: mode == serveCodex, started: time.Now()}
 	if mode == serveClaude {
 		s.startClaude(me)
+	} else if bd, ok := liveBinding(me); ok {
+		// Channels and Codex connections keep their name; only the binder
+		// answers to a bound one.
+		return errBoundElsewhere(me, bd)
 	}
 	s.cwd, _ = os.Getwd()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -527,7 +531,9 @@ func (s *server) call(name string, a map[string]any) (string, error) {
 	if s.regErr != nil && procAlive(s.session) {
 		s.regErr = registerSession(s.session, s.launch)
 	}
-	if s.regErr != nil {
+	// Unregistered matters only while some session speaks for a worktree:
+	// without a live binding every process answers to its launch name.
+	if s.regErr != nil && anyLiveBinding() {
 		return "", fmt.Errorf("yip could not register this Claude session (%v), so it cannot tell which name it answers to", s.regErr)
 	}
 	// Before resolving: a session whose launch name another has bound is
@@ -541,6 +547,8 @@ func (s *server) call(name string, a map[string]any) (string, error) {
 			return "", err
 		}
 		s.me = me
+	} else if bd, ok := liveBinding(s.me); ok && !s.cli {
+		return "", errBoundElsewhere(s.me, bd)
 	}
 	_ = Beat(s.me, name)
 	if name == "channel_ack" {
@@ -782,7 +790,7 @@ func (s *server) doRead(a map[string]any) (string, error) {
 		return "", err
 	}
 	since := argInt(a, "since", 0)
-	mySha, _ := GitTip(s.me)
+	mySha, _ := stampTip(s.me)
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "call %s -- %s\n%s -> %s, opened %s\n", c.ID, c.Subject, c.From, c.To, c.Opened)

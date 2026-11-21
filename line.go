@@ -332,6 +332,9 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 		Reinstall: (!seatMode && owner == agent) || hadSeat,
 	}
 	if bd, ok := liveBinding(agent); ok {
+		if runtime == "claude-channels" || runtime == "codex" {
+			return nil, fmt.Errorf("%s is bound by a live Claude session (pid %d); a %s connection could not be fenced from that name -- install after the binding ends, or under another name", agent, bd.Session.PID, runtime)
+		}
 		res.Notes = append(res.Notes, fmt.Sprintf("%s is bound by a live Claude session (pid %d): a session started here is refused that name until the binding ends.", agent, bd.Session.PID))
 	}
 

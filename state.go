@@ -469,8 +469,8 @@ func parseTurn(n int, from, raw string) Turn {
 }
 
 func renderTurn(n int, from, peer, body string, barge bool) string {
-	mySha, myBr := GitTip(from)
-	peerSha, peerBr := GitTip(peer)
+	mySha, myBr := stampTip(from)
+	peerSha, peerBr := stampTip(peer)
 	var b strings.Builder
 	fmt.Fprintf(&b, "---\n")
 	fmt.Fprintf(&b, "turn: %d\n", n)
@@ -600,6 +600,10 @@ type Presence struct {
 	// TipAt is when Tip and Branch were last measured -- not Beat, which
 	// every heartbeat renews whether or not it measured.
 	TipAt string `json:"tip_at,omitempty"`
+	// TipTried is when a measurement last ran out or found nothing. The next
+	// waits out presenceTipReuse too, so a stalled worktree costs one budget a
+	// minute rather than one per tool call.
+	TipTried string `json:"tip_tried,omitempty"`
 }
 
 func presencePath(agent string) string {
@@ -632,9 +636,7 @@ func Beat(agent, lastTool string) error {
 		return err
 	}
 	p, _ := LoadPresence(agent)
-	measured, err := time.Parse(time.RFC3339Nano, p.TipAt)
-	age := time.Since(measured)
-	fresh := p.Agent != agent || err != nil || age < 0 || age >= presenceTipReuse
+	fresh := p.Agent != agent || !(recent(p.TipAt) || recent(p.TipTried))
 	var tip, branch string
 	var at time.Time
 	measuredOK := false
@@ -645,12 +647,21 @@ func Beat(agent, lastTool string) error {
 		p.Agent, p.Beat = agent, now()
 		if measuredOK {
 			setTip(p, tip, branch, at)
+		} else if fresh {
+			p.TipTried = now()
 		}
 		if lastTool != "" {
 			p.LastTool = lastTool
 		}
 		return nil
 	})
+}
+
+// recent: stamp is within presenceTipReuse of now, and not in the future.
+func recent(stamp string) bool {
+	t, err := time.Parse(time.RFC3339Nano, stamp)
+	age := time.Since(t)
+	return err == nil && age >= 0 && age < presenceTipReuse
 }
 
 // MeasureTip records HEAD now, whatever the reuse window says. The Stop hook
@@ -734,7 +745,19 @@ func measureTipWith(agent string, measure func(string) (string, string), budget 
 	if !done {
 		return "", "", time.Time{}, false
 	}
-	return j.tip, j.branch, j.at, j.tip != "" || j.branch != ""
+	return j.tip, j.branch, j.at, j.tip != ""
+}
+
+// stampTip is HEAD for a message's stamp, within tipBudget. It is unknown
+// ("") when the budget runs out, or when the only sample began before this
+// request: a stamp says what a message was computed against.
+func stampTip(agent string) (sha, branch string) {
+	asked := time.Now()
+	tip, br, at, ok := measureTip(agent)
+	if !ok || at.Before(asked) {
+		return "", ""
+	}
+	return tip, br
 }
 
 // setTip publishes a HEAD measured at at, unless presence already holds a

@@ -289,7 +289,7 @@ func identityFor(launch string, explicit bool) (string, error) {
 	if (inSession && ns == bd.Session) || (!inSession && explicit) {
 		return me, nil
 	}
-	return "", fmt.Errorf("%s is bound by another live Claude session (pid %d); this process is not that session", me, bd.Session.PID)
+	return "", errBoundElsewhere(me, bd)
 }
 
 // nearestSession is the closest registered Claude session above this process.
@@ -344,6 +344,28 @@ func boundIdentity(launch string) (string, error) {
 		}
 	}
 	return launch, nil
+}
+
+// anyLiveBinding: some live session speaks for a worktree on this line. An
+// unreadable bindings file cannot rule one out.
+func anyLiveBinding() bool {
+	if _, err := os.Stat(bindingsPath()); os.IsNotExist(err) {
+		return false
+	}
+	b, err := loadBindingsStrict()
+	if err != nil {
+		return true
+	}
+	for _, bd := range b.Bindings {
+		if procAlive(bd.Session) {
+			return true
+		}
+	}
+	return false
+}
+
+func errBoundElsewhere(name string, bd Binding) error {
+	return fmt.Errorf("%s is bound by another live Claude session (pid %d); this process is not that session", name, bd.Session.PID)
 }
 
 // liveBinding: the session currently speaking for name, if any.

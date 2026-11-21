@@ -181,7 +181,7 @@ func RunRewakeHook(override string, wait time.Duration) int {
 	if _, err := os.Stat(Root()); err != nil {
 		return 0
 	}
-	if registerSession(hookSession(), launch) != nil {
+	if registerSession(hookSession(), launch) != nil && anyLiveBinding() {
 		return 0
 	}
 	me, err := identityFor(launch, true)
