@@ -630,17 +630,18 @@ func Beat(agent, lastTool string) error {
 		return err
 	}
 	p, _ := LoadPresence(agent)
-	measured, err := time.Parse(time.RFC3339, p.TipAt)
+	measured, err := time.Parse(time.RFC3339Nano, p.TipAt)
 	age := time.Since(measured)
 	fresh := p.Agent != agent || err != nil || age < 0 || age >= presenceTipReuse
 	var tip, branch string
+	at := time.Now()
 	if fresh {
 		tip, branch = GitTip(agent)
 	}
 	return updateJSON(presencePath(agent), func(p *Presence) error {
 		p.Agent, p.Beat = agent, now()
 		if fresh {
-			p.Tip, p.Branch, p.TipAt = tip, branch, p.Beat
+			setTip(p, tip, branch, at)
 		}
 		if lastTool != "" {
 			p.LastTool = lastTool
@@ -656,21 +657,35 @@ func MeasureTip(agent string) error {
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
+	at := time.Now()
 	tip, branch := GitTip(agent)
 	return updateJSON(presencePath(agent), func(p *Presence) error {
-		p.Agent, p.Tip, p.Branch, p.TipAt = agent, tip, branch, now()
+		p.Agent = agent
+		setTip(p, tip, branch, at)
 		return nil
 	})
+}
+
+// setTip publishes a HEAD measured at at, unless presence already holds a
+// later measurement: a beat that measured before a Stop and publishes after
+// it must not put the older HEAD back.
+func setTip(p *Presence, tip, branch string, at time.Time) {
+	// A stored time in the future is a stepped-back clock, not a newer HEAD.
+	if prev, err := time.Parse(time.RFC3339Nano, p.TipAt); err == nil && prev.After(at) && !prev.After(time.Now()) {
+		return
+	}
+	p.Tip, p.Branch, p.TipAt = tip, branch, at.UTC().Format(time.RFC3339Nano)
 }
 
 func SetBusy(agent, text string, pids []int) error {
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
+	at := time.Now()
 	tip, branch := GitTip(agent)
 	return updateJSON(presencePath(agent), func(p *Presence) error {
-		p.Agent, p.Tip, p.Branch, p.Beat = agent, tip, branch, now()
-		p.TipAt = p.Beat
+		p.Agent, p.Beat = agent, now()
+		setTip(p, tip, branch, at)
 		p.Busy, p.Pids = text, pids
 		return nil
 	})

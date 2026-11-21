@@ -806,7 +806,7 @@ func TestSessionStartRegistersItsSessionBeforeResolving(t *testing.T) {
 	t.Cleanup(func() { procCmdline = old })
 	procCmdline = func(pid int) string {
 		if pid == shell.PID {
-			return "sh -c yip hook sessionstart  # yip-line-hook"
+			return "/bin/sh\x00-c\x00yip hook sessionstart  # yip-line-hook"
 		}
 		return "claude"
 	}
@@ -924,7 +924,7 @@ func TestNativeAndBoundSessionsCannotShareAName(t *testing.T) {
 	if err := SaveMembers(m); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Bind("claude", sessionA, wt, ""); err == nil || !strings.Contains(err.Error(), "was started as wt") {
+	if _, err := Bind("claude", sessionA, wt, ""); err == nil || !strings.Contains(err.Error(), "answers to wt") {
 		t.Fatal("bound a name a live native session answers to:", err)
 	}
 	// The other order: bound first, then a session is started inside wt.
@@ -1016,5 +1016,85 @@ func TestWatchDoesNotLeakTheOldNamesEventsInTheBindPoll(t *testing.T) {
 	out, _ := io.ReadAll(r)
 	if !errors.Is(err, errWatchIdentity) || strings.Contains(string(out), c.ID) {
 		t.Fatal("the bind poll let the old name's event out:", err, string(out))
+	}
+}
+
+// Review round 6 (Codex call 0008 on e1fe176): one regression each.
+
+func TestAPromptMentioningTheMarkerIsNotAHookShell(t *testing.T) {
+	if isHookShell("claude\x00-p\x00why does # yip-line-hook appear?") {
+		t.Fatal("a Claude prompt passed for a hook shell")
+	}
+	if !isHookShell("/bin/sh\x00-c\x00[ ! -x yip ] || yip hook stop  # yip-line-hook") {
+		t.Fatal("the real hook shell was not recognised")
+	}
+	seedSharedLaunch(t, "wt")
+	fakeProcs(t, []procID{sessionB, sessionA}, sessionA, sessionB) // exec'd hook under B
+	old := procCmdline
+	t.Cleanup(func() { procCmdline = old })
+	procCmdline = func(int) string { return "claude\x00-p\x00# yip-line-hook" }
+	if p := hookSession(); p != sessionB {
+		t.Fatal("skipped a Claude process whose prompt mentions the marker:", p)
+	}
+}
+
+func TestAnotherNamespacesRecordIsNotALocalBoundary(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	shell := procID{PID: 60, Start: "4"}
+	fakeProcs(t, []procID{shell, sessionA}, sessionA)
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	// A registrar in another pid namespace recorded a session whose numbers
+	// happen to match this shell.
+	foreign := sessionRecord{Session: shell, Boot: bootID(), NS: "pid:[999]", Launch: "other"}
+	if err := writeState(filepath.Join(sessionsDir(), "60-4-999.json"), foreign); err != nil {
+		t.Fatal(err)
+	}
+	if me := whoami(t, "claude"); me != "wt" {
+		t.Fatal("a foreign namespace's record stopped the walk:", me)
+	}
+	procAlive = func(p procID) bool { return p == sessionA || p == shell } // same numbers, live here
+	if _, found := answeringTo("other", procID{}, Bindings{}); found {
+		t.Fatal("a foreign namespace's record counted as a live local session")
+	}
+}
+
+func TestBindJudgesWhoAnswersToTheNameNow(t *testing.T) {
+	launchDir, wt := seedSharedLaunch(t, "wt")
+	late := procID{PID: 4800, Start: "24"}
+	fakeProcs(t, nil, sessionA, sessionB)
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	// A session started inside wt after the bind is fenced, not answering:
+	// it does not veto the binder binding again.
+	procAlive = func(p procID) bool { return p == sessionA || p == sessionB || p == late }
+	if err := registerSession(late, "wt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal("the binder's repeat bind was refused:", err)
+	}
+	// A bound away from claude, so claude's folder is free for B (launched
+	// as "other") -- were no other session answering to claude.
+	if err := os.Remove(sessionPath(sessionB)); err != nil {
+		t.Fatal(err)
+	}
+	if err := registerSession(sessionB, "other"); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := Bind("other", sessionB, launchDir, ""); err != nil || res.Name != "claude" {
+		t.Fatal("a vacated launch name stayed reserved:", res, err)
+	}
+}
+
+func TestAnOlderMeasurementNeverReplacesANewerOne(t *testing.T) {
+	newer, older := time.Now(), time.Now().Add(-time.Second)
+	p := &Presence{}
+	setTip(p, "2222222", "main", newer) // the Stop's final measurement
+	setTip(p, "1111111", "main", older) // a beat that measured earlier publishes late
+	if p.Tip != "2222222" {
+		t.Fatal("an in-flight older beat overwrote the final HEAD:", p.Tip)
 	}
 }

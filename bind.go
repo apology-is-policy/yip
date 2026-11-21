@@ -131,17 +131,44 @@ func hookSession() procID {
 	if len(anc) == 0 {
 		return procID{}
 	}
-	if len(anc) > 1 && strings.Contains(procCmdline(anc[0].PID), hookMarker) {
+	if len(anc) > 1 && isHookShell(procCmdline(anc[0].PID)) {
 		return anc[1]
 	}
 	return anc[0]
 }
 
+// isHookShell: argv is a shell running a Yip hook command (`sh -c '...
+// # yip-line-hook'`) -- not merely a process whose arguments mention the
+// marker, as a Claude prompt can.
+func isHookShell(cmdline string) bool {
+	argv := strings.Split(strings.TrimRight(cmdline, "\x00"), "\x00")
+	switch filepath.Base(argv[0]) {
+	case "sh", "bash", "dash", "zsh", "ash", "ksh":
+	default:
+		return false
+	}
+	for i := 1; i+1 < len(argv); i++ {
+		if argv[i] == "-c" {
+			return strings.Contains(argv[i+1], hookMarker)
+		}
+	}
+	return false
+}
+
 func sessionsDir() string { return filepath.Join(Root(), "sessions") }
 
+// sessionPath is keyed by pid namespace too: a pid and start time mean
+// nothing outside the namespace that observed them.
 func sessionPath(p procID) string {
-	return filepath.Join(sessionsDir(), strconv.Itoa(p.PID)+"-"+p.Start+".json")
+	return filepath.Join(sessionsDir(), strconv.Itoa(p.PID)+"-"+p.Start+"-"+nsKey()+".json")
 }
+
+var nsKey = sync.OnceValue(func() string {
+	if k := strings.Trim(strings.TrimPrefix(pidNS(), "pid:"), "[]"); k != "" {
+		return k
+	}
+	return "0"
+})
 
 type sessionRecord struct {
 	Session procID `json:"session"`
@@ -206,14 +233,24 @@ func isRegistered(p procID) bool {
 	return r.Session == p && r.Boot == bootID()
 }
 
-// launchedAs: a live registered session, other than except, that started as
-// name -- one started inside that worktree, which answers to it by path.
-func launchedAs(name string, except procID) (procID, bool) {
+// answeringTo: a live registered session of this namespace, other than
+// except, that answers to name now -- through its binding, or through its
+// launch name if it holds none (one started inside that worktree does).
+func answeringTo(name string, except procID, b Bindings) (procID, bool) {
 	entries, _ := os.ReadDir(sessionsDir())
 	for _, e := range entries {
 		var r sessionRecord
-		if strings.HasSuffix(e.Name(), ".json") && readState(filepath.Join(sessionsDir(), e.Name()), &r) == nil &&
-			r.Launch == name && r.Session != except && r.Boot == bootID() && procAlive(r.Session) {
+		if !strings.HasSuffix(e.Name(), ".json") || readState(filepath.Join(sessionsDir(), e.Name()), &r) != nil ||
+			r.Session == except || r.Boot != bootID() || r.NS != pidNS() || !procAlive(r.Session) {
+			continue
+		}
+		cur := r.Launch
+		for n, bd := range b.Bindings {
+			if bd.Session == r.Session {
+				cur = n
+			}
+		}
+		if cur == name {
 			return r.Session, true
 		}
 	}
@@ -416,13 +453,16 @@ func Bind(launch string, session procID, worktree, as string) (*bindResult, erro
 	} else if name != launch && isCodexIdentity(name, root) {
 		return nil, fmt.Errorf("%s is %s's checkout, and %s is a Codex identity", root, name, name)
 	}
-	if name != launch {
-		if other, ok := launchedAs(name, session); ok {
-			return nil, fmt.Errorf("a live Claude session (pid %d) was started as %s and answers to it; bind a worktree of your own", other.PID, name)
-		}
-	}
-	if cur, ok := b.Bindings[name]; ok && cur.Session != session && procAlive(cur.Session) {
+	cur, bound := b.Bindings[name]
+	if bound && cur.Session != session && procAlive(cur.Session) {
 		return nil, fmt.Errorf("%s is bound to another live Claude session (pid %d, since %s); two sessions cannot answer to one name", name, cur.Session.PID, cur.Bound)
+	}
+	// Already this session's: binding again is idempotent, and a session
+	// started inside the worktree since then is fenced, not answering.
+	if name != launch && !(bound && cur.Session == session) {
+		if other, ok := answeringTo(name, session, b); ok {
+			return nil, fmt.Errorf("a live Claude session (pid %d) answers to %s; bind a worktree of your own", other.PID, name)
+		}
 	}
 	res.Name = name
 	// Prepare before committing, so a failure leaves the identity unchanged.
