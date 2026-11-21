@@ -38,6 +38,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 )
 
 type procID struct {
@@ -196,12 +198,14 @@ func registerSession(p procID, launch string) error {
 	if err := os.MkdirAll(sessionsDir(), 0o755); err != nil {
 		return err
 	}
-	unlock, err := fileGuard(filepath.Join(sessionsDir(), "registry"))
-	if err != nil {
-		return err
+	// Bounded: this runs before the MCP server answers initialize and in the
+	// synchronous SessionStart hook. A stalled holder costs a second, and then
+	// the record is written without pruning, which is only housekeeping.
+	unlock, err := tryGuard(filepath.Join(sessionsDir(), "registry"), time.Second)
+	if err == nil {
+		defer unlock()
 	}
-	defer unlock()
-	if entries, err := os.ReadDir(sessionsDir()); err == nil {
+	if entries, rerr := os.ReadDir(sessionsDir()); err == nil && rerr == nil {
 		for _, e := range entries {
 			var r sessionRecord
 			path := filepath.Join(sessionsDir(), e.Name())
@@ -217,6 +221,23 @@ func registerSession(p procID, launch string) error {
 		return nil
 	}
 	return writeState(sessionPath(p), sessionRecord{Session: p, Boot: bootID(), NS: pidNS(), Launch: launch, Registered: now()})
+}
+
+// tryGuard is fileGuard with a deadline instead of an unbounded wait.
+func tryGuard(path string, budget time.Duration) (func(), error) {
+	f, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	for deadline := time.Now().Add(budget); ; time.Sleep(10 * time.Millisecond) {
+		if err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+			return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }, nil
+		}
+		if !time.Now().Before(deadline) {
+			f.Close()
+			return nil, err
+		}
+	}
 }
 
 // isRegistered: p is a Claude session boundary. A record that exists but
@@ -236,12 +257,22 @@ func isRegistered(p procID) bool {
 // answeringTo: a live registered session of this namespace, other than
 // except, that answers to name now -- through its binding, or through its
 // launch name if it holds none (one started inside that worktree does).
-func answeringTo(name string, except procID, b Bindings) (procID, bool) {
-	entries, _ := os.ReadDir(sessionsDir())
+// A registry it cannot read is an error, not "nobody": that would let a bind
+// take a name a live session answers to.
+func answeringTo(name string, except procID, b Bindings) (procID, bool, error) {
+	entries, err := os.ReadDir(sessionsDir())
+	if err != nil && !os.IsNotExist(err) {
+		return procID{}, false, err
+	}
 	for _, e := range entries {
 		var r sessionRecord
-		if !strings.HasSuffix(e.Name(), ".json") || readState(filepath.Join(sessionsDir(), e.Name()), &r) != nil ||
-			r.Session == except || r.Boot != bootID() || r.NS != pidNS() || !procAlive(r.Session) {
+		if !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		if err := readState(filepath.Join(sessionsDir(), e.Name()), &r); err != nil {
+			return procID{}, false, err
+		}
+		if r.Session == except || r.Boot != bootID() || r.NS != pidNS() || !procAlive(r.Session) {
 			continue
 		}
 		cur := r.Launch
@@ -251,10 +282,10 @@ func answeringTo(name string, except procID, b Bindings) (procID, bool) {
 			}
 		}
 		if cur == name {
-			return r.Session, true
+			return r.Session, true, nil
 		}
 	}
-	return procID{}, false
+	return procID{}, false, nil
 }
 
 // identityFor is what a caller that started as launch answers to, fenced: a
@@ -460,11 +491,20 @@ func Bind(launch string, session procID, worktree, as string) (*bindResult, erro
 	// Already this session's: binding again is idempotent, and a session
 	// started inside the worktree since then is fenced, not answering.
 	if name != launch && !(bound && cur.Session == session) {
-		if other, ok := answeringTo(name, session, b); ok {
+		other, ok, err := answeringTo(name, session, b)
+		if err != nil {
+			return nil, fmt.Errorf("cannot tell who answers to %s: %v", name, err)
+		}
+		if ok {
 			return nil, fmt.Errorf("a live Claude session (pid %d) answers to %s; bind a worktree of your own", other.PID, name)
 		}
 	}
 	res.Name = name
+	// A target delivered through Channels or Codex keeps that connection under
+	// its name -- a second answerer the waiter cannot fence.
+	if tep, terr := readEndpoint(name); name != launch && terr == nil && tep.Runtime != "claude-rewake" {
+		return nil, fmt.Errorf("%s is delivered through %s; bind needs a worktree on the claude-rewake runtime or plain hooks", name, tep.Runtime)
+	}
 	// Prepare before committing, so a failure leaves the identity unchanged.
 	if name != launch && epErr == nil {
 		warning, err := ensureEndpoint(name, ep.Runtime)
@@ -473,6 +513,17 @@ func Bind(launch string, session procID, worktree, as string) (*bindResult, erro
 		}
 		if warning != "" {
 			res.Notes = append(res.Notes, warning)
+		}
+		if tep, err := readEndpoint(name); err == nil {
+			unread := 0
+			for _, d := range tep.Events {
+				if d.Status == "sent" || d.Status == "unknown" {
+					unread++
+				}
+			}
+			if unread > 0 {
+				res.Notes = append(res.Notes, fmt.Sprintf("%d notice(s) for %s went to an earlier session and were never acknowledged; see deliveries.", unread, name))
+			}
 		}
 	}
 	if res.Joined {

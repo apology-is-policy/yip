@@ -600,7 +600,7 @@ A line lives outside the checkouts in `~/.yip/lines/<line-id>/`:
 members.json           checkout membership
 seats.json             identities without a checkout of their own
 bindings.json          live Claude sessions answering as a worktree's identity
-sessions/              live Claude sessions, registered by their Yip MCP server
+sessions/              live Claude sessions, registered by their Yip MCP server and hooks
 calls/                 Markdown turns, notes, lifecycle, disputes, attachments
 broadcasts/            immutable broadcasts and per-recipient receipts/replies
 delivery/              endpoint bindings, attempts, acknowledgments, owner locks

@@ -524,8 +524,16 @@ func (s *server) startClaude(launch string) {
 }
 
 func (s *server) call(name string, a map[string]any) (string, error) {
+	if s.regErr != nil && procAlive(s.session) {
+		s.regErr = registerSession(s.session, s.launch)
+	}
 	if s.regErr != nil {
-		return "", fmt.Errorf("yip could not register this Claude session (%v), so it cannot tell which name it answers to; restart the session once that is fixed", s.regErr)
+		return "", fmt.Errorf("yip could not register this Claude session (%v), so it cannot tell which name it answers to", s.regErr)
+	}
+	// Before resolving: a session whose launch name another has bound is
+	// refused every tool, and bind is its way out to a worktree of its own.
+	if name == "bind" {
+		return s.doBind(a)
 	}
 	if s.launch != "" {
 		me, err := identityFor(s.launch, true)
@@ -533,9 +541,6 @@ func (s *server) call(name string, a map[string]any) (string, error) {
 			return "", err
 		}
 		s.me = me
-	}
-	if name == "bind" {
-		return s.doBind(a)
 	}
 	_ = Beat(s.me, name)
 	if name == "channel_ack" {

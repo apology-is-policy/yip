@@ -102,7 +102,14 @@ func RunRewake(agent string, wait time.Duration, session string, stderr io.Write
 		_ = editEndpoint(agent, func(ep *Endpoint) error { ep.Thread = session; return nil })
 	}
 	deadline := time.Now().Add(wait)
+	// A turn ended by an interrupt or an API error runs no Stop hook; the
+	// waiter armed at the previous one keeps presence measured meanwhile.
+	var measured time.Time
 	for {
+		if time.Since(measured) >= presenceTipReuse {
+			_ = MeasureTip(agent)
+			measured = time.Now()
+		}
 		// Checked and dispatched under the bindings guard: a bind cannot land
 		// between "still this session's identity" and "notices marked sent".
 		unlockB, err := fileGuard(bindingsPath())

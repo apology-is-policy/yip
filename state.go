@@ -634,13 +634,14 @@ func Beat(agent, lastTool string) error {
 	age := time.Since(measured)
 	fresh := p.Agent != agent || err != nil || age < 0 || age >= presenceTipReuse
 	var tip, branch string
+	measuredOK := false
 	at := time.Now()
 	if fresh {
-		tip, branch = GitTip(agent)
+		tip, branch, measuredOK = measureTip(agent)
 	}
 	return updateJSON(presencePath(agent), func(p *Presence) error {
 		p.Agent, p.Beat = agent, now()
-		if fresh {
+		if measuredOK {
 			setTip(p, tip, branch, at)
 		}
 		if lastTool != "" {
@@ -658,12 +659,36 @@ func MeasureTip(agent string) error {
 		return err
 	}
 	at := time.Now()
-	tip, branch := GitTip(agent)
+	tip, branch, ok := measureTip(agent)
+	if !ok {
+		return nil
+	}
 	return updateJSON(presencePath(agent), func(p *Presence) error {
 		p.Agent = agent
 		setTip(p, tip, branch, at)
 		return nil
 	})
+}
+
+// tipBudget bounds a presence measurement. Presence is telemetry, but the
+// hooks that take it gate the session -- Stop decides whether a turn may end
+// -- so a stalled filesystem (9P to a Windows drive) costs them this, no more.
+const tipBudget = time.Second
+
+var tipFunc = GitTip // injectable for tests
+
+// measureTip is a HEAD measurement within tipBudget. ok is false when it ran
+// out or found nothing; such a result is never published over a real one.
+func measureTip(agent string) (tip, branch string, ok bool) {
+	type result struct{ tip, branch string }
+	done := make(chan result, 1)
+	go func() { t, b := tipFunc(agent); done <- result{t, b} }()
+	select {
+	case r := <-done:
+		return r.tip, r.branch, r.tip != "" || r.branch != ""
+	case <-time.After(tipBudget):
+		return "", "", false
+	}
 }
 
 // setTip publishes a HEAD measured at at, unless presence already holds a
@@ -682,10 +707,12 @@ func SetBusy(agent, text string, pids []int) error {
 		return err
 	}
 	at := time.Now()
-	tip, branch := GitTip(agent)
+	tip, branch, ok := measureTip(agent)
 	return updateJSON(presencePath(agent), func(p *Presence) error {
 		p.Agent, p.Beat = agent, now()
-		setTip(p, tip, branch, at)
+		if ok {
+			setTip(p, tip, branch, at)
+		}
 		p.Busy, p.Pids = text, pids
 		return nil
 	})

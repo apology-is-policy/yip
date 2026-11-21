@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -1055,7 +1056,7 @@ func TestAnotherNamespacesRecordIsNotALocalBoundary(t *testing.T) {
 		t.Fatal("a foreign namespace's record stopped the walk:", me)
 	}
 	procAlive = func(p procID) bool { return p == sessionA || p == shell } // same numbers, live here
-	if _, found := answeringTo("other", procID{}, Bindings{}); found {
+	if _, found, _ := answeringTo("other", procID{}, Bindings{}); found {
 		t.Fatal("a foreign namespace's record counted as a live local session")
 	}
 }
@@ -1096,5 +1097,177 @@ func TestAnOlderMeasurementNeverReplacesANewerOne(t *testing.T) {
 	setTip(p, "1111111", "main", older) // a beat that measured earlier publishes late
 	if p.Tip != "2222222" {
 		t.Fatal("an in-flight older beat overwrote the final HEAD:", p.Tip)
+	}
+}
+
+// Review round 7 (prosecutor run 4 on e1fe176): one regression each.
+
+func TestPresenceMeasurementIsBoundedAndNeverEmpty(t *testing.T) {
+	seedSharedLaunch(t, "wt")
+	old := tipFunc
+	t.Cleanup(func() { tipFunc = old })
+	tipFunc = func(string) (string, string) { return "1111111", "main" }
+	if err := MeasureTip("claude"); err != nil {
+		t.Fatal(err)
+	}
+	// A stalled filesystem: the Stop hook still decides within the budget,
+	// and the last good HEAD stays.
+	tipFunc = func(string) (string, string) { time.Sleep(3 * time.Second); return "2222222", "main" }
+	c, _ := NewCall("b", "claude", "owed")
+	AppendTurn(c, "b", "reply please", false)
+	start := time.Now()
+	decision := hookStop("claude")
+	if took := time.Since(start); took > tipBudget+500*time.Millisecond {
+		t.Fatal("Stop waited on a stalled measurement:", took)
+	}
+	if b, _ := json.Marshal(decision); !strings.Contains(string(b), "block") {
+		t.Fatal("Stop lost its block decision:", string(b))
+	}
+	tipFunc = func(string) (string, string) { return "", "" } // nothing found
+	_ = MeasureTip("claude")
+	if p, _ := LoadPresence("claude"); p.Tip != "1111111" {
+		t.Fatal("a stalled or empty measurement replaced the last good HEAD:", p.Tip)
+	}
+}
+
+func TestTheWaiterMeasuresPresenceWhileItRuns(t *testing.T) {
+	seedSharedLaunch(t, "wt")
+	old := tipFunc
+	t.Cleanup(func() { tipFunc = old })
+	tipFunc = func(string) (string, string) { return "3333333", "main" }
+	// A turn ended by an interrupt runs no Stop; the armed waiter measures.
+	RunRewake("claude", 100*time.Millisecond, "", &bytes.Buffer{}, always, 10*time.Millisecond)
+	if p, _ := LoadPresence("claude"); p.Tip != "3333333" {
+		t.Fatal("the waiter left presence unmeasured:", p.Tip)
+	}
+}
+
+func TestEveryHookRegistersItsSessionFirst(t *testing.T) {
+	launchDir, wt := seedSharedLaunch(t, "outer-wt")
+	shell := procID{PID: 50, Start: "3"}
+	fakeProcs(t, []procID{sessionA}, sessionA, sessionB)
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := NewCall("b", "outer-wt", "for A")
+	AppendTurn(c, "b", "your turn", false)
+	// B started inside A before this binary registered it (or registration
+	// failed at its SessionStart): its PostToolUse hook must not answer as A.
+	if err := os.Remove(sessionPath(sessionB)); err != nil {
+		t.Fatal(err)
+	}
+	processAncestors = func() []procID { return []procID{shell, sessionB, sessionA} }
+	old := procCmdline
+	t.Cleanup(func() { procCmdline = old })
+	procCmdline = func(pid int) string {
+		if pid == shell.PID {
+			return "/bin/sh\x00-c\x00yip hook posttooluse  # yip-line-hook"
+		}
+		return "claude"
+	}
+	out := runHook(t, "posttooluse", `{"cwd":"`+launchDir+`","hook_event_name":"PostToolUse","tool_name":"Bash"}`)
+	if strings.Contains(out, c.ID) || !isRegistered(sessionB) {
+		t.Fatal("an unregistered session's hook answered as the outer session:", out)
+	}
+}
+
+func TestASessionWhoseLaunchNameIsFencedCanStillBind(t *testing.T) {
+	launchDir, wt := seedSharedLaunch(t, "wt")
+	fakeProcs(t, []procID{sessionA}, sessionA, sessionB)
+	// B, launched as "other", bound claude's folder: claude is now B's.
+	if err := os.Remove(sessionPath(sessionB)); err != nil {
+		t.Fatal(err)
+	}
+	if err := registerSession(sessionB, "other"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(sessionPath(sessionA)); err != nil {
+		t.Fatal(err)
+	}
+	procAlive = func(p procID) bool { return p == sessionB }
+	if _, err := Bind("other", sessionB, launchDir, ""); err != nil {
+		t.Fatal(err)
+	}
+	procAlive = func(p procID) bool { return p == sessionA || p == sessionB }
+	if err := registerSession(sessionA, "claude"); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{me: "claude", launch: "claude", session: sessionA}
+	if _, err := s.call("busy", map[string]any{"text": "x"}); err == nil {
+		t.Fatal("a fenced session acted as claude")
+	}
+	if out, err := s.call("bind", map[string]any{"worktree": wt}); err != nil {
+		t.Fatal("a fenced session could not bind its way out:", err, out)
+	}
+}
+
+func TestBindRefusesWhatItCannotFenceOrRead(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	fakeProcs(t, nil, sessionA)
+	if _, err := ensureEndpoint("wt", "claude-channels"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind("claude", sessionA, wt, ""); err == nil || !strings.Contains(err.Error(), "delivered through claude-channels") {
+		t.Fatal("bound a worktree delivered through Channels:", err)
+	}
+	if err := os.Remove(endpointPath("wt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionsDir(), "1-1-0.json"), []byte("{bad"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind("claude", sessionA, wt, ""); err == nil || !strings.Contains(err.Error(), "cannot tell who answers") {
+		t.Fatal("bound past an unreadable registry record:", err)
+	}
+}
+
+func TestRegistrationRecoversAndIsNotHeldHostage(t *testing.T) {
+	seedSharedLaunch(t, "wt")
+	fakeProcs(t, []procID{sessionA}, sessionA)
+	if err := os.Remove(sessionPath(sessionA)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sessionsDir(), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{me: "claude"}
+	s.startClaude("claude")
+	_ = os.Chmod(sessionsDir(), 0o755)
+	if s.regErr == nil {
+		t.Skip("registry directory still writable (running as root?)")
+	}
+	if _, err := s.call("busy", map[string]any{"text": "x"}); err != nil {
+		t.Fatal("registration did not recover once the fault was fixed:", err)
+	}
+	// A holder stuck on the registry lock costs a registrar a second, not forever.
+	stuck, err := fileGuard(filepath.Join(sessionsDir(), "registry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stuck()
+	late := procID{PID: 5100, Start: "27"}
+	procAlive = func(p procID) bool { return p == sessionA || p == late }
+	start := time.Now()
+	if err := registerSession(late, "claude"); err != nil || !isRegistered(late) {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatal("registration waited on a stuck registry lock:", took)
+	}
+}
+
+func TestTakingOverANameReportsItsUnacknowledgedNotices(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	fakeProcs(t, nil, sessionA, sessionB)
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := NewCall("b", "wt", "for the first binder")
+	AppendTurn(c, "b", "hello", false)
+	RunRewake("wt", time.Second, "", &bytes.Buffer{}, always, 10*time.Millisecond) // sent, never acked
+	procAlive = func(p procID) bool { return p == sessionB }                       // the first binder exits
+	res, err := Bind("claude", sessionB, wt, "")
+	if err != nil || !strings.Contains(res.text("claude"), "never acknowledged") {
+		t.Fatal("takeover was silent about the earlier session's notices:", res, err)
 	}
 }
