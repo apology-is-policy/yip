@@ -189,6 +189,17 @@ func tools() []toolDef {
 			}, "path"),
 		},
 		{
+			Name: "bind",
+			Description: "Answer as the worktree you work in. For sessions started from one shared folder that each work in a worktree of their own: " +
+				"after bind, calls to that worktree's identity reach THIS session, and the name you started as no longer does. " +
+				"Call it once your worktree exists, and again after a restart or resume. Returns your new name -- give it to peers. " +
+				"It re-identifies this whole Claude session -- the main conversation and every subagent -- so only the main conversation should call it.",
+			InputSchema: obj(map[string]any{
+				"worktree": str("Absolute path of your worktree's top folder. Under WSL a Windows path (C:\\src\\repo-wt) is accepted. The folder you started in ends the binding."),
+				"as":       str("Name to join the line under, if the worktree is not on it yet. Default: the folder's name."),
+			}, "worktree"),
+		},
+		{
 			Name:        "ring",
 			Description: "What is waiting for you: unread turns, and calls where the floor is yours.",
 			InputSchema: obj(map[string]any{}),
@@ -254,6 +265,10 @@ func tools() []toolDef {
 
 type server struct {
 	me           string
+	launch       string // a Claude connection: the identity it started as, which bind can replace
+	session      procID // a Claude connection: the session (its parent) when the server started
+	regErr       error  // registering that session failed: refuse to act rather than guess
+	cli          bool   // yip api: resolves a binding but cannot make one
 	enc          *json.Encoder
 	writeMu      sync.Mutex
 	channelMode  bool
@@ -289,6 +304,11 @@ func serveIO(me, mode string, input io.Reader, output io.Writer) error {
 	}
 	channels := mode == serveChannels
 	s := &server{me: me, enc: json.NewEncoder(output), channelMode: channels, codexMode: mode == serveCodex, started: time.Now()}
+	if mode == serveClaude {
+		s.startClaude(me)
+	} else if err := fenceConnection(me); err != nil {
+		return err
+	}
 	s.cwd, _ = os.Getwd()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -497,7 +517,42 @@ func body(a map[string]any) (string, error) {
 
 // ----------------------------------------------------------------- actions
 
+// startClaude: a Claude connection resolves its identity per call, and
+// registers its session -- its parent -- as a boundary for that resolution.
+func (s *server) startClaude(launch string) {
+	s.launch = launch
+	s.session = parentSession()
+	s.regErr = registerSession(s.session, launch)
+}
+
 func (s *server) call(name string, a map[string]any) (string, error) {
+	if s.regErr != nil && procAlive(s.session) {
+		s.regErr = registerSession(s.session, s.launch)
+	}
+	// Unregistered matters only while some session speaks for a worktree:
+	// without a live binding every process answers to its launch name.
+	// Bind would create one, so it needs the boundary registered first.
+	if s.regErr != nil && (name == "bind" || anyLiveBinding()) {
+		return "", fmt.Errorf("yip could not register this Claude session (%v), so it cannot tell which name it answers to", s.regErr)
+	}
+	// Before resolving: a session whose launch name another has bound is
+	// refused every tool, and bind is its way out to a worktree of its own.
+	if name == "bind" {
+		return s.doBind(a)
+	}
+	if s.launch != "" && s.regErr != nil {
+		s.me = s.launch // nobody was bound; resolution would walk past this session
+	} else if s.launch != "" {
+		me, err := identityFor(s.launch, true)
+		if err != nil {
+			return "", err
+		}
+		s.me = me
+	} else if s.channelMode || s.codexMode {
+		if err := fenceConnection(s.me); err != nil {
+			return "", err
+		}
+	}
 	_ = Beat(s.me, name)
 	if name == "channel_ack" {
 		if !s.channelMode || !s.initialized || s.channel == "" {
@@ -628,6 +683,24 @@ func (s *server) doMeasure(a map[string]any) (string, error) {
 	return fmt.Sprintf("recorded for %s.\n%s", d.ID, DisputeStatus(c, d)), nil
 }
 
+func (s *server) doBind(a map[string]any) (string, error) {
+	if s.launch == "" || s.cli {
+		return "", fmt.Errorf("bind is the Yip MCP tool of a Claude session (claude-rewake runtime or plain hooks); it is not available from Channels, Codex or the CLI")
+	}
+	// The session that started this server -- not whatever is its parent now:
+	// a server orphaned by a dead session must not bind its new parent.
+	if s.session.PID <= 1 || !procAlive(s.session) {
+		return "", fmt.Errorf("bind needs the Claude session that started this server, and it has exited (or /proc is unavailable)")
+	}
+	res, err := Bind(s.launch, s.session, argStr(a, "worktree"), argStr(a, "as"))
+	if err != nil {
+		return "", err
+	}
+	s.me = res.Name
+	_ = Beat(s.me, "bind")
+	return res.text(s.launch), nil
+}
+
 func (s *server) doAttach(a map[string]any) (string, error) {
 	c, err := ResolveCall(argStr(a, "call"), s.me)
 	if err != nil {
@@ -720,7 +793,7 @@ func (s *server) doRead(a map[string]any) (string, error) {
 		return "", err
 	}
 	since := argInt(a, "since", 0)
-	mySha, _ := GitTip(s.me)
+	mySha, _ := stampTip(s.me)
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "call %s -- %s\n%s -> %s, opened %s\n", c.ID, c.Subject, c.From, c.To, c.Opened)

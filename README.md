@@ -129,6 +129,49 @@ next turn, when the ordinary hooks report what arrived. Busy sessions get the
 notice at their next safe point. A waiter whose session has exited sends
 nothing. `yip line` shows whether the waiter is armed.
 
+#### Several sessions started from one folder: `bind`
+
+A common layout starts every Claude session from one folder -- the one that
+holds the shared Claude configuration -- and each session then creates a
+worktree of its own and works there. All of them were installed under the
+folder's one name, so a call to it wakes whichever session armed its waiter
+first. Once its worktree exists, a session calls the `bind` MCP tool:
+
+```text
+bind  worktree=/src/repo-wt-review        # Under WSL, C:\src\repo-wt-review also works
+```
+
+From then on, that session alone answers as the worktree's identity -- in its
+MCP tools, hooks, rewake waiter and the `yip` CLI in its shell -- and no longer
+answers to the folder's name. The worktree joins the line as an ordinary member,
+named after its folder unless you pass `as`. The waiter armed under the old name
+steps aside, and the next turn arms one for the new name. Two live sessions
+cannot bind one worktree. Binding the launch folder ends the binding.
+
+A binding belongs to the Claude process (pid plus kernel start time, read from
+`/proc`), so it ends when the session exits; after a restart or resume, bind
+again. It re-identifies the whole session -- the main conversation and every
+subagent, which share its MCP server -- so only the main conversation should
+call it. It replaces only the identity the session started as. It needs the
+claude-rewake runtime or plain hooks (Channels stay with the name they
+connected as), and Linux or WSL. `yip line` shows which members are bound.
+
+Each Claude session registers itself (under `sessions/`) when its Yip MCP
+server or any of its hooks runs. That is how a bound name stays with its
+binder: a session started inside a bound one (`claude -p` from its shell)
+answers as itself; bind refuses a worktree that a live session started there
+already answers to; and while a worktree is bound, any other Claude session --
+started inside it, or with its shell standing in its folder -- is refused that
+name, even with `--as`, and so is any Channels or Codex connection. Outside
+any Claude session, a person may still name it with `--as`. A session whose
+Yip MCP server and hooks never ran is not known and is not fenced; nor is one
+whose MCP server or rewake waiter still runs a Yip from before bind, so after
+upgrading, restart running sessions before binding their worktrees.
+
+Bind is an MCP tool only: a command in a shell cannot tell which name its
+session started as. A running `yip watch` exits with code 4 when its session
+binds or unbinds; restart it.
+
 For plain hook-based Claude integration (notices at hook boundaries only):
 
 ```sh
@@ -449,7 +492,8 @@ yip watch --once --timeout 10m
 ```
 
 `watch` does not itself wake an agent. With `--once`, exit 0 means an event
-arrived; exit 3 means the deadline passed without one.
+arrived; exit 3 means the deadline passed without one; exit 4 means the
+session now answers to another name (it bound or unbound).
 
 Disputes name measurements rather than electing a winner. Agents can propose
 measurements and record measured outcomes; humans can ratify or arbitrate from
@@ -549,13 +593,16 @@ yip busy 'Reviewing the change'
 Identity is registered against an absolute checkout path, or as a seat whose
 runtime config names it. `--as NAME` explicitly overrides identity; it does not
 create a second registration. One active session per identity keeps delivery
-and ownership unambiguous. `yip line` lists members and seats.
+and ownership unambiguous; a Claude session can `bind` a worktree's identity in
+place of the one it started as. `yip line` lists members, seats and bindings.
 
 A line lives outside the checkouts in `~/.yip/lines/<line-id>/`:
 
 ```text
 members.json           checkout membership
 seats.json             identities without a checkout of their own
+bindings.json          live Claude sessions answering as a worktree's identity
+sessions/              live Claude sessions, registered by their Yip MCP server and hooks
 calls/                 Markdown turns, notes, lifecycle, disputes, attachments
 broadcasts/            immutable broadcasts and per-recipient receipts/replies
 delivery/              endpoint bindings, attempts, acknowledgments, owner locks

@@ -127,7 +127,7 @@ func AppendNote(c *Call, from string, kind AuthorKind, body string) (int, error)
 		var b strings.Builder
 		fmt.Fprintf(&b, "---\nnote: %d\nfrom: %s\nkind: %s\nat: %s\n", n, from, kind, now())
 		if kind == AuthorAgent {
-			sha, br := GitTip(from)
+			sha, br := stampTip(from)
 			fmt.Fprintf(&b, "tip: %s (%s)\n", sha, br)
 		}
 		fmt.Fprintf(&b, "---\n\n%s\n", strings.TrimRight(body, "\n"))
