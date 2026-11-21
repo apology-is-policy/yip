@@ -1274,7 +1274,15 @@ func TestStopDecidesWithinBudgetEvenWhenPresenceIsLocked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held()
+	// The publish outlives Stop by design; let it finish before the line's
+	// directory goes. Captured first: the job leaves the map before done.
+	t.Cleanup(func() {
+		job, running := tipJobs.Load(Root() + "|publish:claude")
+		held()
+		if running {
+			<-job.(*tipJob).done
+		}
+	})
 	start := time.Now()
 	decision := hookStop("claude")
 	if took := time.Since(start); took > tipBudget+500*time.Millisecond {
