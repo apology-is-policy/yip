@@ -144,6 +144,11 @@ func firstLine(s string) string {
 	return s
 }
 
+// errWatchIdentity: the session this watch speaks for no longer answers to
+// the name it started with -- it bound or unbound, or its identity can no
+// longer be resolved -- so these events are not its own.
+var errWatchIdentity = errors.New("this session's name changed or can no longer be resolved; restart the watch")
+
 // Watch emits one line per new event. replay=true reports what is already
 // there before streaming (useful for a switchboard attaching mid-conversation);
 // the default reports only what happens from now on, so arming a monitor does
@@ -159,10 +164,6 @@ func firstLine(s string) string {
 // Exit codes are load-bearing for the --once shape: 0 means an event arrived,
 // 3 means the deadline passed with nothing. A caller that cannot tell those
 // apart will read silence as success.
-// errWatchIdentity: the session this watch speaks for now answers to another
-// name -- it bound or unbound -- so these events are no longer its own.
-var errWatchIdentity = errors.New("this session now answers to another name; restart the watch")
-
 func Watch(me string, still func() bool, interval, deadline time.Duration, once, replay bool) error {
 	if err := EnsureRoot(); err != nil {
 		return err
@@ -178,11 +179,14 @@ func Watch(me string, still func() bool, interval, deadline time.Duration, once,
 		until = time.Now().Add(deadline)
 	}
 	for {
+		snap := watchSnapshot(me)
+		// Checked after the snapshot: a bind landing mid-poll must not let
+		// the old name's events out as this session's.
 		if !still() {
 			return errWatchIdentity
 		}
 		var fresh []watchEvent
-		for k, line := range watchSnapshot(me) {
+		for k, line := range snap {
 			if !seen[k] {
 				seen[k] = true
 				fresh = append(fresh, watchEvent{k, line})

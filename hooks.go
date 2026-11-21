@@ -202,6 +202,7 @@ func ringLine(r Ring, me string) string {
 // second Stop with nothing changed does not block again -- and speaking
 // advances the count, which re-arms it for the next turn.
 func hookStop(me string) any {
+	_ = MeasureTip(me)
 	rings, err := RingFor(me)
 	if err != nil || len(rings) == 0 {
 		return nil

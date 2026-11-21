@@ -569,7 +569,8 @@ func main() {
 	case "watch":
 		me := must(WhoAmI(as, ""))
 		launch := must(launchIdentity(as, ""))
-		still := func() bool { cur, err := boundIdentity(launch); return err == nil && cur == me }
+		explicit := as != "" || os.Getenv("YIP_AGENT") != ""
+		still := func() bool { cur, err := identityFor(launch, explicit); return err == nil && cur == me }
 		var ivs, dls string
 		args, ivs = takeFlag(args, "--interval", "2s")
 		once := hasFlag(args, "--once")

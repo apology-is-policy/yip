@@ -719,8 +719,13 @@ func TestAShellInAnotherSessionsBoundFolderIsRefused(t *testing.T) {
 	if me, err := WhoAmI("", wt); err == nil {
 		t.Fatal("a session nested in the binder answered as its worktree:", me)
 	}
+	if me, err := WhoAmI("wt-one", wt); err == nil {
+		t.Fatal("another Claude session took a bound name with --as:", me)
+	}
+	// A person at a terminal (no Claude session above) may name it outright.
+	processAncestors = func() []procID { return []procID{{PID: 9, Start: "1"}} }
 	if me, err := WhoAmI("wt-one", wt); err != nil || me != "wt-one" {
-		t.Fatal("an explicit --as is still honoured:", me, err)
+		t.Fatal("an explicit --as outside any session:", me, err)
 	}
 }
 
@@ -863,5 +868,153 @@ func TestPruningAndRegistrationAreSerialised(t *testing.T) {
 	guard()
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Review round 5 (prosecutor run 3 on 336ea49): one regression each.
+
+func TestStopMeasuresTheLastCommitOfATurn(t *testing.T) {
+	tmpLine(t)
+	wt := t.TempDir()
+	head := func(sha string) {
+		t.Helper()
+		_ = os.MkdirAll(filepath.Join(wt, "g"), 0o755)
+		if err := os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: "+filepath.Join(wt, "g")+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(wt, "g", "HEAD"), []byte(sha+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := SaveMembers(Members{Members: map[string]string{wt: "wt"}}); err != nil {
+		t.Fatal(err)
+	}
+	head("1111111111111111111111111111111111111111")
+	_ = Beat("wt", "a")
+	head("2222222222222222222222222222222222222222") // committed within the window
+	_ = Beat("wt", "b")
+	hookStop("wt") // the turn ends; the session goes idle
+	if p, _ := LoadPresence("wt"); p.Tip != "2222222" {
+		t.Fatal("idle presence hides the turn's last commit:", p.Tip)
+	}
+	// A measurement stamped in the future (clock stepped back) is stale.
+	_ = updateJSON(presencePath("wt"), func(p *Presence) error {
+		p.TipAt = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+		return nil
+	})
+	head("3333333333333333333333333333333333333333")
+	_ = Beat("wt", "c")
+	if p, _ := LoadPresence("wt"); p.Tip != "3333333" {
+		t.Fatal("a future TipAt was trusted:", p.Tip)
+	}
+}
+
+func TestNativeAndBoundSessionsCannotShareAName(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	native := procID{PID: 4700, Start: "23"}
+	fakeProcs(t, []procID{sessionA}, sessionA, native)
+	if err := os.Remove(sessionPath(native)); err != nil {
+		t.Fatal(err)
+	}
+	if err := registerSession(native, "wt"); err != nil { // started inside wt
+		t.Fatal(err)
+	}
+	m := LoadMembers()
+	m.Members[wt] = "wt"
+	if err := SaveMembers(m); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind("claude", sessionA, wt, ""); err == nil || !strings.Contains(err.Error(), "was started as wt") {
+		t.Fatal("bound a name a live native session answers to:", err)
+	}
+	// The other order: bound first, then a session is started inside wt.
+	procAlive = func(p procID) bool { return p == sessionA }
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	late := procID{PID: 4800, Start: "24"}
+	procAlive = func(p procID) bool { return p == sessionA || p == late }
+	if err := registerSession(late, "wt"); err != nil {
+		t.Fatal(err)
+	}
+	processAncestors = func() []procID { return []procID{late} }
+	if me, err := identityFor("wt", true); err == nil {
+		t.Fatal("a session started inside a bound worktree answered as", me)
+	}
+}
+
+func TestReleasingTheWaiterClearsItsOwner(t *testing.T) {
+	seedSharedLaunch(t, "wt")
+	fakeProcs(t, []procID{sessionA}, sessionA)
+	release, _, err := claimRewake("claude", sessionA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	// A peer's lockHeld probe holds the lock for an instant; the owner is
+	// empty, so a claimant colliding with it retries instead of giving up.
+	probe, err := holdLock(rewakeLockPath("claude"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, held, err := claimRewake("claude", sessionA)
+	probe()
+	if err == nil || held != (procID{}) {
+		t.Fatal("owner not cleared on release:", held, err)
+	}
+}
+
+func TestPruningJudgesOnlyItsOwnNamespace(t *testing.T) {
+	seedSharedLaunch(t, "wt")
+	fakeProcs(t, nil, sessionA)
+	elsewhere := sessionRecord{Session: procID{PID: 4900, Start: "25"}, Boot: bootID(), NS: "pid:[1]", Launch: "claude"}
+	mine := sessionRecord{Session: procID{PID: 5000, Start: "26"}, Boot: bootID(), NS: pidNS(), Launch: "claude"}
+	for _, r := range []sessionRecord{elsewhere, mine} {
+		if err := writeState(sessionPath(r.Session), r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := registerSession(sessionA, "claude"); err != nil {
+		t.Fatal(err)
+	}
+	if !fileExists(sessionPath(elsewhere.Session)) || fileExists(sessionPath(mine.Session)) {
+		t.Fatal("pruned by the wrong namespace's view of liveness")
+	}
+	old := bootID
+	t.Cleanup(func() { bootID = old })
+	bootID = func() string { return "" }
+	if err := writeState(sessionPath(mine.Session), mine); err != nil {
+		t.Fatal(err)
+	}
+	_ = registerSession(sessionA, "claude")
+	if !fileExists(sessionPath(mine.Session)) {
+		t.Fatal("pruned without knowing the boot")
+	}
+}
+
+func TestWatchDoesNotLeakTheOldNamesEventsInTheBindPoll(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	fakeProcs(t, []procID{sessionA}, sessionA)
+	c, _ := NewCall("b", "claude", "for the folder")
+	var calls atomic.Int32
+	still := func() bool {
+		cur, err := identityFor("claude", true)
+		if calls.Add(1) == 1 { // the bind lands just after this check passes
+			AppendTurn(c, "b", "hello", false)
+			if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+				t.Error(err)
+			}
+		}
+		return err == nil && cur == "claude"
+	}
+	r, w, _ := os.Pipe()
+	old := os.Stdout
+	os.Stdout = w
+	err := Watch("claude", still, 10*time.Millisecond, 2*time.Second, true, false)
+	os.Stdout = old
+	w.Close()
+	out, _ := io.ReadAll(r)
+	if !errors.Is(err, errWatchIdentity) || strings.Contains(string(out), c.ID) {
+		t.Fatal("the bind poll let the old name's event out:", err, string(out))
 	}
 }

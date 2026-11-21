@@ -144,11 +144,19 @@ func sessionPath(p procID) string {
 }
 
 type sessionRecord struct {
-	Session    procID `json:"session"`
-	Boot       string `json:"boot"`
+	Session procID `json:"session"`
+	Boot    string `json:"boot"`
+	// NS is the registrar's pid namespace: liveness can only be judged from
+	// inside it, so only same-namespace records are pruned as dead.
+	NS         string `json:"ns,omitempty"`
 	Launch     string `json:"launch"`
 	Registered string `json:"registered"`
 }
+
+var pidNS = sync.OnceValue(func() string {
+	ns, _ := os.Readlink("/proc/self/ns/pid")
+	return ns
+})
 
 // registerSession records p as a Claude session, and forgets sessions that
 // have exited -- under one guard, so a prune cannot remove a record that a
@@ -170,7 +178,10 @@ func registerSession(p procID, launch string) error {
 		for _, e := range entries {
 			var r sessionRecord
 			path := filepath.Join(sessionsDir(), e.Name())
-			if strings.HasSuffix(e.Name(), ".json") && readState(path, &r) == nil && (r.Boot != bootID() || !procAlive(r.Session)) {
+			if !strings.HasSuffix(e.Name(), ".json") || readState(path, &r) != nil || bootID() == "" {
+				continue
+			}
+			if r.Boot != bootID() || (r.NS == pidNS() && !procAlive(r.Session)) {
 				_ = os.Remove(path)
 			}
 		}
@@ -178,7 +189,7 @@ func registerSession(p procID, launch string) error {
 	if isRegistered(p) {
 		return nil
 	}
-	return writeState(sessionPath(p), sessionRecord{Session: p, Boot: bootID(), Launch: launch, Registered: now()})
+	return writeState(sessionPath(p), sessionRecord{Session: p, Boot: bootID(), NS: pidNS(), Launch: launch, Registered: now()})
 }
 
 // isRegistered: p is a Claude session boundary. A record that exists but
@@ -193,6 +204,42 @@ func isRegistered(p procID) bool {
 		return true
 	}
 	return r.Session == p && r.Boot == bootID()
+}
+
+// launchedAs: a live registered session, other than except, that started as
+// name -- one started inside that worktree, which answers to it by path.
+func launchedAs(name string, except procID) (procID, bool) {
+	entries, _ := os.ReadDir(sessionsDir())
+	for _, e := range entries {
+		var r sessionRecord
+		if strings.HasSuffix(e.Name(), ".json") && readState(filepath.Join(sessionsDir(), e.Name()), &r) == nil &&
+			r.Launch == name && r.Session != except && r.Boot == bootID() && procAlive(r.Session) {
+			return r.Session, true
+		}
+	}
+	return procID{}, false
+}
+
+// identityFor is what a caller that started as launch answers to, fenced: a
+// bound name answers only in the session that bound it. Any other Claude
+// session -- one started inside the worktree, whose configuration names it,
+// or one whose shell stands in its folder -- is refused, and so is a
+// path-resolved caller outside any session. A person naming an identity
+// outright (explicit, outside any Claude session) is honoured.
+func identityFor(launch string, explicit bool) (string, error) {
+	me, err := boundIdentity(launch)
+	if err != nil {
+		return "", err
+	}
+	bd, bound := liveBinding(me)
+	if !bound {
+		return me, nil
+	}
+	ns, inSession := nearestSession()
+	if (inSession && ns == bd.Session) || (!inSession && explicit) {
+		return me, nil
+	}
+	return "", fmt.Errorf("%s is bound by another live Claude session (pid %d); this process is not that session", me, bd.Session.PID)
 }
 
 // nearestSession is the closest registered Claude session above this process.
@@ -368,6 +415,11 @@ func Bind(launch string, session procID, worktree, as string) (*bindResult, erro
 		}
 	} else if name != launch && isCodexIdentity(name, root) {
 		return nil, fmt.Errorf("%s is %s's checkout, and %s is a Codex identity", root, name, name)
+	}
+	if name != launch {
+		if other, ok := launchedAs(name, session); ok {
+			return nil, fmt.Errorf("a live Claude session (pid %d) was started as %s and answers to it; bind a worktree of your own", other.PID, name)
+		}
 	}
 	if cur, ok := b.Bindings[name]; ok && cur.Session != session && procAlive(cur.Session) {
 		return nil, fmt.Errorf("%s is bound to another live Claude session (pid %d, since %s); two sessions cannot answer to one name", name, cur.Session.PID, cur.Bound)

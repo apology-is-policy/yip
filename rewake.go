@@ -92,7 +92,7 @@ func RunRewake(agent string, wait time.Duration, session string, stderr io.Write
 	// -- and steps aside within a poll: wait a few polls to take over, or this
 	// session would sit unarmed until its next turn.
 	for retry := time.Now().Add(3 * interval); err != nil; unlock, held, err = claimRewake(agent, owner) {
-		if held == owner || !time.Now().Before(retry) {
+		if (held == owner && held != procID{}) || !time.Now().Before(retry) {
 			return 0
 		}
 		time.Sleep(interval / 4)
@@ -135,7 +135,9 @@ func RunRewake(agent string, wait time.Duration, session string, stderr io.Write
 
 // claimRewake takes the identity's waiter lock and records owner as its
 // holder, or reports the holder -- under one guard, so an owner read while
-// the lock is held always names the process holding it.
+// the lock is held always names the process holding it. Releasing clears the
+// record under the same guard: an empty owner while the lock is taken means
+// a mere probe holds it (lockHeld tests by locking), so try again.
 func claimRewake(agent string, owner procID) (unlock func(), held procID, err error) {
 	guard, err := fileGuard(rewakeOwnerPath(agent))
 	if err != nil {
@@ -150,7 +152,15 @@ func claimRewake(agent string, owner procID) (unlock func(), held procID, err er
 		unlock()
 		return nil, procID{}, err
 	}
-	return unlock, owner, nil
+	unlockLock := unlock
+	release := func() {
+		if g, gerr := fileGuard(rewakeOwnerPath(agent)); gerr == nil {
+			defer g()
+			_ = writeState(rewakeOwnerPath(agent), procID{})
+		}
+		unlockLock()
+	}
+	return release, owner, nil
 }
 
 // RunRewakeHook wires RunRewake to the process: stdin carries Claude's hook
@@ -167,7 +177,7 @@ func RunRewakeHook(override string, wait time.Duration) int {
 	if registerSession(hookSession(), launch) != nil {
 		return 0
 	}
-	me, err := boundIdentity(launch)
+	me, err := identityFor(launch, true)
 	if err != nil {
 		return 0
 	}
@@ -183,7 +193,7 @@ func RunRewakeHook(override string, wait time.Duration) int {
 // arms a waiter for the identity it answers to now.
 func rewakeAlive(ppid int, launch, me string) func() bool {
 	return func() bool {
-		cur, err := boundIdentity(launch)
+		cur, err := identityFor(launch, true)
 		return ppid > 1 && os.Getppid() == ppid && err == nil && cur == me
 	}
 }

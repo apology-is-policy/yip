@@ -150,21 +150,25 @@ cannot bind one worktree. Binding the launch folder ends the binding.
 
 A binding belongs to the Claude process (pid plus kernel start time, read from
 `/proc`), so it ends when the session exits; after a restart or resume, bind
-again. Each Claude session registers itself when its Yip MCP server starts, so
-a session started inside a bound one (`claude -p` from its shell) answers as
-itself, not as the outer session's name. A running `yip watch` exits with code
-4 when its session binds or unbinds; restart it. It replaces only the identity the session started as: `--as other`
-still means other. It needs the claude-rewake runtime or plain hooks (Channels
-stay with the name they connected as), and Linux or WSL. `yip line` shows
-which members are bound.
+again. It re-identifies the whole session -- the main conversation and every
+subagent, which share its MCP server -- so only the main conversation should
+call it. It replaces only the identity the session started as. It needs the
+claude-rewake runtime or plain hooks (Channels stay with the name they
+connected as), and Linux or WSL. `yip line` shows which members are bound.
 
-Bind is for worktrees that have no Yip install of their own. A session
-started *inside* a worktree answers to its name by path, and bind does not
-fence it in either direction: binding a worktree such a session uses, or
-starting one in a bound worktree, leaves two sessions answering to one name.
-Start sessions from the shared folder and bind, or start them in their
-worktree -- not both. Bind is an MCP tool only: a command in a shell cannot
-tell which name its session started as.
+Each Claude session registers itself (under `sessions/`) when its Yip MCP
+server or SessionStart hook runs. That is how a bound name stays with its
+binder: a session started inside a bound one (`claude -p` from its shell)
+answers as itself; bind refuses a worktree that a live session started there
+already answers to; and while a worktree is bound, any other Claude session --
+started inside it, or with its shell standing in its folder -- is refused that
+name, even with `--as`. Outside any Claude session, a person may still name it
+with `--as`. A session whose Yip MCP server and hooks never ran is not known
+and is not fenced.
+
+Bind is an MCP tool only: a command in a shell cannot tell which name its
+session started as. A running `yip watch` exits with code 4 when its session
+binds or unbinds; restart it.
 
 For plain hook-based Claude integration (notices at hook boundaries only):
 

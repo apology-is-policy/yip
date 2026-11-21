@@ -62,22 +62,7 @@ func WhoAmI(override, cwd string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	me, err := boundIdentity(launch)
-	if err != nil {
-		return "", err
-	}
-	// By path, a bound worktree's folder names the identity a live session
-	// speaks for; a process there whose nearest session is not that one --
-	// another session's shell, a session started inside it -- is not it.
-	if me == launch && override == "" && os.Getenv("YIP_AGENT") == "" {
-		if bd, ok := liveBinding(launch); ok {
-			if ns, found := nearestSession(); found && ns == bd.Session {
-				return me, nil
-			}
-			return "", fmt.Errorf("%s is bound by another live Claude session (pid %d); this process is not that session -- pass --as NAME", launch, bd.Session.PID)
-		}
-	}
-	return me, nil
+	return identityFor(launch, override != "" || os.Getenv("YIP_AGENT") != "")
 }
 
 // launchIdentity resolves the calling agent from RECORDED membership keyed by
@@ -646,7 +631,8 @@ func Beat(agent, lastTool string) error {
 	}
 	p, _ := LoadPresence(agent)
 	measured, err := time.Parse(time.RFC3339, p.TipAt)
-	fresh := p.Agent != agent || err != nil || time.Since(measured) >= presenceTipReuse
+	age := time.Since(measured)
+	fresh := p.Agent != agent || err != nil || age < 0 || age >= presenceTipReuse
 	var tip, branch string
 	if fresh {
 		tip, branch = GitTip(agent)
@@ -659,6 +645,20 @@ func Beat(agent, lastTool string) error {
 		if lastTool != "" {
 			p.LastTool = lastTool
 		}
+		return nil
+	})
+}
+
+// MeasureTip records HEAD now, whatever the reuse window says. The Stop hook
+// calls it once per turn, so the last commit of a burst shows while the
+// session idles instead of hiding behind a reused tip.
+func MeasureTip(agent string) error {
+	if err := EnsureRoot(); err != nil {
+		return err
+	}
+	tip, branch := GitTip(agent)
+	return updateJSON(presencePath(agent), func(p *Presence) error {
+		p.Agent, p.Tip, p.Branch, p.TipAt = agent, tip, branch, now()
 		return nil
 	})
 }

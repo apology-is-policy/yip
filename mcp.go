@@ -192,7 +192,8 @@ func tools() []toolDef {
 			Name: "bind",
 			Description: "Answer as the worktree you work in. For sessions started from one shared folder that each work in a worktree of their own: " +
 				"after bind, calls to that worktree's identity reach THIS session, and the name you started as no longer does. " +
-				"Call it once your worktree exists, and again after a restart or resume. Returns your new name -- give it to peers.",
+				"Call it once your worktree exists, and again after a restart or resume. Returns your new name -- give it to peers. " +
+				"It re-identifies this whole Claude session -- the main conversation and every subagent -- so only the main conversation should call it.",
 			InputSchema: obj(map[string]any{
 				"worktree": str("Absolute path of your worktree's top folder. Under WSL a Windows path (C:\\src\\repo-wt) is accepted. The folder you started in ends the binding."),
 				"as":       str("Name to join the line under, if the worktree is not on it yet. Default: the folder's name."),
@@ -527,7 +528,7 @@ func (s *server) call(name string, a map[string]any) (string, error) {
 		return "", fmt.Errorf("yip could not register this Claude session (%v), so it cannot tell which name it answers to; restart the session once that is fixed", s.regErr)
 	}
 	if s.launch != "" {
-		me, err := boundIdentity(s.launch)
+		me, err := identityFor(s.launch, true)
 		if err != nil {
 			return "", err
 		}

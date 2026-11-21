@@ -331,6 +331,9 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 		Line: activeLine, Agent: agent, LineDir: Root(), Bin: bin,
 		Reinstall: (!seatMode && owner == agent) || hadSeat,
 	}
+	if bd, ok := liveBinding(agent); ok {
+		res.Notes = append(res.Notes, fmt.Sprintf("%s is bound by a live Claude session (pid %d): a session started here is refused that name until the binding ends.", agent, bd.Session.PID))
+	}
 
 	if runtime == "codex" {
 		warning, err := ensureCodexEndpoint(agent)
