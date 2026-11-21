@@ -331,10 +331,14 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 		Line: activeLine, Agent: agent, LineDir: Root(), Bin: bin,
 		Reinstall: (!seatMode && owner == agent) || hadSeat,
 	}
-	if bd, ok := liveBinding(agent); ok {
-		if runtime == "claude-channels" || runtime == "codex" {
-			return nil, fmt.Errorf("%s is bound by a live Claude session (pid %d); a %s connection could not be fenced from that name -- install after the binding ends, or under another name", agent, bd.Session.PID, runtime)
+	bd, bound, err := liveBinding(agent)
+	if (err != nil || bound) && (runtime == "claude-channels" || runtime == "codex") {
+		if err != nil {
+			return nil, err
 		}
+		return nil, fmt.Errorf("%s is bound by a live Claude session (pid %d); a %s connection could not be fenced from that name -- install after the binding ends, or under another name", agent, bd.Session.PID, runtime)
+	}
+	if bound {
 		res.Notes = append(res.Notes, fmt.Sprintf("%s is bound by a live Claude session (pid %d): a session started here is refused that name until the binding ends.", agent, bd.Session.PID))
 	}
 

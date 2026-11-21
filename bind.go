@@ -281,7 +281,10 @@ func identityFor(launch string, explicit bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	bd, bound := liveBinding(me)
+	bd, bound, err := liveBinding(me)
+	if err != nil {
+		return "", err
+	}
 	if !bound {
 		return me, nil
 	}
@@ -368,14 +371,32 @@ func errBoundElsewhere(name string, bd Binding) error {
 	return fmt.Errorf("%s is bound by another live Claude session (pid %d); this process is not that session", name, bd.Session.PID)
 }
 
-// liveBinding: the session currently speaking for name, if any.
-func liveBinding(name string) (Binding, bool) {
+// liveBinding: the session currently speaking for name, if any. An
+// unreadable bindings file is an error, not "nobody".
+func liveBinding(name string) (Binding, bool, error) {
+	if _, err := os.Stat(bindingsPath()); os.IsNotExist(err) {
+		return Binding{}, false, nil
+	}
 	b, err := loadBindingsStrict()
 	if err != nil {
-		return Binding{}, false
+		return Binding{}, false, err
 	}
 	bd, ok := b.Bindings[name]
-	return bd, ok && procAlive(bd.Session)
+	return bd, ok && procAlive(bd.Session), nil
+}
+
+// fenceConnection: a Channels or Codex connection keeps the name it started
+// with, so it may not act under one a Claude session has bound -- nor under
+// one it cannot tell is unbound.
+func fenceConnection(name string) error {
+	bd, bound, err := liveBinding(name)
+	if err != nil {
+		return err
+	}
+	if bound {
+		return errBoundElsewhere(name, bd)
+	}
+	return nil
 }
 
 var windowsPathRE = regexp.MustCompile(`^[A-Za-z]:[\\/]`)

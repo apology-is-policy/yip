@@ -121,7 +121,7 @@ func TestTwoLiveSessionsCannotBindOneWorktree(t *testing.T) {
 	if _, err := Bind("claude", sessionB, wt, ""); err != nil {
 		t.Fatal(err)
 	}
-	if b, ok := liveBinding("wt"); !ok || b.Session != sessionB {
+	if b, ok, _ := liveBinding("wt"); !ok || b.Session != sessionB {
 		t.Fatal(b, ok)
 	}
 }
@@ -138,7 +138,7 @@ func TestRebindMovesAndTheLaunchFolderEndsTheBinding(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, ok := liveBinding("wt-one"); ok {
+	if _, ok, _ := liveBinding("wt-one"); ok {
 		t.Fatal("rebinding left the first worktree bound")
 	}
 	if me := whoami(t, "claude"); me != "wt-two" {
@@ -233,7 +233,7 @@ func TestServerBindSwitchesItsIdentity(t *testing.T) {
 func TestRewakeWaiterStepsAsideWhenItsSessionBinds(t *testing.T) {
 	_, wt := seedSharedLaunch(t, "wt")
 	fakeProcs(t, []procID{sessionA}, sessionA)
-	alive := rewakeAlive(os.Getppid(), "claude", "claude")
+	alive := rewakeAlive(os.Getppid(), sessionA, "claude", "claude")
 	if !alive() {
 		t.Fatal("waiter of an unbound session reported gone")
 	}
@@ -259,7 +259,7 @@ func TestRewakeWaiterStepsAsideWhenItsSessionBinds(t *testing.T) {
 	c, _ := NewCall("b", "wt", "review please")
 	AppendTurn(c, "b", "the diff", false)
 	var stderr bytes.Buffer
-	if code := RunRewake("wt", 5*time.Second, "", &stderr, rewakeAlive(os.Getppid(), "claude", "wt"), 10*time.Millisecond); code != 2 || !strings.Contains(stderr.String(), c.ID) {
+	if code := RunRewake("wt", 5*time.Second, "", &stderr, rewakeAlive(os.Getppid(), sessionA, "claude", "wt"), 10*time.Millisecond); code != 2 || !strings.Contains(stderr.String(), c.ID) {
 		t.Fatal("bound waiter did not wake", code, stderr.String())
 	}
 }
@@ -455,7 +455,7 @@ func TestAnUnreadableBindingsFileFailsClosed(t *testing.T) {
 	if _, err := (&server{me: "claude", launch: "claude"}).call("busy", map[string]any{"text": "x"}); err == nil {
 		t.Fatal("a tool acted under the launch name past a corrupt bindings file")
 	}
-	if rewakeAlive(os.Getppid(), "claude", "claude")() {
+	if rewakeAlive(os.Getppid(), sessionA, "claude", "claude")() {
 		t.Fatal("a waiter kept dispatching past a corrupt bindings file")
 	}
 }
@@ -1467,5 +1467,83 @@ func TestAStampIsBoundedAndNeverAnOlderRunsSample(t *testing.T) {
 	close(release)
 	if sha := <-done; sha != "" {
 		t.Fatal("stamped with a sample begun before the message:", sha)
+	}
+}
+
+// Review round 11 (Codex call 0010 on 96b325d): one regression each.
+
+func TestTheCLIOfABoundSessionIsNotTakenForAConnection(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	fakeProcs(t, []procID{{PID: 9, Start: "1"}, sessionA}, sessionA)
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	me := whoami(t, "claude")
+	if out, err := (&server{me: me}).call("presence", map[string]any{}); me != "wt" || err != nil {
+		t.Fatal("the binder's own CLI was refused its name:", me, err, out)
+	}
+}
+
+func TestAnUnregisteredWaiterStopsOnceAnybodyBinds(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	inner := procID{PID: 5400, Start: "30"}
+	fakeProcs(t, []procID{inner, sessionA}, sessionA)
+	procAlive = func(p procID) bool { return p == sessionA || p == inner }
+	if err := os.Chmod(sessionsDir(), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sessionsDir(), 0o755) })
+	if registerSession(inner, "wt") == nil {
+		t.Skip("registry directory still writable (running as root?)")
+	}
+	alive := rewakeAlive(os.Getppid(), inner, "wt", "wt") // started inside wt
+	if !alive() {
+		t.Fatal("fixture: the waiter did not arm on a line nobody bound")
+	}
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	if alive() {
+		t.Fatal("an unregistered session's waiter kept answering once a binding appeared")
+	}
+}
+
+func TestAnUnregisteredSessionCannotCreateTheFirstBinding(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	fakeProcs(t, []procID{sessionA}, sessionA)
+	if err := os.Remove(sessionPath(sessionA)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sessionsDir(), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sessionsDir(), 0o755) })
+	s := &server{me: "claude"}
+	s.startClaude("claude")
+	if s.regErr == nil {
+		t.Skip("registry directory still writable (running as root?)")
+	}
+	if out, err := s.call("bind", map[string]any{"worktree": wt}); err == nil || anyLiveBinding() {
+		t.Fatal("an unregistered session bound:", out)
+	}
+}
+
+func TestConnectionsFailClosedOnAnUnreadableBindingsFile(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "wt")
+	t.Setenv("YIP_HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", t.TempDir())
+	prev := activeLine
+	t.Cleanup(func() { activeLine = prev })
+	if err := os.WriteFile(bindingsPath(), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := (&server{me: "claude", channelMode: true}).call("presence", map[string]any{}); err == nil {
+		t.Fatal("a Channels connection acted past a corrupt bindings file:", out)
+	}
+	if err := serveIO("claude", serveCodex, strings.NewReader(""), io.Discard); err == nil {
+		t.Fatal("a Codex server started past a corrupt bindings file")
+	}
+	if _, err := InstallWith(wt, activeLine, "wt", true, "claude-channels", InstallOptions{}); err == nil {
+		t.Fatal("installed Channels past a corrupt bindings file")
 	}
 }

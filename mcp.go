@@ -306,10 +306,8 @@ func serveIO(me, mode string, input io.Reader, output io.Writer) error {
 	s := &server{me: me, enc: json.NewEncoder(output), channelMode: channels, codexMode: mode == serveCodex, started: time.Now()}
 	if mode == serveClaude {
 		s.startClaude(me)
-	} else if bd, ok := liveBinding(me); ok {
-		// Channels and Codex connections keep their name; only the binder
-		// answers to a bound one.
-		return errBoundElsewhere(me, bd)
+	} else if err := fenceConnection(me); err != nil {
+		return err
 	}
 	s.cwd, _ = os.Getwd()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -533,7 +531,8 @@ func (s *server) call(name string, a map[string]any) (string, error) {
 	}
 	// Unregistered matters only while some session speaks for a worktree:
 	// without a live binding every process answers to its launch name.
-	if s.regErr != nil && anyLiveBinding() {
+	// Bind would create one, so it needs the boundary registered first.
+	if s.regErr != nil && (name == "bind" || anyLiveBinding()) {
 		return "", fmt.Errorf("yip could not register this Claude session (%v), so it cannot tell which name it answers to", s.regErr)
 	}
 	// Before resolving: a session whose launch name another has bound is
@@ -547,8 +546,10 @@ func (s *server) call(name string, a map[string]any) (string, error) {
 			return "", err
 		}
 		s.me = me
-	} else if bd, ok := liveBinding(s.me); ok && !s.cli {
-		return "", errBoundElsewhere(s.me, bd)
+	} else if s.channelMode || s.codexMode {
+		if err := fenceConnection(s.me); err != nil {
+			return "", err
+		}
 	}
 	_ = Beat(s.me, name)
 	if name == "channel_ack" {

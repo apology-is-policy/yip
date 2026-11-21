@@ -181,7 +181,8 @@ func RunRewakeHook(override string, wait time.Duration) int {
 	if _, err := os.Stat(Root()); err != nil {
 		return 0
 	}
-	if registerSession(hookSession(), launch) != nil && anyLiveBinding() {
+	session := hookSession()
+	if registerSession(session, launch) != nil && anyLiveBinding() {
 		return 0
 	}
 	me, err := identityFor(launch, true)
@@ -191,17 +192,25 @@ func RunRewakeHook(override string, wait time.Duration) int {
 	if wait <= 0 || wait > 24*time.Hour {
 		wait = defaultWakeWindow - rewakeMargin
 	}
-	return RunRewake(me, wait, in.SessionID, os.Stderr, rewakeAlive(os.Getppid(), launch, me), 2*time.Second)
+	return RunRewake(me, wait, in.SessionID, os.Stderr, rewakeAlive(os.Getppid(), session, launch, me), 2*time.Second)
 }
 
 // rewakeAlive: the session that started the waiter still runs AND still
 // answers as me. One that binds (or unbinds) mid-window has stopped being me:
 // the waiter steps aside, leaving notices pending, so the session's next turn
-// arms a waiter for the identity it answers to now.
-func rewakeAlive(ppid int, launch, me string) func() bool {
+// arms a waiter for the identity it answers to now. So does one whose session
+// is still unregistered once anybody binds: identity resolution walks past an
+// unregistered session, so it cannot prove what that session answers to.
+func rewakeAlive(ppid int, session procID, launch, me string) func() bool {
 	return func() bool {
+		if ppid <= 1 || os.Getppid() != ppid {
+			return false
+		}
+		if !isRegistered(session) && registerSession(session, launch) != nil && anyLiveBinding() {
+			return false
+		}
 		cur, err := identityFor(launch, true)
-		return ppid > 1 && os.Getppid() == ppid && err == nil && cur == me
+		return err == nil && cur == me
 	}
 }
 

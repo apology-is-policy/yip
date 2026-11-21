@@ -357,7 +357,7 @@ func main() {
 			if endpointExists(name) {
 				delivery = " -- " + EndpointStatus(name)
 			}
-			if b, ok := liveBinding(name); ok {
+			if b, ok, _ := liveBinding(name); ok {
 				delivery += fmt.Sprintf(" -- bound by the Claude session (pid %d) launched as %s", b.Session.PID, b.Launch)
 			}
 			fmt.Printf("  %-16s %s%s\n", name, m.PathOf(name), delivery)
