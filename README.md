@@ -162,9 +162,11 @@ binder: a session started inside a bound one (`claude -p` from its shell)
 answers as itself; bind refuses a worktree that a live session started there
 already answers to; and while a worktree is bound, any other Claude session --
 started inside it, or with its shell standing in its folder -- is refused that
-name, even with `--as`, and so is any Channels or Codex connection. Outside any Claude session, a person may still name it
-with `--as`. A session whose Yip MCP server and hooks never ran is not known
-and is not fenced.
+name, even with `--as`, and so is any Channels or Codex connection. Outside
+any Claude session, a person may still name it with `--as`. A session whose
+Yip MCP server and hooks never ran is not known and is not fenced; nor is one
+whose MCP server or rewake waiter still runs a Yip from before bind, so after
+upgrading, restart running sessions before binding their worktrees.
 
 Bind is an MCP tool only: a command in a shell cannot tell which name its
 session started as. A running `yip watch` exits with code 4 when its session
