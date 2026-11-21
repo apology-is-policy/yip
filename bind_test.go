@@ -1454,7 +1454,6 @@ func TestAStampIsBoundedAndNeverAnOlderRunsSample(t *testing.T) {
 	oldF, oldB := tipFunc, tipBudget
 	t.Cleanup(func() { tipFunc, tipBudget = oldF, oldB })
 	release := make(chan struct{})
-	tipFunc = func(string) (string, string) { <-release; return "1111111", "main" }
 	tipFunc = func(string) (string, string) { return "1111111", "main" }
 	if turn := renderTurn(1, "claude", "b", "x", false); !strings.Contains(turn, "\ntip: 1111111") || !strings.Contains(turn, "\npeer-tip: 1111111") {
 		t.Fatal("a turn was stamped outside the bounded measurement:", turn)
