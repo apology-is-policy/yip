@@ -46,12 +46,32 @@ func emit(v any) {
 func RunHook(event string, override string) { RunHookRuntime(event, override, "claude") }
 func RunHookRuntime(event string, override string, runtime string) {
 	in := readHookInput()
-	me, err := WhoAmI(override, in.Cwd)
-	if err != nil {
-		return
-	}
 	if _, err := os.Stat(Root()); err != nil {
 		return
+	}
+	// A Claude session's boundary is recorded before anything resolves an
+	// identity for it -- by whichever hook runs first -- or a session started
+	// inside a bound one would answer as that one. Unregistrable: say nothing
+	// once anybody is bound; until then answer to the launch name outright --
+	// resolution would walk past this session to a binding made meanwhile.
+	var me string
+	if runtime != "codex" {
+		launch, err := launchIdentity(override, in.Cwd)
+		if err != nil {
+			return
+		}
+		if s := hookSession(); !isRegistered(s) && registerSession(s, launch) != nil {
+			if anyLiveBinding() {
+				return
+			}
+			me = launch
+		}
+	}
+	if me == "" {
+		var err error
+		if me, err = WhoAmI(override, in.Cwd); err != nil {
+			return
+		}
 	}
 	var result any
 	switch strings.ToLower(event) {
@@ -193,6 +213,7 @@ func ringLine(r Ring, me string) string {
 // second Stop with nothing changed does not block again -- and speaking
 // advances the count, which re-arms it for the next turn.
 func hookStop(me string) any {
+	defer func() { _ = MeasureTip(me) }() // bounded; after the decision
 	rings, err := RingFor(me)
 	if err != nil || len(rings) == 0 {
 		return nil

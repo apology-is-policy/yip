@@ -42,6 +42,10 @@ func rewakeLockPath(agent string) string {
 	return filepath.Join(Root(), "delivery", agent+".rewake.lock")
 }
 
+func rewakeOwnerPath(agent string) string {
+	return filepath.Join(Root(), "delivery", agent+".rewake.owner")
+}
+
 func rewakeArmed(agent string) bool {
 	return validComponent(agent) && lockHeld(rewakeLockPath(agent))
 }
@@ -76,17 +80,44 @@ func RunRewake(agent string, wait time.Duration, session string, stderr io.Write
 	if err != nil || ep.Runtime != "claude-rewake" {
 		return 0
 	}
-	unlock, err := holdLock(rewakeLockPath(agent))
-	if err != nil {
-		return 0 // another waiter is armed for this identity
+	// The waiter's owner is the Claude process that ran the hook -- not the
+	// conversation, which a resumed session (a new process) shares.
+	var owner procID
+	if anc := processAncestors(); len(anc) > 0 {
+		owner = anc[0]
+	}
+	unlock, held, err := claimRewake(agent, owner)
+	// Armed already. By this process (every Stop re-arms): nothing to do. By
+	// another, which may be leaving this name -- it rebound, unbound or exited
+	// -- and steps aside within a poll: wait a few polls to take over, or this
+	// session would sit unarmed until its next turn.
+	for retry := time.Now().Add(3 * interval); err != nil; unlock, held, err = claimRewake(agent, owner) {
+		if (held == owner && held != procID{}) || !time.Now().Before(retry) {
+			return 0
+		}
+		time.Sleep(interval / 4)
 	}
 	defer unlock()
 	if session != "" && session != ep.Thread {
 		_ = editEndpoint(agent, func(ep *Endpoint) error { ep.Thread = session; return nil })
 	}
 	deadline := time.Now().Add(wait)
+	// A turn ended by an interrupt or an API error runs no Stop hook; the
+	// waiter armed at the previous one keeps presence measured meanwhile.
+	var measured time.Time
 	for {
+		if time.Since(measured) >= presenceTipReuse {
+			_ = MeasureTip(agent)
+			measured = time.Now()
+		}
+		// Checked and dispatched under the bindings guard: a bind cannot land
+		// between "still this session's identity" and "notices marked sent".
+		unlockB, err := fileGuard(bindingsPath())
+		if err != nil {
+			return 0
+		}
 		if !parentAlive() {
+			unlockB()
 			return 0 // nobody to wake: leave notices pending
 		}
 		var message string
@@ -94,6 +125,7 @@ func RunRewake(agent string, wait time.Duration, session string, stderr io.Write
 			message = text
 			return nil
 		})
+		unlockB()
 		if err != nil {
 			return 0
 		}
@@ -108,23 +140,78 @@ func RunRewake(agent string, wait time.Duration, session string, stderr io.Write
 	}
 }
 
+// claimRewake takes the identity's waiter lock and records owner as its
+// holder, or reports the holder -- under one guard, so an owner read while
+// the lock is held always names the process holding it. Releasing clears the
+// record under the same guard: an empty owner while the lock is taken means
+// a mere probe holds it (lockHeld tests by locking), so try again.
+func claimRewake(agent string, owner procID) (unlock func(), held procID, err error) {
+	guard, err := fileGuard(rewakeOwnerPath(agent))
+	if err != nil {
+		return nil, procID{}, err
+	}
+	defer guard()
+	if unlock, err = holdLock(rewakeLockPath(agent)); err != nil {
+		_ = readState(rewakeOwnerPath(agent), &held)
+		return nil, held, err
+	}
+	if err = writeState(rewakeOwnerPath(agent), owner); err != nil {
+		unlock()
+		return nil, procID{}, err
+	}
+	unlockLock := unlock
+	release := func() {
+		if g, gerr := fileGuard(rewakeOwnerPath(agent)); gerr == nil {
+			defer g()
+			_ = writeState(rewakeOwnerPath(agent), procID{})
+		}
+		unlockLock()
+	}
+	return release, owner, nil
+}
+
 // RunRewakeHook wires RunRewake to the process: stdin carries Claude's hook
 // input, stderr becomes the system reminder, and the parent is the session.
 func RunRewakeHook(override string, wait time.Duration) int {
 	in := readHookInput()
-	me, err := WhoAmI(override, in.Cwd)
+	launch, err := launchIdentity(override, in.Cwd)
 	if err != nil {
 		return 0
 	}
 	if _, err := os.Stat(Root()); err != nil {
 		return 0
 	}
+	session := hookSession()
+	if registerSession(session, launch) != nil && anyLiveBinding() {
+		return 0
+	}
+	me, err := identityFor(launch, true)
+	if err != nil {
+		return 0
+	}
 	if wait <= 0 || wait > 24*time.Hour {
 		wait = defaultWakeWindow - rewakeMargin
 	}
-	ppid := os.Getppid()
-	alive := func() bool { return ppid > 1 && os.Getppid() == ppid }
-	return RunRewake(me, wait, in.SessionID, os.Stderr, alive, 2*time.Second)
+	return RunRewake(me, wait, in.SessionID, os.Stderr, rewakeAlive(os.Getppid(), session, launch, me), 2*time.Second)
+}
+
+// rewakeAlive: the session that started the waiter still runs AND still
+// answers as me. One that binds (or unbinds) mid-window has stopped being me:
+// the waiter steps aside, leaving notices pending, so the session's next turn
+// arms a waiter for the identity it answers to now. So does one whose session
+// is still unregistered once anybody binds: identity resolution walks past an
+// unregistered session, so it cannot prove what that session answers to.
+func rewakeAlive(ppid int, session procID, launch, me string) func() bool {
+	return func() bool {
+		if ppid <= 1 || os.Getppid() != ppid {
+			return false
+		}
+		if !isRegistered(session) && registerSession(session, launch) != nil && anyLiveBinding() {
+			return false
+		}
+		cur, err := identityFor(launch, true)
+		return err == nil && cur == me
+	}
 }
 
 // pushReachable: would a notice for agent reach a running session now?

@@ -12,6 +12,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -55,11 +57,21 @@ func EnsureRoot() error {
 
 // ---------------------------------------------------------------- identity
 
-// WhoAmI resolves the calling agent from RECORDED membership keyed by the
-// checkout's path -- not from a naming convention, and not from a name the
+// WhoAmI is the identity the caller answers to: its launch identity, or the
+// worktree identity its Claude session bound in place of it (bind.go).
+func WhoAmI(override, cwd string) (string, error) {
+	launch, err := launchIdentity(override, cwd)
+	if err != nil {
+		return "", err
+	}
+	return identityFor(launch, override != "" || os.Getenv("YIP_AGENT") != "")
+}
+
+// launchIdentity resolves the calling agent from RECORDED membership keyed by
+// the checkout's path -- not from a naming convention, and not from a name the
 // session chooses for itself. Two sessions therefore cannot answer to one
 // name, and the answer does not depend on how anybody named a directory.
-func WhoAmI(override, cwd string) (string, error) {
+func launchIdentity(override, cwd string) (string, error) {
 	if override != "" {
 		return override, nil
 	}
@@ -126,13 +138,67 @@ func GitTip(agent string) (sha, branch string) {
 	if dir == "" {
 		return "", ""
 	}
-	if out, err := exec.Command("git", "-C", dir, "rev-parse", "--short", "HEAD").Output(); err == nil {
-		sha = strings.TrimSpace(string(out))
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "--short", "HEAD").Output()
+	if err != nil {
+		return headFromFiles(dir)
 	}
+	sha = strings.TrimSpace(string(out))
 	if out, err := exec.Command("git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD").Output(); err == nil {
 		branch = strings.TrimSpace(string(out))
 	}
 	return
+}
+
+// headFromFiles reads HEAD without git, for a worktree this host's git cannot
+// open: one Windows git created, seen from WSL, whose .git file names a
+// C:/... gitdir. Loose ref first, then packed-refs; nothing found is "".
+func headFromFiles(dir string) (sha, branch string) {
+	resolve := func(base, p string) string {
+		p = hostPath(strings.TrimSpace(p))
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(base, p)
+		}
+		return p
+	}
+	gitdir := filepath.Join(dir, ".git")
+	if b, err := os.ReadFile(gitdir); err == nil {
+		p, ok := strings.CutPrefix(strings.TrimSpace(string(b)), "gitdir:")
+		if !ok {
+			return "", ""
+		}
+		gitdir = resolve(dir, p)
+	}
+	head, err := os.ReadFile(filepath.Join(gitdir, "HEAD"))
+	if err != nil {
+		return "", ""
+	}
+	ref, isRef := strings.CutPrefix(strings.TrimSpace(string(head)), "ref: ")
+	if !isRef {
+		return shortSHA(ref), "HEAD"
+	}
+	common := gitdir
+	if b, err := os.ReadFile(filepath.Join(gitdir, "commondir")); err == nil {
+		common = resolve(gitdir, string(b))
+	}
+	branch = strings.TrimPrefix(ref, "refs/heads/")
+	if b, err := os.ReadFile(filepath.Join(common, filepath.FromSlash(ref))); err == nil {
+		return shortSHA(strings.TrimSpace(string(b))), branch
+	}
+	if b, err := os.ReadFile(filepath.Join(common, "packed-refs")); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			if f := strings.Fields(line); len(f) == 2 && f[1] == ref {
+				return shortSHA(f[0]), branch
+			}
+		}
+	}
+	return "", branch
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }
@@ -403,8 +469,8 @@ func parseTurn(n int, from, raw string) Turn {
 }
 
 func renderTurn(n int, from, peer, body string, barge bool) string {
-	mySha, myBr := GitTip(from)
-	peerSha, peerBr := GitTip(peer)
+	mySha, myBr := stampTip(from)
+	peerSha, peerBr := stampTip(peer)
 	var b strings.Builder
 	fmt.Fprintf(&b, "---\n")
 	fmt.Fprintf(&b, "turn: %d\n", n)
@@ -531,6 +597,13 @@ type Presence struct {
 	Busy     string `json:"busy,omitempty"`
 	Pids     []int  `json:"pids,omitempty"`
 	LastTool string `json:"last_tool,omitempty"`
+	// TipAt is when Tip and Branch were last measured -- not Beat, which
+	// every heartbeat renews whether or not it measured.
+	TipAt string `json:"tip_at,omitempty"`
+	// TipTried is when a measurement last ran out or found nothing. The next
+	// waits out presenceTipReuse too, so a stalled worktree costs one budget a
+	// minute rather than one per tool call.
+	TipTried string `json:"tip_tried,omitempty"`
 }
 
 func presencePath(agent string) string {
@@ -549,15 +622,34 @@ func LoadPresence(agent string) (Presence, bool) {
 	return p, true
 }
 
+// presenceTipReuse: a beat re-measures HEAD at most this often. Beats run in
+// hooks Claude waits for, on every tool call, and measuring costs git execs
+// -- tens of milliseconds for a worktree on a Windows drive. Presence may lag
+// a commit by this much; turn stamps, which say what a reply was computed
+// against, still measure every time.
+const presenceTipReuse = time.Minute
+
 // Beat proves the agent is alive; Busy says what it is doing. The hook does
 // the first automatically, the agent declares the second.
 func Beat(agent, lastTool string) error {
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
-	tip, branch := GitTip(agent)
+	p, _ := LoadPresence(agent)
+	fresh := p.Agent != agent || !(recent(p.TipAt) || recent(p.TipTried))
+	var tip, branch string
+	var at time.Time
+	measuredOK := false
+	if fresh {
+		tip, branch, at, measuredOK = measureTip(agent)
+	}
 	return updateJSON(presencePath(agent), func(p *Presence) error {
-		p.Agent, p.Tip, p.Branch, p.Beat = agent, tip, branch, now()
+		p.Agent, p.Beat = agent, now()
+		if measuredOK {
+			setTip(p, tip, branch, at)
+		} else if fresh {
+			p.TipTried = now()
+		}
 		if lastTool != "" {
 			p.LastTool = lastTool
 		}
@@ -565,13 +657,130 @@ func Beat(agent, lastTool string) error {
 	})
 }
 
+// recent: stamp is within presenceTipReuse of now, and not in the future.
+func recent(stamp string) bool {
+	t, err := time.Parse(time.RFC3339Nano, stamp)
+	age := time.Since(t)
+	return err == nil && age >= 0 && age < presenceTipReuse
+}
+
+// MeasureTip records HEAD now, whatever the reuse window says. The Stop hook
+// calls it once per turn, so the last commit of a burst shows while the
+// session idles instead of hiding behind a reused tip. A measurement already
+// in flight is joined, not repeated; its sample keeps its own earlier time, so
+// it renews nothing and the next beat measures again.
+func MeasureTip(agent string) error {
+	measure, budget := tipFunc, tipBudget // read here: the run may outlive this call
+	j, ok := inFlight(Root()+"|publish:"+agent, budget, func(j *tipJob) { j.err = measureAndPublish(agent, measure, budget) })
+	if !ok {
+		return errTipBudget
+	}
+	return j.err
+}
+
+func measureAndPublish(agent string, measure func(string) (string, string), budget time.Duration) error {
+	if err := EnsureRoot(); err != nil {
+		return err
+	}
+	tip, branch, at, ok := measureTipWith(agent, measure, budget)
+	if !ok {
+		return nil
+	}
+	return updateJSON(presencePath(agent), func(p *Presence) error {
+		p.Agent = agent
+		setTip(p, tip, branch, at)
+		return nil
+	})
+}
+
+// tipBudget bounds presence work -- measuring HEAD, publishing it. Presence
+// is telemetry, but the hooks that do it gate the session (Stop decides
+// whether a turn may end), so a stalled filesystem (9P to a Windows drive, a
+// held presence lock) costs them this, no more. A variable for tests.
+var tipBudget = time.Second
+
+var errTipBudget = errors.New("presence work exceeded its time budget")
+
+var tipFunc = GitTip // injectable for tests
+
+type tipJob struct {
+	done        chan struct{}
+	tip, branch string
+	at          time.Time
+	err         error
+}
+
+var tipJobs sync.Map // key -> *tipJob
+
+// inFlight runs work for key unless a run is already in flight, and waits
+// for it at most tipBudget. Callers that time out leave the run going and
+// later callers share it, so a stalled filesystem holds one run per key --
+// however long the server lives and however often it is asked.
+func inFlight(key string, budget time.Duration, work func(*tipJob)) (*tipJob, bool) {
+	j := &tipJob{done: make(chan struct{})}
+	if v, loaded := tipJobs.LoadOrStore(key, j); loaded {
+		j = v.(*tipJob)
+	} else {
+		go func() { work(j); tipJobs.Delete(key); close(j.done) }()
+	}
+	select {
+	case <-j.done:
+		return j, true
+	case <-time.After(budget):
+		return nil, false
+	}
+}
+
+// measureTip is a HEAD measurement within tipBudget, and when it began: a
+// caller that joins a run already in flight gets that run's time, not its own,
+// so an older HEAD is never published as newer than one measured since. ok is
+// false when it ran out or found nothing; such a result is never published
+// over a real one.
+func measureTip(agent string) (tip, branch string, at time.Time, ok bool) {
+	return measureTipWith(agent, tipFunc, tipBudget)
+}
+
+func measureTipWith(agent string, measure func(string) (string, string), budget time.Duration) (tip, branch string, at time.Time, ok bool) {
+	j, done := inFlight(Root()+"|tip:"+agent, budget, func(j *tipJob) { j.at = time.Now(); j.tip, j.branch = measure(agent) })
+	if !done {
+		return "", "", time.Time{}, false
+	}
+	return j.tip, j.branch, j.at, j.tip != ""
+}
+
+// stampTip is HEAD for a message's stamp, within tipBudget. It is unknown
+// ("") when the budget runs out, or when the only sample began before this
+// request: a stamp says what a message was computed against.
+func stampTip(agent string) (sha, branch string) {
+	asked := time.Now()
+	tip, br, at, ok := measureTip(agent)
+	if !ok || at.Before(asked) {
+		return "", ""
+	}
+	return tip, br
+}
+
+// setTip publishes a HEAD measured at at, unless presence already holds a
+// later measurement: a beat that measured before a Stop and publishes after
+// it must not put the older HEAD back.
+func setTip(p *Presence, tip, branch string, at time.Time) {
+	// A stored time in the future is a stepped-back clock, not a newer HEAD.
+	if prev, err := time.Parse(time.RFC3339Nano, p.TipAt); err == nil && prev.After(at) && !prev.After(time.Now()) {
+		return
+	}
+	p.Tip, p.Branch, p.TipAt = tip, branch, at.UTC().Format(time.RFC3339Nano)
+}
+
 func SetBusy(agent, text string, pids []int) error {
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
-	tip, branch := GitTip(agent)
+	tip, branch, at, ok := measureTip(agent)
 	return updateJSON(presencePath(agent), func(p *Presence) error {
-		p.Agent, p.Tip, p.Branch, p.Beat = agent, tip, branch, now()
+		p.Agent, p.Beat = agent, now()
+		if ok {
+			setTip(p, tip, branch, at)
+		}
 		p.Busy, p.Pids = text, pids
 		return nil
 	})

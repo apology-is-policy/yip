@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -90,7 +91,8 @@ WAITING WITHOUT POLLING
   yip watch --timeout 30s   give up waiting (default 10m with --once, else never)
 
   Exit 0 = an event arrived. Exit 3 = the deadline passed with nothing, which
-  is NOT the same as success and must not be read as it.
+  is NOT the same as success and must not be read as it. Exit 4 = the session
+  now answers to another name (it bound or unbound): restart the watch.
 
   Nobody should poll in a shell. Arm it and be woken:
 
@@ -239,7 +241,7 @@ func main() {
 			raw = []byte("{}")
 		}
 		check(json.Unmarshal(raw, &a))
-		out, err := (&server{me: me}).call(args[0], a)
+		out, err := (&server{me: me, cli: true}).call(args[0], a)
 		result := map[string]any{"ok": err == nil, "result": out}
 		if err != nil {
 			result["error"] = err.Error()
@@ -355,6 +357,9 @@ func main() {
 			if endpointExists(name) {
 				delivery = " -- " + EndpointStatus(name)
 			}
+			if b, ok, _ := liveBinding(name); ok {
+				delivery += fmt.Sprintf(" -- bound by the Claude session (pid %d) launched as %s", b.Session.PID, b.Launch)
+			}
 			fmt.Printf("  %-16s %s%s\n", name, m.PathOf(name), delivery)
 		}
 		if len(seats.Seats) > 0 {
@@ -366,7 +371,7 @@ func main() {
 			}
 		}
 	case "serve":
-		me := must(WhoAmI(as, ""))
+		me := must(launchIdentity(as, ""))
 		var err error
 		if len(args) == 1 && args[0] == "--channels" {
 			err = ServeChannels(me)
@@ -563,6 +568,9 @@ func main() {
 		fmt.Printf("ratification %d recorded on %s as %s (human)\n", n, c.ID, by)
 	case "watch":
 		me := must(WhoAmI(as, ""))
+		launch := must(launchIdentity(as, ""))
+		explicit := as != "" || os.Getenv("YIP_AGENT") != ""
+		still := func() bool { cur, err := identityFor(launch, explicit); return err == nil && cur == me }
 		var ivs, dls string
 		args, ivs = takeFlag(args, "--interval", "2s")
 		once := hasFlag(args, "--once")
@@ -577,10 +585,13 @@ func main() {
 		check(err)
 		dl, err := time.ParseDuration(dls)
 		check(err)
-		if err := Watch(me, iv, dl, once, hasFlag(args, "--replay")); err != nil {
+		if err := Watch(me, still, iv, dl, once, hasFlag(args, "--replay")); err != nil {
+			fmt.Fprintln(os.Stderr, "yip:", err)
+			if errors.Is(err, errWatchIdentity) {
+				os.Exit(4)
+			}
 			// 3 = nothing happened, which is not the same as a failure and
 			// must not read as success either.
-			fmt.Fprintln(os.Stderr, "yip:", err)
 			os.Exit(3)
 		}
 	case "dispute":
@@ -806,6 +817,9 @@ func doctor(as string) {
 	root := checkoutRoot("")
 	me, err := WhoAmI(as, "")
 	say(err == nil, "identity: %v", orErr(me, err))
+	if launch, lerr := launchIdentity(as, ""); err == nil && lerr == nil && launch != me {
+		say(true, "bound: this Claude session answers as %s in place of %s", me, launch)
+	}
 	say(true, "line: %s", activeLine)
 	say(fileExists(Root()), "line dir: %s", Root())
 

@@ -84,6 +84,11 @@ TRANSPORT SETUP AND DIAGNOSTICS
   next turn. A waiter whose session exited sends nothing. PostToolUse notices
   are suppressed while a waiter is armed. Every Claude runtime names --as and
   --line in its hooks and .mcp.json; reinstall checkouts installed with --line.
+  Sessions started from one shared folder, each working in its own worktree:
+  once the worktree exists, call the bind MCP tool with its path (a Windows
+  path works under WSL). That session then answers as the worktree's identity
+  everywhere it answered as the folder's; the worktree joins the line. Lasts
+  until the session exits; bind again after a restart or resume.
 
   Existing manual MCP integration:
     yip delivery register-channel [--replay]
