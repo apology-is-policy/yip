@@ -38,8 +38,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
-	"time"
 )
 
 type procID struct {
@@ -159,10 +157,16 @@ func isHookShell(cmdline string) bool {
 
 func sessionsDir() string { return filepath.Join(Root(), "sessions") }
 
-// sessionPath is keyed by pid namespace too: a pid and start time mean
-// nothing outside the namespace that observed them.
+// sessionPath names exactly one process: pid and start time, within the pid
+// namespace that observed them and the boot they ran in. Two processes never
+// share a record file, so no prune can remove a record a registrar has just
+// written for a live session.
 func sessionPath(p procID) string {
-	return filepath.Join(sessionsDir(), strconv.Itoa(p.PID)+"-"+p.Start+"-"+nsKey()+".json")
+	boot := bootID()
+	if boot == "" {
+		boot = "0"
+	}
+	return filepath.Join(sessionsDir(), strconv.Itoa(p.PID)+"-"+p.Start+"-"+nsKey()+"-"+boot+".json")
 }
 
 var nsKey = sync.OnceValue(func() string {
@@ -188,9 +192,11 @@ var pidNS = sync.OnceValue(func() string {
 })
 
 // registerSession records p as a Claude session, and forgets sessions that
-// have exited -- under one guard, so a prune cannot remove a record that a
-// registrar has just replaced. Idempotent: the MCP server, the SessionStart
-// hook and every rewake hook register.
+// have exited. Idempotent: the MCP server, the SessionStart hook and every
+// rewake hook register. It takes no lock -- record files are per process, so
+// a prune removes only records whose own process is gone -- and so contention
+// can never leave a session unregistered: its shell would then walk past it
+// to an outer session's binding.
 func registerSession(p procID, launch string) error {
 	if p.PID <= 1 {
 		return nil
@@ -198,14 +204,6 @@ func registerSession(p procID, launch string) error {
 	if err := os.MkdirAll(sessionsDir(), 0o755); err != nil {
 		return err
 	}
-	// Bounded: this runs before the MCP server answers initialize and in the
-	// synchronous hooks. A stalled holder costs a second and a retryable
-	// error -- never an unguarded write, which a concurrent prune could undo.
-	unlock, err := tryGuard(filepath.Join(sessionsDir(), "registry"), time.Second)
-	if err != nil {
-		return fmt.Errorf("session registry busy: %w", err)
-	}
-	defer unlock()
 	if entries, rerr := os.ReadDir(sessionsDir()); rerr == nil {
 		for _, e := range entries {
 			var r sessionRecord
@@ -222,23 +220,6 @@ func registerSession(p procID, launch string) error {
 		return nil
 	}
 	return writeState(sessionPath(p), sessionRecord{Session: p, Boot: bootID(), NS: pidNS(), Launch: launch, Registered: now()})
-}
-
-// tryGuard is fileGuard with a deadline instead of an unbounded wait.
-func tryGuard(path string, budget time.Duration) (func(), error) {
-	f, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	for deadline := time.Now().Add(budget); ; time.Sleep(10 * time.Millisecond) {
-		if err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
-			return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }, nil
-		}
-		if !time.Now().Before(deadline) {
-			f.Close()
-			return nil, err
-		}
-	}
 }
 
 // isRegistered: p is a Claude session boundary. A record that exists but

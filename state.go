@@ -636,10 +636,10 @@ func Beat(agent, lastTool string) error {
 	age := time.Since(measured)
 	fresh := p.Agent != agent || err != nil || age < 0 || age >= presenceTipReuse
 	var tip, branch string
+	var at time.Time
 	measuredOK := false
-	at := time.Now()
 	if fresh {
-		tip, branch, measuredOK = measureTip(agent)
+		tip, branch, at, measuredOK = measureTip(agent)
 	}
 	return updateJSON(presencePath(agent), func(p *Presence) error {
 		p.Agent, p.Beat = agent, now()
@@ -655,7 +655,9 @@ func Beat(agent, lastTool string) error {
 
 // MeasureTip records HEAD now, whatever the reuse window says. The Stop hook
 // calls it once per turn, so the last commit of a burst shows while the
-// session idles instead of hiding behind a reused tip.
+// session idles instead of hiding behind a reused tip. A measurement already
+// in flight is joined, not repeated; its sample keeps its own earlier time, so
+// it renews nothing and the next beat measures again.
 func MeasureTip(agent string) error {
 	measure, budget := tipFunc, tipBudget // read here: the run may outlive this call
 	j, ok := inFlight(Root()+"|publish:"+agent, budget, func(j *tipJob) { j.err = measureAndPublish(agent, measure, budget) })
@@ -669,8 +671,7 @@ func measureAndPublish(agent string, measure func(string) (string, string), budg
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
-	at := time.Now()
-	tip, branch, ok := measureTipWith(agent, measure, budget)
+	tip, branch, at, ok := measureTipWith(agent, measure, budget)
 	if !ok {
 		return nil
 	}
@@ -694,6 +695,7 @@ var tipFunc = GitTip // injectable for tests
 type tipJob struct {
 	done        chan struct{}
 	tip, branch string
+	at          time.Time
 	err         error
 }
 
@@ -718,18 +720,21 @@ func inFlight(key string, budget time.Duration, work func(*tipJob)) (*tipJob, bo
 	}
 }
 
-// measureTip is a HEAD measurement within tipBudget. ok is false when it ran
-// out or found nothing; such a result is never published over a real one.
-func measureTip(agent string) (tip, branch string, ok bool) {
+// measureTip is a HEAD measurement within tipBudget, and when it began: a
+// caller that joins a run already in flight gets that run's time, not its own,
+// so an older HEAD is never published as newer than one measured since. ok is
+// false when it ran out or found nothing; such a result is never published
+// over a real one.
+func measureTip(agent string) (tip, branch string, at time.Time, ok bool) {
 	return measureTipWith(agent, tipFunc, tipBudget)
 }
 
-func measureTipWith(agent string, measure func(string) (string, string), budget time.Duration) (tip, branch string, ok bool) {
-	j, done := inFlight(Root()+"|tip:"+agent, budget, func(j *tipJob) { j.tip, j.branch = measure(agent) })
+func measureTipWith(agent string, measure func(string) (string, string), budget time.Duration) (tip, branch string, at time.Time, ok bool) {
+	j, done := inFlight(Root()+"|tip:"+agent, budget, func(j *tipJob) { j.at = time.Now(); j.tip, j.branch = measure(agent) })
 	if !done {
-		return "", "", false
+		return "", "", time.Time{}, false
 	}
-	return j.tip, j.branch, j.tip != "" || j.branch != ""
+	return j.tip, j.branch, j.at, j.tip != "" || j.branch != ""
 }
 
 // setTip publishes a HEAD measured at at, unless presence already holds a
@@ -747,8 +752,7 @@ func SetBusy(agent, text string, pids []int) error {
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
-	at := time.Now()
-	tip, branch, ok := measureTip(agent)
+	tip, branch, at, ok := measureTip(agent)
 	return updateJSON(presencePath(agent), func(p *Presence) error {
 		p.Agent, p.Beat = agent, now()
 		if ok {

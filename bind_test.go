@@ -852,26 +852,6 @@ func TestAFailedRegistrationRefusesToActAndABadRecordIsABoundary(t *testing.T) {
 	}
 }
 
-func TestPruningAndRegistrationAreSerialised(t *testing.T) {
-	seedSharedLaunch(t, "wt")
-	fakeProcs(t, nil, sessionA, sessionB)
-	guard, err := fileGuard(filepath.Join(sessionsDir(), "registry"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- registerSession(procID{PID: 4600, Start: "22"}, "claude") }()
-	select {
-	case <-done:
-		t.Fatal("registered while another registrar held the registry")
-	case <-time.After(100 * time.Millisecond):
-	}
-	guard()
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-}
-
 // Review round 5 (prosecutor run 3 on 336ea49): one regression each.
 
 func TestStopMeasuresTheLastCommitOfATurn(t *testing.T) {
@@ -1221,7 +1201,7 @@ func TestBindRefusesWhatItCannotFenceOrRead(t *testing.T) {
 	}
 }
 
-func TestRegistrationRecoversAndIsNotHeldHostage(t *testing.T) {
+func TestRegistrationRecoversOnceTheFaultIsFixed(t *testing.T) {
 	seedSharedLaunch(t, "wt")
 	fakeProcs(t, []procID{sessionA}, sessionA)
 	if err := os.Remove(sessionPath(sessionA)); err != nil {
@@ -1238,22 +1218,6 @@ func TestRegistrationRecoversAndIsNotHeldHostage(t *testing.T) {
 	}
 	if _, err := s.call("busy", map[string]any{"text": "x"}); err != nil {
 		t.Fatal("registration did not recover once the fault was fixed:", err)
-	}
-	// A holder stuck on the registry lock costs a registrar a second, not forever.
-	stuck, err := fileGuard(filepath.Join(sessionsDir(), "registry"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stuck()
-	late := procID{PID: 5100, Start: "27"}
-	procAlive = func(p procID) bool { return p == sessionA || p == late }
-	start := time.Now()
-	// Retryable failure, never an unguarded write a concurrent prune could undo.
-	if err := registerSession(late, "claude"); err == nil || isRegistered(late) {
-		t.Fatal("registered around a held registry lock:", err)
-	}
-	if took := time.Since(start); took > 3*time.Second {
-		t.Fatal("registration waited on a stuck registry lock:", took)
 	}
 }
 
@@ -1284,7 +1248,7 @@ func TestStalledPresenceWorkDoesNotPileUp(t *testing.T) {
 	var running atomic.Int32
 	tipFunc = func(string) (string, string) { running.Add(1); <-release; running.Add(-1); return "", "" }
 	for i := 0; i < 5; i++ {
-		if _, _, ok := measureTip("claude"); ok {
+		if _, _, _, ok := measureTip("claude"); ok {
 			t.Fatal("a stalled measurement reported success")
 		}
 	}
@@ -1313,5 +1277,75 @@ func TestStopDecidesWithinBudgetEvenWhenPresenceIsLocked(t *testing.T) {
 	}
 	if b, _ := json.Marshal(decision); !strings.Contains(string(b), "block") {
 		t.Fatal("Stop lost its block decision:", string(b))
+	}
+}
+
+// Review round 9 (Codex call 0010 on 77d150c): one regression each.
+
+func TestALockHolderNeverLeavesANestedSessionUnregistered(t *testing.T) {
+	_, wt := seedSharedLaunch(t, "outer-wt")
+	inner := procID{PID: 5200, Start: "28"}
+	fakeProcs(t, []procID{sessionA}, sessionA)
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	stuck, err := fileGuard(filepath.Join(sessionsDir(), "registry")) // a stalled registrar
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stuck()
+	procAlive = func(p procID) bool { return p == sessionA || p == inner }
+	processAncestors = func() []procID { return []procID{inner, sessionA} }
+	s := &server{me: "claude"}
+	s.startClaude("claude")
+	if s.regErr != nil {
+		t.Fatal("the nested session was left unregistered:", s.regErr)
+	}
+	// Its first shell command, before any of its hooks has run.
+	processAncestors = func() []procID { return []procID{{PID: 9, Start: "1"}, inner, sessionA} }
+	if me := whoami(t, "claude"); me != "claude" {
+		t.Fatal("the nested session's CLI answered as the outer binding:", me)
+	}
+}
+
+func TestRecordsOfDifferentBootsNeverShareAFile(t *testing.T) {
+	seedSharedLaunch(t, "wt")
+	p := procID{PID: 5300, Start: "29"}
+	old := bootID
+	t.Cleanup(func() { bootID = old })
+	bootID = func() string { return "boot-1" }
+	earlier := sessionPath(p)
+	bootID = func() string { return "boot-2" }
+	if sessionPath(p) == earlier {
+		t.Fatal("a prune reading the earlier boot's record could remove this boot's:", earlier)
+	}
+}
+
+func TestAJoinedMeasurementKeepsItsOwnTime(t *testing.T) {
+	seedSharedLaunch(t, "wt")
+	oldF, oldB := tipFunc, tipBudget
+	t.Cleanup(func() { tipFunc, tipBudget = oldF, oldB })
+	release := make(chan struct{})
+	var calls atomic.Int32
+	tipFunc = func(string) (string, string) { calls.Add(1); <-release; return "1111111", "main" }
+	tipBudget = 30 * time.Millisecond
+	_ = SetBusy("claude", "first", nil) // times out; its measurement runs on
+	// Meanwhile another process measures and publishes a newer HEAD.
+	if err := updateJSON(presencePath("claude"), func(p *Presence) error { setTip(p, "2222222", "main", time.Now()); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	tipBudget = 2 * time.Second
+	done := make(chan error, 1)
+	go func() { done <- SetBusy("claude", "second", nil) }()
+	time.Sleep(50 * time.Millisecond) // the second caller joins the run in flight
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatal("the second caller did not join the run in flight:", n)
+	}
+	if p, _ := LoadPresence("claude"); p.Tip != "2222222" {
+		t.Fatal("a joined older sample overwrote a newer HEAD:", p.Tip)
 	}
 }
