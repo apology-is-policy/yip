@@ -157,12 +157,12 @@ claude-rewake runtime or plain hooks (Channels stay with the name they
 connected as), and Linux or WSL. `yip line` shows which members are bound.
 
 Each Claude session registers itself (under `sessions/`) when its Yip MCP
-server or SessionStart hook runs. That is how a bound name stays with its
+server or any of its hooks runs. That is how a bound name stays with its
 binder: a session started inside a bound one (`claude -p` from its shell)
 answers as itself; bind refuses a worktree that a live session started there
 already answers to; and while a worktree is bound, any other Claude session --
 started inside it, or with its shell standing in its folder -- is refused that
-name, even with `--as`. Outside any Claude session, a person may still name it
+name, even with `--as`, and so is any Channels or Codex connection. Outside any Claude session, a person may still name it
 with `--as`. A session whose Yip MCP server and hooks never ran is not known
 and is not fenced.
 
