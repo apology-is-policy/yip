@@ -1547,3 +1547,59 @@ func TestConnectionsFailClosedOnAnUnreadableBindingsFile(t *testing.T) {
 		t.Fatal("installed Channels past a corrupt bindings file")
 	}
 }
+
+// Review round 12 (Codex call 0010 on 7c57374): one regression each.
+
+// crossTheFirstBind runs act in unregistered session B while A commits the
+// line's first live binding, between B's "nobody is bound" check and its
+// identity resolution.
+func crossTheFirstBind(t *testing.T, act func()) {
+	t.Helper()
+	_, wt := seedSharedLaunch(t, "wt")
+	inner := procID{PID: 5500, Start: "31"}
+	gone := procID{PID: 5600, Start: "32"}
+	fakeProcs(t, []procID{inner, sessionA}, sessionA)
+	if err := writeState(bindingsPath(), Bindings{Version: 1, Boot: bootID(), Bindings: map[string]Binding{"old": {Session: gone, Launch: "claude"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sessionsDir(), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sessionsDir(), 0o755) })
+	if registerSession(inner, "claude") == nil {
+		t.Skip("registry directory still writable (running as root?)")
+	}
+	reached, proceed := make(chan struct{}), make(chan struct{})
+	var first atomic.Bool
+	procAlive = func(p procID) bool {
+		if p == gone && first.CompareAndSwap(false, true) {
+			close(reached)
+			<-proceed
+		}
+		return p == sessionA || p == inner
+	}
+	done := make(chan struct{})
+	go func() { act(); close(done) }()
+	<-reached
+	if _, err := Bind("claude", sessionA, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	close(proceed)
+	<-done
+	if p, ok := LoadPresence("wt"); ok {
+		t.Fatal("an unregistered session acted as the name another bound meanwhile:", p)
+	}
+}
+
+func TestAnUnregisteredToolCannotCrossTheFirstBind(t *testing.T) {
+	var s *server
+	crossTheFirstBind(t, func() {
+		s = &server{me: "claude"}
+		s.launch, s.session, s.regErr = "claude", procID{PID: 5500, Start: "31"}, errors.New("unwritable")
+		_, _ = s.call("busy", map[string]any{"text": "B's work"})
+	})
+}
+
+func TestAnUnregisteredHookCannotCrossTheFirstBind(t *testing.T) {
+	crossTheFirstBind(t, func() { runHook(t, "posttooluse", `{"tool_name":"Edit"}`) })
+}

@@ -540,7 +540,9 @@ func (s *server) call(name string, a map[string]any) (string, error) {
 	if name == "bind" {
 		return s.doBind(a)
 	}
-	if s.launch != "" {
+	if s.launch != "" && s.regErr != nil {
+		s.me = s.launch // nobody was bound; resolution would walk past this session
+	} else if s.launch != "" {
 		me, err := identityFor(s.launch, true)
 		if err != nil {
 			return "", err

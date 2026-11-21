@@ -51,19 +51,27 @@ func RunHookRuntime(event string, override string, runtime string) {
 	}
 	// A Claude session's boundary is recorded before anything resolves an
 	// identity for it -- by whichever hook runs first -- or a session started
-	// inside a bound one would answer as that one. Unregistrable: say nothing.
+	// inside a bound one would answer as that one. Unregistrable: say nothing
+	// once anybody is bound; until then answer to the launch name outright --
+	// resolution would walk past this session to a binding made meanwhile.
+	var me string
 	if runtime != "codex" {
 		launch, err := launchIdentity(override, in.Cwd)
 		if err != nil {
 			return
 		}
-		if s := hookSession(); !isRegistered(s) && registerSession(s, launch) != nil && anyLiveBinding() {
-			return
+		if s := hookSession(); !isRegistered(s) && registerSession(s, launch) != nil {
+			if anyLiveBinding() {
+				return
+			}
+			me = launch
 		}
 	}
-	me, err := WhoAmI(override, in.Cwd)
-	if err != nil {
-		return
+	if me == "" {
+		var err error
+		if me, err = WhoAmI(override, in.Cwd); err != nil {
+			return
+		}
 	}
 	var result any
 	switch strings.ToLower(event) {
