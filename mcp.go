@@ -285,6 +285,11 @@ type server struct {
 	codexRelease func()
 	codexSend    deliverySender // nil = codex queue; injectable for tests
 	startCodex   func()
+	// Antigravity (serve --agy); see agy.go / agy_live.go.
+	agyMode  bool
+	agyConv  string // per tools/call: root conversation UUID from _meta
+	subagent bool
+
 	started      time.Time
 	cwd          string
 }
@@ -293,18 +298,20 @@ const (
 	serveClaude   = "claude"
 	serveChannels = "channels"
 	serveCodex    = "codex"
+	serveAgy      = "agy"
 )
 
 func Serve(me string) error         { return serveIO(me, serveClaude, os.Stdin, os.Stdout) }
 func ServeChannels(me string) error { return serveIO(me, serveChannels, os.Stdin, os.Stdout) }
 func ServeCodex(me string) error    { return serveIO(me, serveCodex, os.Stdin, os.Stdout) }
+func ServeAgy(me string) error      { return serveIO(me, serveAgy, os.Stdin, os.Stdout) }
 func serveIO(me, mode string, input io.Reader, output io.Writer) error {
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
 	channels := mode == serveChannels
-	s := &server{me: me, enc: json.NewEncoder(output), channelMode: channels, codexMode: mode == serveCodex, started: time.Now()}
-	if mode == serveClaude {
+	s := &server{me: me, enc: json.NewEncoder(output), channelMode: channels, codexMode: mode == serveCodex, agyMode: mode == serveAgy, started: time.Now()}
+	if mode == serveClaude || mode == serveAgy {
 		s.startClaude(me)
 	} else if err := fenceConnection(me); err != nil {
 		return err
@@ -401,6 +408,8 @@ func (s *server) handle(req *rpcReq) {
 		instructions := channelInstructions
 		if s.codexMode {
 			instructions = codexInstructions(s.me)
+		} else if s.agyMode {
+			instructions = agyInstructions(s.me, activeLine)
 		}
 		s.reply(req.ID, map[string]any{
 			"protocolVersion": "2024-11-05",
@@ -429,7 +438,9 @@ func (s *server) handle(req *rpcReq) {
 			Name      string         `json:"name"`
 			Arguments map[string]any `json:"arguments"`
 			Meta      struct {
-				ThreadID string `json:"threadId"`
+				ThreadID      string `json:"threadId"`
+				AgyConvID     string `json:"antigravity.google/conversation_id"`
+				AgyRootConvID string `json:"antigravity.google/root_conversation_id"`
 			} `json:"_meta"`
 		}
 		if err := json.Unmarshal(req.Params, &p); err != nil {
@@ -439,7 +450,19 @@ func (s *server) handle(req *rpcReq) {
 		// Codex names the calling thread on every tools/call. The first one
 		// binds delivery; the note tells the model once that it happened.
 		bindNote := s.observeCodexThread(p.Meta.ThreadID)
+		conv := p.Meta.AgyRootConvID
+		if conv == "" {
+			conv = p.Meta.AgyConvID
+		}
+		if threadRE.MatchString(conv) {
+			s.agyConv = conv
+		} else {
+			s.agyConv = ""
+		}
+		s.subagent = p.Meta.AgyConvID != "" && p.Meta.AgyRootConvID != "" && p.Meta.AgyConvID != p.Meta.AgyRootConvID
 		text, err := s.call(p.Name, p.Arguments)
+		s.agyConv = ""
+		s.subagent = false
 		if err != nil {
 			s.reply(req.ID, map[string]any{
 				"content": []any{map[string]any{"type": "text", "text": err.Error() + bindNote}},
@@ -543,7 +566,7 @@ func (s *server) call(name string, a map[string]any) (string, error) {
 	if s.launch != "" && s.regErr != nil {
 		s.me = s.launch // nobody was bound; resolution would walk past this session
 	} else if s.launch != "" {
-		me, err := identityFor(s.launch, true)
+		me, err := identityForConv(s.launch, true, s.agyConv)
 		if err != nil {
 			return "", err
 		}
@@ -685,14 +708,17 @@ func (s *server) doMeasure(a map[string]any) (string, error) {
 
 func (s *server) doBind(a map[string]any) (string, error) {
 	if s.launch == "" || s.cli {
-		return "", fmt.Errorf("bind is the Yip MCP tool of a Claude session (claude-rewake runtime or plain hooks); it is not available from Channels, Codex or the CLI")
+		return "", fmt.Errorf("bind is the Yip MCP tool of a Claude or Antigravity session (claude-rewake, agy, or plain hooks); it is not available from Channels, Codex or the CLI")
+	}
+	if s.subagent {
+		return "", fmt.Errorf("bind re-identifies the whole session and must be called by the main conversation, not a subagent")
 	}
 	// The session that started this server -- not whatever is its parent now:
 	// a server orphaned by a dead session must not bind its new parent.
 	if s.session.PID <= 1 || !procAlive(s.session) {
-		return "", fmt.Errorf("bind needs the Claude session that started this server, and it has exited (or /proc is unavailable)")
+		return "", fmt.Errorf("bind needs the session that started this server, and it has exited (or process inspection is unavailable)")
 	}
-	res, err := Bind(s.launch, s.session, argStr(a, "worktree"), argStr(a, "as"))
+	res, err := BindWithConv(s.launch, s.session, s.agyConv, argStr(a, "worktree"), argStr(a, "as"))
 	if err != nil {
 		return "", err
 	}

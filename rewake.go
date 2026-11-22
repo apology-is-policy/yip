@@ -225,6 +225,8 @@ func pushReachable(agent string) bool {
 		return channelPreferred(agent)
 	case "codex":
 		return codexBindingAlive(ep)
+	case "agy":
+		return agyBindingAlive(ep)
 	case "claude-rewake":
 		return rewakeArmed(agent)
 	}

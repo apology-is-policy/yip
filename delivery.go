@@ -243,10 +243,11 @@ func dispatchEndpoint(agent, runtime, session string, send deliverySender) (int,
 	if err != nil {
 		return 0, err
 	}
-	// A session-scoped dispatcher (Channels, or a live Codex chat's own server)
-	// owns the endpoint only while it is the bound session. An external Codex
-	// dispatcher passes no session and follows the current binding.
-	if ep.Runtime != runtime || ((runtime == "claude-channels" || (runtime == "codex" && session != "")) && ep.Thread != session) {
+	// A session-scoped dispatcher (Channels, a live Codex chat's own server,
+	// or a live Antigravity listener) owns the endpoint only while it is the
+	// bound session. An external Codex dispatcher passes no session and follows
+	// the current binding.
+	if ep.Runtime != runtime || ((runtime == "claude-channels" || ((runtime == "codex" || runtime == "agy") && session != "")) && ep.Thread != session) {
 		return 0, errNotOwner
 	}
 	reconcileEndpoint(&ep)
@@ -265,8 +266,8 @@ func dispatchEndpoint(agent, runtime, session string, send deliverySender) (int,
 	if err = writeState(endpointPath(agent), ep); err != nil {
 		return 0, err
 	}
-	// An unbound Codex endpoint has nowhere to send: events wait as pending.
-	if ep.Paused || Retired(agent) || (runtime == "codex" && ep.Thread == "") {
+	// An unbound Codex/Antigravity endpoint has nowhere to send: events wait as pending.
+	if ep.Paused || Retired(agent) || ((runtime == "codex" || runtime == "agy") && ep.Thread == "") {
 		return 0, nil
 	}
 	// A fresh probe, if the last one went unanswered, leaves in this same pass.
@@ -369,6 +370,9 @@ func endpointStatusFrom(agent string, ep Endpoint, err error) string {
 	}
 	if ep.Runtime == "claude-rewake" {
 		return rewakeStatus(agent)
+	}
+	if ep.Runtime == "agy" {
+		return agyEndpointStatus(ep)
 	}
 	return codexEndpointStatus(ep)
 }

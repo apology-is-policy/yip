@@ -22,6 +22,27 @@ type hookInput struct {
 	HookEventName string `json:"hook_event_name"`
 	Source        string `json:"source"`
 	SessionID     string `json:"session_id"`
+
+	// Antigravity (agy) camelCase protojson fields.
+	ConversationID     string `json:"conversationId"`
+	AgyHookEventName   string `json:"hookEventName"`
+	TerminationReason  string `json:"terminationReason"`
+	ContinuationActive bool   `json:"continuationActive"`
+	FullyIdle          bool   `json:"fullyIdle"`
+	ToolCall           *struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"toolCall"`
+}
+
+func (in hookInput) toolName() string {
+	if in.ToolName != "" {
+		return in.ToolName
+	}
+	if in.ToolCall != nil {
+		return in.ToolCall.Name
+	}
+	return ""
 }
 
 func readHookInput() hookInput {
@@ -46,22 +67,32 @@ func emit(v any) {
 func RunHook(event string, override string) { RunHookRuntime(event, override, "claude") }
 func RunHookRuntime(event string, override string, runtime string) {
 	in := readHookInput()
+	quiet := func() {
+		if runtime == "agy" {
+			emit(map[string]any{})
+		}
+	}
 	if _, err := os.Stat(Root()); err != nil {
+		quiet()
 		return
 	}
-	// A Claude session's boundary is recorded before anything resolves an
-	// identity for it -- by whichever hook runs first -- or a session started
+	// A Claude/Antigravity session's boundary is recorded before anything resolves
+	// an identity for it -- by whichever hook runs first -- or a session started
 	// inside a bound one would answer as that one. Unregistrable: say nothing
 	// once anybody is bound; until then answer to the launch name outright --
 	// resolution would walk past this session to a binding made meanwhile.
 	var me string
+	var launch string
 	if runtime != "codex" {
-		launch, err := launchIdentity(override, in.Cwd)
+		var err error
+		launch, err = launchIdentity(override, in.Cwd)
 		if err != nil {
+			quiet()
 			return
 		}
 		if s := hookSession(); !isRegistered(s) && registerSession(s, launch) != nil {
 			if anyLiveBinding() {
+				quiet()
 				return
 			}
 			me = launch
@@ -69,24 +100,51 @@ func RunHookRuntime(event string, override string, runtime string) {
 	}
 	if me == "" {
 		var err error
-		if me, err = WhoAmI(override, in.Cwd); err != nil {
+		if runtime == "agy" && threadRE.MatchString(in.ConversationID) {
+			me, err = identityForConv(launch, true, in.ConversationID)
+		} else {
+			me, err = WhoAmI(override, in.Cwd)
+		}
+		if err != nil {
+			quiet()
 			return
 		}
+	}
+	if launch == "" {
+		launch = me
 	}
 	var result any
 	switch strings.ToLower(event) {
 	case "posttooluse":
+		if runtime == "agy" {
+			// Antigravity PostToolUse expects `{}` only and cannot inject context;
+			// heartbeat presence here and deliver mid-turn notices in PreInvocation.
+			_ = Beat(me, in.toolName())
+		} else {
+			result = hookPostToolUse(me, in)
+		}
+	case "preinvocation":
 		result = hookPostToolUse(me, in)
 	case "stop":
-		result = hookStop(me)
+		if runtime == "agy" && in.TerminationReason != "" && in.TerminationReason != "NO_TOOL_CALL" {
+			// Never hold a turn that stopped due to user cancel, error, or limits.
+			result = nil
+		} else {
+			result = hookStop(me)
+		}
 	case "sessionstart":
 		result = hookSessionStart(me)
 		if runtime == "codex" {
 			result = withContext(result, "SessionStart", codexBindNudge(me, in.SessionID))
+		} else if runtime == "agy" {
+			result = withContext(result, "SessionStart", agyListenNudge(me, launch, activeLine, in.ConversationID))
 		}
 	}
-	if runtime == "codex" {
+	switch runtime {
+	case "codex":
 		result = codexHookOutput(event, result)
+	case "agy":
+		result = agyHookOutput(event, result)
 	}
 	emit(result)
 }
@@ -132,12 +190,12 @@ func withContext(result any, event, line string) any {
 // changed. NotifiedAt is what keeps it from repeating itself: one notice per
 // new turn, not one per tool call until the agent reads.
 func hookPostToolUse(me string, in hookInput) any {
-	_ = Beat(me, in.ToolName)
+	_ = Beat(me, in.toolName())
 	nudge := roadmapNudge(me)
 	// A live push path delivers these already; repeating them per tool call is
 	// noise. Cursors are not advanced, so the hook resumes when push lapses.
 	// The roadmap nudge is not a delivered notice, so it still speaks.
-	if channelPreferred(me) || rewakeArmed(me) {
+	if channelPreferred(me) || rewakeArmed(me) || agyPushLive(me) {
 		if nudge == "" {
 			return nil
 		}

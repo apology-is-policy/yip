@@ -99,6 +99,24 @@ func launchIdentity(override, cwd string) (string, error) {
 			return "", fmt.Errorf("this Codex chat is not bound to a Yip identity yet, and %s belongs to %q, which is not a Codex agent -- use the Yip MCP tools (which binds this chat) or pass --as NAME", root, owner)
 		}
 	}
+	// Antigravity sets ANTIGRAVITY_CONVERSATION_ID in the shell of commands it
+	// runs. A live listener binding or registered session record outranks the
+	// checkout path so an agy seat sharing a checkout never impersonates the
+	// checkout's Claude/Codex member.
+	if conv := os.Getenv("ANTIGRAVITY_CONVERSATION_ID"); threadRE.MatchString(conv) {
+		if a := agentBoundToAgyConv(conv); a != "" {
+			return a, nil
+		}
+		if r, ok := nearestSessionRecord(); ok && r.Launch != "" && isAgyIdentity(r.Launch, root) {
+			return r.Launch, nil
+		}
+		if here := seats.At(root); len(here) > 0 {
+			return "", fmt.Errorf("this Antigravity session is not bound to a Yip identity yet, and %s is shared by seat(s) %s -- use the Yip MCP tools or pass --as NAME", root, strings.Join(here, ", "))
+		}
+		if owner := m.AgentAt(root); owner != "" && !isAgyIdentity(owner, root) {
+			return "", fmt.Errorf("this Antigravity session is not bound to a Yip identity yet, and %s belongs to %q, which is not an Antigravity agent -- use the Yip MCP tools or pass --as NAME", root, owner)
+		}
+	}
 	if a := m.AgentAt(root); a != "" {
 		return a, nil
 	}
@@ -116,7 +134,7 @@ func worktreeFor(agent string) string {
 		if s.Workdir != "" {
 			return s.Workdir
 		}
-		if ep, err := readEndpoint(agent); err == nil && ep.Runtime == "codex" {
+		if ep, err := readEndpoint(agent); err == nil && (ep.Runtime == "codex" || ep.Runtime == "agy") {
 			return ep.Cwd
 		}
 	}

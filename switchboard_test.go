@@ -18,6 +18,7 @@ func tmpLine(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("YIP_ROOT", dir)
+	t.Setenv("ANTIGRAVITY_CONVERSATION_ID", "")
 	if err := EnsureRoot(); err != nil {
 		t.Fatalf("EnsureRoot: %v", err)
 	}

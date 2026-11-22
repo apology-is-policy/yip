@@ -23,7 +23,7 @@ type TmuxTarget struct {
 var paneRE = regexp.MustCompile(`^%[0-9]+$`)
 
 func validTmuxTarget(t *TmuxTarget) bool {
-	return t != nil && filepath.IsAbs(t.Socket) && paneRE.MatchString(t.Pane) && t.PID > 0 && t.Start != "" && (t.Runtime == "claude" || t.Runtime == "codex")
+	return t != nil && filepath.IsAbs(t.Socket) && paneRE.MatchString(t.Pane) && t.PID > 0 && t.Start != "" && (t.Runtime == "claude" || t.Runtime == "codex" || t.Runtime == "agy")
 }
 func inspectTmux(ctx context.Context, socket, pane string) (TmuxTarget, error) {
 	t := TmuxTarget{Socket: socket, Pane: pane}
@@ -50,15 +50,15 @@ func inspectTmux(ctx context.Context, socket, pane string) (TmuxTarget, error) {
 		return t, e
 	}
 	t.Runtime = fields[2]
-	if t.Runtime != "claude" && t.Runtime != "codex" {
-		return t, fmt.Errorf("pane must directly run claude or codex")
+	if t.Runtime != "claude" && t.Runtime != "codex" && t.Runtime != "agy" {
+		return t, fmt.Errorf("pane must directly run claude, codex or agy")
 	}
 	comm, e := exec.CommandContext(ctx, "ps", "-p", fields[1], "-o", "comm=").Output()
 	if e != nil {
 		return t, e
 	}
 	if filepath.Base(strings.TrimSpace(string(comm))) != t.Runtime {
-		return t, fmt.Errorf("pane PID is a shell/wrapper; start pane with exec claude or exec codex")
+		return t, fmt.Errorf("pane PID is a shell/wrapper; start pane with exec claude, exec codex or exec agy")
 	}
 	t.Start, e = runnerStart(t.PID)
 	return t, e

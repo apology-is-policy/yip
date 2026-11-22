@@ -265,8 +265,8 @@ func TestRewakeWaiterStepsAsideWhenItsSessionBinds(t *testing.T) {
 }
 
 func TestProcStatReadsTheRealProcessTree(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("bind reads /proc")
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("bind process inspection is supported on linux and darwin")
 	}
 	ppid, start, ok := procStat(os.Getpid())
 	if !ok || ppid != os.Getppid() || start == "" {

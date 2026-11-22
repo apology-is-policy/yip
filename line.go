@@ -210,8 +210,8 @@ func InstallRuntime(cwd, lineOverride, asOverride string, local bool, runtime st
 // take a SEAT -- automatically when the checkout already has a different
 // member, or on request with --seat / --profile.
 func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime string, opts InstallOptions) (*installResult, error) {
-	if runtime != "claude" && runtime != "claude-channels" && runtime != "claude-rewake" && runtime != "codex" {
-		return nil, fmt.Errorf("runtime must be claude, claude-channels, claude-rewake or codex")
+	if runtime != "claude" && runtime != "claude-channels" && runtime != "claude-rewake" && runtime != "codex" && runtime != "agy" {
+		return nil, fmt.Errorf("runtime must be claude, claude-channels, claude-rewake, codex or agy")
 	}
 	if opts.WakeWindow == 0 {
 		opts.WakeWindow = defaultWakeWindow
@@ -219,8 +219,11 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 	if opts.WakeWindow < 2*rewakeMargin || opts.WakeWindow > 24*time.Hour {
 		return nil, fmt.Errorf("--wake-window must be between %s and 24h", 2*rewakeMargin)
 	}
-	if (opts.Seat || opts.Profile != "") && runtime != "codex" {
-		return nil, fmt.Errorf("--seat and --profile are Codex installs: Claude's hooks identify an agent by its checkout, so a Claude agent needs a checkout of its own")
+	if opts.Profile != "" && runtime != "codex" {
+		return nil, fmt.Errorf("--profile is a Codex install: profiles write $CODEX_HOME/NAME.config.toml")
+	}
+	if opts.Seat && runtime != "codex" && runtime != "agy" {
+		return nil, fmt.Errorf("--seat and --profile are Codex/Antigravity installs: Claude's hooks identify an agent by its checkout, so a Claude agent needs a checkout of its own")
 	}
 	if opts.Profile != "" && !validComponent(opts.Profile) {
 		return nil, fmt.Errorf("profile name must be letters, digits, - or _")
@@ -283,15 +286,21 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 	// install moves it to a seat beside the new member instead of refusing,
 	// and the two can be installed in either order.
 	movedOwner := false
+	movedOwnerRuntime := ""
 	if owner != "" && owner != agent && !seatMode {
 		switch {
-		case runtime == "codex":
-			seatMode = true // a Codex config names its identity; share the checkout
+		case runtime == "codex" || runtime == "agy":
+			seatMode = true // config names its identity explicitly; share the checkout
 		case isCodexIdentity(owner, root):
 			if _, taken := seats.Seats[owner]; taken {
 				return nil, fmt.Errorf("%q is both %s's member and a seat elsewhere; uninstall it first", owner, root)
 			}
-			movedOwner = true
+			movedOwner, movedOwnerRuntime = true, "codex"
+		case isAgyIdentity(owner, root):
+			if _, taken := seats.Seats[owner]; taken {
+				return nil, fmt.Errorf("%q is both %s's member and a seat elsewhere; uninstall it first", owner, root)
+			}
+			movedOwner, movedOwnerRuntime = true, "agy"
 		default:
 			return nil, fmt.Errorf("%s already belongs to %q on line %s. Claude's hooks identify an agent by its checkout, so a second Claude identity needs its own worktree", root, owner, activeLine)
 		}
@@ -342,7 +351,21 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 		res.Notes = append(res.Notes, fmt.Sprintf("%s is bound by a live Claude session (pid %d): a session started here is refused that name until the binding ends.", agent, bd.Session.PID))
 	}
 
-	if runtime == "codex" {
+	if runtime == "agy" {
+		warning, err := ensureAgyEndpoint(agent)
+		if err != nil {
+			return nil, err
+		}
+		if warning != "" {
+			res.Notes = append(res.Notes, warning)
+		}
+		if err := agyFiles(root, bin, activeLine, agent, false); err != nil {
+			return nil, err
+		}
+		pluginDir := agyPluginDir(root)
+		res.McpPath = filepath.Join(pluginDir, "mcp_config.json")
+		res.HookPath = filepath.Join(pluginDir, "hooks.json")
+	} else if runtime == "codex" {
 		warning, err := ensureCodexEndpoint(agent)
 		if err != nil {
 			return nil, err
@@ -438,16 +461,24 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 			delete(m.Members, root)
 			res.Notes = append(res.Notes, fmt.Sprintf("%s no longer owns %s by path; it is now a seat there.", agent, root))
 		} else if owner != "" && owner != agent && !opts.Seat && opts.Profile == "" && !hadSeat {
-			res.Notes = append(res.Notes, fmt.Sprintf("%s belongs to %s; %s joined as a Codex seat beside it, so %s is unaffected.", root, owner, agent, owner))
+			rtLabel := "Codex"
+			if runtime == "agy" {
+				rtLabel = "Antigravity"
+			}
+			res.Notes = append(res.Notes, fmt.Sprintf("%s belongs to %s; %s joined as a %s seat beside it, so %s is unaffected.", root, owner, agent, rtLabel, owner))
 		}
 		res.Seat = seatDescription(seat)
 	} else {
 		if movedOwner {
-			seats.Seats[owner] = Seat{Agent: owner, Runtime: "codex", Workdir: root, Created: now()}
+			seats.Seats[owner] = Seat{Agent: owner, Runtime: movedOwnerRuntime, Workdir: root, Created: now()}
 			if err := saveSeats(seats); err != nil {
 				return nil, err
 			}
-			res.Notes = append(res.Notes, fmt.Sprintf("%s was this checkout's member; it is now a Codex seat beside %s (its config names it, so nothing changes for it).", owner, agent))
+			rtLabel := "Codex"
+			if movedOwnerRuntime == "agy" {
+				rtLabel = "Antigravity"
+			}
+			res.Notes = append(res.Notes, fmt.Sprintf("%s was this checkout's member; it is now a %s seat beside %s (its config names it, so nothing changes for it).", owner, rtLabel, agent))
 		}
 		m.Members[root] = agent
 	}
@@ -617,6 +648,14 @@ func uninstallLocked(root, agent, profile string, m Members, seats Seats) error 
 		block, _, _ := codexManagedBlock(string(b))
 		if agent == "" || codexBlockAgent(block) == agent {
 			if err := codexFiles(root, "", "", "", true); err != nil {
+				return err
+			}
+		}
+	}
+	// .agents/plugins/yip/ serves one Antigravity launch identity: the member or a seat sharing root.
+	if agyOwner := agyPluginAgent(root); agyOwner != "" || fileExists(agyPluginDir(root)) {
+		if agent == "" || agyOwner == agent {
+			if err := agyFiles(root, "", "", "", true); err != nil {
 				return err
 			}
 		}

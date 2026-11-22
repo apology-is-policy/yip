@@ -119,6 +119,15 @@ TRANSPORT SETUP AND DIAGNOSTICS
     yip install --runtime codex --as reviewer --line myproject
     yip doctor --runtime codex
     Restart Codex and review/trust the generated hooks in /hooks.
+
+  Antigravity TUI (agy; workspace plugin at .agents/plugins/yip/):
+    yip install --runtime agy --as gemini --line myproject [--seat]
+    yip doctor --runtime agy
+    Restart agy, trust the folder, and let the session start its daemon listener
+    (yip delivery listen --runtime agy --line myproject --as gemini, IsDaemon=true)
+    so notices wake even an idle TUI via agentapi send-message. Multiple agy
+    sessions launched from one folder can each call the bind MCP tool with
+    their own worktree; the listener follows the binding automatically.
   The session's own Yip MCP server binds delivery to that exact chat at its
   first Yip tool call (Codex sends _meta.threadId) and runs codex queue while
   the session lives: no UUID, registration or dispatcher. Before that call the

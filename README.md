@@ -22,11 +22,14 @@ without Yip.
 - **Notify an idle session.** Claude Code can receive MCP Channels events, or
   be woken by a background rewake hook where Channels is unavailable; a Codex
   chat binds itself at its first Yip tool call and receives queued messages,
-  with no UUID or separate dispatcher. Hooks and the inbox remain available. An
-  optional tmux transport supports controlled terminal setups.
-- **Join without a checkout of your own.** A Codex agent can take a *seat*
-  beside another agent's checkout, or run from a Codex profile anywhere, e.g.
-  as a reviewer that a Claude Code agent calls.
+  with no UUID or separate dispatcher; a Gemini / Antigravity TUI (`agy`)
+  session receives notices via its `delivery listen` daemon and
+  `agentapi send-message`. Hooks and the inbox remain available. An optional
+  tmux transport supports controlled terminal setups.
+- **Join without a checkout of your own.** A Codex or Antigravity (`agy`) agent
+  can take a *seat* beside another agent's checkout, or a Codex agent can run
+  from a Codex profile anywhere, e.g. as a reviewer that a Claude Code agent
+  calls.
 - **Share machines without guessing.** Exclusive leases, durable FIFO requests,
   runner identities and recovery history keep a quiet machine from being
   mistaken for an available one.
@@ -58,7 +61,7 @@ yip --help-agents                    # agent protocol and MCP/API schemas
 Run setup inside **each participating checkout**, using a different agent name
 for each one. Git worktrees share a line automatically. For separate clones or
 repositories, pass the same `--line NAME` in their setup commands and subsequent
-operations. A Codex agent does not need a checkout of its own; see
+operations. A Codex or Antigravity (`agy`) agent does not need a checkout of its own; see
 [seats](#agents-without-their-own-checkout-seats).
 
 ### Claude Code: Channels
@@ -148,13 +151,15 @@ named after its folder unless you pass `as`. The waiter armed under the old name
 steps aside, and the next turn arms one for the new name. Two live sessions
 cannot bind one worktree. Binding the launch folder ends the binding.
 
-A binding belongs to the Claude process (pid plus kernel start time, read from
-`/proc`), so it ends when the session exits; after a restart or resume, bind
-again. It re-identifies the whole session -- the main conversation and every
-subagent, which share its MCP server -- so only the main conversation should
-call it. It replaces only the identity the session started as. It needs the
-claude-rewake runtime or plain hooks (Channels stay with the name they
-connected as), and Linux or WSL. `yip line` shows which members are bound.
+A binding belongs to the session process (pid plus kernel start time, read from
+`/proc` on Linux/WSL or `sysctl` on macOS — and, for Antigravity, the session's
+root conversation UUID), so it ends when the session exits; after a restart or
+resume, bind again. It re-identifies the whole session -- the main conversation
+and every subagent, which share its MCP server -- so only the main conversation
+should call it (Antigravity enforces this from `_meta`). It replaces only the
+identity the session started as. It needs the `claude-rewake` runtime, the
+`agy` runtime, or plain hooks (Channels stay with the name they connected as),
+on Linux, WSL, or macOS. `yip line` shows which members are bound.
 
 Each Claude session registers itself (under `sessions/`) when its Yip MCP
 server or any of its hooks runs. That is how a bound name stays with its
@@ -219,17 +224,59 @@ The previous manual route still works as a fallback:
 `yip delivery register EXACT-CHAT-UUID` plus
 `yip delivery dispatch --watch 1h` in a supervised terminal.
 
+### Antigravity TUI (`agy`): live delivery via `agentapi`
+
+```sh
+cd /path/to/checkout
+yip install --runtime agy --as gemini --line myproject
+agy                                    # restart an already-open session and trust the folder
+yip doctor --runtime agy
+```
+
+This writes a self-contained workspace plugin at `.agents/plugins/yip/`
+(`plugin.json`, `mcp_config.json`, `hooks.json`, and `rules/AGENTS.md`),
+without touching global `~/.gemini/config/` files or colliding with `.claude/`
+or `.codex/`. If the checkout already has another path member, Antigravity
+joins as a **seat** beside it automatically (or pass `--seat`).
+
+Antigravity's hooks (`SessionStart`, `PreInvocation`, `PostToolUse`, `Stop`)
+keep presence, mid-turn reminders and Stop-floor enforcement working even
+without push delivery. For **live idle wakeups**, the session starts its
+daemon listener once via `run_command` (`IsDaemon: true`,
+`WaitMsBeforeAsync: 500`; `BypassSandbox: true` if sandboxed):
+
+```sh
+yip delivery listen --runtime agy --line myproject --as gemini
+```
+
+Because `run_command` inherits `ANTIGRAVITY_CONVERSATION_ID` and
+`ANTIGRAVITY_LS_ADDRESS`, the listener delivers queued notices directly to that
+conversation via `agentapi send-message`, waking even a completely idle
+interactive `agy` TUI.
+
+- **Multiple sessions from one launch folder (`bind`)**: Several `agy` sessions
+  launched from one shared folder can each create their own worktree and call
+  the Yip `bind` MCP tool with its absolute path (on both macOS and Linux).
+  Bindings record the session's root conversation UUID, so MCP tools, hooks,
+  shell CLI commands and the running `delivery listen` daemon all follow the
+  bound worktree automatically — and subagents are refused from re-identifying
+  the main session.
+- `agentapi send-message` success means `accepted`, not read: the agent records
+  `read` with `delivery_ack`. The optional `tmux` transport also supports
+  panes running `exec agy`.
+
 ### Agents without their own checkout (seats)
 
 A checkout has one **path member**: the identity Claude's hooks and your CLI
-answer to there. Installing never replaces it. A Codex agent, whose config
-names its identity explicitly, can instead take a **seat**:
+answer to there. Installing never replaces it. A Codex or Antigravity (`agy`)
+agent, whose config names its identity explicitly, can instead take a **seat**:
 
 ```sh
 # Beside a Claude agent, in the same checkout (a seat automatically):
 cd /path/to/checkout
 yip install --runtime claude-rewake --as main --line myproject --local   # or claude-channels
 yip install --runtime codex --as reviewer --line myproject
+yip install --runtime agy --as gemini --line myproject
 
 # Or with no checkout at all, via a Codex profile you start anywhere:
 yip install --runtime codex --as reviewer --line myproject --profile yip-reviewer
@@ -238,12 +285,12 @@ yip doctor --runtime codex --profile yip-reviewer --line myproject
 ```
 
 The profile seat writes only `~/.codex/yip-reviewer.config.toml` (MCP server and
-inline hooks); nothing goes into the repository. Inside a Codex shell, `yip`
-identifies the seat by its bound chat, never by the checkout path it shares.
-Install order doesn't matter: a Claude install into a folder owned by a Codex
-agent moves that agent to a seat beside it (`--seat` does the same by hand). A second
-*Claude* identity still needs its own worktree, because Claude's hooks identify
-an agent by its checkout.
+inline hooks); nothing goes into the repository. Inside a Codex or Antigravity
+shell, `yip` identifies the seat by its bound chat/conversation, never by the
+checkout path it shares. Install order doesn't matter: a Claude install into a
+folder owned by a Codex or Antigravity agent moves that agent to a seat beside
+it (`--seat` does the same by hand). A second *Claude* identity still needs its
+own worktree, because Claude's hooks identify an agent by its checkout.
 
 **Example: Claude asks a Codex reviewer for a review.** With either setup above
 and the Codex TUI open as `reviewer`:
@@ -263,7 +310,7 @@ approval mode can skip prompts for them; Yip does not change approval settings.
 ### Optional tmux: the “Stallman channel”
 
 For a controlled terminal setup, explicitly register a socket and pane whose
-foreground process directly runs `claude` or `codex`:
+foreground process directly runs `claude`, `codex`, or `agy`:
 
 ```sh
 yip delivery register-tmux --socket /absolute/tmux.socket --pane %1
@@ -593,16 +640,17 @@ yip busy 'Reviewing the change'
 Identity is registered against an absolute checkout path, or as a seat whose
 runtime config names it. `--as NAME` explicitly overrides identity; it does not
 create a second registration. One active session per identity keeps delivery
-and ownership unambiguous; a Claude session can `bind` a worktree's identity in
-place of the one it started as. `yip line` lists members, seats and bindings.
+and ownership unambiguous; a Claude or Antigravity (`agy`) session can `bind` a
+worktree's identity in place of the one it started as. `yip line` lists members,
+seats and bindings.
 
 A line lives outside the checkouts in `~/.yip/lines/<line-id>/`:
 
 ```text
 members.json           checkout membership
 seats.json             identities without a checkout of their own
-bindings.json          live Claude sessions answering as a worktree's identity
-sessions/              live Claude sessions, registered by their Yip MCP server and hooks
+bindings.json          live Claude/Antigravity sessions answering as a worktree's identity
+sessions/              live Claude/Antigravity sessions, registered by their Yip MCP server and hooks
 calls/                 Markdown turns, notes, lifecycle, disputes, attachments
 broadcasts/            immutable broadcasts and per-recipient receipts/replies
 delivery/              endpoint bindings, attempts, acknowledgments, owner locks
@@ -657,13 +705,14 @@ python3 scripts/release.py --version YOUR_VERSION --out /absolute/output
 ```
 
 Tests cover call/state concurrency, resource fairness and guards, durable delivery,
-Channels handshakes, Codex routing, broadcasts, the map, terminal interaction and
+Channels handshakes, Codex routing, Antigravity (`agy`) plugin/hook/`agentapi`
+delivery and worktree binding, broadcasts, the map, terminal interaction and
 install preservation. Runtime simulations are distinct from live delivery checks.
 `perf-switchboard.py` drives a real Switchboard in a pty and measures what scrolling
 feels like; point it at a copy of a line, not the live one.
 
 The current local rollout was exercised on macOS arm64, including actual Claude
-Channels and Codex queue delivery. Reproducible archives can target macOS/Linux
+Channels, Codex queue, and Antigravity `agentapi` delivery. Reproducible archives can target macOS/Linux
 on arm64/amd64; cross-compilation alone does not qualify another runtime. Native
 Windows is not supported. Archive generation does not publish a release.
 

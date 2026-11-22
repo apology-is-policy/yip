@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -36,6 +39,9 @@ DELIVERY AND BROADCASTS
       --wake-window 4h          how long an idle session stays wakeable per turn
   yip install --runtime codex    Codex MCP + hooks; the chat binds delivery itself
       --seat | --profile NAME   share a checkout, or no checkout (codex -p NAME)
+  yip install --runtime agy      Antigravity TUI plugin (.agents/plugins/yip/)
+      --seat                    share a checkout alongside Claude/Codex
+  yip delivery listen --runtime agy   daemon listener for idle wake via agentapi
   yip delivery register UUID    manual fallback: one exact Codex chat
   yip delivery dispatch --watch 1h   bounded external dispatcher for that
   yip delivery pause|resume|status   control/inspect the registered endpoint
@@ -219,6 +225,19 @@ func main() {
 	case "broadcast":
 		check(BroadcastCLI(args))
 	case "delivery":
+		if first(args) == "listen" {
+			launch := must(launchIdentity(as, ""))
+			_, ivs := takeFlag(args[1:], "--interval", "2s")
+			iv, err := time.ParseDuration(ivs)
+			check(err)
+			if runtime != "agy" && runtime != "claude" {
+				check(fmt.Errorf("delivery listen supports --runtime agy"))
+			}
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			check(RunAgyListen(ctx, launch, os.Getenv("ANTIGRAVITY_CONVERSATION_ID"), "", nil, iv, os.Stdout))
+			return
+		}
 		check(DeliveryCLI(args, must(WhoAmI(as, ""))))
 	case "api":
 		me := must(WhoAmI(as, ""))
@@ -313,6 +332,12 @@ func main() {
 			fmt.Printf("\nStart Codex with: %s   (restart an already-open session)\n", start)
 			fmt.Println("Review and trust the Yip hooks in /hooks. Delivery binds to the chat at its first Yip tool call;")
 			fmt.Printf("no UUID or separate dispatcher is needed. Then: %s\n", doc)
+		case runtime == "agy":
+			fmt.Println("\nStart Antigravity here with: agy   (restart an already-open session and trust the folder)")
+			fmt.Println("Live idle wakeups connect when the session runs its daemon listener via run_command (IsDaemon=true):")
+			fmt.Printf("  %s\n", agyListenCommand(res.Bin, res.Line, res.Agent))
+			fmt.Println("Multiple sessions from one launch folder can each call the Yip `bind` MCP tool with their own worktree;")
+			fmt.Println("the running listener follows the binding automatically. Then: yip doctor --runtime agy")
 		default:
 			fmt.Printf("\nRestart %s here, then yip doctor --runtime %s. Review and trust new hooks in the runtime.\n", runtime, runtime)
 		}
@@ -358,7 +383,11 @@ func main() {
 				delivery = " -- " + EndpointStatus(name)
 			}
 			if b, ok, _ := liveBinding(name); ok {
-				delivery += fmt.Sprintf(" -- bound by the Claude session (pid %d) launched as %s", b.Session.PID, b.Launch)
+				kind := "Claude"
+				if b.ConvID != "" {
+					kind = "Antigravity"
+				}
+				delivery += fmt.Sprintf(" -- bound by the %s session (pid %d) launched as %s", kind, b.Session.PID, b.Launch)
 			}
 			fmt.Printf("  %-16s %s%s\n", name, m.PathOf(name), delivery)
 		}
@@ -377,10 +406,12 @@ func main() {
 			err = ServeChannels(me)
 		} else if len(args) == 1 && args[0] == "--codex" {
 			err = ServeCodex(me)
+		} else if len(args) == 1 && args[0] == "--agy" {
+			err = ServeAgy(me)
 		} else if len(args) == 0 {
 			err = Serve(me)
 		} else {
-			err = fmt.Errorf("serve [--channels | --codex]")
+			err = fmt.Errorf("serve [--channels | --codex | --agy]")
 		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -676,6 +707,10 @@ func main() {
 		}
 		if runtime == "codex" {
 			check(CodexDoctor("", profile))
+			return
+		}
+		if runtime == "agy" {
+			check(AgyDoctor(""))
 			return
 		}
 		if runtime == "claude-rewake" {
