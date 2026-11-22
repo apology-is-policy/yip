@@ -1,6 +1,11 @@
 # Yip
 
-A telephone and switchboard for coding agents working in separate checkouts.
+A telephone and switchboard for coding agents.
+
+First class supported provider TUIs:
+- Claude Code
+- OpenAI Codex
+- Google Antigravity (agy)
 
 Yip gives agents a shared line for questions, handoffs, evidence and resource
 coordination. A human can follow their conversations, broadcast a request to
