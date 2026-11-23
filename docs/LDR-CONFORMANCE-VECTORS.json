@@ -13,8 +13,8 @@
     "reviewed_statically": "Codex also read A105-A125 and T03, T16, T27, T32, T33, T37 statically (call 0002 turn 16), then A126-A130 and T38 (turn 18). A131-A145 and T39 are newer than any review.",
     "executed": "ldrcore/apply_test.go runs every active apply vector. A134-A145 were added after a mutation check of that package showed eleven rules that no earlier vector pinned; their expected results were still written from the draft, not copied from the implementation. A146-A162 follow Codex's independent run of the checker (docs/LDR-CHECKER-REVIEW.md), which found three behaviours no vector covered: an oversize turn committed, a record other than line_init committed on an empty log, and a subset committed as the default audience. A163-A173 follow its second probe, which showed counters wrapping at the top of their range.",
     "not_covered": "recovery_generation has no apply vector: its effect is a rebuild from a base, not a patch. It appears in traces T15 and T28 only. Root and bootstrap coverage (A116-A123) is a handful of semantic cases, not a complete suite, and models no cryptographic proof.",
-    "traces_are": "Reviewable scenarios in prose with symbolic intents and often without explicit times. They are not executable inputs. Each trace has a run label saying whether a Go test in ldrcore/ re-enacts it with explicit inputs: 26 against the sequencer model, 4 as a sequence of Apply calls only, 9 not at all.",
-    "traces_by_scope": {"sequencer model": 26, "apply-only part": 4, "not executed": 9}
+    "traces_are": "Reviewable scenarios in prose with symbolic intents and often without explicit times. They are not executable inputs. Each trace has a run label saying whether a Go test in ldrcore/ re-enacts it with explicit inputs: 26 against the sequencer model, 7 against the client model, 3 against the register model, and 3 as a sequence of Apply calls only.",
+    "traces_by_scope": {"sequencer model": 26, "client model": 7, "register model": 3, "apply-only part": 3}
   },
 
   "conventions": {
@@ -845,31 +845,31 @@
      "steps": [
        {"do": "apply A01 (a1, expect 2)", "expect": "committed; turn_count 3"},
        {"do": "apply b1's barge with expect 2 against the new state", "expect": "rejected conflict; no contradictory floor"}]},
-    {"id": "T22", "run": {"scope": "not executed", "limits": "client projection and delivery are not modelled"}, "spec": "11.2, 11.3", "title": "Crash between log-store commit and projection",
+    {"id": "T22", "run": {"scope": "client model", "test": "TestClientTraces/T22"}, "spec": "11.2, 11.3", "title": "Crash between log-store commit and projection",
      "steps": [
        {"do": "record at seq 41 is durably in the verified local log store; the process dies before projecting", "expect": "projected_seq is 40"},
        {"do": "restart", "expect": "projection resumes from 41; the turn file is written once; no duplicate file"},
        {"do": "local delivery scan", "expect": "the notice for seq 41 is found by the scan cursor and delivered under its stable delivery ID; none is lost"}]},
-    {"id": "T23", "run": {"scope": "not executed", "limits": "client projection is not modelled"}, "spec": "11.1", "title": "A locally edited projection file has no authority",
+    {"id": "T23", "run": {"scope": "client model", "test": "TestClientTraces/T23"}, "spec": "11.1", "title": "A locally edited projection file has no authority",
      "steps": [
        {"do": "edit a projected turn file by hand so it appears the peer spoke last", "expect": "floor, status and unread counts computed from verified state are unchanged"},
        {"do": "rebuild the projection", "expect": "the file is restored from the verified log store"}]},
-    {"id": "T24", "run": {"scope": "not executed", "limits": "reader-side decryption states are not modelled"}, "spec": "10.2", "title": "Three unreadable states, and replay continues past each",
+    {"id": "T24", "run": {"scope": "client model", "test": "TestClientTraces/T24"}, "spec": "10.2", "title": "Three unreadable states, and replay continues past each",
      "steps": [
        {"do": "replay a turn encrypted under an epoch this reader holds no key for", "expect": "control record verified; payload not inspected; shown as unreadable to this reader"},
        {"do": "replay a turn whose ciphertext fails authentication", "expect": "shown as a decryption failure that does not assert writer fault"},
        {"do": "replay a call_status whose decrypted reason is empty", "expect": "the lifecycle change stands; shown as malformed by author"},
        {"do": "replay the next record", "expect": "applied normally in all three cases"}]},
-    {"id": "T25", "run": {"scope": "not executed", "limits": "register publication is not modelled"}, "spec": "9", "title": "Registers have no authority and old writers do not return",
+    {"id": "T25", "run": {"scope": "register model", "test": "TestRegisterTraces/T25"}, "spec": "9", "title": "Registers have no authority and old writers do not return",
      "steps": [
        {"do": "register update signed under writer_rev 1 arrives after a register_activate raised writer_rev to 2", "expect": "rejected"},
        {"do": "register update from a revoked credential", "expect": "rejected; the cached value stays as a historical observation with its age"},
        {"do": "re-run every apply vector with arbitrary register contents", "expect": "no outcome changes"}]},
-    {"id": "T26", "run": {"scope": "not executed", "limits": "register publication is not modelled"}, "spec": "6.3, 9", "title": "Register bodies obey the key gate",
+    {"id": "T26", "run": {"scope": "register model", "test": "TestRegisterTraces/T26"}, "spec": "6.3, 9", "title": "Register bodies obey the key gate",
      "steps": [
        {"do": "register update with a body under key_epoch 1 while the current epoch is 2", "expect": "rejected"},
        {"do": "register update with a body while rekey_pending is set", "expect": "rejected"}]},
-    {"id": "T27", "run": {"scope": "not executed", "limits": "the client outbox is not modelled"}, "spec": "5.7", "title": "Outbox single-flight is client discipline",
+    {"id": "T27", "run": {"scope": "client model", "test": "TestClientTraces/T27"}, "spec": "5.7", "title": "Outbox single-flight is client discipline",
      "note": "The slot key is (acting identity, target): the actor for actor-origin records. It is client policy, not the wire dedup identity, which is (line, generation, credential, op_id).",
      "steps": [
        {"do": "the client holds an unresolved call_note intent in slot (a1, c1); the agent acting as a1 asks for another note on c1", "expect": "the client refuses or waits; no second intent is built"},
@@ -879,7 +879,7 @@
     {"id": "T28", "run": {"scope": "sequencer model", "test": "TestTraces/T28", "limits": "only that no post-recovery fixture is installed without its reconciliation premise; this is not a recovery gate"}, "spec": "6.2", "title": "Recovery that cannot establish later security state",
      "steps": [
        {"do": "the log is restored to a base that predates credB's revocation, and no independently retained security state is available", "expect": "recovery fails closed, or proceeds only as an explicitly approved migration to a new line; credB is not silently re-authorized"}]},
-    {"id": "T29", "run": {"scope": "not executed", "limits": "local delivery state is not modelled"}, "spec": "8", "title": "A local delivery pause does not change a broadcast's audience",
+    {"id": "T29", "run": {"scope": "client model", "test": "TestClientTraces/T29"}, "spec": "8", "title": "A local delivery pause does not change a broadcast's audience",
      "steps": [
        {"do": "b1's host pauses its local delivery endpoint while the operator composes a default-audience broadcast", "expect": "audience_rev unchanged; b1 remains in the snapshot; the broadcast commits"}]},
     {"id": "T30", "run": {"scope": "sequencer model", "test": "TestTraces/T30"}, "spec": "6.1", "title": "A call opened to an actor that is declared a moment later",
@@ -909,15 +909,15 @@
        {"do": "I3 is evaluated at T and answered expired; the time floor is persisted at T or later in the same step; the reply is lost", "expect": "no index entry; floor >= T"},
        {"do": "the sequencer restarts and its clock reads a few seconds before T", "expect": "no evaluation uses a time below the floor; if the regression is treated as a discontinuity, evaluation is suspended instead"},
        {"do": "submit I3, identical bytes", "expect": "expired, or an admission error while suspended; never admitted"}]},
-    {"id": "T35", "run": {"scope": "not executed", "limits": "client projection is not modelled"}, "spec": "11.2", "title": "Crash after projecting a file and before the projection cursor advances",
+    {"id": "T35", "run": {"scope": "client model", "test": "TestClientTraces/T35"}, "spec": "11.2", "title": "Crash after projecting a file and before the projection cursor advances",
      "steps": [
        {"do": "the turn file for seq 41 is written; the process dies before projected_seq moves from 40 to 41", "expect": "the file exists; projected_seq is 40"},
        {"do": "restart", "expect": "seq 41 is projected again; the existing byte-identical immutable file is success, not corruption; no duplicate file; projected_seq becomes 41"}]},
-    {"id": "T36", "run": {"scope": "not executed", "limits": "client delivery is not modelled"}, "spec": "11.3", "title": "Crash after a notice is enqueued and before the delivery scan cursor advances",
+    {"id": "T36", "run": {"scope": "client model", "test": "TestClientTraces/T36"}, "spec": "11.3", "title": "Crash after a notice is enqueued and before the delivery scan cursor advances",
      "steps": [
        {"do": "the local notice for seq 41 is enqueued; the process dies before the delivery scan cursor advances", "expect": "the cursor still points before seq 41"},
        {"do": "restart and rescan", "expect": "the same source is found and maps to the same stable delivery ID; delivery is at least once; exactly-once delivery to an external runtime is not claimed"}]},
-    {"id": "T37", "run": {"scope": "apply-only part", "test": "TestTraceRegisterWriterAcrossMove", "limits": "only the steps that are a sequence of Apply calls"}, "spec": "6.2, 9", "title": "Registers across an actor move",
+    {"id": "T37", "run": {"scope": "register model", "test": "TestRegisterTraces/T37"}, "spec": "6.2, 9", "title": "Registers across an actor move",
      "steps": [
        {"do": "a2 has an active presence writer under credA (fixture a2_moved_with_writer before the move); the operator moves a2 to credB", "expect": "writer state is kept: writer_rev 1, incarnation i1"},
        {"do": "credA publishes a presence update for a2 under the old activation", "expect": "rejected: credA no longer holds a2"},

@@ -61,6 +61,23 @@ type Entry struct {
 	Key     OpKey // zero for a sequencer-origin record
 	Digest  string
 	Record  Record
+	// Payload travelled with the intent. The sequencer stores and serves it
+	// and never reads it.
+	Payload Payload
+}
+
+// Payload stands for the encrypted payload that travels with an intent. No
+// decision of Submit or Apply depends on it. Its fields are facts a reader
+// could discover only by trying to decrypt; they are stated up front because
+// this package has no cryptography. The epoch a payload claims is the
+// record's visible KeyEpoch.
+type Payload struct {
+	// Forged is ciphertext that fails authentication under the key of the
+	// epoch the record names.
+	Forged bool
+	// Malformed is plaintext that authenticates and then breaks a rule only a
+	// reader can check, such as an empty reason where one is required.
+	Malformed bool
 }
 
 // OpKey is the operation identity of spec section 5.1, without the line. An
@@ -85,6 +102,8 @@ type Intent struct {
 	Digest      string
 	SignatureOK bool
 	Record      Record
+	// Payload is carried into the log untouched. Digest is taken to cover it.
+	Payload Payload
 }
 
 // Clock is one reading of the sequencer's clock, as the deployment reports
@@ -395,7 +414,7 @@ func (q *Sequencer) Submit(in Intent, c Clock) Answer {
 	next, out := Apply(q.state, rec, t, q.prof)
 	switch out.Kind {
 	case Committed:
-		q.commit(next, Entry{Key: key, Digest: in.Digest, Record: rec}, t)
+		q.commit(next, Entry{Key: key, Digest: in.Digest, Record: rec, Payload: in.Payload}, t)
 		seq := q.state.Line.HeadSeq
 		q.logIndex[key] = OpReceipt{Seq: seq, Digest: in.Digest}
 		q.hot[key] = hotEntry{digest: in.Digest, outcome: out, seq: seq}

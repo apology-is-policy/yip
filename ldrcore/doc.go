@@ -16,4 +16,9 @@
 //
 // The draft it follows is unapproved beyond the scope decisions recorded in
 // its section 0. Do not build a deployment on this package.
+//
+// Besides Apply and the sequencer model, the package holds a model of one
+// credential's local side (client.go, outbox.go) and of advisory register
+// publication (registers.go). They exist to run the scenario traces. They
+// have no disk, transport or cryptography, and they are not a client.
 package ldrcore

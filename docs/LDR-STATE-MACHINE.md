@@ -57,7 +57,7 @@ from them.
 | Credential principal with delegated actor namespace (§3) | **Decided by the operator, 2026-11-23:** enroll machine accounts, not individual agents. |
 | Line confidentiality policy | **Decided by the operator, 2026-11-23:** 3A — everyone enrolled on the line can read everything on it. 3B is out of scope and not drafted. |
 | History for a newly enrolled account | **Decided by the operator, 2026-11-23: none.** A new account reads only what is written after it joins; the operator arranges a briefing for the new agent. The stated reason is practical — history gets long on multi-month projects — not confidentiality. `history_grant` is therefore removed from phase 1 (§6.3). |
-| Reference checker | **Operator go-ahead, 2026-11-23,** for a small Go implementation of the rule-checking core only: no crypto, no network, no relay. Later the same day the operator also approved an in-memory model of the relay-side bookkeeping (retries, expiry, clock handling), under the same limits, so that the scenario traces can run. Both live in `ldrcore/`. Results are in §14. Recovery is not modelled. |
+| Reference checker | **Operator go-ahead, 2026-11-23,** for a small Go implementation of the rule-checking core only: no crypto, no network, no relay. Later the same day the operator also approved an in-memory model of the relay-side bookkeeping (retries, expiry, clock handling), under the same limits, so that the scenario traces can run. A third go-ahead the same day covers a model of the agent's own machine and of register publication (§14.4). All of it lives in `ldrcore/`. Results are in §14. Recovery is not modelled. |
 | What those decisions are not | They are scope and policy choices. They do not approve a cipher, an enrollment ceremony, a deployment, or implementation. |
 | Sequencer deployment (Durable Object, Go relay, other) | Open. This draft must not depend on it. |
 | Time anchors (§4.2) | Supported by Codex as the preferred proposal, with corrections folded in. Not operator-approved. |
@@ -1285,7 +1285,8 @@ Each trace in the vectors file now carries a label saying how far a Go test
 re-enacts it, and a test checks the labels against what actually runs: 26 of
 the 39 traces run against the sequencer model, 4 run only as a sequence of
 transitions, and 9 are not executed because they concern the client (outbox,
-projection, delivery, reader states) or register publication.
+projection, delivery, reader states) or register publication. Those nine now
+run against the models of §14.4.
 
 Measured on 2026-11-23:
 
@@ -1351,7 +1352,73 @@ Rules the model forced that this document had not stated, each needing review:
 - An operator key outside the active set is refused access without implying
   anything about its past (O22).
 
-### 14.4 Index of intent
+### 14.4 The client and register models
+
+With the operator's third go-ahead (2026-11-23), `ldrcore/` also models the
+agent's own machine, so that the nine traces §14.3 left unexecuted can run:
+
+- `client.go`: the verified local log store and checkpoint, the projection
+  with its cursor and its two kinds of file, local delivery from a scan
+  cursor, and the three reader states of §10.2.
+- `outbox.go`: the client discipline of §5.7.
+- `registers.go`: publication of advisory registers against committed writer
+  state (§9), including the key gate of §6.3.
+
+The limits are the same as before, and they matter more here. There is no
+disk: every field is durable by definition, and a crash is a procedure
+stopping between two durable steps. There is no cryptography: whether a
+payload decrypts is a flag on the payload, and whether a wrap verified is a
+flag on the client. A client starts empty and replays from genesis, which
+does not settle how a new member really establishes its first checkpoint
+(Appendix A, Q5). Recovery is not modelled. None of this is evidence that an
+implementation survives a real crash.
+
+All 39 traces now have a test, and a test checks the labels in the vectors
+file against the tables of tests: 26 run against the sequencer model, 7
+against the client model, 3 against the register model, and 3 remain a plain
+sequence of transitions (T20, T21, T31).
+
+Measured on 2026-11-23:
+
+- **First run: every new test passed except one, and the fault was in the
+  test.** It counted acknowledged notices as undelivered ones. No model code
+  changed to make a test pass. As §14.1 says, that is weak evidence: the
+  model and its tests have one author.
+- A randomized test kills the client at each of three points, repeatedly,
+  over three seeds, and requires it to end with exactly the files and notices
+  of a client that never crashed, with no rebuild.
+- `go vet` and `go test -race` pass for the package.
+- **Not done: no mutation check of these three files, and no probe by
+  Codex.** Both earlier models looked finished at this stage and were not.
+
+Rules the models forced that this document had not stated, each needing
+review:
+
+- A client that meets a sequencer violation stops: it applies nothing further
+  and composes nothing. A different record offered at a sequence number it
+  has already verified is a violation; a record offered out of order is only
+  a transport error.
+- A reader holds an epoch's key when the manifest names its credential and
+  its own wrap verified. Bad ciphertext and wrong local key material give the
+  same reader state, which is why that state cannot blame the writer.
+- A state-derived view is tagged with the last record that changed its
+  object. A view that claims a sequence number beyond the checkpoint taints
+  the projection. A view that is merely older than the store is lag, not
+  corruption, and a verified read of it reports that it is not yet projected.
+- Which records owe a local notice, and to whom, is the model's choice, as is
+  the delivery ID: generation, sequence number and recipient.
+- An outbox slot's target is the object a record acts on, and every record on
+  a call shares the call's slot. §5.7 gives the rule and not the table.
+- "A stale-checkpoint refusal" in §5.7 rule 3 is read as `expired` or
+  `unknown_anchor`.
+- `history_unavailable` stops the client from composing anything until the
+  suspicion is cleared from outside the model. `duplicate_mismatch` on an
+  intent the client itself stored marks it reconciliation-required.
+- Within one activation a register value must carry a higher counter than
+  the cached one. A value naming a writer revision that does not exist yet is
+  refused as having no activation.
+
+### 14.5 Index of intent
 
 Conversation:
 
@@ -1519,7 +1586,7 @@ How M3 and M4 are established is not stated in this document: see Q5.
 
 | # | The state machine depends on | From |
 | --- | --- | --- |
-| K1 | `key_epoch_activate` is operator-origin, signs `expect.key_epoch`, and carries a manifest of credential IDs with one wrap commitment each. It commits only if the manifest names exactly the entitled readers as of commit: enrolled, unrevoked credentials granted reader capability. Omitting one, naming a revoked credential, naming one without reader capability, a duplicate entry, or an empty manifest is rejected. | §5.8, §6.1, §6.2, §14.1, §14.4 item 18 |
+| K1 | `key_epoch_activate` is operator-origin, signs `expect.key_epoch`, and carries a manifest of credential IDs with one wrap commitment each. It commits only if the manifest names exactly the entitled readers as of commit: enrolled, unrevoked credentials granted reader capability. Omitting one, naming a revoked credential, naming one without reader capability, a duplicate entry, or an empty manifest is rejected. | §5.8, §6.1, §6.2, §14.1, §14.5 item 18 |
 | K2 | The sequencer checks completeness over visible fields only. It cannot check that a wrap decrypts, that the key is right, or that the epoch key is fresh. Each client verifies its own wrap. A garbage wrap or an undecryptable body from an authorized writer is denial of service and must not stop replay. | §6.3 |
 | K3 | Confidentiality after a rotation depends on the generating client creating a fresh epoch key and verifying the distribution context. A reused epoch key, or a wrap to a recipient the manifest does not declare, preserves or exposes access, and the relay can detect neither. | §6.3 |
 | K4 | Membership and key-distribution records carry no line-scope ciphertext, only visible fields and per-recipient wraps, and they commit while `rekey_pending` is set. | §6.3 |

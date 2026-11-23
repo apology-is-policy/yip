@@ -919,15 +919,34 @@ func TestTraceCoverageLabels(t *testing.T) {
 	f := loadVectors(t)
 	applyOnly := map[string]bool{
 		"TestTraceNewMemberIsFutureOnly": true, "TestTraceTwoTurnsRace": true,
-		"TestTraceLastNamespaceSlot": true, "TestTraceRegisterWriterAcrossMove": true,
+		"TestTraceLastNamespaceSlot": true,
+	}
+	// Each model has its own table of trace tests, and a trace is run by
+	// exactly one of them.
+	models := map[string]struct {
+		tests  map[string]func(*testing.T)
+		runner string
+	}{
+		"sequencer model": {traceTests, "TestTraces/"},
+		"client model":    {clientTraceTests, "TestClientTraces/"},
+		"register model":  {registerTraceTests, "TestRegisterTraces/"},
 	}
 	byScope := map[string]int{}
 	for _, tr := range f.Traces {
 		byScope[tr.Run.Scope]++
-		_, executed := traceTests[tr.ID]
+		executed := false
+		for scope, m := range models {
+			if _, ok := m.tests[tr.ID]; !ok {
+				continue
+			}
+			executed = true
+			if scope != tr.Run.Scope {
+				t.Errorf("%s has a test in the %s table but is labelled %q", tr.ID, scope, tr.Run.Scope)
+			}
+		}
 		switch tr.Run.Scope {
-		case "sequencer model":
-			if !executed || tr.Run.Test != "TestTraces/"+tr.ID {
+		case "sequencer model", "client model", "register model":
+			if !executed || tr.Run.Test != models[tr.Run.Scope].runner+tr.ID {
 				t.Errorf("%s is labelled as run by %q, but no such trace test exists", tr.ID, tr.Run.Test)
 			}
 		case "apply-only part":
@@ -945,8 +964,10 @@ func TestTraceCoverageLabels(t *testing.T) {
 	if !reflect.DeepEqual(byScope, f.Coverage.TracesByScope) {
 		t.Errorf("file says %v traces by scope; found %v", f.Coverage.TracesByScope, byScope)
 	}
-	if byScope["sequencer model"] != len(traceTests) {
-		t.Errorf("%d trace tests exist, %d traces are labelled as run by one", len(traceTests), byScope["sequencer model"])
+	for scope, m := range models {
+		if byScope[scope] != len(m.tests) {
+			t.Errorf("%d trace tests exist for the %s, %d traces are labelled as run by one", len(m.tests), scope, byScope[scope])
+		}
 	}
 }
 
