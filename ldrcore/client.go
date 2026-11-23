@@ -20,7 +20,11 @@ import (
 //   - No transport. Records are handed to Sync by the test.
 //   - No cryptography. A signature is a premise, the chain head is the same
 //     non-cryptographic stand-in the sequencer model uses, and whether a
-//     payload decrypts is a flag on Payload.
+//     payload decrypts is a flag on Payload. The premise covers the signed
+//     context as well: Sync does not check a record's generation, the head
+//     it was signed over, its deadline, or that its operation identity had
+//     not committed before. Under a profile that commits state, and only
+//     there, Sync checks all of that and the signature stand-in (commit.go).
 //   - No disk. Every field below is durable by definition. A crash is
 //     modelled as a procedure stopping between two durable steps (Fault), so
 //     the only thing a crash can lose is the rest of that procedure.
@@ -49,10 +53,14 @@ type Client struct {
 	// The verified local log store. A record, the state derived from it, the
 	// checkpoint and the indexes below advance together in one step (spec
 	// 11.2 rule 1). This is the local source of authority (spec 11.1).
-	store     []Entry
-	state     State
-	ckSeq     int64
-	ckHead    string
+	store  []Entry
+	state  State
+	ckSeq  int64
+	ckHead string
+	// signed is set only under a profile that commits state (commit.go): the
+	// heads and operation identities the frame verification refers back to.
+	// It advances in the same step as the rest of the store.
+	signed    *signedContext
 	touchedBy [][]string        // per record: the objects it changed
 	touched   map[string]int64  // object -> the last record that changed it
 	source    map[string]int64  // record-derived file -> the record that defines it
@@ -108,7 +116,12 @@ func (e *ViolationError) Error() string {
 
 // NewClient returns a client with an empty store, anchored on genesis.
 func NewClient(lineID, cred string, prof Profile) *Client {
+	var signed *signedContext
+	if prof.StateCommit {
+		signed = newSignedContext()
+	}
 	return &Client{
+		signed:     signed,
 		LineID:     lineID,
 		Cred:       cred,
 		ValidityMS: min(60000, prof.ValidityMaxMS),
@@ -177,26 +190,36 @@ func (c *Client) Sync(entries []Entry) error {
 			// Out of order is a transport matter, not a verdict on anyone.
 			return fmt.Errorf("ldrcore: record %d offered while the checkpoint is at %d", e.Seq, c.ckSeq)
 		}
-		if !c.prof.StateCommit && e.StateDigest != "" {
-			return c.halt(e.Seq, "the frame carries a state digest that this profile does not define")
-		}
-		// The head is computed from the head this client verified, never from
-		// the predecessor a frame claims for itself.
-		linked := e
-		linked.Prev = c.ckHead
-		if frameHead(&linked) != e.Head {
-			return c.halt(e.Seq, "the record does not chain onto the verified head")
-		}
-		next, out := Apply(c.state, e.Record, e.SeqTime, c.prof)
-		if out.Kind != Committed {
-			return c.halt(e.Seq, fmt.Sprintf("%s does not commit on replay: %s %s", e.Record.Type, out.Kind, out.Reason))
-		}
-		// Where the profile commits state, the frame must commit to the state
-		// this client derived. A difference does not say which side is right:
-		// the client stops on it all the same, and signs nothing on a head
-		// whose state it has not derived itself.
-		if c.prof.StateCommit && StateDigest(c.LineID, c.prof, next) != e.StateDigest {
-			return c.halt(e.Seq, "the frame commits to a different state than the one this client derives")
+		var next State
+		if c.signed != nil {
+			// Under a profile that commits state, a signature made from this
+			// checkpoint may be what a joiner takes its whole starting state
+			// on (join.go). So here the signature is not a premise: the client
+			// runs the full frame verification, signed context included, and
+			// signs nothing on a head it has not verified that way. A
+			// difference in the committed state does not say which side is
+			// right; the client stops on it all the same.
+			n, err := verifyFrame(c.LineID, c.prof, c.state, c.ckHead, c.signed, e)
+			if err != nil {
+				return c.halt(e.Seq, err.Error())
+			}
+			next = n
+		} else {
+			if e.StateDigest != "" {
+				return c.halt(e.Seq, "the frame carries a state digest that this profile does not define")
+			}
+			// The head is computed from the head this client verified, never
+			// from the predecessor a frame claims for itself.
+			linked := e
+			linked.Prev = c.ckHead
+			if frameHead(&linked) != e.Head {
+				return c.halt(e.Seq, "the record does not chain onto the verified head")
+			}
+			n, out := Apply(c.state, e.Record, e.SeqTime, c.prof)
+			if out.Kind != Committed {
+				return c.halt(e.Seq, fmt.Sprintf("%s does not commit on replay: %s %s", e.Record.Type, out.Kind, out.Reason))
+			}
+			next = n
 		}
 		// One durable step.
 		e.Record = e.Record.Clone()
@@ -212,6 +235,9 @@ func (c *Client) Sync(entries []Entry) error {
 		}
 		c.owed = append(c.owed, c.noticesFor(&next, e))
 		c.state, c.ckSeq, c.ckHead = next, e.Seq, e.Head
+		if c.signed != nil {
+			c.signed.record(&e, e.Head)
+		}
 		// A key whose revocation this client has now verified signs nothing
 		// more (outbox.go).
 		c.stopRevoked()

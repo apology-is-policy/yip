@@ -13,13 +13,17 @@ import (
 
 // forgeFrame starts a chain at one hand-built frame: numbered seq, stamped
 // at, committing to enc, which the forger also supplies as the snapshot. s is
-// the state the forger goes on from.
+// the state the forger goes on from. Before the frame stands one that is old
+// enough to end the live window.
 func forgeFrame(t *testing.T, s State, seq, at int64, enc []byte) *forger {
 	t.Helper()
-	e := Entry{Seq: seq, SeqTime: at, Prev: "invented", Record: Record{Origin: OriginSequencer, Type: "time_anchor"},
+	f := &forger{t: t, snaps: snapshots{seq: enc}, state: s, head: "invented"}
+	f.stale(seq-1, at)
+	e := Entry{Seq: seq, SeqTime: at, Prev: f.head, Record: Record{Origin: OriginSequencer, Type: "time_anchor"},
 		StateDigest: digestEncoded("L", commitProfile, enc)}
 	e.Head = frameHead(&e)
-	return &forger{t: t, snaps: snapshots{seq: enc}, entries: []Entry{e}, state: s, head: e.Head}
+	f.entries, f.head = append(f.entries, e), e.Head
+	return f
 }
 
 // anchor appends a time anchor far enough after the last record to be legal.
@@ -89,13 +93,19 @@ func TestANullIsNotAnObject(t *testing.T) {
 // and whose head is right for that predecessor, does not follow the head the
 // member verified.
 func TestAMemberLinksOntoItsOwnHead(t *testing.T) {
-	for name, prof := range map[string]Profile{"committing state": commitProfile, "plain": testProfile} {
-		log := newLineWith(t, prof).q.Log()
+	for name, tc := range map[string]struct {
+		prof Profile
+		part string
+	}{
+		"committing state": {commitProfile, "does not name the head before it"},
+		"plain":            {testProfile, "does not chain"},
+	} {
+		log := newLineWith(t, tc.prof).q.Log()
 		log[10].Prev = "0123456789abcdef"
 		log[10].Head = frameHead(&log[10])
-		c := NewClient("L", "credA", prof)
+		c := NewClient("L", "credA", tc.prof)
 		var v *ViolationError
-		if err := c.Sync(log); !errors.As(err, &v) || v.Seq != 11 || !strings.Contains(v.Reason, "does not chain") {
+		if err := c.Sync(log); !errors.As(err, &v) || v.Seq != 11 || !strings.Contains(v.Reason, tc.part) {
 			t.Errorf("%s: got %v, want a violation at 11", name, err)
 		}
 		if ck, _ := c.Checkpoint(); ck != 10 {
@@ -208,7 +218,7 @@ func TestFrameVerification(t *testing.T) {
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
 			e := joinLine(t)
-			f := forgeOnto(t, e.q.Entries(12, 14), e.q.State())
+			f := forgeOnto(t, e.q.Log(), e.q.State())
 			c.build(f)
 			wantRefused(t, joinErr(t, pinC, f, e.q, e.now), c.part)
 		})
@@ -217,7 +227,7 @@ func TestFrameVerification(t *testing.T) {
 	t.Run("a sequence number skipped", func(t *testing.T) {
 		// Fifteen records, the last of them numbered 16.
 		e := joinLine(t)
-		f := forgeOnto(t, e.q.Entries(12, 14), e.q.State())
+		f := forgeOnto(t, e.q.Log(), e.q.State())
 		f.sign(note("a1"), "cred:credA", func(en *Entry) { en.Seq = 16 })
 		wantPending(t, joinErr(t, pinC, f, e.q, e.now), "supplied 4 of the 5 records")
 		wantRefused(t, joinErr(t, pinC, misnumbering{f}, e.q, e.now), "numbered 16 follows the record numbered 14")
@@ -225,7 +235,7 @@ func TestFrameVerification(t *testing.T) {
 
 	t.Run("a legal time anchor is taken", func(t *testing.T) {
 		e := joinLine(t)
-		f := forgeOnto(t, e.q.Entries(12, 14), e.q.State())
+		f := forgeOnto(t, e.q.Log(), e.q.State())
 		f.anchor()
 		if j := mustJoin(t, pinC, f, e.q, e.now); j.Seq != 15 {
 			t.Fatalf("accepted at %d, want 15", j.Seq)
@@ -326,7 +336,7 @@ func TestJoinBindsTheTwoTogether(t *testing.T) {
 	t.Run("a head named from before the enrollment", func(t *testing.T) {
 		s, now := real(t)
 		f := forgeFrame(t, s, 12, s.Line.HeadTime, EncodeState(s))
-		first := f.entries[0]
+		first := *f.at(12)
 		enrollC(f)
 		wantRefused(t, joinErr(t, pinC, earlier{f, first}, f, now), "does not fit under the head the relay named")
 	})
@@ -377,23 +387,108 @@ func TestJoinBindsTheTwoTogether(t *testing.T) {
 		enrollC(f)
 		wantRefused(t, joinErr(t, pinC, f, f, now), "does not open the head the operator signed over")
 	})
+
+	t.Run("a frame in the live window under another number than its place", func(t *testing.T) {
+		// The frame before the endorsed one hashes to the head it should and
+		// says it is record 10.
+		s, now := real(t)
+		enc := EncodeState(s)
+		f := &forger{t: t, snaps: snapshots{12: enc}, state: s, head: "invented"}
+		f.stale(10, s.Line.HeadTime)
+		e := Entry{Seq: 12, SeqTime: s.Line.HeadTime, Prev: f.head, Record: Record{Origin: OriginSequencer, Type: "time_anchor"},
+			StateDigest: digestEncoded("L", commitProfile, enc)}
+		e.Head = frameHead(&e)
+		f.entries, f.head = append(f.entries, e), e.Head
+		enrollC(f)
+		f.sign(activate(2, "credA", "credB", "credC"), "op:op1")
+		wantPending(t, joinErr(t, pinC, f, f, now), "did not supply the record at 11")
+		wantRefused(t, joinErr(t, pinC, misplaced{f, 11, *f.at(10)}, f, now),
+			"record offered at 11 does not open the head before the record at 12")
+	})
+
+	t.Run("a first record that does not stand on genesis", func(t *testing.T) {
+		// A chain that claims to begin at record 1 and is built on something
+		// other than this line's genesis. The frames before 12 commit to
+		// nothing anyone asks for; the joiner opens them and replays none.
+		_, now := real(t)
+		f := chainOf(t, "invented", 12)
+		wantRefused(t, joinErr(t, pinC, f, f, now), "first record does not stand on this line's genesis")
+		g := chainOf(t, genesisHead("L"), 12)
+		if j := mustJoin(t, pinC, g, g, now); j.WindowSeq != 1 {
+			t.Fatalf("the window was opened back to %d, want 1", j.WindowSeq)
+		}
+	})
+
+	t.Run("a live window longer than the default budget", func(t *testing.T) {
+		_, now := real(t)
+		fits := chainOf(t, genesisHead("L"), DefaultWindowBudget)
+		if j := mustJoin(t, pinC, fits, fits, now); j.WindowSeq != 1 || j.EndorsedSeq != DefaultWindowBudget {
+			t.Fatalf("provenance %+v", j.Provenance)
+		}
+		over := chainOf(t, genesisHead("L"), DefaultWindowBudget+1)
+		je := joinErr(t, pinC, over, over, now)
+		if je.Pending || !errors.Is(je, ErrWindowTooLarge) {
+			t.Fatalf("got %v, want the window refused as too large", je)
+		}
+	})
 }
 
-// misnumbering is a relay that counts its records and hands them all over,
-// whatever number each one claims.
+// chainOf is a chain of n frames built on prev, all stamped alike, of which
+// only the last commits to a state anyone asks for: the real state of the
+// twelve-record line, renumbered n. On it op1 enrolls credC and activates a
+// key epoch. A party holding op1's key can build it with no relay at all.
+func chainOf(t *testing.T, prev string, n int64) *forger {
+	t.Helper()
+	s := newLineWith(t, commitProfile).q.State()
+	s.Line.HeadSeq = n
+	f := &forger{t: t, snaps: snapshots{n: EncodeState(s)}, state: s, head: prev}
+	for seq := int64(1); seq <= n; seq++ {
+		e := Entry{Seq: seq, SeqTime: s.Line.HeadTime, Prev: f.head,
+			Record: Record{Origin: OriginSequencer, Type: "time_anchor"}, StateDigest: "0000000000000000"}
+		if seq == n {
+			e.StateDigest = StateDigest("L", commitProfile, s)
+		}
+		e.Head = frameHead(&e)
+		f.entries, f.head = append(f.entries, e), e.Head
+	}
+	f.sign(enroll("credC", "nsC", "jr3"), "op:op1")
+	f.sign(activate(2, "credA", "credB", "credC"), "op:op1")
+	return f
+}
+
+// misnumbering is a relay that counts its records and hands them over by
+// position, whatever number each one claims. Its log begins at record 1.
 type misnumbering struct{ *forger }
 
 func (r misnumbering) AnchorRequest(string, Clock) (int64, string, bool, Answer) {
-	return r.entries[0].Seq + int64(len(r.entries)) - 1, r.head, false, Answer{}
+	return int64(len(r.entries)), r.head, false, Answer{}
 }
 
-func (r misnumbering) Entries(int64, int64) []Entry { return r.entries }
+func (r misnumbering) Entries(from, to int64) []Entry {
+	return r.entries[from-1 : min(to, int64(len(r.entries)))]
+}
 
-// everything is a relay that hands over all its records, whatever range it
-// is asked for.
+// misplaced is a relay that, asked for the one record at a given number,
+// hands over another.
+type misplaced struct {
+	*forger
+	at   int64
+	give Entry
+}
+
+func (r misplaced) Entries(from, to int64) []Entry {
+	if from == r.at && to == r.at {
+		return []Entry{r.give}
+	}
+	return r.forger.Entries(from, to)
+}
+
+// everything is a relay that hands over all its records from its invented
+// frame on, whatever range it is asked for. The frame before that one only
+// ends the live window.
 type everything struct{ *forger }
 
-func (r everything) Entries(int64, int64) []Entry { return r.entries }
+func (r everything) Entries(int64, int64) []Entry { return r.entries[1:] }
 
 // earlier is a relay that names an older head than its last.
 type earlier struct {

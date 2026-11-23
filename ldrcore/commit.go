@@ -207,35 +207,108 @@ func (q *Sequencer) Enrollment(cred string) (Entry, bool) {
 
 // ReplayVerified is full replay as a member holding the whole log would do
 // it, with the checks Replay leaves to its caller: every frame links onto the
-// one before, every signed record carries the signature of the principal it
-// names over a head that is on this chain, every record commits, and, where
-// the profile commits state, every frame commits to the state derived here.
-// It returns the state and the head it reached.
+// one before; every signed record carries the signature of the principal it
+// names, for this generation, over a head that is on this chain, and
+// committed within its deadline under an operation identity that had not
+// committed before; every record commits; and, where the profile commits
+// state, every frame commits to the state derived here. It returns the state
+// and the head it reached.
 //
 // It exists to be compared with Join. It replays a log that begins at
 // genesis and does not model a generation change.
 func ReplayVerified(lineID string, log []Entry, prof Profile) (State, string, error) {
 	var s State
 	head := genesisHead(lineID)
-	heads := map[int64]string{0: head}
+	ctx := newSignedContext()
 	for _, e := range log {
-		next, err := verifyFrame(lineID, prof, s, head, e)
+		next, err := verifyFrame(lineID, prof, s, head, ctx, e)
 		if err != nil {
 			return State{}, "", err
 		}
-		if e.Record.Origin != OriginSequencer && heads[e.Key.SeenSeq] != e.SeenHead {
-			// Evidence of divergent histories (spec 5.2).
-			return State{}, "", fmt.Errorf("record %d was signed over a head that is not on this chain", e.Seq)
-		}
 		s, head = next, e.Head
-		heads[e.Seq] = head
+		ctx.record(&e, head)
 	}
 	return s, head, nil
 }
 
-// verifyFrame checks one frame against the state and the head before it, and
-// returns the state after it. It is the step Join and ReplayVerified share.
-func verifyFrame(lineID string, prof Profile, s State, head string, e Entry) (State, error) {
+// signedContext is what verifying a signed record needs besides the state and
+// the head before it: the heads a record may name, each with its seq_time,
+// and the operation identities that have committed. Apply does not see these.
+// They belong to admission (spec 5.2, 5.3, 5.5), and a verifier that left
+// them out would take whatever a relay chose to admit. Codex's probe of the
+// first version of this file showed exactly that (call 0003, turn 27).
+//
+// It keeps everything it is given. A verifier that runs for long would drop
+// what has retired: an anchor older than the head by more than the maximum
+// validity can be named by nothing that is still admissible, and the
+// identities under it can no longer be repeated.
+type signedContext struct {
+	anchors map[int64]anchor
+	ops     map[OpKey]int64
+}
+
+// anchor is a head a signer may have named, with the seq_time recorded there.
+type anchor struct {
+	head string
+	time int64
+}
+
+func newSignedContext() *signedContext {
+	return &signedContext{anchors: map[int64]anchor{}, ops: map[OpKey]int64{}}
+}
+
+// record takes in a frame whose head is established: verified, or opened
+// under a head that is (join.go).
+func (x *signedContext) record(e *Entry, head string) {
+	x.anchors[e.Seq] = anchor{head: head, time: e.SeqTime}
+	if e.Record.Origin != OriginSequencer {
+		x.ops[e.Key] = e.Seq
+	}
+}
+
+// admitted re-checks, from recorded values alone, what admission decided
+// when a signed record committed. The times are the relay's own: this shows
+// that they are consistent with the record, not that they are true.
+func (x *signedContext) admitted(lineID string, e *Entry) error {
+	// One operation identity commits once, whether or not the bytes are the
+	// same. A retry of committed bytes is answered with the original outcome
+	// and appends nothing (spec 5.5).
+	if at, again := x.ops[e.Key]; again {
+		return fmt.Errorf("record %d (%s) repeats the operation identity that committed at %d", e.Seq, e.Record.Type, at)
+	}
+	if e.Record.Type == "line_init" {
+		// The bootstrap exception: signed over genesis, exempt from validity.
+		// It commits only as the first record, where the one sequence number
+		// it can name is zero.
+		if e.SeenHead != genesisHead(lineID) {
+			return fmt.Errorf("record %d (line_init) is not signed over genesis", e.Seq)
+		}
+		return nil
+	}
+	a, held := x.anchors[e.Key.SeenSeq]
+	switch {
+	case !held:
+		// Genesis is never held: only line_init is signed over it.
+		return fmt.Errorf("record %d (%s) is anchored at %d, which is not a head this verifier holds", e.Seq, e.Record.Type, e.Key.SeenSeq)
+	case a.head != e.SeenHead:
+		// Evidence of divergent histories (spec 5.2).
+		return fmt.Errorf("record %d was signed over a head that is not on this chain", e.Seq)
+	case e.SeqTime-a.time > e.Record.ValidityMS:
+		// The deadline is inclusive (spec 5.3). It is compared with the time
+		// the record committed, never with the time of this replay: a record
+		// that committed in time verifies for ever. A validity above the
+		// maximum does not commit at all, which Apply checks.
+		return fmt.Errorf("record %d (%s) committed %d ms after its anchor at %d, with a validity of %d ms",
+			e.Seq, e.Record.Type, e.SeqTime-a.time, e.Key.SeenSeq, e.Record.ValidityMS)
+	}
+	return nil
+}
+
+// verifyFrame checks one frame against the state and the head before it and
+// against what ctx holds, and returns the state after it. It changes nothing:
+// the caller takes the frame into ctx once it has accepted it. It is the step
+// Join, ReplayVerified and a member under a profile that commits state share.
+func verifyFrame(lineID string, prof Profile, s State, head string, ctx *signedContext, e Entry) (State, error) {
 	if e.Seq != s.Line.HeadSeq+1 {
 		return State{}, fmt.Errorf("a record numbered %d follows the record numbered %d", e.Seq, s.Line.HeadSeq)
 	}
@@ -245,7 +318,8 @@ func verifyFrame(lineID string, prof Profile, s State, head string, e Entry) (St
 	if frameHead(&e) != e.Head {
 		return State{}, fmt.Errorf("record %d does not chain onto the head before it", e.Seq)
 	}
-	if e.Record.Origin == OriginSequencer {
+	signed := e.Record.Origin != OriginSequencer
+	if !signed {
 		if e.Sig != "" || e.SeenHead != "" || e.Key != (OpKey{}) {
 			return State{}, fmt.Errorf("record %d is sequencer-origin and carries a signer's fields", e.Seq)
 		}
@@ -257,10 +331,18 @@ func verifyFrame(lineID string, prof Profile, s State, head string, e Entry) (St
 		if e.Key.Signer != signer || e.Key.SeenSeq >= e.Seq || e.Key.SeenSeq < 0 {
 			return State{}, fmt.Errorf("record %d (%s) has an operation identity that does not fit it", e.Seq, e.Record.Type)
 		}
+		if err := ctx.admitted(lineID, &e); err != nil {
+			return State{}, err
+		}
 	}
 	next, out := Apply(s, e.Record, e.SeqTime, prof)
 	if out.Kind != Committed {
 		return State{}, fmt.Errorf("record %d (%s) does not commit on replay: %s %s", e.Seq, e.Record.Type, out.Kind, out.Reason)
+	}
+	// The generation is compared after the record is applied, because
+	// line_init names the generation it creates.
+	if signed && e.Key.Generation != next.Line.Generation {
+		return State{}, fmt.Errorf("record %d (%s) was signed for another generation", e.Seq, e.Record.Type)
 	}
 	switch {
 	case prof.StateCommit && StateDigest(lineID, prof, next) != e.StateDigest:

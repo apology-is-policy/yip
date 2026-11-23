@@ -20,7 +20,14 @@ import (
 //     commits to. The joiner has not replayed the records before that head:
 //     the state is an endorsed prefix, not a verified one.
 //   - Every record from that head to the head the relay named was verified
-//     here: linkage, signature, outcome and state commitment.
+//     here: linkage, signature, generation, the head it was signed over, its
+//     deadline, that its operation identity had not committed before, its
+//     outcome and its state commitment.
+//   - For the last three of those the joiner needs something from before the
+//     endorsed head: the heads a later record may name, with their times, and
+//     the operation identities a later record may repeat. It opens the chain
+//     backwards from the endorsed head as far as either can matter (the live
+//     window, openWindow) and replays none of it.
 //   - The enrollment is on the chain the pinned relay served, the credential
 //     is still entitled at the head the relay named, and, for a reader, a key
 //     epoch includes it.
@@ -32,25 +39,30 @@ import (
 //     If the device that enrolls the joiner also tells it where the relay
 //     is, that device alone can do everything the operator and the relay can
 //     do together.
-//   - The pinned operator's device derived the state at the head it signed
-//     over. The client model does (Client.Sync refuses a frame whose
-//     commitment it cannot reproduce), and a signer that skipped the check
-//     would be endorsing whatever the relay computed.
+//   - The pinned operator's device verified every record up to the head it
+//     signed over, as ReplayVerified does, and derived the state there. The
+//     client model does under a profile that commits state: Client.Sync runs
+//     the same frame verification as this file and stops at a frame that
+//     fails it, and a client that has stopped signs nothing. A signer that
+//     checked less would be endorsing whatever the relay served it.
 //
 // What it does not establish:
 //
 //   - Anything about the records before the endorsed head. The operator's
 //     key and the relay together can commit to a state holding actions that
 //     no honest member signed, and Join accepts it; replay from genesis
-//     would not (ReplayVerified, and the tests that compare the two).
+//     would not (ReplayVerified, and the tests that compare the two). The
+//     live window is opened, not replayed, and is worth what the endorsement
+//     is worth.
 //   - Freshness against a relay that withholds records or serves a fork.
+//   - That the relay's bookkeeping was honest where it left no record: an
+//     index of committed operations says nothing about a rejection or a
+//     no-op that was never logged.
 //
 // Not modelled: the ceremony that produces the pin, the root-signed evidence
 // of the operator's authorization that Codex's draft also requires, transfer
 // in chunks, a bound on the length of the suffix, a device that had already
-// accepted a checkpoint, and a generation change. A suffix record anchored
-// before the endorsed head names a head the joiner cannot compare with
-// anything; Join counts those and checks the rest.
+// accepted a checkpoint, and a generation change.
 
 // JoinPin is what a joining device fixed before it was handed any state: the
 // line, the profile and the root key from the creation descriptor, the
@@ -75,14 +87,25 @@ type JoinPin struct {
 	// MaxSnapshotBytes is the joiner's budget for an encoded state. Zero
 	// means DefaultSnapshotBudget.
 	MaxSnapshotBytes int
+	// MaxWindowRecords is the joiner's budget for the live window before the
+	// endorsed head, in records. Zero means DefaultWindowBudget. A window
+	// over the budget is refused whole; it is never cut short.
+	MaxWindowRecords int
 	// OnEndorserRevoked is the policy for an endorsing operator whose key is
 	// revoked after the enrollment committed and before the join is accepted.
 	OnEndorserRevoked int
 }
 
-// DefaultSnapshotBudget is the budget used when a pin sets none. The number
-// is arbitrary.
-const DefaultSnapshotBudget = 1 << 20
+// DefaultSnapshotBudget and DefaultWindowBudget are the budgets used when a
+// pin sets none. The numbers are arbitrary.
+const (
+	DefaultSnapshotBudget = 1 << 20
+	DefaultWindowBudget   = 1 << 12
+)
+
+// ErrWindowTooLarge: the live window before the endorsed head holds more
+// records than the joiner's budget. Nothing was accepted.
+var ErrWindowTooLarge = errors.New("ldrcore: the live window before the endorsed head is larger than the budget")
 
 // Policies for JoinPin.OnEndorserRevoked.
 const (
@@ -132,18 +155,18 @@ type Provenance struct {
 	// Operator is the pinned operator whose enrollment endorsed the state.
 	Operator string
 	// EndorsedSeq and EndorsedHead are the head that operator signed over.
-	// Nothing before it was verified by this joiner.
+	// Nothing at or before it was replayed by this joiner.
 	EndorsedSeq  int64
 	EndorsedHead string
+	// WindowSeq is the oldest record of the live window: from there to
+	// EndorsedSeq the joiner opened each frame under the endorsed head and
+	// replayed none.
+	WindowSeq int64
 	// EnrollSeq is where the enrollment committed.
 	EnrollSeq int64
 	// EndorserRevokedAt is the record that revoked the endorsing operator's
 	// key after the enrollment committed, or zero.
 	EndorserRevokedAt int64
-	// UncheckedAnchors counts the verified suffix records that were signed
-	// over a head before the endorsed one, which the joiner could not
-	// compare with its chain.
-	UncheckedAnchors int
 }
 
 // JoinError says why a join did not finish. Nothing was accepted, and no
@@ -228,8 +251,9 @@ func Join(pin JoinPin, relay JoinRelay, snaps SnapshotSource, clk Clock) (*Joine
 			len(run), fseq-at+1)
 	}
 
-	// The frame that opens the head the operator signed over. Its own
-	// record is not examined: it is the last record of the endorsed prefix.
+	// The frame that opens the head the operator signed over. Its record is
+	// the last of the endorsed prefix: it is opened with the live window
+	// below, and it is not replayed.
 	frame := run[0]
 	if frame.Seq != at || frame.StateDigest == "" || frameHead(&frame) != en.SeenHead {
 		return nil, joinRefused("the frame offered at %d does not open the head the operator signed over", at)
@@ -261,26 +285,23 @@ func Join(pin JoinPin, relay JoinRelay, snaps SnapshotSource, clk Clock) (*Joine
 		return nil, joinRefused("the pinned operator is not authorized in the endorsed state")
 	}
 
+	// What the records after the endorsed head may refer back to.
+	ctx, from, err := openWindow(&pin, relay, frame, en.SeenHead)
+	if err != nil {
+		return nil, err
+	}
+
 	// Replay to the named head. The candidate stays in local variables until
-	// the last check has passed.
-	prov := Provenance{Operator: pin.Operator, EndorsedSeq: at, EndorsedHead: en.SeenHead, EnrollSeq: en.Seq}
+	// the last check has passed. A record anchored before the window is
+	// refused by the frame verification: the window reaches back to the
+	// oldest head that anything after the endorsed one could have been
+	// admitted on.
+	prov := Provenance{Operator: pin.Operator, EndorsedSeq: at, EndorsedHead: en.SeenHead, WindowSeq: from, EnrollSeq: en.Seq}
 	head := en.SeenHead
-	heads := map[int64]string{at: head}
 	for _, e := range run[1:] {
-		next, err := verifyFrame(pin.LineID, prof, state, head, e)
+		next, err := verifyFrame(pin.LineID, prof, state, head, ctx, e)
 		if err != nil {
 			return nil, &JoinError{Reason: "the records after the endorsed head do not verify", Err: err}
-		}
-		if e.Record.Origin != OriginSequencer {
-			switch {
-			case e.Key.Generation != pin.Generation:
-				return nil, joinRefused("record %d was signed for another generation", e.Seq)
-			case e.Key.SeenSeq < at:
-				prov.UncheckedAnchors++
-			case heads[e.Key.SeenSeq] != e.SeenHead:
-				// Evidence of divergent histories (spec 5.2).
-				return nil, joinRefused("record %d was signed over a head that is not on this chain", e.Seq)
-			}
 		}
 		if e.Seq == en.Seq && !reflect.DeepEqual(e, en) {
 			return nil, joinRefused("the record at %d is not the enrollment the relay showed", e.Seq)
@@ -289,7 +310,7 @@ func Join(pin JoinPin, relay JoinRelay, snaps SnapshotSource, clk Clock) (*Joine
 			prov.EndorserRevokedAt = e.Seq
 		}
 		state, head = next, e.Head
-		heads[e.Seq] = head
+		ctx.record(&e, head)
 	}
 	// The count and the numbering were checked above, so the last record is
 	// the one numbered fseq. What is left is whether it has the head named.
@@ -317,6 +338,74 @@ func Join(pin JoinPin, relay JoinRelay, snaps SnapshotSource, clk Clock) (*Joine
 	}
 
 	return &Joined{State: state.Clone(), Seq: fseq, Head: fhead, Provenance: prov}, nil
+}
+
+// openWindow opens the chain backwards from the frame of the endorsed head,
+// as far as anything in it can matter to a record after that head: a head
+// such a record may name, with its seq_time, or an operation identity it may
+// repeat. Nothing after the endorsed head can have been admitted on an anchor
+// stamped more than the maximum validity before the endorsed head (spec 5.3),
+// and an identity is tied to its anchor, so the window ends at the first
+// frame older than that, or at genesis. Its length is set by recorded times
+// and the profile, never by a guess at how busy the line was.
+//
+// Opening is not replay. Each frame is checked to hash to the head that the
+// frame after it names, which makes its number, its time and the digest of
+// its bytes as good as the endorsed head. No outcome is re-derived, and the
+// window says nothing more about those records than the endorsement does.
+//
+// In this model a frame's digest is an opaque name for the signed bytes, so
+// what ties an operation identity to its frame is the signature stand-in, and
+// it is checked here for that reason. With real bytes the digest ties them,
+// and whether a joiner also verifies the window's signatures is a separate
+// choice. That two different signed records never share a digest is the
+// premise stated at Intent.
+//
+// It returns the context for verifying the records after the endorsed head,
+// and the number of the oldest record it opened.
+func openWindow(pin *JoinPin, relay JoinRelay, frame Entry, head string) (*signedContext, int64, error) {
+	budget := pin.MaxWindowRecords
+	if budget == 0 {
+		budget = DefaultWindowBudget
+	}
+	oldest := frame.SeqTime - pin.Profile.ValidityMaxMS
+	ctx := newSignedContext()
+	e := frame
+	for n := 1; ; n++ {
+		// The type is under the head and the origin is not, and a type has one
+		// origin. Without this a relay could show a member's record as its own
+		// and keep the identity out of the index.
+		if e.Record.Origin != recordOrigin[e.Record.Type] {
+			return nil, 0, joinRefused("the record at %d, in the live window, is a %s of %s origin", e.Seq, e.Record.Type, e.Record.Origin)
+		}
+		if e.Record.Origin != OriginSequencer && !signedBy(&e, signerOf(&e.Record)) {
+			return nil, 0, joinRefused("the record at %d, in the live window, is not what its signer signed", e.Seq)
+		}
+		ctx.record(&e, head)
+		switch {
+		case e.SeqTime < oldest:
+			// Too old to be named by anything after the endorsed head, and so
+			// is everything before it: the window is complete.
+			return ctx, e.Seq, nil
+		case e.Seq == 1:
+			if e.Prev != genesisHead(pin.LineID) {
+				return nil, 0, joinRefused("the first record does not stand on this line's genesis")
+			}
+			return ctx, 1, nil
+		case n >= budget:
+			// A budget below one, which no joiner means, opens nothing.
+			return nil, 0, &JoinError{Reason: "the live window before the endorsed head is over this joiner's budget", Err: ErrWindowTooLarge}
+		}
+		older := relay.Entries(e.Seq-1, e.Seq-1)
+		if len(older) != 1 {
+			return nil, 0, joinPending("the relay did not supply the record at %d, which the live window before the endorsed head needs; nothing is taken in its place", e.Seq-1)
+		}
+		p := older[0]
+		if p.Seq != e.Seq-1 || frameHead(&p) != e.Prev {
+			return nil, 0, joinRefused("the record offered at %d does not open the head before the record at %d", e.Seq-1, e.Seq)
+		}
+		head, e = e.Prev, p
+	}
 }
 
 // checkEnrollment compares the committed enrollment with the pin: the

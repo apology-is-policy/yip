@@ -124,13 +124,26 @@ type forger struct {
 }
 
 // forgeFrom starts a chain at an invented frame that commits to s. The frame
-// claims to be the record numbered s.Line.HeadSeq.
+// claims to be the record numbered s.Line.HeadSeq. Before it stands one more
+// invented frame, old enough to end the live window a joiner opens.
 func forgeFrom(t *testing.T, s State) *forger {
 	t.Helper()
 	f := &forger{t: t, snaps: snapshots{}, head: "invented"}
+	f.stale(s.Line.HeadSeq-1, s.Line.HeadTime)
 	f.push(Entry{Seq: s.Line.HeadSeq, SeqTime: s.Line.HeadTime,
 		Record: Record{Origin: OriginSequencer, Type: "time_anchor"}}, s, "")
 	return f
+}
+
+// stale appends a frame numbered seq and stamped more than the maximum
+// validity before the time given: a frame nothing later can name. It commits
+// to no state anyone will ask for.
+func (f *forger) stale(seq, before int64) {
+	e := Entry{Seq: seq, SeqTime: before - commitProfile.ValidityMaxMS - 1, Prev: f.head,
+		Record: Record{Origin: OriginSequencer, Type: "time_anchor"}, StateDigest: "0000000000000000"}
+	e.Head = frameHead(&e)
+	f.entries = append(f.entries, e)
+	f.head = e.Head
 }
 
 // forgeOnto continues a real chain: entries are real records ending in the
@@ -138,6 +151,33 @@ func forgeFrom(t *testing.T, s State) *forger {
 func forgeOnto(t *testing.T, entries []Entry, s State) *forger {
 	t.Helper()
 	return &forger{t: t, snaps: snapshots{}, entries: entries, state: s, head: entries[len(entries)-1].Head}
+}
+
+// at returns the forger's frame numbered seq, to be read or changed.
+func (f *forger) at(seq int64) *Entry {
+	f.t.Helper()
+	for i := range f.entries {
+		if f.entries[i].Seq == seq {
+			return &f.entries[i]
+		}
+	}
+	f.t.Fatalf("the forger has no frame numbered %d", seq)
+	return nil
+}
+
+// frame appends an intent a member really signed, committed at the time
+// given. The bytes are the member's own; the frame, its time and the state it
+// claims are the forger's.
+func (f *forger) frame(in Intent, at int64) Entry {
+	f.t.Helper()
+	rec := in.Record.Clone()
+	rec.ValidityMS = in.ValidityMS
+	next, out := Apply(f.state, rec, at, commitProfile)
+	if out.Kind != Committed {
+		f.t.Fatalf("the member's %s does not commit where the forger puts it: %s %s", rec.Type, out.Kind, out.Reason)
+	}
+	return f.push(Entry{Seq: next.Line.HeadSeq, SeqTime: at, Record: rec, SeenHead: in.SeenHead, Key: keyOf(in),
+		Digest: in.Digest}, next, signerOf(&rec))
 }
 
 // push appends a frame that claims next as its state. edit, if given, runs
@@ -207,9 +247,10 @@ func (f *forger) Enrollment(cred string) (Entry, bool) {
 
 func (f *forger) Entries(from, to int64) []Entry {
 	var out []Entry
-	for _, e := range f.entries[:len(f.entries)-f.withhold] {
-		if e.Seq >= from && e.Seq <= to {
-			out = append(out, e)
+	held := f.entries[:len(f.entries)-f.withhold]
+	for i := range held {
+		if held[i].Seq >= from && held[i].Seq <= to {
+			out = append(out, held[i])
 		}
 	}
 	return out
@@ -404,7 +445,9 @@ func TestJoin(t *testing.T) {
 			t.Fatalf("the accepted state is not the line's: %v", d)
 		}
 		head12, known := e.q.HeadAt(12)
-		want := Provenance{Operator: "op1", EndorsedSeq: 12, EndorsedHead: head12, EnrollSeq: 13}
+		// The line is younger than the maximum validity, so the live window
+		// reaches back to its first record.
+		want := Provenance{Operator: "op1", EndorsedSeq: 12, EndorsedHead: head12, WindowSeq: 1, EnrollSeq: 13}
 		if !known || j.Provenance != want {
 			t.Fatalf("provenance %+v, want %+v", j.Provenance, want)
 		}
@@ -433,7 +476,9 @@ func TestJoin(t *testing.T) {
 		if en.SeenSeq != 13 {
 			t.Fatalf("the enrollment is signed over %d, want 13", en.SeenSeq)
 		}
-		e.wantOutcome(e.submit(early), Committed, "", false) // 14, anchored before the endorsed head
+		// 14 is anchored before the endorsed head. The joiner checks the head
+		// it names, and its deadline, against the live window.
+		e.wantOutcome(e.submit(early), Committed, "", false)
 		e.commit(Record{Origin: OriginCredential, Type: "actor_declare", Cred: "credB", Namespace: "nsB", Actor: "b2"})
 		e.commit(activate(2, "credA", "credB")) // 16: an epoch change before the enrollment
 		e.now++
@@ -442,7 +487,7 @@ func TestJoin(t *testing.T) {
 
 		j := mustJoin(t, pinC, e.q, e.q, e.now)
 		head13, _ := e.q.HeadAt(13)
-		want := Provenance{Operator: "op1", EndorsedSeq: 13, EndorsedHead: head13, EnrollSeq: 17, UncheckedAnchors: 1}
+		want := Provenance{Operator: "op1", EndorsedSeq: 13, EndorsedHead: head13, WindowSeq: 1, EnrollSeq: 17}
 		if j.Provenance != want || j.Seq != 18 {
 			t.Fatalf("provenance %+v at %d, want %+v at 18", j.Provenance, j.Seq, want)
 		}
@@ -580,7 +625,7 @@ func TestJoin(t *testing.T) {
 		// A relay that commits the enrollment regardless. It holds no key:
 		// the enrollment is the operator's own bytes, and the state it claims
 		// is one the rules do not give.
-		f := forgeOnto(t, e.q.Entries(12, 13), e.q.State())
+		f := forgeOnto(t, e.q.Log(), e.q.State())
 		forced := e.q.State()
 		forced.Line.Credentials["credC"] = &Credential{SigningKey: "sk-credC", EncryptionKey: "ek-credC", Namespace: "nsC", ActorLimit: 4}
 		forced.Line.Tombstones.JoinRequests = addToSet(forced.Line.Tombstones.JoinRequests, "jr3")
@@ -595,10 +640,11 @@ func TestJoin(t *testing.T) {
 // TestJoinAgainstADishonestRelay: the operator's device is honest and its key
 // is safe; the relay is not bound by the rules and holds no member's key.
 func TestJoinAgainstADishonestRelay(t *testing.T) {
-	// start gives a forger the real records from the endorsed head on.
+	// start gives a forger the real log: the enrollment is at 13 and the key
+	// epoch at 14.
 	start := func(t *testing.T) (*env, *forger) {
 		e := joinLine(t)
-		return e, forgeOnto(t, e.q.Entries(12, 14), e.q.State())
+		return e, forgeOnto(t, e.q.Log(), e.q.State())
 	}
 
 	t.Run("it cannot put another state under the head the operator signed over", func(t *testing.T) {
@@ -655,7 +701,7 @@ func TestJoinAgainstADishonestRelay(t *testing.T) {
 		// different sets of bytes (spec 5.1). The relay committed one and
 		// shows the other. Both signatures are the operator's own.
 		e, f := start(t)
-		shown := f.entries[1]
+		shown := *f.at(13)
 		shown.Digest = "another-copy"
 		shown.Sig = signatureOf("op:op1", &shown)
 		f.shown = &shown
@@ -689,7 +735,7 @@ func TestJoinAgainstADishonestRelay(t *testing.T) {
 		// frame's head does not cover the record's fields in this model; the
 		// signature does.
 		e, f := start(t)
-		f.entries[2].Record.Manifest = []string{"credA", "credC"}
+		f.at(14).Record.Manifest = []string{"credA", "credC"}
 		wantRefused(t, joinErr(t, pinC, f, e.q, e.now), "record 14 (key_epoch_activate) does not carry the signature")
 		// The same for each part of its operation identity.
 		for name, alter := range map[string]func(*OpKey){
@@ -699,7 +745,7 @@ func TestJoinAgainstADishonestRelay(t *testing.T) {
 			"signer":     func(k *OpKey) { k.Signer = "op:op2" },
 		} {
 			_, g := start(t)
-			alter(&g.entries[2].Key)
+			alter(&g.at(14).Key)
 			je := joinErr(t, pinC, g, e.q, e.now)
 			if je.Pending || je.Err == nil || !strings.Contains(je.Err.Error(), "record 14 (key_epoch_activate) does not carry the signature") {
 				t.Errorf("%s altered: %v", name, je)
@@ -709,7 +755,7 @@ func TestJoinAgainstADishonestRelay(t *testing.T) {
 
 	t.Run("it cannot enroll a joiner the operator did not", func(t *testing.T) {
 		e := newLineWith(t, commitProfile)
-		f := forgeOnto(t, e.q.Entries(12, 12), e.q.State())
+		f := forgeOnto(t, e.q.Log(), e.q.State())
 		f.sign(enroll("credC", "nsC", "jr3"), "") // no operator key
 		wantRefused(t, joinErr(t, pinC, f, e.q, e.now), "does not carry the pinned operator's signature")
 	})
@@ -756,14 +802,14 @@ func TestJoinTrustLimits(t *testing.T) {
 			!strings.Contains(err.Error(), "record 13 (call_turn) does not carry the signature") {
 			t.Fatalf("replay from genesis: %v, want a refusal at the invented turn", err)
 		}
-		// The joiner takes that history as well. The invented turn is the
-		// last record of the endorsed prefix, and the joiner opens its frame
-		// without examining the record in it.
-		if j := mustJoin(t, pinC, h, h, e.now); j.EndorsedSeq != 13 || j.State.Calls["c1"].TurnCount != 3 {
-			t.Fatalf("endorsed at %d with %d turns", j.EndorsedSeq, j.State.Calls["c1"].TurnCount)
-		}
-		// One record later it is inside what the joiner verifies, and the
-		// joiner refuses it.
+		// The joiner does not take that history either, though it replays
+		// nothing at or before the endorsed head. The invented turn is in the
+		// live window, where the joiner checks that each record is what its
+		// signer signed. That costs the two parties nothing: they put the
+		// invented state under a record of their own instead, as above.
+		wantRefused(t, joinErr(t, pinC, h, h, e.now), "record at 13, in the live window, is not what its signer signed")
+		// One record later it is inside what the joiner replays, and the
+		// joiner refuses it there.
 		k := forgeOnto(t, e.q.Log(), e.q.State())
 		k.sign(enroll("credC", "nsC", "jr3"), "op:op1")
 		k.sign(activate(2, "credA", "credB", "credC"), "op:op1")

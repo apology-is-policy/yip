@@ -84,7 +84,9 @@ inside a validity window (§13, O25 and O26). They were put to the operator on
 §14.7 was added the same day. The operator asked for a better way than the
 two routes of O25, and the section records a third one and a reference model
 of it. It is an exploration: it changes no rule, so the draft number is
-unchanged, and nobody has chosen it.
+unchanged, and nobody has chosen it. Codex probed the model and found three
+missing checks and one unexercised premise; the section says what they were
+and what changed.
 
 This document owns: record types, authority, preconditions, effects, time
 rules, the sequencer-visible field allowlist, retry and dedup behaviour, and
@@ -2061,6 +2063,15 @@ sequence the model follows. Its review grants no scope and selects nothing.
   frame of the head that enrollment names, checks a snapshot from anyone
   against the frame's commitment, and verifies every record from there to a
   fresh head the relay names.
+- To verify those records the joiner needs a little from before the endorsed
+  head: the heads a later record may have been signed over, with their times,
+  and the operation identities a later record may repeat. It opens the chain
+  backwards from the endorsed head over the *live window*: back to the first
+  frame stamped more than the maximum validity before the endorsed head, or
+  to genesis. Those are the anchors that had not retired at the endorsed
+  head, by the rule of §5.6 and with its strict comparison. It checks each
+  frame's hash and replays none of them. This was added after Codex's probe
+  (below).
 
 Codex's name for it is an operator-endorsed state commitment with
 relay-confirmed inclusion. It is not a trustless snapshot: the joiner never
@@ -2079,10 +2090,14 @@ tests):
    under the head the operator signed over, add a record no member signed,
    commit to a state the records do not give, or show a record signed over
    another history.
-3. The signing device must derive the state at the head it signs over. The
-   client model does: it stops at a frame whose commitment it cannot
-   reproduce, so it has no checkpoint there to sign from. A signer that
-   skipped this would endorse whatever the relay computed.
+3. The signing device must verify every record up to the head it signs over,
+   signatures and signed context included, and derive the state there. Under
+   this profile the client model does: it runs the same frame verification
+   as the joiner and stops at a frame that fails it, and a client that has
+   stopped signs nothing. A signer that checked less would endorse whatever
+   the relay served it. The first version of the model only re-derived
+   outcomes and compared the commitment, which Codex's probe showed is not
+   enough (J4 below).
 4. The endorsement has a position in the log, which a detached attestation
    has not. An operator whose key is revoked before the enrollment commits
    endorses nothing: the relay refuses the enrollment, and a relay that
@@ -2111,17 +2126,19 @@ a fork is not detected by this route, by P4 or by replay.
 **What modelling it turned up.**
 
 - A record in the verified suffix can be signed over a head from before the
-  endorsed one. The joiner has nothing to compare that head with. The model
-  counts such records and reports the count with the accepted state.
-  Comparing them would need the frames before the endorsed head, opened
-  backwards from it.
+  endorsed one. The first version of the model had nothing to compare that
+  head with and only counted such records. The live window now supplies the
+  head and its time, and the count is gone: a record anchored before the
+  window is refused, because nothing after the endorsed head could have been
+  admitted on an anchor that old.
 - An operator key can sign an enrollment over a head at which it was not yet
   an operator, and an honest relay commits it once the key is authorized,
   because the relay judges the signer at commit. The model refuses that
-  endorsement. Whether a real joiner should is a question for Codex's draft.
-- The joiner opens the frame at the endorsed head without examining the
-  record in it. That record is the last of the endorsed prefix, so the line
-  between what is endorsed and what is verified runs exactly at that head.
+  endorsement. Codex's answer is to keep the refusal (below).
+- The joiner replays nothing at or before the endorsed head. The record in
+  the frame at that head is the last of the endorsed prefix, so the line
+  between what is endorsed and what is replayed runs exactly there. That
+  frame and the rest of the live window are opened and not replayed.
 - The endorsed state is the derived state that A.3 (M4) already lists.
   Rejection caches, outboxes and delivery queues are not part of it.
 - The route rests on `seen_seq` and `seen_head` being signed fields (§5.1).
@@ -2135,41 +2152,148 @@ a fork is not detected by this route, by P4 or by replay.
   decoder could be brought down by a `null` where a state has an object.
   The author found that in review as well.
 
+**What Codex's probe found (call 0003, turn 27).** Codex ran four probes of
+its own against the first version. Each passed by reproducing an acceptance
+that should not happen. Three are checks neither verifier made. All three are
+things admission decides and the transition function never sees, so a
+verifier that only re-derives outcomes takes whatever a relay chose to admit.
+In none of them does the relay forge a signature: it commits bytes a member
+really signed, where or when an honest relay would not have.
+
+- **J1, generation.** Replay from genesis accepted a note signed for
+  generation 2 in a generation-1 log. The join had the check and the
+  comparator did not. *Now:* the shared frame verification compares the
+  generation a record was signed for with the line's, after applying the
+  record, because `line_init` names the generation it creates.
+- **J2, deadline.** Both verifiers accepted a note with a validity of 1 ms
+  committed 2 ms after the time of its anchor. *Now:* both compare the
+  recorded commit time with the anchor's recorded time and the signed
+  validity (§5.3, inclusive). The comparison is with the time the record
+  committed and never with the time of the replay: a record that committed in
+  time verifies for ever. It shows that the relay's times are consistent with
+  the record, not that they are true.
+- **J3, one operation, two effects.** Both verifiers accepted the same signed
+  note in two frames, and the note count rose twice. *Now:* both keep the
+  operation identities that have committed and refuse a second commit under
+  one identity, whether or not the bytes are the same (§5.5). For a joiner
+  the identities that committed before the endorsed head come from the live
+  window. An identity is tied to its anchor, so one whose anchor is older
+  than the window can no longer be admitted at all. This does not show that
+  the relay's bookkeeping was honest where it left no record: an index of
+  commits says nothing about a rejection or a no-op that was never logged.
+- **J4, the endorsing device.** The client model took signatures as a premise
+  and checked nothing of the signed context. A relay could serve it an
+  invented, unsigned member action with a consistent frame and commitment,
+  an honest operator's device would sign an enrollment over it, and the join
+  accepted the result. Codex classed this as a premise nothing exercised,
+  not as a way for a relay to fool a signer that validates correctly. *Now:*
+  under this profile the client model runs the full frame verification, and
+  its tests serve an operator's device each of the cases above and check
+  that it stops and composes nothing. Under the ordinary profile the client
+  model is unchanged and still takes signatures and signed context as a
+  premise; a test says so.
+
+The live window follows from J2, J3 and Codex's answer 3. In this model a
+frame's digest is an opaque name for the signed bytes, so what ties an
+operation identity to its frame is the signature stand-in, and the joiner
+checks it on every window record for that reason. With real bytes the digest
+ties them, and whether a joiner also verifies the window's signatures is a
+separate choice. A side effect in the model: an invented member action placed
+exactly at the endorsed head is now refused, where the first version took
+it. That costs two colluding parties nothing, since they can commit to the
+invented state under a record of their own.
+
+**Codex's answers to the four questions put to it.** They are its design
+answers. None is a decision, and O25 is still the operator's.
+
+1. *May the relay's identity reach the joiner through the enrolling device?*
+   Not as that device's bare word. The enrolling device must not be the sole
+   authority for the relay's identity if the route claims to survive that
+   device's compromise. What must be independent is the authority that
+   authenticates the identity, not the wire it travels on: the device may
+   carry material that the joiner checks under a trust anchor it obtained
+   independently and that binds the relay's identity. An unchecked endpoint
+   and a new root pin supplied together by the enrolling device do not
+   qualify. Codex calls its draft's "trusted operator channel" underspecified
+   on this point. The same holds for P4 and for replay from genesis: neither
+   rescues a joiner whose first pins were chosen by an attacker.
+2. *An operator that was not yet an operator at the head it signed over.*
+   Keep the refusal, as a rule about endorsements and not as a new admission
+   rule. The enrollment is legal; it endorses nothing. Such a joiner needs
+   replay from genesis or a later endorsement that is specified separately,
+   and its committed enrollment is neither altered nor repeated.
+3. *Records anchored before the endorsed head.* Require authenticated
+   evidence of those heads and their times, which opening the chain backwards
+   supplies without replaying it. A count of unchecked anchors describes a
+   weaker route and would have to be an explicit opt-in. The model now does
+   the first and has no weaker mode. The transfer is bounded, and a window
+   that is missing or over the bound fails; it is never cut short.
+4. *Is cost the only reason replay from genesis is not the normal path?* No.
+   It also needs the whole control history to be kept, to be available, and
+   to be something a new member is allowed to see, which the no-history
+   decision does not settle for control metadata; and formats must stay
+   readable for as long as the history is. With that granted and a startup
+   cost that is acceptable, Codex prefers replay from genesis before
+   ordinary use, since it needs no endorsed prefix at all. Starting from an
+   endorsed state and replaying in the background can raise the standing of
+   the starting point afterwards, if the replay reproduces exactly the
+   endorsed state on the same branch. It cannot undo anything the member
+   did, disclosed or signed before the replay finished. To have replay's
+   assurance before use, ordinary actions wait for the replay.
+
+**For this document itself.** §11.2 rule 1 has a client append "verified"
+records and re-derive each outcome, and nowhere says that verifying a record
+includes its generation, its deadline against the recorded times, and that
+its operation identity had not committed before. J1 to J3 apply to every
+replaying member and not only to this exploration. The ordinary client model
+does not make those checks either. Whether they become rules of §11.2, with
+vectors, is put to Codex and is not changed in this draft.
+
 **Costs the model does not measure.** The state encoding becomes
 consensus-critical for every member at every record, and a defect in it stops
 the line. Each record costs a digest of the state unless the digest is built
 incrementally or only at chosen records. The relay must keep the snapshot of
 every head an enrollment may name. The chain frame of Codex's draft changes.
+A joiner also fetches the live window: every record of the last
+maximum-validity period before the endorsed head, ten minutes on the
+provisional numbers (§4.2). On a line younger than that it is the whole log,
+opened and not replayed.
 
 **Not modelled.** The ceremony that produces the joiner's pins, the
 root-signed evidence of the operator's authorization that Codex's draft also
 requires, transfer in chunks, a bound on the suffix, a generation change, and
-a device that had already accepted a checkpoint. The client model still
-starts from genesis: the join yields a verified starting point and nothing
-runs from it yet. The encoding is JSON and the digest is FNV; neither is a
-proposal.
+a device that had already accepted a checkpoint. A verifier here keeps every
+head and identity it has seen; one that runs for long would drop what has
+retired. The client model still starts from genesis: the join yields a
+verified starting point and nothing runs from it yet. The encoding is JSON
+and the digest is FNV; neither is a proposal.
 
 **Measured on 2026-11-23.**
 
 - `gofmt` and `go vet` are clean. The package's tests pass, with the race
   detector as well. With the switch off the chain is byte for byte what it
-  was, and a test says so. Codex's six earlier probes still pass.
-- A break check of the new code, 99 hand-chosen breaks on one full run: 91
-  caught, 4 not caught, and 4 that did not compile. Of the 4 not caught, one
-  showed a missing test (nothing checked that the signature stand-in covers
-  the operation identity), which was added, and one was a redundant term,
-  which was removed. Two remain. The lookup of an enrollment also matches on
-  the record type, and no log the model can reach tells the difference,
-  since the first record that names a credential is its enrollment. The
-  comparison of the credential in the verified state with the joiner's
-  request cannot fail in phase 1, where nothing changes a grant after
-  enrollment. The 4 that did not compile were rewritten and run again with
-  the five breaks of the signature stand-in: 9 of 9 caught. The full set was
-  not run again after that.
-- Codex has not probed this code. As everywhere in this section, code, tests
-  and breaks have one author; a count of breaks caught is not a measure of
-  rules covered, and every earlier round of Codex's probes found a defect the
-  author's tests had not.
+  was, and a test says so. Codex's six earlier probes still pass. Its four
+  probes of turn 27 no longer reproduce what they reproduced: each stops at
+  the check that was missing.
+- The first version (commit 2fe084e), before Codex's probe: a break check of
+  99 hand-chosen breaks, run in full, 97 caught and 2 not. All of those
+  tests passed, and so did the three gaps and the premise that Codex then
+  found. The breaks were chosen by the author of the code, and none of them
+  could remove a check the code did not have.
+- This version: 127 hand-chosen breaks, run in full on the committed code,
+  125 caught and 2 not. The same two remain. The lookup of an enrollment
+  also matches on the record type, and no log the model can reach tells the
+  difference, since the first record that names a credential is its
+  enrollment. The comparison of the credential in the verified state with
+  the joiner's request cannot fail in phase 1, where nothing changes a grant
+  after enrollment. An earlier run of 125 breaks had 3 that did not compile;
+  they were rewritten, and a hardening of the window budget added breaks,
+  before the run reported here.
+- Codex has not probed this version: the live window and the argument that
+  it is complete are new. As everywhere in this section, code, tests and
+  breaks have one author; a count of breaks caught is not a measure of rules
+  covered, and every round of Codex's probes, this one included, found what
+  the author's tests had not.
 
 ## Appendix A. What this document requires from the enrollment, control-bootstrap and envelope design
 
