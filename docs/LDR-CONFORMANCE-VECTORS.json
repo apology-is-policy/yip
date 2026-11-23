@@ -1089,7 +1089,7 @@
     {"id": "T42", "run": {"scope": "client model", "test": "TestClientTraces/T42"}, "spec": "5.4, 5.7", "title": "A relay that refuses the signer gives neither a reason to send again nor evidence of non-commit",
      "steps": [
        {"do": "the relay is overloaded; credA's client sends a stored note", "expect": "an admission error that can pass; the intent stays pending and the same bytes may be sent again"},
-       {"do": "premise: a relay that has a line of the same name and has never heard of credA answers those bytes", "expect": "unknown signer, an admission error that sending again cannot change; the intent is marked reconciliation-required, keeps its slot, and is not sent again to any relay"},
+       {"do": "premise: a relay that has a line of the same name and has never heard of credA answers those bytes", "expect": "unknown signer, an admission error that waiting does not remove; the client stops sending on its own, the intent is marked reconciliation-required and keeps its slot"},
        {"do": "the agent asks for another note on the same call", "expect": "refused: the slot is held until the first intent is reconciled"},
        {"do": "an authorized principal asks the relay the client had verified about the intent, by identity and digest, before and after its anchor retires", "expect": "outcome_unknown first, which settles nothing; then expired, which is definitive: the intent is closed and the slot is free"}]}
   ]

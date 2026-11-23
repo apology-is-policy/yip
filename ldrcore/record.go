@@ -65,7 +65,9 @@ type Record struct {
 	EncryptionKey     string `json:"encryption_key,omitempty"`
 	// CredIDMismatch says that Cred is not the derivation of the two keys.
 	// The derivation is a hash, and this package computes none: like a
-	// signature, the fact is stated instead of checked.
+	// signature, the fact is stated instead of checked. It is a premise of
+	// the model and never a field on the wire. An implementation computes
+	// the derivation and takes no sender's word for it.
 	CredIDMismatch bool `json:"cred_id_mismatch,omitempty"`
 
 	// RootKey is the root public key a line_init names.

@@ -59,6 +59,13 @@ and the cross-review of it on call 0003. It changes rules:
 - A register value signs the incarnation of its activation (§9).
 - An admission error is never an instruction to retry (§5.4, §5.7).
 
+Draft v7 was corrected the same day after Codex reviewed it (call 0003, turn
+5, and its draft v2). No rule changed. Three statements did: a persistent
+admission error suspends automatic sending and does not claim that its cause
+can never change (§5.4, §5.7); an error code the client does not know is
+treated as persistent; and an intent's profile digest is compared with the
+profile of the generation the intent names, never with a later one (§5.5).
+
 These are two agents' design-review agreement and nothing more. None is
 operator-approved. Two questions in Codex's draft are the operator's and have
 not been put to them: who vouches for a new member's starting state, and
@@ -80,7 +87,7 @@ from them.
 | Line confidentiality policy | **Decided by the operator, 2026-11-23:** 3A — everyone enrolled on the line can read everything on it. 3B is out of scope and not drafted. |
 | History for a newly enrolled account | **Decided by the operator, 2026-11-23: none.** A new account reads only what is written after it joins; the operator arranges a briefing for the new agent. The stated reason is practical — history gets long on multi-month projects — not confidentiality. `history_grant` is therefore removed from phase 1 (§6.3). |
 | Reference checker | **Operator go-ahead, 2026-11-23,** for a small Go implementation of the rule-checking core only: no crypto, no network, no relay. Later the same day the operator also approved an in-memory model of the relay-side bookkeeping (retries, expiry, clock handling), under the same limits, so that the scenario traces can run. A third go-ahead the same day covers a model of the agent's own machine and of register publication (§14.4). All of it lives in `ldrcore/`, and draft v7's rules are in it (§14.5). Results are in §14. Recovery is not modelled. |
-| Enrollment, control bootstrap and envelope | Codex's draft v1 is a proposal under cross-review. The rules in this document that follow it carry design-review agreement only. Two points in it are the operator's to accept and have not been put to them (§13, O25 and O26). |
+| Enrollment, control bootstrap and envelope | Codex's draft (v2 as of 2026-11-23) is a proposal under cross-review. The rules in this document that follow it carry design-review agreement only. Two points in it are the operator's to accept and have not been put to them (§13, O25 and O26). |
 | What those decisions are not | They are scope and policy choices. They do not approve a cipher, an enrollment ceremony, a deployment, or implementation. |
 | Sequencer deployment (Durable Object, Go relay, other) | Open. This draft must not depend on it. |
 | Time anchors (§4.2) | Supported by Codex as the preferred proposal, with corrections folded in. Not operator-approved. |
@@ -139,7 +146,8 @@ Processing is staged, and the stages stay separate in the specification and
 in any implementation:
 
 1. Bounded decode. Refuse bad framing, unknown versions, a profile digest
-   that is not the generation's, unsupported fields and scopes, and
+   that is not that of the generation the intent names, unsupported fields
+   and scopes, and
    transport envelopes over the size bound. Bound every
    allocation before processing. No application compression in the first
    profile. These are admission errors (§5.4): the input is refused and
@@ -367,7 +375,7 @@ Every `actor`, `credential`, `operator` and `root` intent signs, at minimum:
 | Field | Purpose |
 | --- | --- |
 | `version` | Protocol version; unknown is rejected, never downgraded |
-| `profile` | Digest of the generation's profile (§4.4). An intent that names another is refused before admission, like an unknown version |
+| `profile` | Digest of the profile of the generation the intent names (§4.4). An intent that states another is refused before admission, like an unknown version. The comparison is with that generation's profile, never with a later generation's (§5.5) |
 | `line_id`, `generation` | No cross-line or cross-generation replay |
 | `origin`, signing principal | Who signs, tagged by role: a credential (its `cred_id`), an operator key, or the root key. Actor and credential origins both sign as the credential |
 | `actor_id`, `binding_gen` | Actor on whose behalf the credential signs (`actor` origin only) |
@@ -435,16 +443,19 @@ unresolved. They are of two kinds, and neither closes an intent:
 
 - *Transient:* overload, rate limit, exhausted rejection quota, clock
   uncertainty, network failure. The same bytes may be sent again. Whether and
-  how often is client policy. An admission error is never an instruction to
-  retry.
-- *Persistent:* the relay refuses these bytes or this signer, and sending the
-  same bytes again cannot change that: bad framing, an unknown version, a
-  profile digest that is not the generation's, an unsupported field, an
-  oversized transport envelope, a bad signature, a signer the relay has no
-  record of (a credential never enrolled, an operator key never authorized),
-  a requester not entitled to ask. The client does not send again. This is
-  still not evidence that nothing committed, so the action is marked
-  reconciliation-required (§5.7).
+  how often is client policy, and that policy is bounded: an admission error
+  is never an instruction to retry, and never a reason to retry without end.
+- *Persistent:* the relay refuses these bytes or this signer for a reason
+  that waiting does not remove: bad framing, an unknown version, a profile
+  digest that is not that of the generation the intent names, an unsupported
+  field, an oversized transport envelope, a bad signature, a signer the relay
+  has no record of (a credential never enrolled, an operator key never
+  authorized), a requester not entitled to ask. An error code the client does
+  not know is treated the same way. "Persistent" means that the client stops
+  sending on its own until someone has diagnosed the cause. It does not mean
+  the cause can never change: a wrong endpoint can be corrected, a missing
+  line provisioned, an unknown key enrolled. None of that shows what became
+  of the operation, so the action is marked reconciliation-required (§5.7).
 
 A rate-limit response never implies non-commit; admission and outcome
 decisions for one operation identity are serialized.
@@ -512,8 +523,19 @@ verification, and authorization of the requester to learn this outcome. A
 resubmission may carry the signed envelope without its payload bytes: the
 lookup below comes before any check of them, and a hit returns the recorded
 outcome. Only on a miss must the payload be complete, before step 7 (Codex's
-draft, P5). Then, with every lookup keyed by the full operation identity of
-§5.1:
+draft, P5).
+
+The profile digest is part of that decode, and it is compared with the
+profile of the generation the intent names. An intent of an earlier
+generation is never refused because its profile is not the current one: that
+would hide the receipts of step 3. Either the relay keeps, with the history
+it retains from a generation, what it needs to verify that generation's
+intents, or the outcome is learned by a query that an authorized principal
+signs under the current profile. Which of the two applies belongs to the
+recovery design and the wire profile, both Codex's. Neither is modelled, and
+no vector covers it.
+
+Then, with every lookup keyed by the full operation identity of §5.1:
 
 1. Hot index hit, same digest → the original outcome.
 2. Hot index hit, different digest → `duplicate_mismatch`; the original stands.
@@ -634,14 +656,20 @@ recognize them as one intention.
    `op_id`. Nothing is reissued automatically.
 5. `history_unavailable`, `revoked` and `abandoned(generation)` do not close
    it. Nor does a persistent admission error (§5.4), such as an unknown
-   signer. The action is marked reconciliation-required and shown to the
-   caller. It is never resubmitted, and the refusal is never treated as
-   grounds to repeat the action.
+   signer or an error code the client does not know. The client stops
+   sending on its own, marks the action reconciliation-required and shows it
+   to the caller. The slot stays occupied. The refusal is never grounds to
+   free the slot, repeat the action, sign again or choose a new anchor. A
+   signed query may still settle the intent, with an outcome or a definitive
+   refusal. Sending the stored bytes again once someone has corrected the
+   cause would need a client policy of its own; this draft states none, and
+   the model never resumes.
 6. A completed result is stored and surfaced to the action that caused it.
 7. A transient admission error leaves the intent stored and unresolved. The
-   client may send the same bytes again and stops when its own policy says
-   so. Stopping settles nothing: the intent still needs an outcome, a
-   definitive refusal or reconciliation before its slot is free.
+   client may send the same bytes again, a bounded number of times, and stops
+   when its own policy says so. Stopping settles nothing: the intent still
+   needs an outcome, a definitive refusal or reconciliation before its slot
+   is free.
 
 ### 5.8 Rejection precedence
 
@@ -769,7 +797,11 @@ alone, which is why a revoked credential keeps its entry and a revoked
 operator key leaves a tombstone. "A key" here means an algorithm identifier
 together with that algorithm's one accepted public encoding, so that an alias
 or a second encoding of the same key cannot slip past the reservation; the
-encoding is Codex's to specify.
+encoding is Codex's to specify. The principal that names an operator key or
+the root key is that same value with its role tag, and not a separate
+identifier or a digest; the reservation is over the value without the tag
+(Codex's draft v2, §2). The reservation is of encodings. It cannot tell that
+two public keys under different algorithms were derived from one secret.
 
 **Namespace capacity.** In phase 1 a namespace has exactly one declaration
 owner: it is granted to one credential at enrollment and a `namespace_id` is
@@ -1293,8 +1325,8 @@ one:
 | O21 | Default-audience broadcast: should the sequencer verify the list equals the default audience? | Yes: exact set equality at the named revision (§8). Codex's verdict; implemented | Agreed |
 | O22 | Operator key lifecycle | Draft v7, following Codex's P8: a revoked operator key leaves a tombstone, is never authorized again, and is told `revoked` once it has shown possession; a key never authorized gets an admission error (§5.4, §6.2) | Agreed in design review; not operator-approved |
 | O23 | Sequence numbering across generations | Whether `seq` restarts in a new generation is undecided; §5.9 depends on the answer | Open, Codex, with recovery |
-| O24 | Questions this document leaves to the enrollment, control-bootstrap and envelope design | Listed in Appendix A.7 as Q1 to Q16. Where each stands after Codex's draft v1 is in A.8. The four that were gaps in this document's own text or vectors (Q2, Q10, Q11, Q16) are closed in draft v7 | Partly closed; see A.8 |
-| O25 | Who vouches for a new member's starting state | Codex's draft v1 (P4) proposes that the enrolling operator's device attests the complete control state at the enrollment's commit, and that the joiner verifies every record after it. That trusts the operator's verified store and signing path for everything before the join. The alternative is to replay every control record from genesis, which needs no such trust and grows with the line's age. Neither changes a rule in this document | Open: operator, not yet asked |
+| O24 | Questions this document leaves to the enrollment, control-bootstrap and envelope design | Listed in Appendix A.7 as Q1 to Q16. Where each stands after Codex's drafts v1 and v2 is in A.8. The four that were gaps in this document's own text or vectors (Q2, Q10, Q11, Q16) are closed in draft v7 | Partly closed; see A.8 |
+| O25 | Who vouches for a new member's starting state | Codex's draft (P4) proposes that the enrolling operator's device attests the complete control state at the enrollment's commit, and that the joiner verifies every record after it. That trusts the operator's verified store and signing path for everything before the join. If the records the joiner verifies revoke that operator's key before the joiner has accepted its starting state, the joiner stops, and a currently authorized operator must attest afresh for the same credential; that is not a second enrollment (draft v2, §4.2). The alternative is to replay every control record from genesis, which needs no such trust and grows with the line's age. Neither changes a rule in this document | Open: operator, not yet asked |
 | O26 | Whether the root key can sign inside a validity window | §4.4 gives root records ordinary validity, 10 minutes at most on the provisional numbers. Whether a protected or offline root key can catch up and sign in that time is to be found by a dry run. If it cannot, root records need a validity rule this document does not have | Open: operator, not yet asked |
 | O19 | Retirement of operation identity | Anchor-scoped identity; an anchor's identity space retires at its `seq_time` plus a maximum validity that is fixed per generation (§5.6). The alternative is a permanent digest tombstone per rejected operation | Accepted by Codex at design-review level, with two constraints that are folded in |
 
@@ -1630,9 +1662,15 @@ Measured on 2026-11-23, after the change:
   changed no longer exists. Both have successors among the 57, and both
   successors are caught.
 - `go vet` and `go test -race` pass for the package.
-- **No probe by Codex yet, of this change or of the client and register
-  models.** Each time before, such a probe found defects after every check
-  above was green.
+- **Codex made a bounded check of this change** (call 0003, turn 5). It ran
+  five of the tests, and an independent probe through the exported interface
+  of six rules: the root key's reservation, one key in both enrollment roles,
+  the stated derivation mismatch, both keys still reserved after a
+  revocation, no second authorization of an operator key, and the answer to
+  a second revocation. All passed. Its review changed three statements and
+  no rule; they are listed at the top of this document.
+- **The client and register models have had no probe by Codex.** Each time
+  before, such a probe found defects after every check above was green.
 
 Rules this change forced that had not been stated, each needing review:
 
@@ -1652,7 +1690,8 @@ Rules this change forced that had not been stated, each needing review:
   so a new owner that has not activated still hears "no activation".
 - Which admission errors are transient is a short list in the model:
   overload, exhausted quota, uncertain clock. Everything else is persistent,
-  including "no line here" and "another line".
+  including "no line here", "another line" and any code the model does not
+  know.
 
 ### 14.6 Index of intent
 
@@ -1893,7 +1932,7 @@ tombstones of E2 must survive it (§3, §6.2).
 
 ### A.8 Where each question stands
 
-As of 2026-11-23, after Codex's draft v1
+As of 2026-11-23, after Codex's drafts v1 and v2
 ([LDR-ENROLLMENT-BOOTSTRAP-ENVELOPE.md](LDR-ENROLLMENT-BOOTSTRAP-ENVELOPE.md),
 proposals P1 to P9) and the cross-review on call 0003. "Agreed" is
 design-review agreement between two agents. Nothing in this table is operator
@@ -1905,13 +1944,13 @@ approval, and no row rests on a cryptographic test.
 | Q2 | Closed in this document: the profile is committed in `line_init`, and its digest is signed in every intent (P1). | §4.4, §5.1 |
 | Q3 | **Open, the operator's (O26).** Root records keep ordinary validity. Whether a protected or offline root key can sign in time needs a dry run. | §4.4, §13 |
 | Q4 | Agreed: operator-key tombstones, no re-authorization, `revoked` only after possession is shown (P8). | §5.4, §6.2 |
-| Q5 | **Open, the operator's (O25).** Codex proposes a complete-state attestation by the enrolling operator's device, with root- and operator-signed authority evidence, and a verified suffix (P4). The signed envelopes show signed intent; they do not show commit, completeness or currency. The attestation is a trust exception in favour of that operator's verified store, not a re-derivation from the root, and a compromised or rolled-back attesting device remains a limitation. Replay from genesis is the alternative. Codex withdrew an earlier relay-attested variant after this review found that it let a relay invent a line for a joiner. | Codex's draft §4; §13 |
+| Q5 | **Open, the operator's (O25).** Codex proposes a complete-state attestation by the enrolling operator's device, with root- and operator-signed authority evidence, and a verified suffix (P4). The signed envelopes show signed intent; they do not show commit, completeness or currency. The attestation is a trust exception in favour of that operator's verified store, not a re-derivation from the root, and a compromised or rolled-back attesting device remains a limitation. Replay from genesis is the alternative. Codex withdrew an earlier relay-attested variant after this review found that it let a relay invent a line for a joiner. Draft v2 adds the case this review raised: an attestation has no position in the log, so if the records the joiner verifies revoke the attesting operator before the joiner has accepted its state, the joiner stops and keeps the candidate state aside, and a currently authorized, independently pinned operator attests afresh for the same credential. That is not a second `credential_enroll`. A revocation the relay withholds is still not seen. | Codex's draft §4; §13 |
 | Q6 | Agreed: `cred_id` is derived from the two keys; neither key is replaced; each key is reserved for life across roles (P2). | §3, §6.1, §6.2 |
 | Q7 | Agreed: the operator's tooling checks possession; the sequencer has no rung for it (P3). | §6.2 |
 | Q8 | Agreed in direction: the join request binds the line, both keys, the grant and a request ID, and its digest is a visible field of the enrollment (P3). The ceremony itself is Codex's and is not reviewed here beyond that. | §6.2, §10 |
 | Q9 | Agreed: the digest covers the signed envelope including the signature, and the payload only through its commitment; a client never signs an intent twice (P5). | §5.1, §5.7 |
 | Q10 | Closed in this document: an absent required expectation is syntactic `invalid`. The encoding that tells absent from zero is Codex's (P6). | §5.8 |
-| Q11 | Closed in this document: the signer in an operation identity is the tagged signing principal. | §5.1 |
+| Q11 | Closed in this document: the signer in an operation identity is the tagged signing principal. For an operator key or the root, the principal names the key's own normalized value, not a separate identifier (Codex's draft v2, §2). | §5.1, §6.1 |
 | Q12 | Agreed, as a stated limit: the device that generates an epoch key holds it, so it must be an enrolled reader (P9). The relay cannot check that. | Codex's draft §6 |
 | Q13 | Open: waits on the chosen cipher suite and its framing overhead. | §10.1 |
 | Q14 | Agreed in direction: queries and anchor requests are bound to a fresh session challenge, not to an anchor or a validity, and answers are bound to their request (P7). The transport mechanism is not chosen. | Codex's draft §7 |

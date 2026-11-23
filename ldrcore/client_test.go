@@ -742,7 +742,7 @@ func TestOutboxDiscipline(t *testing.T) {
 		}
 	})
 
-	t.Run("an admission error that sending again cannot change stops the intent", func(t *testing.T) {
+	t.Run("an admission error that waiting does not remove suspends sending", func(t *testing.T) {
 		for code, relay := range map[string]*Sequencer{
 			"no_line":    NewSequencer("L", testProfile),
 			"wrong_line": NewSequencer("M", testProfile),
@@ -758,6 +758,32 @@ func TestOutboxDiscipline(t *testing.T) {
 			if _, err := ca.Compose("turn again", turn("a1", 2), Payload{}); !errors.Is(err, ErrSlotBusy) {
 				t.Fatalf("%s: the slot: %v, want ErrSlotBusy", code, err)
 			}
+			// The cause may be corrected, but nothing here sends on its own:
+			// offered the right relay, the client still does not send.
+			if a, _ := ca.Send(e.q, id, At(e.now)); a.Class != ClassAdmission || entry(ca, id).Sends != 1 {
+				t.Fatalf("%s: a suspended intent was sent again: %+v, sends %d", code, a, entry(ca, id).Sends)
+			}
+			// A query that finds no outcome settles nothing and frees nothing.
+			in := entry(ca, id).Intent
+			unknown := e.q.Query(signerOf(&in.Record), opKey(in), in.Digest, At(e.now))
+			if err := ca.Reconciled(id, unknown); err == nil || entry(ca, id).Status != OutReconcile {
+				t.Fatalf("%s: %s %s settled the intent: %+v", code, unknown.Class, unknown.Code, entry(ca, id))
+			}
+		}
+	})
+
+	t.Run("an admission code the client does not know suspends sending", func(t *testing.T) {
+		e, ca := setup(t)
+		id, _ := ca.Compose("turn", turn("a1", 2), Payload{})
+		ca.settle(ca.out.find(id), Answer{Class: ClassAdmission, Code: "a_code_from_a_later_relay"})
+		if o := entry(ca, id); o.Status != OutReconcile {
+			t.Fatalf("%+v, want reconciliation-required", o)
+		}
+		if _, err := ca.Compose("turn again", turn("a1", 2), Payload{}); !errors.Is(err, ErrSlotBusy) {
+			t.Fatalf("the slot: %v, want ErrSlotBusy", err)
+		}
+		if a, _ := ca.Send(e.q, id, At(e.now)); a.Code != "a_code_from_a_later_relay" || entry(ca, id).Sends != 0 {
+			t.Fatalf("a suspended intent was sent: %+v, sends %d", a, entry(ca, id).Sends)
 		}
 	})
 
