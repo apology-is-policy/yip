@@ -1,71 +1,139 @@
-# LDR hosting: a Durable Object, or a Go relay the operator runs
+# LDR hosting options
 
-**Status:** draft 1, 2026-11-23, written by Fable (Claude) for Codex's
-correction. The operator has not seen it. It compares, recommends nothing and
-decides nothing. No relay exists in either form, and nothing was run on
-Cloudflare.
+**Joint-review draft 2, 2026-11-23. No recommendation and no deployment
+approval.** The options are a Cloudflare Durable Object per line, or a Go
+relay on an operator-managed host. Neither relay exists yet. Platform facts
+below come from documentation; the implications are our design assessment.
 
-The **relay** is the server every machine on a line talks to. It puts records
-in one order and applies the rules of
-[LDR-STATE-MACHINE.md](LDR-STATE-MACHINE.md). Two ways to host it:
+Both must preserve signed control history, keep payload keys on client
+machines, and handle uncertain outcomes without repeating actions. Client key
+custody and local crash safety remain required either way. A relay cannot
+invent membership for a joining client: the proposed operator-attested
+bootstrap exception is a separate decision, not a hosting feature.
 
-- **Durable Object:** a program hosted by Cloudflare that has its own SQLite
-  database and runs on a single thread. One would be created per line.
-- **Go relay:** a Go program on a host the operator runs, storing the line on
-  that host's disk.
-
-They are compared against the state-machine document (§2 stage 6, §4.1, §5.4
-to §5.6, §10) and the eight boundaries in §8 of Codex's
-LDR-ENROLLMENT-BOOTSTRAP-ENVELOPE.md.
-
-## The same under either choice
-
-- **Trust.** The relay is trusted for one order and for current
-  authorization. A compromised relay can withhold records or show two
-  histories. It holds ciphertext and the visible control fields, and never a
-  payload key.
-- **The agents' machines.** Key custody and the client's own atomic storage,
-  two of the eight boundaries, do not depend on hosting.
-- **Ciphers.** The relay decrypts nothing, so the payload cipher and key
-  wrapping are not hosting questions. The relay decodes strictly, verifies
-  signatures, hashes, and issues random challenges.
-- **Sizes.** The proposed bound of 512 KiB for a record is far below both
-  platforms' request limits.
-- **Provisioning and snapshots.** Installing a line's creation descriptor
-  takes administrator access in both: to the Cloudflare account, or to the
-  host. Serving a new member's snapshot in bounded chunks met no obstacle in
-  either, and is unbuilt in both.
-- **Moving later.** Moving a line to another relay has no procedure yet
-  (Codex's draft, §2.1), so the first choice is not cheaply undone.
-
-## Where they differ
-
-| The design needs | Durable Object | Go relay |
+| Decision area | Cloudflare Durable Object | Operator-hosted Go relay |
 | --- | --- | --- |
-| **One atomic step.** Record, sidecars, state, outcome and time floor are saved together, and nothing is answered before that is durable (§2). | Provided, according to the documentation: SQL calls are synchronous, writes with no `await` between them commit as one transaction, and replies are held until the write is confirmed [S, R, ST]. Requests can interleave at an `await` [R], and signature verification is asynchronous, so the step that evaluates and writes must contain no `await`. We cannot crash Cloudflare's machine to test any of this. | Not provided. The repository uses only Go's standard library, which has no transactional store. Either write an append-only store with `fsync` and show how it behaves in a crash, or take the first outside dependency. Killing the process at each step can be tested. The line is on one disk unless copies are added. |
-| **Clock.** A stated source, detection of jumps and freezes, a saved floor, and suspension while the clock is uncertain (§4.1). | `Date.now()` is the time of the last I/O, and "No other timers are provided" [SM, PF]. One reading per request is enough to stamp a record. Its source, accuracy and monotonicity are not documented, and there is no second clock to compare it with, so the only detectable fault is a reading below the saved floor. Local development behaves differently [PF]. | The operating system gives a wall clock and a separate monotonic clock [Go `time`], which can be compared within one run of the process. Across a restart only the saved floor remains. The operator configures and monitors time synchronization. |
-| **Restore and outside edits.** Restoring an old database is not recovery; revocations and used identifiers must survive it. Neither platform prevents a rollback. The defence is the clients' checkpoints and evidence kept outside the relay's store, and where that evidence lives is not designed. | Code in the object can restore its database to any point in the past 30 days [S]; whether the dashboard or the API can is not documented. An account member with Editor access can read and write the object's SQL data from the dashboard, and each query is audit-logged [DS]. Cloudflare manages the storage encryption keys [SEC]. | Anyone who can write to the host's disk can edit or replace the store, and so can the host's provider if the host is rented. There is no audit log unless one is built. |
-| **Sessions.** TLS to a pinned relay, then a signed fresh challenge bound to the connection by a standard mechanism (Codex's draft, §7). | Cloudflare terminates TLS, and "the Workers runtime never sees TLS keys" [SM]. The TLS fields a request exposes are the cipher, the version, client-certificate details and values from the client's hello [RQ]. None is exported keying material, so binding a session to the connection is not established. Client certificates work on all plans, 100 active per zone [MT, CC]. | The relay holds its own TLS key, so clients can pin that key. `crypto/tls` gives exported keying material (RFC 5705) for binding a session to the connection, and supports client certificates. The operator issues, protects and renews the key, and makes the host reachable from every machine. |
-| **One set of rules.** Relay and clients must reach the same outcome for every record and accept exactly the same signatures (§2; Codex's draft, §5.2). | First-class languages are JavaScript, TypeScript, Python and Rust; Go runs only as WebAssembly [LG, WA]. Either rewrite the rules and the strict decoder in TypeScript and verify with the platform's Ed25519 [WC], which makes a second implementation and a second signature library, held to the first by test vectors. Or compile the Go code to WebAssembly: a stand-in program builds to 3.4 MB, against a 64 MiB limit [WL], but it has not been run there. | Runs `ldrcore` and the client's own `crypto/ed25519`: one implementation of the rules and one signature library. |
-| **Storage growth.** The log is kept, not cached (§5.6), and ciphertext is stored with its record. The design does not yet say what a full line does. | 10 GB per object on the paid plan, 1 GB on the free plan; when full, writes fail and reads continue [L]. With one object per line that is about 19,000 records of the largest proposed size, or about 2.4 million of 4 KiB (my arithmetic, ignoring indexes). | The disk the operator provides. |
-| **Running it.** | No server to run. A free plan with daily limits, or a paid plan from $5 a month [P, WP]. Updates restart the object and drop connections, with no shutdown hook [LC]. Data can be confined to `eu`, `us` or `fedramp` [DL]. Request logging is on by default for a new Worker and records each request's method and URL [WLG]. No availability commitment naming Durable Objects was found. Cloudflare sees what the relay sees. | The operator runs a host: supervision, updates, backups, time synchronization, a TLS key. The cost is the host, not priced here. When that host is down, nobody can write to the line. Its provider, if there is one, sees what the relay sees. |
+| **Rules and verification** | A TypeScript port duplicates the Go rules; Go/Wasm is possible but integration remains untested. [Runtime options](https://developers.cloudflare.com/workers/languages/) | Can reuse the Go core directly. Production decoding, signatures and storage integration still need verification. |
+| **Durable commit** | SQLite storage supplies transactions, including synchronous rollback on callback failure. The complete LDR record/state/outcome/floor update still needs implementation and fault tests. [Storage](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#transactionsync) | Storage and durability design remain to be selected: database or explicit log. Host control helps testing; process-kill tests alone do not prove power-loss safety. |
+| **Authenticated sessions** | Inbound TLS terminates outside Workers; exporter access is not established by the documented API. [TLS boundary](https://developers.cloudflare.com/workers/reference/security-model/) | TLS exporters are available when Go terminates the client connection itself. A proxy can change that boundary. [TLS API](https://pkg.go.dev/crypto/tls#ConnectionState.ExportKeyingMaterial) |
+| **Trustworthy time** | Timers advance with I/O. Expiry sampling, fault detection and monitoring need a deployment contract. [Timers](https://developers.cloudflare.com/workers/runtime-apis/performance/) | Wall and process-local monotonic readings help detection, but restart validation and monitoring remain necessary. [Clocks](https://pkg.go.dev/time#hdr-Monotonic_Clocks) |
+| **Growth** | Documented SQLite limits are 10 GB per object on paid plans and 1 GB on free; a full object rejects writes. [Limits](https://developers.cloudflare.com/durable-objects/platform/limits/) | Capacity follows the chosen storage/host. Retention, disk-full behavior and migration still need policy. |
+| **Who holds the data** | Cloudflare stores the ciphertext and sees sizes, timing and who talks to whom. An account member with Editor access can read and edit an object's SQL data from the dashboard; queries are audit-logged. [Data Studio](https://developers.cloudflare.com/durable-objects/observability/data-studio/) | Whoever controls the host can read and edit the store and sees the same metadata; so can its provider if the host is rented. Any audit trail has to be built. |
+| **Operations and recovery** | Provider operates the infrastructure; we still manage code, account access, provisioning, monitoring and restore policy. | We also operate host supervision, updates, reachability, TLS and backups. Neither option yet preserves security history across rollback by a specified recovery procedure. |
+
+The session-binding mechanism is still open; an application challenge is not
+automatically equivalent to TLS exporter binding. Hosting also affects
+signature-library compatibility, provisioning and snapshot capture/retention,
+although payload encryption and key wrapping stay on clients. Snapshot and
+clock correctness are unproven on both platforms.
+
+**Decisions still separate from hosting:** O25 asks whether new members may
+trust a pinned operator's checkpoint instead of replaying the complete prefix.
+O26 asks whether the protected root-signing ceremony is practical within the
+ordinary validity window. Neither is settled.
+
+Before selecting a deployment, identify its store, session binding, clock
+contract, bounded snapshot path and recovery-evidence retention. Compare
+costs against an expected workload and operator maintenance capacity; no
+cost winner is established.
+
+---
+
+Everything below is background for checking a row. It is not part of the one
+page.
+
+## How this page was made
+
+Fable wrote draft 1. Codex reviewed it against the primary documentation
+(call 0003, turn 7; its review note is `LDR-HOSTING-REVIEW.md` in Codex's
+files) and supplied the page above as replacement text. The row "Who holds
+the data" was added by Fable afterwards. Draft 1 made claims that the review
+removed: that one clock reading per request is enough, that a reading below
+the saved floor is the only detectable clock fault, that serving a snapshot
+met no obstacle, and that a standard-library-only repository forces a
+hand-written store.
+
+## Background notes
+
+Facts are from the documentation listed under Evidence unless marked. Nothing
+was run on Cloudflare.
+
+**Rules and verification.** Workers gives first-class support to JavaScript,
+TypeScript, Python and Rust. Go is reached through WebAssembly; WASI support
+is experimental and threads are not possible [LG, WA]. A Worker may be 64 MiB
+and must start within 1 second [WL]. Web Crypto there lists Ed25519
+verification and SHA-256 [WC]; Ed25519 is a candidate, not a chosen
+algorithm. A stand-in Go program with JSON, SHA-256 and Ed25519 built to 3.4
+MB of WebAssembly (measured locally). That says nothing about start-up,
+memory, CPU limits or a real relay. Reusing the Go core removes one source of
+divergence and not decoder, version or storage-integration bugs. Negative
+signature and encoding vectors across runtimes are needed either way.
+
+**Durable commit.** On a Durable Object, SQL calls are synchronous, writes
+with no `await` between them are one implicit transaction, `transactionSync`
+rolls back when its callback throws, replies are held until a write is
+confirmed, and a failed write resets the object [S, R, ST]. Requests can
+interleave at an `await` [R]. The candidate strategy is Codex's: verify the
+immutable bytes first; then, inside one synchronous transaction, check
+authorization, duplicates and state again and write the whole update; throw
+on failure; update in-memory caches only after success. A rollback does not
+restore JavaScript memory. For the Go relay no store is chosen. The
+repository has no dependencies today (`go.mod`), so a database would be its
+first; an explicit log is the other option.
+
+**Authenticated sessions.** "The Workers runtime never sees TLS keys" [SM].
+The TLS fields a request exposes are the cipher, the version,
+client-certificate details and values from the client's hello [RQ]. Client
+certificates are available on all plans with a Cloudflare-managed authority,
+100 active per zone [MT, CC]. Go's exporter needs TLS 1.3 or Extended Master
+Secret (`go doc crypto/tls`), and RFC 9266 defines the TLS 1.3 binding. No
+binding mechanism has been selected, so this is a difference in what is
+available and not a pass or a fail.
+
+**Trustworthy time.** `Date.now()` "returns the time of the last I/O", and
+"No other timers are provided" [SM, PF]. Its source, accuracy and
+monotonicity are not documented. Local development behaves differently [PF].
+Go's monotonic reading has no meaning outside the process and may stop while
+the machine sleeps (`go doc time`).
+
+**Growth.** When a Durable Object is full, writes fail and reads continue; a
+row or value may be 8 MB [L]. At the proposed record bound of 512 KiB, 10 GB
+is about 19,000 records of the largest size or about 2.4 million of 4 KiB
+(Fable's arithmetic, ignoring indexes). The design does not yet say what a
+full line does.
+
+**Who holds the data.** Data Studio needs "at least `Editor` access to the
+Worker" and logs each query [DS]. Stored data is encrypted at rest with keys
+Cloudflare manages [SEC].
+
+**Operations and recovery.** Durable Objects are available on the free plan
+with daily limits (100,000 requests a day) and on the paid plan from $5 a
+month [P, WP]. Code and runtime updates restart an object and drop its
+connections, with no shutdown hook [LC]. Data can be confined to `eu`, `us`
+or `fedramp` [DL]. Request logging is on by default for a new Worker and
+records each request's method and URL [WLG]. Code in an object can restore
+its database to any point in the past 30 days; whether anything outside the
+object can is not documented, and local development cannot test it [S]. No
+availability commitment naming Durable Objects was found.
 
 ## Not established
 
 - **Durable Object:** whether its clock is monotonic, and where it comes
   from; whether a restore can be started from outside the object's code;
-  whether writes made before an uncaught exception are kept; whether Go
-  compiled to WebAssembly starts within the 1-second limit [WL] and runs
-  correctly; whether the platform's Ed25519 and Go's accept exactly the same
-  signatures; whether a session can be bound to the TLS connection.
+  whether Go compiled to WebAssembly starts within the limit and runs
+  correctly; whether the platform's signature verification and Go's accept
+  exactly the same signatures; whether a session can be bound to the TLS
+  connection.
 - **Go relay:** which store, and how it behaves in a crash or a power loss;
   which host, what it costs and how the machines reach it; how a failure of
   time synchronization is noticed.
-- **Both:** where security evidence is kept outside the relay; what a full
+- **Both:** the session-binding mechanism; how a snapshot is captured, kept
+  and served; where security evidence is kept outside the relay; what a full
   line does; how a line moves to another relay.
 
-Settling any of these takes an experiment or a design step outside what the
-operator has approved so far, which is the `ldrcore` reference models only.
+Reading documentation and reviewing designs continues within the agents'
+work. Running anything on Cloudflare, and any network or cryptographic
+implementation, is outside what the operator has approved so far.
 
 ## Evidence
 
@@ -95,6 +163,4 @@ WLG `/workers/observability/logs/workers-logs/` (2026-11-18) ·
 CC `/ssl/client-certificates/` (2026-10-12) ·
 MT `/api-shield/security/mtls/` (2026-05-06)
 
-Go: `go doc time` and `go doc crypto/tls`, Go 1.25.3. The 3.4 MB figure is a
-stand-in program with JSON, SHA-256 and Ed25519 verification, built for
-WebAssembly with the standard Go toolchain on 2026-11-23.
+Go: `go doc time` and `go doc crypto/tls`, Go 1.25.3.
