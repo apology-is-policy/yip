@@ -66,6 +66,14 @@ can never change (§5.4, §5.7); an error code the client does not know is
 treated as persistent; and an intent's profile digest is compared with the
 profile of the generation the intent names, never with a later one (§5.5).
 
+A second correction the same day followed Codex's independent probe of the
+client model (call 0003, turn 11), which found two defects in the model and
+proposed one rule. The rule is new: a key that is revoked signs and submits
+nothing more (§5.7 rule 8). §5.7 rule 5 and §11.3 now say what the model got
+wrong: an answer obtained by another principal settles an intent as the
+client's own would, and a queued notice is checked against verified state
+again when it is handed over (§14.4).
+
 These are two agents' design-review agreement and nothing more. None is
 operator-approved. Two questions in Codex's draft are the operator's: who
 vouches for a new member's starting state, and whether the root key can sign
@@ -665,15 +673,37 @@ recognize them as one intention.
    to the caller. The slot stays occupied. The refusal is never grounds to
    free the slot, repeat the action, sign again or choose a new anchor. A
    signed query may still settle the intent, with an outcome or a definitive
-   refusal. Sending the stored bytes again once someone has corrected the
-   cause would need a client policy of its own; this draft states none, and
-   the model never resumes.
+   refusal. Whoever signed the query, the answer settles the intent exactly
+   as the client's own would: a refusal that names a stale checkpoint brings
+   rule 3 into force for every other stored intent. Sending the stored bytes
+   again once someone has corrected the cause would need a client policy of
+   its own; this draft states none, and the model never resumes.
 6. A completed result is stored and surfaced to the action that caused it.
 7. A transient admission error leaves the intent stored and unresolved. The
    client may send the same bytes again, a bounded number of times, and stops
    when its own policy says so. Stopping settles nothing: the intent still
    needs an outcome, a definitive refusal or reconciliation before its slot
    is free.
+8. A key that is revoked signs and submits nothing more. The client stops a
+   key when it accepts an authenticated `revoked` answer about that key, to
+   a submission or to a query, and when it verifies the revocation in the
+   records. For a credential the stop covers its own records and those of
+   every actor bound to it. For an operator key it covers that key. Every
+   unsettled intent the key signed keeps its slot and is marked
+   reconciliation-required, one that was never sent included. None is sent
+   again, none is signed again under another key, and none is taken not to
+   have committed. A principal that is still authorized may settle them by
+   query (§5.5). The stop is not a suspected rollback, and other keys held
+   on the same device go on. Nothing in this draft lifts a stop.
+
+Rule 8 is Codex's proposal (call 0003, turn 11). Before it this document had
+no rule, and the model let a client that had been told `revoked` go on
+composing. It is design-review agreement between two agents and not operator
+approval. Two things it leaves open: what a client does if it is told
+`revoked` and the records it then verifies show no revocation, and whether a
+revoked key's anchor request should be told `revoked` too. The model's relay
+answers that request with an admission error that does not say why, so there
+the client learns nothing.
 
 ### 5.8 Rejection precedence
 
@@ -1245,6 +1275,27 @@ uses: it reconciles from retained source records and needs no dual-write
 transaction (delivery.go:79–82). Delivery IDs, attempts and acknowledgements
 stay local.
 
+What a record owes on a host is fixed by the record: one notice to each
+addressed actor that is live and bound to this host's credential in the state
+the record produced. It does not depend on how far the client had replayed
+before it scanned. A notice keeps the binding generation it was derived
+under.
+
+Being queued is not enough to be delivered. A notice is handed to a runtime
+only while verified state still shows its actor live, on this credential, at
+that binding generation. Otherwise it is withheld: it stays in the queue with
+its attempts, and it is not recorded as acknowledged. So a move carries
+neither notices nor acknowledgements to another host. The new host owes
+notices only for records committed after the move, and an actor that is moved
+away and back does not get the notices of its earlier binding. What an actor
+has not read is a separate question, answered from verified state and a local
+cursor, not from notices.
+
+A notice is a local prompt. It grants nothing, and withholding one takes
+nothing back: what a removed or moved actor's runtime already received, it
+received. This paragraph and the two before it follow Codex's finding C2
+(§14.4) and are the model's choice, not a decision anyone has approved.
+
 ### 11.4 Local-only state
 
 **Unchanged and never sent:** session and binding records (bind.go), delivery
@@ -1593,18 +1644,59 @@ Measured on 2026-11-23:
   `registers_test.go`, the 4 were rewritten, and 4 breaks were added for the
   model change below. The set of 130 was run again: 126 caught. One more
   test was then written for an unreadable view and checked on its own
-  against its break, without a third full run. Three breaks remain uncaught,
-  and none is a rule a test can reach: a second disagreement after a rebuild
-  cannot happen in this model, because a rebuild starts from no files;
-  clearing an injected fault on restart belongs to the test harness; and the
-  register model's "revoked credential" test of history is implied by the
-  others, since revocation disables the credential's actors.
+  against its break, without a third full run. Three breaks remain uncaught.
+  Codex checked the three and worded them more carefully than the author
+  had. A second disagreement after a rebuild cannot happen under this
+  model's premise that a rebuild starts from no files; that is a limit of
+  the model, not tested handling of a corrupt directory. Clearing an
+  injected fault on restart is harness behaviour and is left out of the
+  count; it is not strictly equivalent, since removing it can change which
+  later injected crash fires. The register model's "revoked credential" test
+  of history is redundant on the states the current rules can reach, since
+  revocation disables the credential's actors; that says nothing about
+  malformed fixtures or about recovery, which is not designed.
 - **One model change came out of it.** Resolving stored intents after a
   restart now asks about those awaiting reconciliation as well as the
   pending ones, which is §5.7 rule 3 read literally. Before, the restart
   demanded a resolve that did nothing for them.
-- **No probe by Codex yet.** Both earlier models looked finished at this
-  stage and were not.
+
+**Codex's probe found two defects the author's tests and the mutation check
+had both missed** (call 0003, turn 11; five independent probes, three
+failing, for two findings):
+
+- **C1. An answer obtained by another principal settled an intent without
+  the stale-checkpoint guard.** `Reconciled` repeated the settlement code
+  and left out the step that forces a resolve. With a second intent stored
+  and never asked about, an `expired` obtained by an authorized query closed
+  the first, and the client then composed. It now settles through the one
+  path the client's own answers use (§5.7 rule 5).
+- **C2. Whether a notice may be delivered was decided when it was queued and
+  never again.** A notice queued for an actor was still handed to its
+  runtime after the actor had been removed, or moved to another credential.
+  What was queued also depended on how far the client had replayed before
+  it scanned. Both are changed: what a record owes is fixed when the record
+  is stored, and delivery checks verified state again at handoff, binding
+  generation included (§11.3).
+- **A rule the document did not have,** proposed by Codex: a key that is
+  revoked signs and submits nothing more (§5.7 rule 8).
+
+Measured after the changes, on 2026-11-23:
+
+- Codex's five probes pass against the changed model. They are its file,
+  run here through a build overlay and not copied into the package.
+- The author's tests for the three are in `client_probe_test.go`.
+- A break check of the new code only: 27 hand-chosen breaks. On the first
+  run 23 were caught, 2 were not, and 2 did not compile. One of the 2 was a
+  gap: no test checked that the record opening a call notifies the other
+  participant. A test was added and the 2 were rewritten. On the second run
+  26 were caught. The one left drops the comparison of credentials at
+  handoff; it changes nothing, because every move raises the binding
+  generation. The comparison stays, as the plain statement of ownership.
+- `gofmt` and `go vet` are clean, and `go test -race` passes for the
+  package.
+- As before, code, tests and breaks have one author, and a count of breaks
+  caught is not a measure of rules covered. Codex has not yet seen these
+  changes.
 
 Rules the models forced that this document had not stated, each needing
 review:
@@ -1632,16 +1724,18 @@ review:
 - Within one activation a register value must carry a higher counter than
   the cached one. A value naming a writer revision that does not exist yet is
   refused as having no activation.
-- Only `history_unavailable` raises the suspicion of a rollback. This
-  document does not say what a client that has been told `revoked` may still
-  compose before it has replayed its own revocation, and the model lets it.
-  That needs a rule.
+- Only `history_unavailable` raises the suspicion of a rollback. A client
+  that has been told `revoked` is not suspected of anything, but its key
+  stops (§5.7 rule 8). Until Codex proposed that rule the model let such a
+  client compose.
 - A view file that carries a higher sequence number than the store would
   give it, but not one beyond the checkpoint, is left in place by projection
   and refused when it is read.
-- A sender is not notified of its own record, an actor that is no longer
-  live is not notified, and an operator's record on a call notifies both
-  participants.
+- A sender is not notified of its own record, and an operator's record on a
+  call notifies both participants. An actor that is not live in the state a
+  record produced is owed no notice for it, and one that stops being live
+  later has its queued notices withheld (§11.3). Codex accepts the first two
+  as local choices that change no authority and no committed audience.
 
 ### 14.5 Draft v7: the enrollment rules
 

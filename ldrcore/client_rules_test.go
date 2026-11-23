@@ -362,11 +362,11 @@ func TestOutboxRules(t *testing.T) {
 		e.commit(revoke("credA"))
 		a, _ := ca.Send(e.q, id, At(e.now))
 		e.want(a, ClassUnresolved, "revoked")
-		// This client has not yet replayed its own revocation. What it may
-		// compose is not the point; that it is not refused for a suspected
-		// rollback is.
-		if _, err := ca.Compose("activate", activate, Payload{}); errors.Is(err, ErrFailClosed) {
-			t.Fatalf("composing after revoked: %v", err)
+		// This client has not yet replayed its own revocation. Its key signs
+		// nothing more (client_probe_test.go), but that is the key stopping,
+		// not a suspected rollback.
+		if _, err := ca.Compose("activate", activate, Payload{}); !errors.Is(err, ErrKeyRevoked) || errors.Is(err, ErrFailClosed) {
+			t.Fatalf("composing after revoked: %v, want ErrKeyRevoked", err)
 		}
 	})
 

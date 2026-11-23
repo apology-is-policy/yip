@@ -3,6 +3,8 @@ package ldrcore
 import (
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 )
 
 // The outbox is the client discipline of spec section 5.7. It does not make a
@@ -28,12 +30,19 @@ import (
 //     operation: it is neither a reason to retry nor a non-commit. A query
 //     may still settle the intent. This model has no way to resume sending.
 //  6. The result is stored with the action that caused it.
+//  7. A key that is revoked signs and submits nothing more. The client learns
+//     that from an authenticated `revoked` answer, or by verifying the
+//     revocation itself. Every unsettled intent the key signed keeps its slot
+//     and awaits reconciliation by a principal that is still authorized. This
+//     is not a suspected rollback, and other keys the device holds go on.
+//     Proposed by Codex on call 0003; the spec had no rule.
 type outbox struct {
 	entries     []*OutboxEntry
 	slots       map[string]string // slot -> ID of the unsettled intent holding it
 	nextOp      int64             // op_ids are never reused
 	mustResolve bool
-	suspect     bool // history_unavailable was seen: rollback is suspected
+	suspect     bool            // history_unavailable was seen: rollback is suspected
+	stopped     map[string]bool // keys that sign and submit nothing more (rule 7)
 }
 
 // Outbox entry states.
@@ -77,7 +86,74 @@ var (
 	// ErrNoLine: nothing but line_init can be composed without a verified
 	// record to anchor on.
 	ErrNoLine = errors.New("ldrcore: no verified record to anchor on")
+	// ErrKeyRevoked: the key this record needs was told it is revoked, or the
+	// verified records revoke it. It is not ErrFailClosed: other keys on this
+	// device may still sign.
+	ErrKeyRevoked = errors.New("ldrcore: this key is revoked and signs nothing more")
 )
+
+// principalOf names the key a record of this origin would be signed with on
+// this device.
+func (c *Client) principalOf(origin string) string {
+	switch origin {
+	case OriginActor, OriginCredential:
+		return CredentialPrincipal(c.Cred)
+	case OriginOperator:
+		return OperatorPrincipal(c.OperatorKey)
+	case OriginRoot:
+		return Root
+	}
+	return ""
+}
+
+// signsNoMore reports whether principal p has stopped: it was told it is
+// revoked, or verified state shows its revocation.
+func (c *Client) signsNoMore(p string) bool {
+	if c.out.stopped[p] {
+		return true
+	}
+	l := &c.state.Line
+	switch {
+	case strings.HasPrefix(p, "cred:"):
+		cr := l.Credentials[strings.TrimPrefix(p, "cred:")]
+		return cr != nil && cr.Revoked
+	case strings.HasPrefix(p, "op:"):
+		return slices.Contains(l.Tombstones.OperatorKeys, strings.TrimPrefix(p, "op:"))
+	}
+	return false
+}
+
+// stop records that principal p signs and submits nothing more. Every intent
+// it signed that is still pending now awaits reconciliation: it cannot be
+// sent again under this key, and nothing here says whether it committed. Each
+// keeps its slot and the last answer it had. The model never lifts a stop.
+func (c *Client) stop(p string) {
+	c.out.stopped[p] = true
+	for _, e := range c.out.entries {
+		if e.Status == OutPending && signerOf(&e.Intent.Record) == p {
+			e.Status = OutReconcile
+		}
+	}
+}
+
+// stopRevoked stops each key of this device whose revocation is in verified
+// state. The root key is not among them: nothing in this design revokes it.
+func (c *Client) stopRevoked() {
+	for _, p := range c.Stopped() {
+		c.stop(p)
+	}
+}
+
+// Stopped returns the keys of this device that sign nothing more.
+func (c *Client) Stopped() []string {
+	var out []string
+	for _, p := range []string{CredentialPrincipal(c.Cred), OperatorPrincipal(c.OperatorKey)} {
+		if c.signsNoMore(p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 func (o *outbox) unsettled() int {
 	n := 0
@@ -181,6 +257,8 @@ func (c *Client) Compose(action string, r Record, p Payload) (string, error) {
 		return "", fmt.Errorf("%w: a rollback is suspected", ErrFailClosed)
 	case c.out.mustResolve:
 		return "", ErrMustResolve
+	case c.signsNoMore(c.principalOf(r.Origin)):
+		return "", ErrKeyRevoked
 	}
 	r = r.Clone()
 	who, err := c.acting(&r)
@@ -215,8 +293,10 @@ func (c *Client) Compose(action string, r Record, p Payload) (string, error) {
 	return id, nil
 }
 
-// Send transmits a stored intent, exactly as stored. A settled intent is not
-// sent: its stored result is returned.
+// Send transmits a stored intent, exactly as stored. An intent that is not
+// pending is not sent, and its stored result is returned: that covers a
+// settled intent, one awaiting reconciliation, and so every intent of a key
+// that has stopped.
 func (c *Client) Send(q *Sequencer, id string, clk Clock) (Answer, error) {
 	e := c.out.find(id)
 	if e == nil {
@@ -250,9 +330,15 @@ func (c *Client) settle(e *OutboxEntry, a Answer) {
 		}
 	case ClassUnresolved:
 		e.Status = OutReconcile
-		if a.Code == "history_unavailable" {
+		switch a.Code {
+		case "history_unavailable":
 			// The relay knows less history than this client has verified.
 			c.out.suspect = true
+		case "revoked":
+			// The key that signed this intent is revoked. That the answer is
+			// authenticated and is about this key is a premise here. It is no
+			// sign of a rollback, and it says nothing about what committed.
+			c.stop(signerOf(&e.Intent.Record))
 		}
 	case ClassMismatch:
 		// The relay holds other bytes under this identity. Nothing here can
@@ -306,7 +392,12 @@ func (c *Client) ResolveAll(q *Sequencer, clk Clock) {
 
 // Reconciled records the answer an authorized principal obtained for an
 // intent that needed reconciliation. Only a durable outcome or a definitive
-// refusal settles it.
+// refusal settles it, and it settles exactly as the client's own answer
+// would: a refusal that says the checkpoint was stale still forces every
+// other stored intent to be asked about before anything new is composed.
+//
+// That the answer is authenticated, and is about this operation and these
+// bytes, is a premise. An Answer carries neither.
 func (c *Client) Reconciled(id string, a Answer) error {
 	e := c.out.find(id)
 	switch {
@@ -315,12 +406,7 @@ func (c *Client) Reconciled(id string, a Answer) error {
 	case a.Class != ClassOutcome && a.Class != ClassRefusal:
 		return fmt.Errorf("ldrcore: %s does not settle an intent", a.Class)
 	}
-	e.Result = a
-	e.Status = OutClosed
-	if a.Class == ClassOutcome {
-		e.Status = OutDone
-	}
-	delete(c.out.slots, e.Slot)
+	c.settle(e, a)
 	return nil
 }
 
@@ -330,6 +416,11 @@ func (c *Client) ClearSuspicion() { c.out.suspect = false }
 
 // Anchor asks for a time anchor, then catches up to the head it was given and
 // verifies it durably, which is what must happen before signing on it.
+//
+// The request is made as the credential. The relay model refuses a revoked
+// requester with an admission error that does not say why, so a refused
+// request stops no key: a key learns it is revoked from the answer to a
+// submission or a query, or by verifying the revocation.
 func (c *Client) Anchor(q *Sequencer, clk Clock) error {
 	if _, _, _, a := q.AnchorRequest(CredentialPrincipal(c.Cred), clk); a.Class != "" {
 		return fmt.Errorf("ldrcore: anchor request refused: %s %s", a.Class, a.Code)

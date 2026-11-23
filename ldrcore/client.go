@@ -57,6 +57,7 @@ type Client struct {
 	touched   map[string]int64  // object -> the last record that changed it
 	source    map[string]int64  // record-derived file -> the record that defines it
 	viewOf    map[string]string // object-view file -> its object
+	owed      [][]Notice        // per record: the local notices it owes
 	halted    string            // set by a sequencer violation; the client fails closed
 
 	// The projection: rebuildable files that follow a separate cursor (spec
@@ -122,7 +123,7 @@ func NewClient(lineID, cred string, prof Profile) *Client {
 		seen:       map[string]int64{},
 		badWrap:    map[int64]bool{},
 		corruptKey: map[int64]bool{},
-		out:        outbox{slots: map[string]string{}},
+		out:        outbox{slots: map[string]string{}, stopped: map[string]bool{}},
 	}
 }
 
@@ -195,7 +196,11 @@ func (c *Client) Sync(entries []Entry) error {
 		for _, f := range recordFiles(e, "") {
 			c.source[f.path] = e.Seq
 		}
+		c.owed = append(c.owed, c.noticesFor(&next, e))
 		c.state, c.ckSeq, c.ckHead = next, e.Seq, e.Head
+		// A key whose revocation this client has now verified signs nothing
+		// more (outbox.go).
+		c.stopRevoked()
 	}
 	return nil
 }
@@ -599,24 +604,30 @@ func (c *Client) Unread(actor, call string) int64 {
 
 // Notice is one local delivery. ID is stable: it is derived from the source
 // record and the recipient, so finding the same source again maps to the same
-// delivery. Attempts and acknowledgement never leave this host.
+// delivery. BindingGen is the actor's binding generation in the state the
+// source record produced: the notice belongs to that binding and to no later
+// one. Attempts and acknowledgement never leave this host.
 type Notice struct {
-	ID       string
-	Seq      int64
-	Actor    string
-	Kind     string
-	Attempts int
-	Acked    bool
+	ID         string
+	Seq        int64
+	Actor      string
+	Kind       string
+	BindingGen int64
+	Attempts   int
+	Acked      bool
 }
 
-// noticesFor derives the notices one record owes to actors bound to this
-// credential. Which records notify whom is this model's choice; the spec
-// fixes only that delivery is derived from the store by a scan cursor.
-func (c *Client) noticesFor(e Entry) []Notice {
+// noticesFor derives the notices one record owes on this host: one to each
+// addressed actor that is live and bound to this credential in s, the state
+// the record produced. It is computed when the record is stored, so what a
+// record owes does not depend on how far the client had replayed before it
+// scanned. Which records notify whom is this model's choice; the spec fixes
+// only that delivery is derived from the store by a scan cursor.
+func (c *Client) noticesFor(s *State, e Entry) []Notice {
 	r := e.Record
 	var to []string
 	other := func() {
-		if v := c.state.Calls[r.Call]; v != nil {
+		if v := s.Calls[r.Call]; v != nil {
 			for _, p := range []string{v.From, v.To} {
 				if p != r.Actor {
 					to = append(to, p)
@@ -635,12 +646,13 @@ func (c *Client) noticesFor(e Entry) []Notice {
 	}
 	var out []Notice
 	for _, a := range canonSet(to) {
-		if v := c.state.Line.Actors[a]; v != nil && v.Live && v.Cred == c.Cred {
+		if v := s.Line.Actors[a]; v != nil && v.Live && v.Cred == c.Cred {
 			out = append(out, Notice{
-				ID:    fmt.Sprintf("g%d-s%d-%s", c.state.Line.Generation, e.Seq, a),
-				Seq:   e.Seq,
-				Actor: a,
-				Kind:  r.Type,
+				ID:         fmt.Sprintf("g%d-s%d-%s", s.Line.Generation, e.Seq, a),
+				Seq:        e.Seq,
+				Actor:      a,
+				Kind:       r.Type,
+				BindingGen: v.BindingGen,
 			})
 		}
 	}
@@ -653,7 +665,7 @@ func (c *Client) noticesFor(e Entry) []Notice {
 func (c *Client) Scan() error {
 	for c.scanned < c.ckSeq {
 		seq := c.scanned + 1
-		for _, n := range c.noticesFor(c.store[seq-1]) {
+		for _, n := range c.owed[seq-1] {
 			if _, queued := c.queue[n.ID]; !queued {
 				c.queue[n.ID] = &n
 			}
@@ -673,14 +685,42 @@ func (c *Client) Pause(actor string) { c.paused[actor] = true }
 // Resume undoes Pause.
 func (c *Client) Resume(actor string) { delete(c.paused, actor) }
 
+// bound reports whether verified state still shows a notice's actor live, on
+// this credential, under the binding the notice was queued for. Being queued
+// is not enough: the actor may have been removed or moved since.
+func (c *Client) bound(n *Notice) bool {
+	a := c.state.Line.Actors[n.Actor]
+	return a != nil && a.Live && a.Cred == c.Cred && a.BindingGen == n.BindingGen
+}
+
 // Deliver hands every unacknowledged notice of an unpaused actor to its
 // runtime and counts the attempt. Delivery is at least once: a notice is
 // handed over again until it is acknowledged, always under the same ID.
+//
+// Eligibility is decided again here, against verified state: a notice whose
+// actor has since been removed, or moved to another credential, is withheld.
+// It stays in the queue as it was, unacknowledged. An actor that is moved
+// away and later moved back has a new binding generation, so the notices of
+// its earlier binding stay withheld: a move carries neither notices nor
+// acknowledgements between hosts.
 func (c *Client) Deliver() []Notice {
 	var out []Notice
 	for _, n := range c.queue {
-		if !n.Acked && !c.paused[n.Actor] {
+		if !n.Acked && !c.paused[n.Actor] && c.bound(n) {
 			n.Attempts++
+			out = append(out, *n)
+		}
+	}
+	sortNotices(out)
+	return out
+}
+
+// Withheld returns a copy of the unacknowledged notices that verified state
+// no longer lets this host hand over. They are history, not acknowledgements.
+func (c *Client) Withheld() []Notice {
+	var out []Notice
+	for _, n := range c.queue {
+		if !n.Acked && !c.bound(n) {
 			out = append(out, *n)
 		}
 	}
