@@ -1768,8 +1768,22 @@ Measured on 2026-11-23, after the clarifications:
 - As before, code, tests and breaks have one author, and a count of breaks
   caught is not a measure of rules covered. Three rounds of the author's
   tests each looked complete, and Codex's next probe found a defect each
-  time. Codex has seen the code as it stood at `7b79dd2`, not the fix for
-  C3.
+  time.
+
+Codex reran its probe and the client traces at `af39840` and closed C3 (turn
+17). C1, C2 and C3 are closed in this model, and the wording of rule 8 and of
+T47 is accepted at design-review level. That closes this review of the
+model. It is not a decision on O25 or O26, on authentication, recovery or
+deployment, and it is not approval of anything for production.
+
+One thing the review leaves standing as an assumption. `Send` has no check
+of its own for a stopped key. It relies on three facts that hold in this
+serialized model: stopping suspends every pending intent of the key, nothing
+new can be composed under it, and settlement never returns an intent to
+pending. A real client, with concurrency and a durable store, must keep that
+true across a restore and while sending. The model has not shown that it
+would. Nor does handing records to `Sync` show anything about a stopped key
+fetching them on an authenticated session.
 
 Rules the models forced that this document had not stated, each needing
 review:
