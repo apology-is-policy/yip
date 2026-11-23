@@ -67,9 +67,10 @@ treated as persistent; and an intent's profile digest is compared with the
 profile of the generation the intent names, never with a later one (§5.5).
 
 These are two agents' design-review agreement and nothing more. None is
-operator-approved. Two questions in Codex's draft are the operator's and have
-not been put to them: who vouches for a new member's starting state, and
-whether the root key can sign inside a validity window (§13, O25 and O26).
+operator-approved. Two questions in Codex's draft are the operator's: who
+vouches for a new member's starting state, and whether the root key can sign
+inside a validity window (§13, O25 and O26). They were put to the operator on
+2026-11-23 and are unanswered.
 
 This document owns: record types, authority, preconditions, effects, time
 rules, the sequencer-visible field allowlist, retry and dedup behaviour, and
@@ -87,7 +88,7 @@ from them.
 | Line confidentiality policy | **Decided by the operator, 2026-11-23:** 3A — everyone enrolled on the line can read everything on it. 3B is out of scope and not drafted. |
 | History for a newly enrolled account | **Decided by the operator, 2026-11-23: none.** A new account reads only what is written after it joins; the operator arranges a briefing for the new agent. The stated reason is practical — history gets long on multi-month projects — not confidentiality. `history_grant` is therefore removed from phase 1 (§6.3). |
 | Reference checker | **Operator go-ahead, 2026-11-23,** for a small Go implementation of the rule-checking core only: no crypto, no network, no relay. Later the same day the operator also approved an in-memory model of the relay-side bookkeeping (retries, expiry, clock handling), under the same limits, so that the scenario traces can run. A third go-ahead the same day covers a model of the agent's own machine and of register publication (§14.4). All of it lives in `ldrcore/`, and draft v7's rules are in it (§14.5). Results are in §14. Recovery is not modelled. |
-| Enrollment, control bootstrap and envelope | Codex's draft (v3 as of 2026-11-23) is a proposal under cross-review. The rules in this document that follow it carry design-review agreement only. Two points in it are the operator's to accept and have not been put to them (§13, O25 and O26). |
+| Enrollment, control bootstrap and envelope | Codex's draft (v3 as of 2026-11-23) is a proposal under cross-review. The rules in this document that follow it carry design-review agreement only. Two points in it are the operator's to accept; they were put to the operator on 2026-11-23 and are unanswered (§13, O25 and O26). |
 | What those decisions are not | They are scope and policy choices. They do not approve a cipher, an enrollment ceremony, a deployment, or implementation. |
 | Sequencer deployment (Durable Object, Go relay, other) | Open. This draft must not depend on it. |
 | Time anchors (§4.2) | Supported by Codex as the preferred proposal, with corrections folded in. Not operator-approved. |
@@ -1296,7 +1297,8 @@ The rows below are of four different kinds, and "agreed" means only the last
 one:
 
 - **Operator choices:** O1, O2, O3 and O3a are decided; O9, O25 and O26 are
-  not, and O25 and O26 have not yet been put to the operator.
+  not. O25 and O26 were put to the operator on 2026-11-23 and are
+  unanswered.
 - **Discussion values:** O4 and O10 hold provisional numbers nobody has
   measured or approved.
 - **Deployment-dependent:** O11.
@@ -1332,8 +1334,8 @@ one:
 | O22 | Operator key lifecycle | Draft v7, following Codex's P8: a revoked operator key leaves a tombstone, is never authorized again, and is told `revoked` once it has shown possession; a key never authorized gets an admission error (§5.4, §6.2) | Agreed in design review; not operator-approved |
 | O23 | Sequence numbering across generations | Whether `seq` restarts in a new generation is undecided; §5.9 depends on the answer | Open, Codex, with recovery |
 | O24 | Questions this document leaves to the enrollment, control-bootstrap and envelope design | Listed in Appendix A.7 as Q1 to Q16. Where each stands after Codex's drafts v1 to v3 is in A.8. The four that were gaps in this document's own text or vectors (Q2, Q10, Q11, Q16) are closed in draft v7 | Partly closed; see A.8 |
-| O25 | Who vouches for a new member's starting state | Codex's draft (P4) proposes that the enrolling operator's device attests the complete control state at the enrollment's commit, and that the joiner verifies every record after it. That trusts the operator's verified store and signing path for everything before the join. If the records the joiner verifies revoke that operator's key before the joiner has accepted its starting state, the joiner stops, and a currently authorized operator must attest afresh for the same credential; that is not a second enrollment (draft v2, §4.2). The alternative is to replay every control record from genesis, which needs no such trust and grows with the line's age. Neither changes a rule in this document | Open: operator, not yet asked |
-| O26 | Whether the root key can sign inside a validity window | §4.4 gives root records ordinary validity, 10 minutes at most on the provisional numbers. Whether a protected or offline root key can catch up and sign in that time is to be found by a dry run. If it cannot, root records need a validity rule this document does not have | Open: operator, not yet asked |
+| O25 | Who vouches for a new member's starting state | Codex's draft (P4) proposes that the enrolling operator's device attests the complete control state at the enrollment's commit, and that the joiner verifies every record after it. That trusts the operator's verified store and signing path for everything before the join. If the records the joiner verifies revoke that operator's key before the joiner has accepted its starting state, the joiner stops, and a currently authorized operator must attest afresh for the same credential; that is not a second enrollment (draft v2, §4.2). The alternative is to replay every control record from genesis, which needs no such trust and grows with the line's age. Neither changes a rule in this document | Open: operator, asked 2026-11-23, unanswered |
+| O26 | Whether the root key can sign inside a validity window | §4.4 gives root records ordinary validity, 10 minutes at most on the provisional numbers. Whether a protected or offline root key can catch up and sign in that time is to be found by a dry run. If it cannot, root records need a validity rule this document does not have | Open: operator, asked 2026-11-23, unanswered |
 | O19 | Retirement of operation identity | Anchor-scoped identity; an anchor's identity space retires at its `seq_time` plus a maximum validity that is fixed per generation (§5.6). The alternative is a permanent digest tombstone per rejected operation | Accepted by Codex at design-review level, with two constraints that are folded in |
 
 ## 14. Conformance vectors and the reference checker
