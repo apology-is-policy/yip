@@ -177,12 +177,26 @@ func (c *Client) Sync(entries []Entry) error {
 			// Out of order is a transport matter, not a verdict on anyone.
 			return fmt.Errorf("ldrcore: record %d offered while the checkpoint is at %d", e.Seq, c.ckSeq)
 		}
-		if chainHead(c.ckHead, e.Seq, e.SeqTime, e.Record.Type, e.Digest) != e.Head {
+		if !c.prof.StateCommit && e.StateDigest != "" {
+			return c.halt(e.Seq, "the frame carries a state digest that this profile does not define")
+		}
+		// The head is computed from the head this client verified, never from
+		// the predecessor a frame claims for itself.
+		linked := e
+		linked.Prev = c.ckHead
+		if frameHead(&linked) != e.Head {
 			return c.halt(e.Seq, "the record does not chain onto the verified head")
 		}
 		next, out := Apply(c.state, e.Record, e.SeqTime, c.prof)
 		if out.Kind != Committed {
 			return c.halt(e.Seq, fmt.Sprintf("%s does not commit on replay: %s %s", e.Record.Type, out.Kind, out.Reason))
+		}
+		// Where the profile commits state, the frame must commit to the state
+		// this client derived. A difference does not say which side is right:
+		// the client stops on it all the same, and signs nothing on a head
+		// whose state it has not derived itself.
+		if c.prof.StateCommit && StateDigest(c.LineID, c.prof, next) != e.StateDigest {
+			return c.halt(e.Seq, "the frame commits to a different state than the one this client derives")
 		}
 		// One durable step.
 		e.Record = e.Record.Clone()

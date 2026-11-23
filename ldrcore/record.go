@@ -142,6 +142,12 @@ type Expect struct {
 type Profile struct {
 	FreshnessMS   int64
 	ValidityMaxMS int64
+	// StateCommit makes every chain frame commit to the state its record
+	// produced (commit.go). It is an exploration of one possible answer to an
+	// open question, how a new member comes by its starting state (spec
+	// section 13, O25), and nobody has chosen it. With the field unset the
+	// chain is exactly what it was.
+	StateCommit bool
 }
 
 // Outcome kinds.

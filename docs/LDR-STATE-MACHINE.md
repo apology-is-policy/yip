@@ -81,6 +81,11 @@ vouches for a new member's starting state, and whether the root key can sign
 inside a validity window (§13, O25 and O26). They were put to the operator on
 2026-11-23 and are unanswered.
 
+§14.7 was added the same day. The operator asked for a better way than the
+two routes of O25, and the section records a third one and a reference model
+of it. It is an exploration: it changes no rule, so the draft number is
+unchanged, and nobody has chosen it.
+
 This document owns: record types, authority, preconditions, effects, time
 rules, the sequencer-visible field allowlist, retry and dedup behaviour, and
 materialization. It does not own cryptographic constructions, enrollment
@@ -96,7 +101,7 @@ from them.
 | Credential principal with delegated actor namespace (§3) | **Decided by the operator, 2026-11-23:** enroll machine accounts, not individual agents. |
 | Line confidentiality policy | **Decided by the operator, 2026-11-23:** 3A — everyone enrolled on the line can read everything on it. 3B is out of scope and not drafted. |
 | History for a newly enrolled account | **Decided by the operator, 2026-11-23: none.** A new account reads only what is written after it joins; the operator arranges a briefing for the new agent. The stated reason is practical — history gets long on multi-month projects — not confidentiality. `history_grant` is therefore removed from phase 1 (§6.3). |
-| Reference checker | **Operator go-ahead, 2026-11-23,** for a small Go implementation of the rule-checking core only: no crypto, no network, no relay. Later the same day the operator also approved an in-memory model of the relay-side bookkeeping (retries, expiry, clock handling), under the same limits, so that the scenario traces can run. A third go-ahead the same day covers a model of the agent's own machine and of register publication (§14.4). All of it lives in `ldrcore/`, and draft v7's rules are in it (§14.5). Results are in §14. Recovery is not modelled. |
+| Reference checker | **Operator go-ahead, 2026-11-23,** for a small Go implementation of the rule-checking core only: no crypto, no network, no relay. Later the same day the operator also approved an in-memory model of the relay-side bookkeeping (retries, expiry, clock handling), under the same limits, so that the scenario traces can run. A third go-ahead the same day covers a model of the agent's own machine and of register publication (§14.4). All of it lives in `ldrcore/`, and draft v7's rules are in it (§14.5). Results are in §14. Recovery is not modelled. The exploration of §14.7 is in the same package, behind a switch. Its author took it to fall under the go-ahead for reference models and told the operator so before writing it; the operator has not been asked to approve it separately. |
 | Enrollment, control bootstrap and envelope | Codex's draft (v3 as of 2026-11-23) is a proposal under cross-review. The rules in this document that follow it carry design-review agreement only. Two points in it are the operator's to accept; they were put to the operator on 2026-11-23 and are unanswered (§13, O25 and O26). |
 | What those decisions are not | They are scope and policy choices. They do not approve a cipher, an enrollment ceremony, a deployment, or implementation. |
 | Sequencer deployment (Durable Object, Go relay, other) | Open. This draft must not depend on it. |
@@ -1421,7 +1426,7 @@ one:
 | O22 | Operator key lifecycle | Draft v7, following Codex's P8: a revoked operator key leaves a tombstone, is never authorized again, and is told `revoked` once it has shown possession; a key never authorized gets an admission error (§5.4, §6.2) | Agreed in design review; not operator-approved |
 | O23 | Sequence numbering across generations | Whether `seq` restarts in a new generation is undecided; §5.9 depends on the answer | Open, Codex, with recovery |
 | O24 | Questions this document leaves to the enrollment, control-bootstrap and envelope design | Listed in Appendix A.7 as Q1 to Q16. Where each stands after Codex's drafts v1 to v3 is in A.8. The four that were gaps in this document's own text or vectors (Q2, Q10, Q11, Q16) are closed in draft v7 | Partly closed; see A.8 |
-| O25 | Who vouches for a new member's starting state | Codex's draft (P4) proposes that the enrolling operator's device attests the complete control state at the enrollment's commit, and that the joiner verifies every record after it. That trusts the operator's verified store and signing path for everything before the join. If the records the joiner verifies revoke that operator's key before the joiner has accepted its starting state, the joiner stops, and a currently authorized operator must attest afresh for the same credential; that is not a second enrollment (draft v2, §4.2). The alternative is to replay every control record from genesis, which needs no such trust and grows with the line's age. Neither changes a rule in this document | Open: operator, asked 2026-11-23, unanswered |
+| O25 | Who vouches for a new member's starting state | Codex's draft (P4) proposes that the enrolling operator's device attests the complete control state at the enrollment's commit, and that the joiner verifies every record after it. That trusts the operator's verified store and signing path for everything before the join. If the records the joiner verifies revoke that operator's key before the joiner has accepted its starting state, the joiner stops, and a currently authorized operator must attest afresh for the same credential; that is not a second enrollment (draft v2, §4.2). The alternative is to replay every control record from genesis, which needs no such trust and grows with the line's age. Neither changes a rule in this document. The operator asked on 2026-11-23 for a better way than either. A third route is explored in §14.7: the chain commits to the state, and the operator's signature on the enrollment is the endorsement. It would change the chain frame, and it is not chosen | Open: operator, asked 2026-11-23, unanswered |
 | O26 | Whether the root key can sign inside a validity window | §4.4 gives root records ordinary validity, 10 minutes at most on the provisional numbers. Whether a protected or offline root key can catch up and sign in that time is to be found by a dry run. If it cannot, root records need a validity rule this document does not have | Open: operator, asked 2026-11-23, unanswered |
 | O19 | Retirement of operation identity | Anchor-scoped identity; an anchor's identity space retires at its `seq_time` plus a maximum validity that is fixed per generation (§5.6). The alternative is a permanent digest tombstone per rejected operation | Accepted by Codex at design-review level, with two constraints that are folded in |
 
@@ -2031,6 +2036,141 @@ The threat model's fault scenarios and the security review's fixtures that
 concern resources, offers, fences and enrollment substitution belong to §12
 and to Codex's documents respectively.
 
+### 14.7 An exploration for O25: a state commitment in the chain
+
+On 2026-11-23 the operator asked whether there is a better way than the two
+routes of O25. This section records a third route and what a reference model
+of it shows. Nobody has chosen it. Codex's P4 and its draft are unchanged, and
+no rule of this document changes: the model is reached only under a profile
+switch that nothing else sets.
+
+The route was proposed by this document's author (call 0003, turn 24) and
+reviewed by Codex (turn 25). Codex judged it worth exploring in an isolated
+model, corrected four of the claims made for it, and set out the acceptance
+sequence the model follows. Its review grants no scope and selects nothing.
+
+**The route.**
+
+- Every chain frame also commits to the state its record produced. The
+  sequencer computes the commitment. Every member recomputes it while
+  replaying and stops on a difference.
+- Every signed intent already names the head its signer had verified (§5.1).
+  The operator's signature on an enrollment therefore endorses the state at
+  the head it names. No separate attestation is signed.
+- A joiner takes its committed enrollment from the relay it pinned, opens the
+  frame of the head that enrollment names, checks a snapshot from anyone
+  against the frame's commitment, and verifies every record from there to a
+  fresh head the relay names.
+
+Codex's name for it is an operator-endorsed state commitment with
+relay-confirmed inclusion. It is not a trustless snapshot: the joiner never
+replays the records before the endorsed head.
+
+**What the model shows** (`ldrcore/commit.go` and `join.go`, with their
+tests):
+
+1. With an honest relay, the enrolling operator's device alone cannot give a
+   joiner a false state. A false snapshot for a real head fails the
+   commitment. An enrollment signed over an invented head is one the relay
+   never committed, and a joiner that asks the relay accepts nothing. Under P4
+   a signed statement of a false state would be believed, which Codex's draft
+   says itself (its §4.2).
+2. With an honest operator's device, the relay alone cannot put another state
+   under the head the operator signed over, add a record no member signed,
+   commit to a state the records do not give, or show a record signed over
+   another history.
+3. The signing device must derive the state at the head it signs over. The
+   client model does: it stops at a frame whose commitment it cannot
+   reproduce, so it has no checkpoint there to sign from. A signer that
+   skipped this would endorse whatever the relay computed.
+4. The endorsement has a position in the log, which a detached attestation
+   has not. An operator whose key is revoked before the enrollment commits
+   endorses nothing: the relay refuses the enrollment, and a relay that
+   commits it regardless is caught on replay. For a key revoked after the
+   commit the model has an explicit switch. Its default is to stop, as P4
+   does; the other setting accepts and records the revocation with the
+   accepted state. Which one is right is a policy choice.
+
+**Where its trust ends.** Two tests pass when the attack succeeds:
+
+1. The operator's key and the relay together can commit to a state that holds
+   actions no member signed, and the joiner accepts it. Replay from genesis
+   refuses the same history at the invented record. This route is materially
+   weaker than full replay. The author's first description called the two
+   close; Codex corrected that.
+2. If the enrolling device also tells the joiner where the relay is, that
+   device alone is both parties. The relay's identity has to reach the joiner
+   by a path that does not run through the enrolling device. Codex's ceremony
+   has the joiner obtain it "through the trusted operator channel" (its §3);
+   whether that channel survives a compromised operator device is for that
+   draft to say.
+
+Freshness is separate and unchanged: a relay that withholds records or serves
+a fork is not detected by this route, by P4 or by replay.
+
+**What modelling it turned up.**
+
+- A record in the verified suffix can be signed over a head from before the
+  endorsed one. The joiner has nothing to compare that head with. The model
+  counts such records and reports the count with the accepted state.
+  Comparing them would need the frames before the endorsed head, opened
+  backwards from it.
+- An operator key can sign an enrollment over a head at which it was not yet
+  an operator, and an honest relay commits it once the key is authorized,
+  because the relay judges the signer at commit. The model refuses that
+  endorsement. Whether a real joiner should is a question for Codex's draft.
+- The joiner opens the frame at the endorsed head without examining the
+  record in it. That record is the last of the endorsed prefix, so the line
+  between what is endorsed and what is verified runs exactly at that head.
+- The endorsed state is the derived state that A.3 (M4) already lists.
+  Rejection caches, outboxes and delivery queues are not part of it.
+- The route rests on `seen_seq` and `seen_head` being signed fields (§5.1).
+  The first version of the model stood a signature in by the signer's name
+  alone, and a relay holding no key could then point the operator's
+  endorsement at a frame of its own making. The author found that in review.
+  The stand-in now binds the signed fields.
+- A snapshot is decoded only after its bytes match the endorsed commitment,
+  and that does not make the decoder safe to be careless: the operator's key
+  and the relay together choose the commitment. The first version of the
+  decoder could be brought down by a `null` where a state has an object.
+  The author found that in review as well.
+
+**Costs the model does not measure.** The state encoding becomes
+consensus-critical for every member at every record, and a defect in it stops
+the line. Each record costs a digest of the state unless the digest is built
+incrementally or only at chosen records. The relay must keep the snapshot of
+every head an enrollment may name. The chain frame of Codex's draft changes.
+
+**Not modelled.** The ceremony that produces the joiner's pins, the
+root-signed evidence of the operator's authorization that Codex's draft also
+requires, transfer in chunks, a bound on the suffix, a generation change, and
+a device that had already accepted a checkpoint. The client model still
+starts from genesis: the join yields a verified starting point and nothing
+runs from it yet. The encoding is JSON and the digest is FNV; neither is a
+proposal.
+
+**Measured on 2026-11-23.**
+
+- `gofmt` and `go vet` are clean. The package's tests pass, with the race
+  detector as well. With the switch off the chain is byte for byte what it
+  was, and a test says so. Codex's six earlier probes still pass.
+- A break check of the new code, 99 hand-chosen breaks on one full run: 91
+  caught, 4 not caught, and 4 that did not compile. Of the 4 not caught, one
+  showed a missing test (nothing checked that the signature stand-in covers
+  the operation identity), which was added, and one was a redundant term,
+  which was removed. Two remain. The lookup of an enrollment also matches on
+  the record type, and no log the model can reach tells the difference,
+  since the first record that names a credential is its enrollment. The
+  comparison of the credential in the verified state with the joiner's
+  request cannot fail in phase 1, where nothing changes a grant after
+  enrollment. The 4 that did not compile were rewritten and run again with
+  the five breaks of the signature stand-in: 9 of 9 caught. The full set was
+  not run again after that.
+- Codex has not probed this code. As everywhere in this section, code, tests
+  and breaks have one author; a count of breaks caught is not a measure of
+  rules covered, and every earlier round of Codex's probes found a defect the
+  author's tests had not.
+
 ## Appendix A. What this document requires from the enrollment, control-bootstrap and envelope design
 
 Added 2026-11-23 at Codex's request, as input to its draft and to the
@@ -2166,7 +2306,7 @@ approval, and no row rests on a cryptographic test.
 | Q2 | Closed in this document: the profile is committed in `line_init`, and its digest is signed in every intent (P1). | §4.4, §5.1 |
 | Q3 | **Open, the operator's (O26).** Root records keep ordinary validity. Whether a protected or offline root key can sign in time needs a dry run. | §4.4, §13 |
 | Q4 | Agreed: operator-key tombstones, no re-authorization, `revoked` only after possession is shown (P8). | §5.4, §6.2 |
-| Q5 | **Open, the operator's (O25).** Codex proposes a complete-state attestation by the enrolling operator's device, with root- and operator-signed authority evidence, and a verified suffix (P4). The signed envelopes show signed intent; they do not show commit, completeness or currency. The attestation is a trust exception in favour of that operator's verified store, not a re-derivation from the root, and a compromised or rolled-back attesting device remains a limitation. Replay from genesis is the alternative. Codex withdrew an earlier relay-attested variant after this review found that it let a relay invent a line for a joiner. Draft v2 adds the case this review raised: an attestation has no position in the log, so if the records the joiner verifies revoke the attesting operator before the joiner has accepted its state, the joiner stops and keeps the candidate state aside, and a currently authorized, independently pinned operator attests afresh for the same credential. That is not a second `credential_enroll`. The check covers every record up to and including the head the joiner's fresh anchor names; a revocation after that head follows the ordinary rules, and one the relay withholds is still not seen (draft v3). | Codex's draft §4; §13 |
+| Q5 | **Open, the operator's (O25).** Codex proposes a complete-state attestation by the enrolling operator's device, with root- and operator-signed authority evidence, and a verified suffix (P4). The signed envelopes show signed intent; they do not show commit, completeness or currency. The attestation is a trust exception in favour of that operator's verified store, not a re-derivation from the root, and a compromised or rolled-back attesting device remains a limitation. Replay from genesis is the alternative. Codex withdrew an earlier relay-attested variant after this review found that it let a relay invent a line for a joiner. Draft v2 adds the case this review raised: an attestation has no position in the log, so if the records the joiner verifies revoke the attesting operator before the joiner has accepted its state, the joiner stops and keeps the candidate state aside, and a currently authorized, independently pinned operator attests afresh for the same credential. That is not a second `credential_enroll`. The check covers every record up to and including the head the joiner's fresh anchor names; a revocation after that head follows the ordinary rules, and one the relay withholds is still not seen (draft v3). A third route, in which the chain commits to the state and the enrollment itself is the endorsement, is explored in §14.7 and is not chosen. | Codex's draft §4; §13; §14.7 |
 | Q6 | Agreed: `cred_id` is derived from the two keys; neither key is replaced; each key is reserved for life across roles (P2). | §3, §6.1, §6.2 |
 | Q7 | Agreed: the operator's tooling checks possession; the sequencer has no rung for it (P3). | §6.2 |
 | Q8 | Agreed in direction: the join request binds the line, both keys, the grant and a request ID, and its digest is a visible field of the enrollment (P3). The ceremony itself is Codex's and is not reviewed here beyond that. | §6.2, §10 |

@@ -22,6 +22,12 @@
 // between two steps. Enrollment ceremony, encryption, transport and recovery
 // are outside it. The yip binary does not import it.
 //
+// Two more files are an exploration and not a model of the draft. commit.go
+// and join.go try one possible answer to a question the draft leaves open:
+// how a new member comes by its starting state (section 13, O25, and section
+// 14.7). They are reached only under Profile.StateCommit, which nothing else
+// sets, and nobody has chosen that answer.
+//
 // Passing tests here show that the code agrees with tests written by the
 // same author. They are not evidence that the design is safe.
 //

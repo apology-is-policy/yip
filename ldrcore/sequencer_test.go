@@ -26,7 +26,12 @@ type env struct {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	return &env{t: t, q: NewSequencer("L", testProfile), now: 1000000}
+	return newEnvWith(t, testProfile)
+}
+
+func newEnvWith(t *testing.T, prof Profile) *env {
+	t.Helper()
+	return &env{t: t, q: NewSequencer("L", prof), now: 1000000}
 }
 
 // intent builds an intent for r anchored on the current head, filling the
@@ -174,7 +179,13 @@ func revoke(cred string) Record {
 // is a1's; and broadcast bc1 to a1 and b1. Twelve records.
 func newLine(t *testing.T) *env {
 	t.Helper()
-	e := newEnv(t)
+	return newLineWith(t, testProfile)
+}
+
+// newLineWith is newLine under another profile.
+func newLineWith(t *testing.T, prof Profile) *env {
+	t.Helper()
+	e := newEnvWith(t, prof)
 	e.commit(lineInit())
 	e.commit(Record{Origin: OriginRoot, Type: "operator_key_authorize", OperatorKey: "op1", Expect: Expect{RootRev: ptr(1)}})
 	e.commit(enroll("credA", "nsA", "jr1"))

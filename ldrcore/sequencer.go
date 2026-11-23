@@ -45,6 +45,10 @@ type Sequencer struct {
 	hot         map[OpKey]hotEntry
 	quota       map[string]int
 	floor       int64
+	// snaps holds the encoded state after each record, when the profile
+	// commits state (commit.go). Keeping every one is this model's
+	// simplification; how long a relay must keep one is not modelled.
+	snaps map[int64][]byte
 }
 
 // OpReceipt is what the log index keeps for a committed operation: where it
@@ -65,6 +69,29 @@ type Entry struct {
 	// Payload travelled with the intent. The sequencer stores and serves it
 	// and never reads it.
 	Payload Payload
+
+	// The four fields below are read only by the state-commitment exploration
+	// (commit.go, join.go). Nothing else in the package looks at them.
+
+	// Prev is the chain head before this record: with the other fields it is
+	// what the head was computed from.
+	Prev string
+	// SeenHead is the head the signer named, a signed field of the intent.
+	// Key.SeenSeq is the sequence number it named. Empty for a
+	// sequencer-origin record.
+	SeenHead string
+	// Sig stands for the signature stored with the record. It is a value
+	// computed from a principal and the signed part of the entry: the record,
+	// the operation identity, the head named and the digest of the bytes
+	// (signatureOf in commit.go). A verifier recomputes it for the principal
+	// the record names, so changing a signed field afterwards is caught.
+	// Nothing stops code in this package from computing it for a principal
+	// whose key the party it plays does not hold. That a test does not is a
+	// premise of the test. Empty for a sequencer-origin record.
+	Sig string
+	// StateDigest is the digest of the state this record produced, when the
+	// profile commits state. The head then covers it.
+	StateDigest string
 }
 
 // Payload stands for the encrypted payload that travels with an intent. No
@@ -417,7 +444,7 @@ func (q *Sequencer) Submit(in Intent, c Clock) Answer {
 	next, out := Apply(q.state, rec, t, q.prof)
 	switch out.Kind {
 	case Committed:
-		q.commit(next, Entry{Key: key, Digest: in.Digest, Record: rec, Payload: in.Payload}, t)
+		q.commit(next, Entry{Key: key, Digest: in.Digest, Record: rec, Payload: in.Payload, SeenHead: in.SeenHead}, t)
 		seq := q.state.Line.HeadSeq
 		q.logIndex[key] = OpReceipt{Seq: seq, Digest: in.Digest}
 		q.hot[key] = hotEntry{digest: in.Digest, outcome: out, seq: seq}
@@ -481,7 +508,7 @@ func (q *Sequencer) submitLineInit(in Intent, signer string, c Clock) Answer {
 		return admission("invalid_bootstrap")
 	}
 	q.gen, q.genStartSeq = 1, 1
-	q.commit(next, Entry{Key: key, Digest: in.Digest, Record: in.Record}, t)
+	q.commit(next, Entry{Key: key, Digest: in.Digest, Record: in.Record, SeenHead: in.SeenHead}, t)
 	q.logIndex[key] = OpReceipt{Seq: 1, Digest: in.Digest}
 	return Answer{Class: ClassOutcome, Outcome: out, Seq: 1}
 }
@@ -493,7 +520,22 @@ func (q *Sequencer) commit(next State, e Entry, t int64) {
 	// The log owns its records: the caller keeps the pointers and slices of
 	// the intent it submitted, and must not be able to change history.
 	e.Record = e.Record.Clone()
-	e.Head = chainHead(q.heads[e.Seq-1], e.Seq, t, e.Record.Type, e.Digest)
+	e.Prev = q.heads[e.Seq-1]
+	if e.Record.Origin != OriginSequencer {
+		// Only an intent whose signature verified is admitted, so the log
+		// holds a signature that verifies. Computing it here stands for
+		// storing the one that came with the intent.
+		e.Sig = signatureOf(signerOf(&e.Record), &e)
+	}
+	if q.prof.StateCommit {
+		enc := EncodeState(next)
+		e.StateDigest = digestEncoded(q.LineID, q.prof, enc)
+		if q.snaps == nil {
+			q.snaps = map[int64][]byte{}
+		}
+		q.snaps[e.Seq] = enc
+	}
+	e.Head = frameHead(&e)
 	q.log = append(q.log, e)
 	q.heads[e.Seq] = e.Head
 	q.times[e.Seq] = t
@@ -506,6 +548,19 @@ func (q *Sequencer) commit(next State, e Entry, t int64) {
 func chainHead(prev string, seq, t int64, typ, digest string) string {
 	h := fnv.New64a()
 	fmt.Fprintf(h, "%s|%d|%d|%s|%s", prev, seq, t, typ, digest)
+	return fmt.Sprintf("%016x", h.Sum64())
+}
+
+// frameHead is the head of the frame e describes: chainHead over e.Prev and
+// e's own fields, and over the state digest as well when the frame carries
+// one. A frame without a state digest has exactly the head it had before
+// state commitment existed.
+func frameHead(e *Entry) string {
+	if e.StateDigest == "" {
+		return chainHead(e.Prev, e.Seq, e.SeqTime, e.Record.Type, e.Digest)
+	}
+	h := fnv.New64a()
+	fmt.Fprintf(h, "%s|%d|%d|%s|%s|state:%s", e.Prev, e.Seq, e.SeqTime, e.Record.Type, e.Digest, e.StateDigest)
 	return fmt.Sprintf("%016x", h.Sum64())
 }
 
