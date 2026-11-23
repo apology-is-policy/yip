@@ -350,8 +350,10 @@ var traceTests = map[string]func(*testing.T){
 		e.commit(revoke("credB"))
 		e.now += 3600000
 		logLen := len(e.q.Log())
-		if _, _, wrote, a := e.q.AnchorRequest(CredentialPrincipal("credB"), At(e.now)); wrote || a.Code != "not_authorized" || len(e.q.Log()) != logLen {
-			t.Fatalf("a revoked requester: wrote=%v %s", wrote, showAnswer(a))
+		// The revoked credential is told that it is revoked, and gets nothing.
+		seq, head, wrote, a := e.q.AnchorRequest(CredentialPrincipal("credB"), At(e.now))
+		if wrote || seq != 0 || head != "" || a.Class != ClassUnresolved || a.Code != "revoked" || len(e.q.Log()) != logLen {
+			t.Fatalf("a revoked requester: wrote=%v seq=%d head=%q %s", wrote, seq, head, showAnswer(a))
 		}
 	},
 	"T12": func(t *testing.T) { // anchor at an occupied sequence with the wrong head
@@ -672,8 +674,9 @@ var traceTests = map[string]func(*testing.T){
 		e.want(e.submit(never), ClassAdmission, "unknown_signer")
 		e.want(e.q.Query(OperatorPrincipal("op9"), keyOf(in), in.Digest, At(e.now)), ClassAdmission, "unknown_signer")
 
-		for _, key := range []string{"op1", "op9"} {
-			if _, _, wrote, a := e.q.AnchorRequest(OperatorPrincipal(key), At(e.now+3600000)); wrote || a.Code != "not_authorized" {
+		// An anchor request makes the same distinction, and serves neither.
+		for key, want := range map[string]Answer{"op1": unresolved("revoked"), "op9": admission("not_authorized")} {
+			if _, _, wrote, a := e.q.AnchorRequest(OperatorPrincipal(key), At(e.now+3600000)); wrote || a != want {
 				t.Fatalf("anchor request by %s: %s, wrote %t", key, showAnswer(a), wrote)
 			}
 		}

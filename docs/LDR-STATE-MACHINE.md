@@ -67,12 +67,13 @@ treated as persistent; and an intent's profile digest is compared with the
 profile of the generation the intent names, never with a later one (§5.5).
 
 A second correction the same day followed Codex's independent probe of the
-client model (call 0003, turn 11), which found two defects in the model and
-proposed one rule. The rule is new: a key that is revoked signs and submits
-nothing more (§5.7 rule 8). §5.7 rule 5 and §11.3 now say what the model got
-wrong: an answer obtained by another principal settles an intent as the
-client's own would, and a queued notice is checked against verified state
-again when it is handed over (§14.4).
+client model (call 0003, turns 11 and 13), which found two defects in the
+model and proposed two rules. The rules are new: a key that is revoked
+signs, submits and asks nothing more (§5.7 rule 8), and a revoked key's
+anchor request is told `revoked` (§4.2). §5.7 rule 5 and §11.3 now say what
+the model got wrong: an answer obtained by another principal settles an
+intent as the client's own would, and a queued notice is checked against
+verified state again when it is handed over (§14.4).
 
 These are two agents' design-review agreement and nothing more. None is
 operator-approved. Two questions in Codex's draft are the operator's: who
@@ -292,6 +293,17 @@ Concurrent requests coalesce against the current head. The client catches up
 to the returned head and verifies it durably before signing; that delay still
 consumes the validity window.
 
+A requester that is not authorized is refused, and nothing is written. If
+the state holds its key as revoked, and the session has shown possession of
+that exact key, the refusal is `revoked` (§5.4), bound to the request, the
+line and the principal. It carries no anchor, and no outcome access or
+working session follows from it. A key that never held the role gets an
+admission error that does not say that, and so does a requester that has
+shown possession of nothing. This is Codex's amendment (call 0003, turn 13).
+Before it the refusal did not say why, and a client could not learn from it
+that its key was revoked (§5.7 rule 8). How the answer is bound belongs to
+the authentication design, which is open.
+
 `time_anchor` has origin `sequencer`. It changes no conversation, membership
 or key state. It is not effect-free: it advances order and time and uses
 storage. Its typed precondition is checkable by every replaying client from
@@ -487,8 +499,9 @@ needs reconciliation. None of these is permission to repeat the action:
 - `revoked` — signed by a credential or an operator key that is now revoked.
   It may have committed before the revocation, and the revoked key may not
   ask (§5.5). The answer goes only to a requester that has shown possession
-  of that key, by the signature on the intent or on its session. It says the
-  key is revoked and nothing else. A key that never held the role gets the
+  of that key, by the signature on the intent or on its session. It is the
+  answer to that key's submission, query or anchor request alike (§4.2). It
+  says the key is revoked and nothing else. A key that never held the role gets the
   persistent admission error above, which does not say even that, and an
   unauthenticated request learns neither.
 - `abandoned(generation)` — signed for an earlier generation and not found in
@@ -662,7 +675,11 @@ recognize them as one intention.
    cancellation is not evidence of non-commit. An intent marked
    reconciliation-required is asked about as well: asking is not sending. An
    answer that establishes nothing leaves it as it was, with the reason it
-   already had.
+   already had. The intents of a key that has stopped (rule 8) are the
+   exception: nothing is asked with that key. Leaving them as they are, for
+   a principal that is still authorized, completes the pass as far as they
+   are concerned. It settles none of them, and it does not hold back the
+   device's other keys.
 4. Only a definitive refusal or a durable rejection closes the intent. The
    caller may then issue a deliberately new or corrected intent with a new
    `op_id`. Nothing is reissued automatically.
@@ -684,26 +701,39 @@ recognize them as one intention.
    when its own policy says so. Stopping settles nothing: the intent still
    needs an outcome, a definitive refusal or reconciliation before its slot
    is free.
-8. A key that is revoked signs and submits nothing more. The client stops a
-   key when it accepts an authenticated `revoked` answer about that key, to
-   a submission or to a query, and when it verifies the revocation in the
-   records. For a credential the stop covers its own records and those of
-   every actor bound to it. For an operator key it covers that key. Every
-   unsettled intent the key signed keeps its slot and is marked
-   reconciliation-required, one that was never sent included. None is sent
-   again, none is signed again under another key, and none is taken not to
-   have committed. A principal that is still authorized may settle them by
-   query (§5.5). The stop is not a suspected rollback, and other keys held
-   on the same device go on. Nothing in this draft lifts a stop.
+8. A key that is revoked signs and submits nothing more, and asks nothing
+   more either: a query is signed too, and a revoked key cannot obtain an
+   outcome. The client stops a key when it accepts an authenticated
+   `revoked` answer about that key, to a submission, a query or an anchor
+   request, and when it verifies the revocation in the records. An admission
+   error is never taken for that answer.
+   - For a credential the stop covers its own records and those of every
+     actor bound to it. For an operator key it covers that key.
+   - Every unsettled intent the key signed keeps its slot and is marked
+     reconciliation-required, one that was never sent included. Each keeps
+     the last answer it actually received; none is given a `revoked` answer
+     it did not get. None is sent again, none is signed again under another
+     key, and none is taken not to have committed.
+   - A principal that is still authorized may settle them by query (§5.5).
+     The client does not use another key it holds for that on its own, an
+     operator or root key included.
+   - The stop is not a suspected rollback, and other keys held on the same
+     device go on.
+   - The stop stands if the records the client then verifies show no
+     revocation. The client keeps the answer and the checkpoint it held when
+     the answer arrived, and reports the difference. It does not make up a
+     revocation, call the difference a rollback, or resume because a query
+     returned an old outcome. A prefix that ends before a revocation does
+     not disprove the answer, and a later head does not say which head the
+     answer spoke of.
+   - Nothing in this draft lifts a stop. Lifting a mistaken one would need a
+     recovery procedure of its own, which nobody has designed. A key that
+     really was revoked is never authorized again (§6.2).
 
-Rule 8 is Codex's proposal (call 0003, turn 11). Before it this document had
-no rule, and the model let a client that had been told `revoked` go on
-composing. It is design-review agreement between two agents and not operator
-approval. Two things it leaves open: what a client does if it is told
-`revoked` and the records it then verifies show no revocation, and whether a
-revoked key's anchor request should be told `revoked` too. The model's relay
-answers that request with an admission error that does not say why, so there
-the client learns nothing.
+Rule 8 is Codex's proposal, with its clarifications (call 0003, turns 11 and
+13). Before it this document had no rule, and the model let a client that had
+been told `revoked` go on composing. It is design-review agreement between
+two agents and not operator approval.
 
 ### 5.8 Rejection precedence
 
@@ -1680,23 +1710,45 @@ failing, for two findings):
 - **A rule the document did not have,** proposed by Codex: a key that is
   revoked signs and submits nothing more (§5.7 rule 8).
 
-Measured after the changes, on 2026-11-23:
+Codex reran its probes and the author's new tests at `8a53f37` and closed
+both findings (turn 13). It accepted the delivery policy of §11.3 at
+design-review level, and accepted rule 8 with three clarifications, which
+are now in the text and the models:
 
-- Codex's five probes pass against the changed model. They are its file,
-  run here through a build overlay and not copied into the package.
-- The author's tests for the three are in `client_probe_test.go`.
-- A break check of the new code only: 27 hand-chosen breaks. On the first
-  run 23 were caught, 2 were not, and 2 did not compile. One of the 2 was a
-  gap: no test checked that the record opening a call notifies the other
-  participant. A test was added and the 2 were rewritten. On the second run
-  26 were caught. The one left drops the comparison of credentials at
-  handoff; it changes nothing, because every move raises the binding
-  generation. The comparison stays, as the plain statement of ownership.
+1. A revoked key's anchor request is told `revoked`, once the session has
+   shown possession of that key; a key that never held the role is not told
+   that (§4.2). This changes the relay model, and with it the expectations
+   of traces T11 and T40.
+2. A stop stands when the records the client then verifies show no
+   revocation. The client keeps the answer and its checkpoint as evidence
+   and reports the difference, without judging it.
+3. A stopped key asks nothing. Resolving stored intents leaves that key's
+   intents as they are, and that completes the pass (§5.7 rule 3).
+
+Traces T43 to T47 re-enact the two findings and rule 8. All 47 traces have a
+test: 27 against the sequencer model, 13 against the client model, 4 against
+the register model, and 3 as a plain sequence of transitions.
+
+Measured on 2026-11-23, after the clarifications:
+
+- Codex's five probes pass. They are its file, run here through a build
+  overlay and not copied into the package.
+- A break check of the changed code only, 27 hand-chosen breaks at first.
+  On the first run 23 were caught, 2 were not, and 2 did not compile. One of
+  the 2 was a gap: no test checked that the record opening a call notifies
+  the other participant. A test was added and the 2 were rewritten, and 26
+  were caught.
+- After the clarifications the set grew to 41, and 40 were caught on the one
+  run made. The one left, both times, drops the comparison of credentials at
+  handoff. It changes nothing on the states this model can reach, where a
+  client's credential is fixed, actors are never redefined and every move
+  raises the binding generation. The comparison stays, as the plain
+  statement of ownership (Codex's wording of the limit).
 - `gofmt` and `go vet` are clean, and `go test -race` passes for the
   package.
 - As before, code, tests and breaks have one author, and a count of breaks
-  caught is not a measure of rules covered. Codex has not yet seen these
-  changes.
+  caught is not a measure of rules covered. Codex has seen the code as it
+  stood at `8a53f37`, not the clarifications or the five traces.
 
 Rules the models forced that this document had not stated, each needing
 review:
@@ -2031,7 +2083,7 @@ How M3 and M4 are established is not stated in this document: see Q5.
 
 | # | The state machine depends on | From |
 | --- | --- | --- |
-| S1 | `anchor_request` is not an intent. It is served over an authenticated session to an enrolled, unrevoked credential or a currently authorized operator or root principal, and that authorization is re-checked inside the serialized step that answers it. A session authenticated before a revocation is not enough. | §4.2 |
+| S1 | `anchor_request` is not an intent. It is served over an authenticated session to an enrolled, unrevoked credential or a currently authorized operator or root principal, and that authorization is re-checked inside the serialized step that answers it. A session authenticated before a revocation is not enough. A revoked key whose session has shown possession of it is told `revoked`, bound to the request, the line and the principal, and gets nothing else. A key that never held the role is not told even that. | §4.2, §5.4 |
 | S2 | A sequencer-origin record carries no signature and is accepted only over authenticated relay transport. A valid hash chain alone authenticates neither origin nor freshness. | §2 |
 | S3 | `head` covers the previous head, the signed intent bytes and every sequencer-assigned field. `seen_head` in an intent is that value. | §2, §5.1 |
 | S4 | Durable rejections and no-ops are trusted relay decisions. They are authenticated to the client under the relay boundary and cannot be re-derived from the chain. | §5.4 |

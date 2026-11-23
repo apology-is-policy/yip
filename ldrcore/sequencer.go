@@ -522,7 +522,14 @@ func (q *Sequencer) AnchorRequest(principal string, c Clock) (seq int64, head st
 	}
 	// Authorization is re-checked here, inside the same step as the append.
 	// A session authenticated before a revocation is not enough.
-	if q.standing(principal) != standingActive {
+	switch q.standing(principal) {
+	case standingRevoked:
+		// A key that has shown possession, and that the state holds a
+		// tombstone for, is told that it is revoked, as on a submission or a
+		// query. That is all it gets: no anchor, no record, no outcome.
+		return 0, "", false, unresolved("revoked")
+	case standingNever:
+		// A key that never held the role is not told even that.
 		return 0, "", false, admission("not_authorized")
 	}
 	t, ok := q.tick(c)

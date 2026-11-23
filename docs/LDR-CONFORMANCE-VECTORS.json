@@ -7,14 +7,14 @@
   "coverage": {
     "apply_vectors": 209,
     "retired_vectors": 2,
-    "traces": 42,
-    "trace_steps": 126,
+    "traces": 47,
+    "trace_steps": 152,
     "checked_by": "A structural lint, and since draft v6 the reference checker in ldrcore/ for apply vectors (not traces). The lint checks: identifiers unique and sequential, fixtures resolve, premises declared, reasons and types from the declared sets, these counts correct. The lint computes no outcome and establishes none. Codex's static review of the first 95 vectors and 29 traces is docs/LDR-CONFORMANCE-REVIEW.md; it did not execute anything either.",
-    "reviewed_statically": "Codex also read A105-A125 and T03, T16, T27, T32, T33, T37 statically (call 0002 turn 16), then A126-A130 and T38 (turn 18). A131-A145 and T39 are newer than any review. A174-A211 and T40-T42 (draft v7) have not been reviewed by anyone.",
+    "reviewed_statically": "Codex also read A105-A125 and T03, T16, T27, T32, T33, T37 statically (call 0002 turn 16), then A126-A130 and T38 (turn 18). A131-A145 and T39 are newer than any review. A174-A211 and T40-T42 (draft v7) have not been reviewed by anyone. T43-T47 follow Codex's independent probe of the client model (call 0003, turns 11 and 13): Codex reran the Go tests behind T43-T45 as they stood at 8a53f37, and has not read the trace texts or seen T46 and T47. The expectations of T11 and T40 about a revoked key's anchor request changed with the same review.",
     "executed": "ldrcore/apply_test.go runs every active apply vector. A134-A145 were added after a mutation check of that package showed eleven rules that no earlier vector pinned; their expected results were still written from the draft, not copied from the implementation. A146-A162 follow Codex's independent run of the checker (docs/LDR-CHECKER-REVIEW.md), which found three behaviours no vector covered: an oversize turn committed, a record other than line_init committed on an empty log, and a subset committed as the default audience. A163-A173 follow its second probe, which showed counters wrapping at the top of their range. A174-A211 came with draft v7, which follows Codex's enrollment, bootstrap and envelope draft v1: A174-A194 cover a credential's two keys, the key registry across roles, operator-key tombstones, a line_init without a root key, and a disabled actor that cannot be moved; A195-A211 pin that an absent required expectation is malformed, one vector per required expectation. Draft v7 also changed vectors that already existed, because the rules changed: enrollment records and credential state carry two keys and a request digest (A77-A79, A130, A135, A136, A158, A159, A167 and the fixtures), line_init names a root key (A122, A123), a revoked operator key leaves a tombstone (A120's resulting state, A124's starting state), and A135 and A136 were restated for derived identifiers. No expected outcome changed.",
     "not_covered": "recovery_generation has no apply vector: its effect is a rebuild from a base, not a patch. It appears in traces T15 and T28 only. Root and bootstrap coverage (A116-A123) is a handful of semantic cases, not a complete suite, and models no cryptographic proof.",
-    "traces_are": "Reviewable scenarios in prose with symbolic intents and often without explicit times. They are not executable inputs. Each trace has a run label saying whether a Go test in ldrcore/ re-enacts it with explicit inputs: 27 against the sequencer model, 8 against the client model, 4 against the register model, and 3 as a sequence of Apply calls only.",
-    "traces_by_scope": {"sequencer model": 27, "client model": 8, "register model": 4, "apply-only part": 3}
+    "traces_are": "Reviewable scenarios in prose with symbolic intents and often without explicit times. They are not executable inputs. Each trace has a run label saying whether a Go test in ldrcore/ re-enacts it with explicit inputs: 27 against the sequencer model, 13 against the client model, 4 against the register model, and 3 as a sequence of Apply calls only.",
+    "traces_by_scope": {"sequencer model": 27, "client model": 13, "register model": 4, "apply-only part": 3}
   },
 
   "conventions": {
@@ -930,7 +930,7 @@
      "steps": [
        {"do": "credB authenticates a session", "expect": "session established"},
        {"do": "credential_revoke credB commits", "expect": "committed"},
-       {"do": "anchor_request on credB's existing session", "expect": "refused; no time_anchor written"}]},
+       {"do": "anchor_request on credB's existing session", "expect": "told revoked, since the session has shown possession of credB's key; no anchor is returned and no time_anchor is written"}]},
     {"id": "T12", "run": {"scope": "sequencer model", "test": "TestTraces/T12"}, "spec": "5.4", "title": "Anchor at an occupied sequence with the wrong head",
      "steps": [
        {"do": "submit an intent with seen_seq 38 and a seen_head that is not the head recorded at 38", "expect": "unknown_anchor; definitive; no index entry"}]},
@@ -1077,7 +1077,7 @@
        {"do": "op1's credential_enroll I10 commits; the root then revokes op1", "expect": "both committed; op1 is tombstoned"},
        {"do": "op1 resubmits I10, submits an intent it signed before its revocation, and queries I10", "expect": "revoked, each time: nothing is evaluated, no index entry is written, and nothing is said about whether I10 committed"},
        {"do": "a key that was never an operator key submits an operator intent, and queries I10", "expect": "refused as an unknown signer: an admission error, which does not say that the key is revoked"},
-       {"do": "op1 and the never-authorized key each request an anchor", "expect": "refused; no time_anchor written"},
+       {"do": "op1 and the never-authorized key each request an anchor", "expect": "op1 is told revoked; the never-authorized key gets an admission error that does not say that. Neither gets an anchor, and no time_anchor is written"},
        {"do": "the root signs operator_key_authorize for op1 again", "expect": "rejected conflict: a revoked operator key is never authorized again"},
        {"do": "the root authorizes a fresh key op2; the root and op2 each query I10 by its identity and digest", "expect": "the original receipt; I10's signer is unchanged. Asked about the intent op1 never sent, op2 is told outcome_unknown, which is not a cancellation"}]},
     {"id": "T41", "run": {"scope": "register model", "test": "TestRegisterTraces/T41"}, "spec": "9", "title": "A register value is bound to the incarnation of its activation",
@@ -1091,6 +1091,47 @@
        {"do": "the relay is overloaded; credA's client sends a stored note", "expect": "an admission error that can pass; the intent stays pending and the same bytes may be sent again"},
        {"do": "premise: a relay that has a line of the same name and has never heard of credA answers those bytes", "expect": "unknown signer, an admission error that waiting does not remove; the client stops sending on its own, the intent is marked reconciliation-required and keeps its slot"},
        {"do": "the agent asks for another note on the same call", "expect": "refused: the slot is held until the first intent is reconciled"},
-       {"do": "an authorized principal asks the relay the client had verified about the intent, by identity and digest, before and after its anchor retires", "expect": "outcome_unknown first, which settles nothing; then expired, which is definitive: the intent is closed and the slot is free"}]}
+       {"do": "an authorized principal asks the relay the client had verified about the intent, by identity and digest, before and after its anchor retires", "expect": "outcome_unknown first, which settles nothing; then expired, which is definitive: the intent is closed and the slot is free"}]},
+    {"id": "T43", "run": {"scope": "client model", "test": "TestClientTraces/T43"}, "spec": "5.7", "title": "An answer obtained by another principal settles an intent as the client's own would",
+     "note": "Finding C1 of Codex's probe of the client model (call 0003, turn 11). That the answer is authenticated and is about this operation and these bytes is a premise.",
+     "steps": [
+       {"do": "credA's client stores a turn and a register activation; premise: a relay that has never heard of credA answers the turn", "expect": "unknown signer; the turn is marked reconciliation-required and keeps its slot; the activation has not been sent or asked about"},
+       {"do": "the turn's anchor retires; the operator asks the relay the client had verified about the turn, by identity and digest, and the answer is handed to the client", "expect": "expired, which is definitive: the turn is closed and its slot is free"},
+       {"do": "the agent asks for a new turn", "expect": "refused: the answer said the checkpoint was stale, so every other stored intent is asked about before anything new is composed"},
+       {"do": "the client asks about its stored intents; the agent asks for the turn again", "expect": "composed"}]},
+    {"id": "T44", "run": {"scope": "client model", "test": "TestClientTraces/T44"}, "spec": "11.3", "title": "A queued notice is checked again when it is handed over",
+     "note": "Finding C2 of Codex's probe. The backlog policy is the model's choice, accepted by Codex at design-review level (turn 13). A notice grants nothing, and withholding one takes nothing back.",
+     "steps": [
+       {"do": "a1's note commits; credB's client takes it in", "expect": "a notice for b1 is queued, under binding generation 1"},
+       {"do": "the operator moves b1 to credA; credB's client takes the move in and delivers", "expect": "the notice is withheld: it stays queued and unacknowledged, and is not handed over"},
+       {"do": "credA's client replays the line, in one piece or record by record", "expect": "it queues no notice for that note: the note was committed before b1 was bound to credA"},
+       {"do": "a1 writes a second note", "expect": "credA's client queues and hands over a notice for b1 under binding generation 2; credB's client queues none"},
+       {"do": "the operator moves b1 back to credB; a1 writes a third note", "expect": "credB's client hands over the notice for the third note, under binding generation 3; the notice of the first binding stays withheld"},
+       {"do": "credB removes b1", "expect": "nothing more is handed to b1; its notices stay queued with their attempts and are not marked acknowledged"}]},
+    {"id": "T45", "run": {"scope": "client model", "test": "TestClientTraces/T45"}, "spec": "5.4, 5.7", "title": "A key that is told it is revoked signs and sends nothing more",
+     "note": "Rule 8 of section 5.7, proposed by Codex (call 0003, turns 11 and 13). Design-review agreement, not operator approval.",
+     "steps": [
+       {"do": "a device holds credA and operator key op1; its client has one settled intent of credA, and stores a turn and a register activation as credA and a ratification as op1; credA is revoked at the relay, and the client has not taken the revocation in", "expect": "four stored intents, three unsettled"},
+       {"do": "the client sends the turn", "expect": "revoked: credA stops. The turn and the activation are marked reconciliation-required and keep their slots; the activation was never sent and is given no answer. The settled intent stays settled. No rollback is suspected"},
+       {"do": "the agent asks for a record by credA, and for one by an actor of credA", "expect": "refused: the key signs nothing more"},
+       {"do": "the client sends the ratification and composes another operator record", "expect": "sent, and answered with an outcome; composed: the operator key is another principal"},
+       {"do": "after the anchor retires, the operator asks about the turn and the activation, by identity and digest, and the answers are handed to the client", "expect": "expired: both are closed. credA still signs nothing"}]},
+    {"id": "T46", "run": {"scope": "client model", "test": "TestClientTraces/T46"}, "spec": "4.2, 5.7", "title": "A stopped key asks nothing, and does not hold back another key",
+     "note": "Codex's clarifications 1 and 3 to rule 8 (call 0003, turn 13). The client never uses another held key in the stopped key's place.",
+     "steps": [
+       {"do": "a device holds credA and op1; its client stores two intents as credA; credA is revoked at the relay; the process restarts and the agent asks for an operator record", "expect": "refused: stored intents are asked about first"},
+       {"do": "the client asks about its stored intents", "expect": "the first query, made as credA, is answered revoked: credA stops. The second intent is not asked about and is given no answer. Both await reconciliation and keep their slots"},
+       {"do": "the agent asks for an operator record, then for a record by credA", "expect": "the first is composed: the pass is complete, and the stopped key's intents do not hold back op1. The second is refused"},
+       {"do": "the process restarts again and the client asks about its stored intents", "expect": "nothing is asked as credA; its intents are exactly as they were; an operator record is composed"},
+       {"do": "another client of credA, not yet told, requests an anchor", "expect": "told revoked: credA stops there too; no anchor is returned"},
+       {"do": "a third client of credA takes in the records and verifies the revocation; elsewhere, an anchor request is refused with an admission error", "expect": "the third client stops without being told, and its stored intent awaits reconciliation unsent; the admission error stops nothing"}]},
+    {"id": "T47", "run": {"scope": "client model", "test": "TestClientTraces/T47"}, "spec": "5.7", "title": "A stop stands when the records the client verifies show no revocation",
+     "note": "Codex's clarification 2 to rule 8. A prefix that ends before a revocation does not disprove the answer, and a later head does not say which head the answer spoke of. Lifting a mistaken stop would need a procedure nobody has designed.",
+     "steps": [
+       {"do": "premise: a relay that holds the same line with a revocation of credA, which the relay the client had verified does not have, answers credA's stored turn", "expect": "revoked: credA stops; the answer is kept with the client's checkpoint at that moment"},
+       {"do": "the client takes in further records from the relay it had verified; none revokes credA", "expect": "the stop stands. It is reported as told and not verified. That is not a rollback suspicion and not a finding that the answer was false; no revocation is made up"},
+       {"do": "a second revoked answer arrives", "expect": "the evidence of the first is unchanged"},
+       {"do": "the turn had committed at the first relay; the operator's query returns its outcome and the answer is handed to the client", "expect": "the turn is settled. credA still signs nothing: an old outcome is no reason to resume"},
+       {"do": "the revocation is later committed and the client verifies it", "expect": "the stop is reported as verified as well; the evidence of the earlier answer is unchanged"}]}
   ]
 }

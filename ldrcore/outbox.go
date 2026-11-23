@@ -30,19 +30,41 @@ import (
 //     operation: it is neither a reason to retry nor a non-commit. A query
 //     may still settle the intent. This model has no way to resume sending.
 //  6. The result is stored with the action that caused it.
-//  7. A key that is revoked signs and submits nothing more. The client learns
+//  7. A key that is revoked signs and submits nothing more, and asks nothing
+//     more either: a revoked key cannot obtain an outcome. The client learns
 //     that from an authenticated `revoked` answer, or by verifying the
 //     revocation itself. Every unsettled intent the key signed keeps its slot
 //     and awaits reconciliation by a principal that is still authorized. This
 //     is not a suspected rollback, and other keys the device holds go on.
+//     Nothing here uses another held key in the stopped key's place.
 //     Proposed by Codex on call 0003; the spec had no rule.
 type outbox struct {
 	entries     []*OutboxEntry
 	slots       map[string]string // slot -> ID of the unsettled intent holding it
 	nextOp      int64             // op_ids are never reused
 	mustResolve bool
-	suspect     bool            // history_unavailable was seen: rollback is suspected
-	stopped     map[string]bool // keys that sign and submit nothing more (rule 7)
+	suspect     bool                // history_unavailable was seen: rollback is suspected
+	told        map[string]*KeyStop // keys that were told they are revoked, with the evidence
+}
+
+// KeyStop reports one key of this device that signs nothing more, and why.
+type KeyStop struct {
+	Key string
+	// Verified: the records this client has verified revoke the key.
+	Verified bool
+	// Told: an authenticated `revoked` answer about the key was accepted.
+	// Answer is the first such answer, and Seq and Head are the client's
+	// checkpoint when it arrived. They are evidence for whoever looks into
+	// it, and nothing alters them afterwards.
+	//
+	// Told without Verified is a discrepancy to report, not a verdict. The
+	// records verified so far may simply end before the revocation, and a
+	// later head does not say which head the answer spoke of. The stop
+	// stands either way: this model has no procedure that lifts one.
+	Told   bool
+	Answer Answer
+	Seq    int64
+	Head   string
 }
 
 // Outbox entry states.
@@ -106,12 +128,9 @@ func (c *Client) principalOf(origin string) string {
 	return ""
 }
 
-// signsNoMore reports whether principal p has stopped: it was told it is
-// revoked, or verified state shows its revocation.
-func (c *Client) signsNoMore(p string) bool {
-	if c.out.stopped[p] {
-		return true
-	}
+// revokedInRecords reports whether the records this client has verified
+// revoke principal p.
+func (c *Client) revokedInRecords(p string) bool {
 	l := &c.state.Line
 	switch {
 	case strings.HasPrefix(p, "cred:"):
@@ -123,12 +142,27 @@ func (c *Client) signsNoMore(p string) bool {
 	return false
 }
 
-// stop records that principal p signs and submits nothing more. Every intent
-// it signed that is still pending now awaits reconciliation: it cannot be
-// sent again under this key, and nothing here says whether it committed. Each
-// keeps its slot and the last answer it had. The model never lifts a stop.
-func (c *Client) stop(p string) {
-	c.out.stopped[p] = true
+// signsNoMore reports whether principal p has stopped: it was told it is
+// revoked, or verified state shows its revocation.
+func (c *Client) signsNoMore(p string) bool {
+	return c.out.told[p] != nil || c.revokedInRecords(p)
+}
+
+// toldRevoked records that an authenticated `revoked` answer about principal
+// p was accepted, and stops the key. The first such answer is kept with the
+// checkpoint it arrived at; a later one does not replace it.
+func (c *Client) toldRevoked(p string, a Answer) {
+	if c.out.told[p] == nil {
+		c.out.told[p] = &KeyStop{Key: p, Told: true, Answer: a, Seq: c.ckSeq, Head: c.ckHead}
+	}
+	c.suspend(p)
+}
+
+// suspend marks every pending intent that principal p signed as awaiting
+// reconciliation: it cannot be sent again under this key, and nothing here
+// says whether it committed. Each keeps its slot and the last answer it
+// actually received, which for an intent never sent is none.
+func (c *Client) suspend(p string) {
 	for _, e := range c.out.entries {
 		if e.Status == OutPending && signerOf(&e.Intent.Record) == p {
 			e.Status = OutReconcile
@@ -136,21 +170,42 @@ func (c *Client) stop(p string) {
 	}
 }
 
-// stopRevoked stops each key of this device whose revocation is in verified
-// state. The root key is not among them: nothing in this design revokes it.
+// stopRevoked suspends the intents of each key of this device that has
+// stopped. Sync calls it, so that verifying a revocation has the same effect
+// as being told of it.
 func (c *Client) stopRevoked() {
 	for _, p := range c.Stopped() {
-		c.stop(p)
+		c.suspend(p)
 	}
+}
+
+// deviceKeys names the keys of this device that can be revoked. The root key
+// is not among them: nothing in this design revokes it.
+func (c *Client) deviceKeys() []string {
+	return []string{CredentialPrincipal(c.Cred), OperatorPrincipal(c.OperatorKey)}
 }
 
 // Stopped returns the keys of this device that sign nothing more.
 func (c *Client) Stopped() []string {
 	var out []string
-	for _, p := range []string{CredentialPrincipal(c.Cred), OperatorPrincipal(c.OperatorKey)} {
+	for _, p := range c.deviceKeys() {
 		if c.signsNoMore(p) {
 			out = append(out, p)
 		}
+	}
+	return out
+}
+
+// Stops reports why each stopped key stopped, with the evidence kept for it.
+func (c *Client) Stops() []KeyStop {
+	var out []KeyStop
+	for _, p := range c.Stopped() {
+		s := KeyStop{Key: p}
+		if t := c.out.told[p]; t != nil {
+			s = *t
+		}
+		s.Verified = c.revokedInRecords(p)
+		out = append(out, s)
 	}
 	return out
 }
@@ -338,7 +393,7 @@ func (c *Client) settle(e *OutboxEntry, a Answer) {
 			// The key that signed this intent is revoked. That the answer is
 			// authenticated and is about this key is a premise here. It is no
 			// sign of a rollback, and it says nothing about what committed.
-			c.stop(signerOf(&e.Intent.Record))
+			c.toldRevoked(signerOf(&e.Intent.Record), a)
 		}
 	case ClassMismatch:
 		// The relay holds other bytes under this identity. Nothing here can
@@ -376,9 +431,19 @@ var transientAdmission = map[string]bool{
 // and it never sends. An intent the relay has no outcome for keeps the status
 // it had. For one awaiting reconciliation, an answer that teaches nothing
 // also leaves the stored reason in place.
+//
+// A key that has stopped asks nothing: a query is signed too, and a revoked
+// key cannot obtain an outcome. Its intents are left exactly as they are, for
+// a principal that is still authorized, and no answer is made up for them.
+// That completes the pass as far as they are concerned, so they do not hold
+// back the device's other keys. A key can also learn that it is revoked from
+// its first query here; its remaining intents are then not asked about.
 func (c *Client) ResolveAll(q *Sequencer, clk Clock) {
 	for _, e := range c.out.entries {
 		if e.Status != OutPending && e.Status != OutReconcile {
+			continue
+		}
+		if c.signsNoMore(signerOf(&e.Intent.Record)) {
 			continue
 		}
 		a := q.Query(signerOf(&e.Intent.Record), opKey(e.Intent), e.Intent.Digest, clk)
@@ -417,12 +482,15 @@ func (c *Client) ClearSuspicion() { c.out.suspect = false }
 // Anchor asks for a time anchor, then catches up to the head it was given and
 // verifies it durably, which is what must happen before signing on it.
 //
-// The request is made as the credential. The relay model refuses a revoked
-// requester with an admission error that does not say why, so a refused
-// request stops no key: a key learns it is revoked from the answer to a
-// submission or a query, or by verifying the revocation.
+// The request is made as the credential. A refusal that says the credential
+// is revoked stops it, like the same answer to a submission or a query. Any
+// other refusal stops nothing: an admission error is not evidence of a
+// revocation.
 func (c *Client) Anchor(q *Sequencer, clk Clock) error {
 	if _, _, _, a := q.AnchorRequest(CredentialPrincipal(c.Cred), clk); a.Class != "" {
+		if a.Class == ClassUnresolved && a.Code == "revoked" {
+			c.toldRevoked(CredentialPrincipal(c.Cred), a)
+		}
 		return fmt.Errorf("ldrcore: anchor request refused: %s %s", a.Class, a.Code)
 	}
 	return c.Run(q.Log())

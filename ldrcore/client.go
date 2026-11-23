@@ -123,7 +123,7 @@ func NewClient(lineID, cred string, prof Profile) *Client {
 		seen:       map[string]int64{},
 		badWrap:    map[int64]bool{},
 		corruptKey: map[int64]bool{},
-		out:        outbox{slots: map[string]string{}, stopped: map[string]bool{}},
+		out:        outbox{slots: map[string]string{}, told: map[string]*KeyStop{}},
 	}
 }
 
