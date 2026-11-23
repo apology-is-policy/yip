@@ -1,6 +1,6 @@
 # LDR hosting options
 
-**Joint-review draft 2, 2026-11-23. No recommendation and no deployment
+**Joint-review draft 3, 2026-11-23. No recommendation and no deployment
 approval.** The options are a Cloudflare Durable Object per line, or a Go
 relay on an operator-managed host. Neither relay exists yet. Platform facts
 below come from documentation; the implications are our design assessment.
@@ -18,7 +18,7 @@ bootstrap exception is a separate decision, not a hosting feature.
 | **Authenticated sessions** | Inbound TLS terminates outside Workers; exporter access is not established by the documented API. [TLS boundary](https://developers.cloudflare.com/workers/reference/security-model/) | TLS exporters are available when Go terminates the client connection itself. A proxy can change that boundary. [TLS API](https://pkg.go.dev/crypto/tls#ConnectionState.ExportKeyingMaterial) |
 | **Trustworthy time** | Timers advance with I/O. Expiry sampling, fault detection and monitoring need a deployment contract. [Timers](https://developers.cloudflare.com/workers/runtime-apis/performance/) | Wall and process-local monotonic readings help detection, but restart validation and monitoring remain necessary. [Clocks](https://pkg.go.dev/time#hdr-Monotonic_Clocks) |
 | **Growth** | Documented SQLite limits are 10 GB per object on paid plans and 1 GB on free; a full object rejects writes. [Limits](https://developers.cloudflare.com/durable-objects/platform/limits/) | Capacity follows the chosen storage/host. Retention, disk-full behavior and migration still need policy. |
-| **Who holds the data** | Cloudflare stores the ciphertext and sees sizes, timing and who talks to whom. An account member with Editor access can read and edit an object's SQL data from the dashboard; queries are audit-logged. [Data Studio](https://developers.cloudflare.com/durable-objects/observability/data-studio/) | Whoever controls the host can read and edit the store and sees the same metadata; so can its provider if the host is rented. Any audit trail has to be built. |
+| **Who holds the data** | Cloudflare hosts ciphertext and visible metadata. At least Editor access to the implementing Worker permits SQL reads/writes through Data Studio; Data Studio queries are audit-logged. [Data Studio](https://developers.cloudflare.com/durable-objects/observability/data-studio/) | Privileged host administrators and, under ordinary hosting assumptions, the provider can access the store and metadata. Audit coverage needs design and configuration; existing host/database/provider tools may supply parts of it. |
 | **Operations and recovery** | Provider operates the infrastructure; we still manage code, account access, provisioning, monitoring and restore policy. | We also operate host supervision, updates, reachability, TLS and backups. Neither option yet preserves security history across rollback by a specified recovery procedure. |
 
 The session-binding mechanism is still open; an application challenge is not
@@ -46,8 +46,10 @@ page.
 
 Fable wrote draft 1. Codex reviewed it against the primary documentation
 (call 0003, turn 7; its review note is `LDR-HOSTING-REVIEW.md` in Codex's
-files) and supplied the page above as replacement text. The row "Who holds
-the data" was added by Fable afterwards. Draft 1 made claims that the review
+files) and supplied the page above as replacement text. Fable proposed the
+row "Who holds the data"; its wording is Codex's, after it checked the Data
+Studio page (turn 9). Audit logging prevents neither a privileged edit nor a
+rollback in either deployment. Draft 1 made claims that the review
 removed: that one clock reading per request is enough, that a reading below
 the saved floor is the only detectable clock fault, that serving a snapshot
 met no obstacle, and that a standard-library-only repository forces a
@@ -103,7 +105,9 @@ is about 19,000 records of the largest size or about 2.4 million of 4 KiB
 full line does.
 
 **Who holds the data.** Data Studio needs "at least `Editor` access to the
-Worker" and logs each query [DS]. Stored data is encrypted at rest with keys
+Worker that implements the Durable Object" and logs the queries it issues
+[DS]. That is the documented scope: not every account role, and not every
+path by which data can be written. Stored data is encrypted at rest with keys
 Cloudflare manages [SEC].
 
 **Operations and recovery.** Durable Objects are available on the free plan
