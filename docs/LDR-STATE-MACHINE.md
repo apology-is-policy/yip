@@ -37,6 +37,11 @@ v5 also makes `actor_remove` an explicit line-wide act rather than a
 consequence of local uninstall, and states one declaration owner per
 namespace (§6.1, §6.2).
 
+Appendix A was added on 2026-11-23, after draft v6 and at Codex's request. It
+restates, with section references, what this document needs from the
+enrollment, control-bootstrap and envelope design, and lists what it leaves
+open. It changes no rule, so the draft number is unchanged.
+
 This document owns: record types, authority, preconditions, effects, time
 rules, the sequencer-visible field allowlist, retry and dedup behaviour, and
 materialization. It does not own cryptographic constructions, enrollment
@@ -1137,6 +1142,7 @@ one:
 | O21 | Default-audience broadcast: should the sequencer verify the list equals the default audience? | Yes: exact set equality at the named revision (§8). Codex's verdict; implemented | Agreed |
 | O22 | Operator key lifecycle | State keeps no history of operator keys, so a key outside the active set cannot be told apart as revoked or never authorized. Until that is specified, such a key gets an access refusal that establishes nothing, and may not be assumed re-authorizable | Open, Codex |
 | O23 | Sequence numbering across generations | Whether `seq` restarts in a new generation is undecided; §5.9 depends on the answer | Open, Codex, with recovery |
+| O24 | Questions this document leaves to the enrollment, control-bootstrap and envelope design | Listed in Appendix A.7 as Q1 to Q16. Four of them (Q2, Q10, Q11, Q16) are gaps in this document's own text or vectors | Open, Codex and Fable |
 | O19 | Retirement of operation identity | Anchor-scoped identity; an anchor's identity space retires at its `seq_time` plus a maximum validity that is fixed per generation (§5.6). The alternative is a permanent digest tombstone per rejected operation | Accepted by Codex at design-review level, with two constraints that are folded in |
 
 ## 14. Conformance vectors and the reference checker
@@ -1439,3 +1445,121 @@ Registers and materialization:
 The threat model's fault scenarios and the security review's fixtures that
 concern resources, offers, fences and enrollment substitution belong to §12
 and to Codex's documents respectively.
+
+## Appendix A. What this document requires from the enrollment, control-bootstrap and envelope design
+
+Added 2026-11-23 at Codex's request, as input to its draft and to the
+cross-review of it. It changes no rule. Each row restates something a numbered
+section already says or depends on, and cites it; if a row and its section
+ever differ, the section governs and the row is wrong. Where this document is
+silent the point is an open question in A.7, not a rule. No construction,
+cipher, library, ceremony or deployment is selected or implied, and nothing
+here authorizes implementation.
+
+Setting up a line (A.1) and joining one (A.2, A.3) are kept apart because
+their trust inputs differ. At setup nothing exists to verify against. A
+joining member has a line whose control state it must establish without that
+line's message history.
+
+### A.1 Root and genesis setup
+
+| # | The state machine depends on | From |
+| --- | --- | --- |
+| G1 | A `line_id` that does not depend on any local path. | §2 |
+| G2 | A genesis constant derived from the line identity and the root key. `line_init` names it as its anchor and names generation 1. A `line_init` that names a different genesis is answered `unknown_anchor`, so the relay holds the line identity and root key it expects before any record exists. | §4.4 |
+| G3 | `line_init` is root-signed, exempt from validity but not from its context, and commits only into an empty log. The first record of an empty log can only be `line_init`; a replaying client treats anything else there as a sequencer violation. A malformed or wrongly signed `line_init` is refused with nothing recorded, and is never answered "a line exists". | §4.4, §6.2 |
+| G4 | After `line_init` the line has generation 1, `root_rev` 1, `auth_epoch`, `audience_rev` and `key_epoch` at 0, no operators, no credentials, and `rekey_pending` set. Nothing payload-bearing commits until at least three more records have: a root `operator_key_authorize`, an operator `credential_enroll` that grants reader capability (an activation's manifest is a required list and must equal the entitled readers), and an operator `key_epoch_activate`. | §5.8, §6.2, §6.3 |
+| G5 | Every root record other than `line_init` and `recovery_generation` uses the ordinary envelope and ordinary validity. The root key therefore signs from a verified checkpoint, anchored on the generation's first record or a later anchor, inside a validity window whose provisional maximum is 10 minutes. Root may request an anchor over an authenticated session. | §4.2, §4.4, §5.3, O10 |
+| G6 | `operator_key_authorize` and `operator_key_revoke` sign `expect.root_rev`. Each increments `root_rev` and `auth_epoch`. | §6.2 |
+| G7 | An operator record is a guarantee only if the operator key cannot be used by a process running as the operator's OS user without an authorized, action-scoped approval in which the operator sees the actual action and what the payload means. The signed intent carries an action scope that must match the record type and target. | §3, §7.3 item 9, §10.2 |
+| G8 | The freshness window `F` and the maximum validity are protocol profile data known through authenticated configuration, never chosen by the relay per request. The maximum validity is fixed for a whole generation. A replaying client needs `F` to check `time_anchor` spacing. | §4.2, §5.6 |
+
+### A.2 Enrolling a credential
+
+| # | The state machine depends on | From |
+| --- | --- | --- |
+| E1 | A credential is a signing key and an encryption key controlled by one isolation domain. `credential_enroll` is operator-origin. Its visible fields carry the join-request ID, the credential ID, the public keys, and the grant: `namespace_id`, the limit on live actors (zero or more), whether the credential holds reader capability, and capabilities. | §3, §6.1, §6.2, §10 |
+| E2 | An enrollment reserves four things for life, and the sequencer checks each on visible fields alone: the join-request ID (never used), each of the two keys (neither enrolled nor tombstoned), the `cred_id` (never re-enrolled), and the `namespace_id` (never granted before). Each leaves a tombstone that must survive recovery. | §3, §6.1, §6.2 |
+| E3 | It follows that a machine whose keys are lost or replaced cannot return as the same credential or into the same namespace. It joins as a new credential with a new namespace. Its existing actors keep their identity only if the operator moves them with `actor_move`, and the move must commit before the old credential is revoked: revocation disables every actor bound to it, and a move needs a live actor. The new credential controls the moved actors and cannot declare siblings in their namespace. Once the old credential is revoked nobody can, because a namespace is never granted twice. | §3, §6.1, §6.2 |
+| E4 | Namespace grant, reader capability and authority to sign as operator are three separate grants. A grant with an actor limit of zero and reader capability is valid; it is the natural shape for an operator's own device. | §6.1 |
+| E5 | `credential_enroll` is an ordinary operator intent. It signs the current `auth_epoch`, an anchor and a validity. Committing it increments `auth_epoch` and sets `rekey_pending`, so every intent in flight that was signed under the old epoch is rejected `conflict`, and nothing payload-bearing commits until the next `key_epoch_activate`. | §5.1, §5.8, §6.2, §6.3 |
+| E6 | The sequencer does not check that the joiner holds the private keys, that the join request came from the machine the operator meant, or that the grant is what the operator intended. Field contents, proofs of possession and ceremony are the enrollment design's. The state machine needs only that the result is an operator-signed record whose visible fields it can check as in E2. | §6, §6.2 |
+
+### A.3 What a new member starts from
+
+| # | The state machine depends on | From |
+| --- | --- | --- |
+| M1 | A new member receives no earlier epoch. Enrollment sets `rekey_pending`; the next `key_epoch_activate` must name exactly the entitled readers as of its commit; and phase 1 has no record that adds a credential to the readers of an earlier epoch. Nothing wraps an old epoch key to a new member. | §0, §6.3, trace T20 |
+| M2 | Control state needs no payload keys. Every authorization and transition predicate is over sequencer-visible fields, so a member can verify control records and re-derive each committed outcome for stretches of the log whose payloads it cannot read. A payload under an epoch the reader holds no key for is one of three distinct reader states, and it does not stop replay. | §2, §10, §10.2, trace T24 |
+| M3 | Before it signs anything, a member needs a verified, durably stored checkpoint `(seen_seq, seen_head)` with the accepted `seq_time` at that sequence. The checkpoint never regresses and is shared by every session of the credential. Its first intent anchors on a record of the current generation, never on genesis, that is fresh enough; in practice it requests an anchor first, which it may do once enrolled. | §4.2, §4.4, §5.1, §5.3, §14.3 |
+| M4 | What it must hold to act correctly is the whole derived state at that checkpoint, not only current membership: `generation`, `root_rev`, `auth_epoch`, `audience_rev`, operators, credentials with their grants, `key_epoch`, `rekey_pending`, the readers of the current epoch, every actor's namespace, binding, `binding_gen`, `addr_rev`, addressability and liveness, register writer state including incarnations already used, the tombstone sets, and the state of every call and broadcast. Calls and broadcasts matter because expected versions refer to them. Tombstones and used identifiers matter because re-deriving a later committed create needs to know the identifier was unused. | §2, §5.1, §6.1, §7.1, §8 |
+| M5 | A new member's operation identities cannot collide with anyone else's, because identity includes the signer, the generation and the anchor. It starts with an empty outbox and nothing to reconcile. | §5.1, §5.6, §5.7 |
+| M6 | The member declares its own actors with `actor_declare`, inside its granted namespace and capacity; no existing binding is needed. Declaring increments `audience_rev` and leaves `auth_epoch` alone. A declaration with an encrypted label is payload-bearing, so it waits for the member's first epoch; one without a label does not. | §3, §6.1, §6.2, §6.3 |
+
+How M3 and M4 are established is not stated in this document: see Q5.
+
+### A.4 The intent envelope
+
+| # | The state machine depends on | From |
+| --- | --- | --- |
+| V1 | The signature covers at minimum the fields of §5.1: version; `line_id` and `generation`; the signer's key identity; `actor_id` and `binding_gen` for actor origin; `op_id`; `op_type` and `target`; `expect`; `auth_epoch`; `key_scope` and `key_epoch`; `seen_seq` and `seen_head`; `validity`; `payload_commit`; and every field on §10's allowlist for the record type. Operator and root intents also sign their action scope. | §3, §5.1, §10 |
+| V2 | The signature is verified over the exact bytes received. A client stores the serialized intent durably before the first send, and every retry sends those bytes. Two submissions are the same operation content when a digest of the intent is equal. | §2, §5.5, §5.7 |
+| V3 | Operation identity is `(line_id, generation, cred_id, seen_seq, op_id)`. An `op_id` is unique only within its anchor. Different bytes under one identity are `duplicate_mismatch` until the anchor retires; after that an identity that never committed is `expired`, and one that committed still returns its receipt. A later anchor makes a different operation by definition, and a client never chooses one to refresh an unresolved intent. | §5.1, §5.5, §5.6, §5.7 |
+| V4 | Anything derived per operation must bind the full context: line, generation, signer, anchor and operation identity, with the relevant scope and epoch. Different plaintext under the same identity is a hazard that arises before sending, and dedup at the relay cannot cure it. | §5.6 |
+| V5 | Binding generations. An actor-origin intent names `(actor_id, binding_gen)` and is authorized only while that is the current binding to the signing credential and the actor is live. `actor_move` increments `binding_gen` and `auth_epoch`, which invalidates intents pending under the old binding. A register value signs `binding_gen` and `writer_rev`, and an activation belongs to the binding generation that made it. | §3, §6.2, §9 |
+| V6 | Expected versions are signed, visible, and defined per record type: `root_rev`; `key_epoch`; `binding_gen`; `addr_rev`; `writer_rev`; `turn_count`; `lifecycle_rev`; a dispute's `rev` and the signer's own `measure_rev`; and `audience_rev` for a default-audience broadcast. A value that is not current is `conflict`. Zero is a real expected value: the first `key_epoch_activate` expects `key_epoch` 0, and a new call's `lifecycle_rev` is 0. See Q10. | §5.1, §5.8, §6.2, §7.2, §8 |
+| V7 | Every counter, revision, epoch, sequence number and time is an integer in `[0, 2^53 - 1]`. The decoder rejects a fraction or an out-of-domain value before any lossy conversion. | §5.9 |
+| V8 | Decode is bounded before any processing. Unknown versions are refused and never downgraded; unknown or unsupported fields and scopes are refused; there is no application compression in the first profile; and the whole encoded record has a size bound that also bounds recipient arrays, signatures and manifests. | §2, §5.1, §10, §10.1 |
+| V9 | The envelope keeps the line between refusing input and rejecting an operation. Bad framing, an unknown version or field, an oversized transport envelope, a bad signature and an unknown credential are admission errors: nothing is recorded and nothing is promised. A decoded, in-bound, attributable intent with a value outside its allowed set, or content over a record-specific limit, is admitted and durably rejected `invalid` or `too_large`. | §2, §5.4, §5.8 |
+| V10 | `payload_commit` is the digest and length of the encrypted payload. A ciphertext-free record still signs it, over an empty payload. A payload-bearing record commits only with `key_scope` the line scope, `key_epoch` current and `rekey_pending` clear. Line ciphertext on a type declared ciphertext-free is syntactic `invalid`. Record-specific size limits are judged by the sequencer on what the record states. | §5.1, §5.8, §6.3, §10.1 |
+| V11 | A reader can tell three cases apart: no key for the epoch; authentication or decryption failure; authenticated but malformed plaintext. None stops replay, and the second is never reported as the writer's fault. | §10.2 |
+| V12 | Everything not on §10's allowlist for a record type is ciphertext: subjects, bodies, reasons, claims and measurements, attachment names and content, actor labels, the writer's tip claim and register bodies. Secrets stay out of URLs, logs, error strings and unencrypted registers. | §10 |
+
+### A.5 Key epochs and wraps
+
+| # | The state machine depends on | From |
+| --- | --- | --- |
+| K1 | `key_epoch_activate` is operator-origin, signs `expect.key_epoch`, and carries a manifest of credential IDs with one wrap commitment each. It commits only if the manifest names exactly the entitled readers as of commit: enrolled, unrevoked credentials granted reader capability. Omitting one, naming a revoked credential, naming one without reader capability, a duplicate entry, or an empty manifest is rejected. | §5.8, §6.1, §6.2, §14.1, §14.4 item 18 |
+| K2 | The sequencer checks completeness over visible fields only. It cannot check that a wrap decrypts, that the key is right, or that the epoch key is fresh. Each client verifies its own wrap. A garbage wrap or an undecryptable body from an authorized writer is denial of service and must not stop replay. | §6.3 |
+| K3 | Confidentiality after a rotation depends on the generating client creating a fresh epoch key and verifying the distribution context. A reused epoch key, or a wrap to a recipient the manifest does not declare, preserves or exposes access, and the relay can detect neither. | §6.3 |
+| K4 | Membership and key-distribution records carry no line-scope ciphertext, only visible fields and per-recipient wraps, and they commit while `rekey_pending` is set. | §6.3 |
+| K5 | No record re-distributes the current epoch. The only repair for a bad or missing wrap is another `key_epoch_activate`, which makes a new epoch. Activation does not require `rekey_pending` to be set, so an operator can rotate at any time. | §6.2 |
+| K6 | Removing a reader does not recall plaintext or keys already learned. | §6.3 |
+| K7 | Register bodies obey the same epoch and rekey checks. A register value signs namespace, `line_id`, `generation`, `actor_id`, `cred_id`, `binding_gen`, `writer_rev`, `key_epoch` and counter. | §6.3, §9 |
+
+### A.6 Sessions, anchors and answers
+
+| # | The state machine depends on | From |
+| --- | --- | --- |
+| S1 | `anchor_request` is not an intent. It is served over an authenticated session to an enrolled, unrevoked credential or a currently authorized operator or root principal, and that authorization is re-checked inside the serialized step that answers it. A session authenticated before a revocation is not enough. | §4.2 |
+| S2 | A sequencer-origin record carries no signature and is accepted only over authenticated relay transport. A valid hash chain alone authenticates neither origin nor freshness. | §2 |
+| S3 | `head` covers the previous head, the signed intent bytes and every sequencer-assigned field. `seen_head` in an intent is that value. | §2, §5.1 |
+| S4 | Durable rejections and no-ops are trusted relay decisions. They are authenticated to the client under the relay boundary and cannot be re-derived from the chain. | §5.4 |
+| S5 | A query is signed, carries an operation identity and a digest and not the bytes, and is answered only to a requester authorized to learn that outcome. A query authenticated only by a revoked key is refused. An active, separately authorized principal may reconcile a revoked signer's history by signing a query that names the original operation and digest. | §5.5 |
+| S6 | Request authorization, input bounds and rate limits are required for anchor requests and submissions, and each credential has a bounded quota of durable rejections and no-ops. The quota is per credential, so the principal is authenticated before it is charged. A rate-limit answer never implies non-commit. | §4.2, §5.4 |
+
+Recovery is outside this appendix. It touches enrollment in one place: the
+tombstones of E2 must survive it (§3, §6.2).
+
+### A.7 What this document leaves open
+
+"Whose" names who writes the answer down. It does not name who decides.
+
+| # | Question | Why the state machine cares | Whose |
+| --- | --- | --- | --- |
+| Q1 | How does a relay come to hold the line identity and root key it checks the first record against, and who may create a line on a relay? | G2 and G3 assume the relay already has them. The reference model stipulates them. | Codex, with deployment |
+| Q2 | Where does the profile live? "Authenticated configuration" is not defined here. | §4.2 says a replaying client can check `time_anchor` spacing from the chain alone. That holds only if `F` is committed in the chain, for instance in a generation's first record, or reaches the client by an equally authenticated path. | Fable, once the content of `line_init` is drafted |
+| Q3 | Can the root key meet an ordinary validity window? | G5 needs the root key to catch up to a fresh head and sign within minutes for every operator-key change. If the root key is to be kept offline, either that is workable in practice or these records need a validity rule this document does not have. | Codex to frame; an operational choice for the operator |
+| Q4 | Operator key lifecycle (O22). | State keeps no history of operator keys. As written, a revoked operator key could be authorized again, and a key outside the active set cannot be told apart as revoked or never authorized. | Codex |
+| Q5 | What is the trust basis for a new member's first checkpoint and state (M3, M4)? Either the member replays every control record from genesis, or it starts from an authenticated checkpoint with state. | Replay from genesis needs only the trust pins, but grows with the line's age and requires the relay to serve the whole log; the operator's stated reason for giving new members no history was its length. A checkpoint is short but needs someone to vouch for it and a rule against a stale one. In either case `head` covers the signed intent bytes, so whether the chain can be verified without downloading ciphertext depends on whether those bytes contain the payload or only `payload_commit`. | Codex; the choice may need the operator |
+| Q6 | How does `cred_id` relate to the two keys, and can a credential's keys ever be replaced? | E2 needs "neither key enrolled or tombstoned" to be decidable from visible fields. The reference checker models a credential as one identifier. Phase 1 has no key-replacement record, which is what makes E3 the only path after a lost key store; that should be confirmed as intended. | Codex |
+| Q7 | Who checks proof of possession? | If only the operator's client does, the state machine is unchanged. If the sequencer does, the failure needs a place: an admission error or a durable `invalid`. The ladder in §5.8 has no rung for it. | Codex, then Fable for §5.8 |
+| Q8 | What does a join request bind? | This document knows only its identifier. Whether it is bound to the line, the joining keys and the grant asked for decides whether a consumed or copied request can be turned into a different enrollment. | Codex |
+| Q9 | Which bytes does the intent digest cover: with or without the signature, with the payload or only its commitment? | The digest decides `duplicate_mismatch`. If re-signing the same intent can yield different bytes, a re-signed retry is a mismatch. That is safe, but then "store the bytes, never re-sign" must be a stated client rule and not only a consequence. | Codex |
+| Q10 | What is an intent that omits a required expectation? | This document does not say in words. The reference checker rejects it as syntactic `invalid`. Because zero is a real expected value (V6), the encoding must be able to tell an expectation of zero from no expectation. | Fable for §5.8; Codex for the encoding |
+| Q11 | What is the signer in an operator or root operation identity? | §5.1 writes `cred_id`. The reference model uses the signing principal, with each operator key and the root having its own identity space. §5.1 should say so, and the action-scoped approval design should confirm it fits. | Fable for §5.1; Codex to confirm |
+| Q12 | The client that generates an epoch key holds it. | §6.1 separates authority to sign as operator from reader capability. That separation is of grants. It does not keep an epoch key from the operator device that created it, whether or not that device is an entitled reader. Under 3A this may be acceptable; it should be stated and not left implicit. | Codex |
+| Q13 | Which visible quantity do the size limits apply to? | §10.1 states limits for plaintext and for total ciphertext, and the sequencer sees only what the record states about ciphertext. The mapping waits on framing overhead. | Codex and Fable (O4) |
+| Q14 | Do queries carry an anchor or a validity, and what binds an answer to its question? | S4 and S5 assume answers are authenticated "under the relay boundary" and say no more. §4.2 argues against a relay signing key for time; that does not settle it for answers. | Codex |
+| Q15 | Does `seq` restart in a new generation (O23)? | `seen_seq` is part of operation identity and of every derivation in V4. | Codex, with recovery |
+| Q16 | Is an actor whose credential was revoked gone for good? | §3 and §6.2 say revocation disables the credential's actors, and `actor_move` needs a live actor. The reference checker implements that as terminal, which is what E3's ordering rests on. No vector pins it. | Fable: add a vector once confirmed |
