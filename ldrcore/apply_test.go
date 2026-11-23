@@ -358,7 +358,8 @@ func TestTraceTwoTurnsRace(t *testing.T) {
 func TestTraceNewMemberIsFutureOnly(t *testing.T) {
 	s, p := baseState(t, "line_basic")
 	s = mustCommit(t, s, Record{Origin: OriginOperator, Type: "credential_enroll", Operator: "op1", AuthEpoch: 3,
-		Cred: "credC", JoinRequest: "jr3", Grant: &Grant{Namespace: "nsC", ActorLimit: 4, Reader: true}}, 1005000, p)
+		Cred: "credC", SigningKey: "skC", EncryptionKey: "ekC", JoinRequest: "jr3", JoinRequestDigest: "jd3",
+		Grant: &Grant{Namespace: "nsC", ActorLimit: 4, Reader: true}}, 1005000, p)
 	if !s.Line.RekeyPending {
 		t.Fatal("enrollment did not set rekey_pending")
 	}

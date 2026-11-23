@@ -193,7 +193,7 @@ var clientTraceTests = map[string]func(*testing.T){
 
 	"T24": func(t *testing.T) { // three unreadable states, and replay continues past each
 		e := newEnv(t)
-		e.commit(Record{Origin: OriginRoot, Type: "line_init"})
+		e.commit(lineInit())
 		e.commit(Record{Origin: OriginRoot, Type: "operator_key_authorize", OperatorKey: "op1", Expect: Expect{RootRev: ptr(1)}})
 		e.commit(enroll("credA", "nsA", "jr1"))
 		e.commit(Record{Origin: OriginOperator, Type: "key_epoch_activate", Operator: "op1", Manifest: []string{"credA"}, Expect: Expect{KeyEpoch: ptr(0)}})
@@ -384,6 +384,73 @@ var clientTraceTests = map[string]func(*testing.T){
 			t.Fatal("an acknowledged notice was delivered again")
 		}
 	},
+
+	"T42": func(t *testing.T) { // a relay that refuses the signer: no reason to send again, no evidence of non-commit
+		e := newLine(t)
+		ca := e.client("credA")
+		id, err := ca.Compose("note", noteOn("a1", "c1"), Payload{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.q.Overloaded = true
+		a, _ := ca.Send(e.q, id, At(e.now))
+		e.want(a, ClassAdmission, "overloaded")
+		if stored(ca, id).Status != OutPending {
+			t.Fatal("an overload must leave the intent pending")
+		}
+		e.q.Overloaded = false
+
+		// A relay that has a line called L and has never heard of credA.
+		stranger := newEnv(t)
+		stranger.commit(lineInit())
+		a, _ = ca.Send(stranger.q, id, At(e.now))
+		e.want(a, ClassAdmission, "unknown_signer")
+		if o := stored(ca, id); o.Status != OutReconcile || o.Sends != 2 {
+			t.Fatalf("after the refusal of the signer: %+v", o)
+		}
+		// It is not sent again, to that relay or to the one the client knows.
+		logLen := len(e.q.Log())
+		ca.Send(stranger.q, id, At(e.now))
+		ca.Send(e.q, id, At(e.now))
+		if stored(ca, id).Sends != 2 || len(e.q.Log()) != logLen {
+			t.Fatal("an intent awaiting reconciliation was sent again")
+		}
+		if _, err := ca.Compose("another note", noteOn("a1", "c1"), Payload{}); !errors.Is(err, ErrSlotBusy) {
+			t.Fatalf("its slot while unreconciled: %v, want ErrSlotBusy", err)
+		}
+
+		// The operator asks the relay the client had verified. While the
+		// anchor is live the answer settles nothing; once it has retired, a
+		// miss is definitive.
+		in := stored(ca, id).Intent
+		got := e.q.Query(OperatorPrincipal("op1"), opKey(in), in.Digest, At(e.now))
+		e.want(got, ClassUnknown, "outcome_unknown")
+		if err := ca.Reconciled(id, got); err == nil {
+			t.Fatal("outcome_unknown must not settle an intent")
+		}
+		e.retire(in.SeenSeq)
+		got = e.q.Query(OperatorPrincipal("op1"), opKey(in), in.Digest, At(e.now))
+		e.want(got, ClassRefusal, "expired")
+		if err := ca.Reconciled(id, got); err != nil || stored(ca, id).Status != OutClosed {
+			t.Fatalf("after reconciliation: err %v, %+v", err, stored(ca, id))
+		}
+		if err := ca.Anchor(e.q, At(e.now)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ca.Compose("another note", noteOn("a1", "c1"), Payload{}); err != nil {
+			t.Fatalf("the slot after reconciliation: %v", err)
+		}
+	},
+}
+
+// stored returns the outbox entry with the given ID.
+func stored(c *Client, id string) OutboxEntry {
+	for _, o := range c.Outbox() {
+		if o.ID == id {
+			return o
+		}
+	}
+	return OutboxEntry{}
 }
 
 func TestClientTraces(t *testing.T) {
@@ -653,6 +720,47 @@ func TestOutboxDiscipline(t *testing.T) {
 		}
 	})
 
+	t.Run("an admission error that can pass leaves the intent pending", func(t *testing.T) {
+		e, ca := setup(t)
+		id, _ := ca.Compose("turn", turn("a1", 1), Payload{}) // a stale count: it will be rejected
+		e.q.QuotaMax = 0
+		a, _ := ca.Send(e.q, id, At(e.now))
+		e.want(a, ClassAdmission, "quota")
+		if entry(ca, id).Status != OutPending {
+			t.Fatal("a full quota must leave the intent pending")
+		}
+		a, _ = ca.Send(e.q, id, Clock{Now: e.now, Trusted: false})
+		e.want(a, ClassAdmission, "clock_uncertain")
+		if entry(ca, id).Status != OutPending {
+			t.Fatal("an uncertain clock must leave the intent pending")
+		}
+		e.q.QuotaMax = 64
+		a, _ = ca.Send(e.q, id, At(e.now))
+		e.wantOutcome(a, Rejected, "conflict", false)
+		if o := entry(ca, id); o.Status != OutDone || o.Sends != 3 {
+			t.Fatalf("after the third send: %+v", o)
+		}
+	})
+
+	t.Run("an admission error that sending again cannot change stops the intent", func(t *testing.T) {
+		for code, relay := range map[string]*Sequencer{
+			"no_line":    NewSequencer("L", testProfile),
+			"wrong_line": NewSequencer("M", testProfile),
+		} {
+			e, ca := setup(t)
+			id, _ := ca.Compose("turn", turn("a1", 2), Payload{})
+			a, _ := ca.Send(relay, id, At(e.now))
+			e.want(a, ClassAdmission, code)
+			if o := entry(ca, id); o.Status != OutReconcile {
+				t.Fatalf("%s: %+v, want reconciliation-required", code, o)
+			}
+			// It is not closed: an admission error is not evidence of non-commit.
+			if _, err := ca.Compose("turn again", turn("a1", 2), Payload{}); !errors.Is(err, ErrSlotBusy) {
+				t.Fatalf("%s: the slot: %v, want ErrSlotBusy", code, err)
+			}
+		}
+	})
+
 	t.Run("after a restart nothing is composed before stored intents are asked about", func(t *testing.T) {
 		e, ca := setup(t)
 		sent, _ := ca.Compose("turn", turn("a1", 2), Payload{})
@@ -800,7 +908,7 @@ func TestClientBootstrapsALine(t *testing.T) {
 		Expect: Expect{RootRev: ptr(1)}}, Payload{}); !errors.Is(err, ErrNoLine) {
 		t.Fatalf("an ordinary intent with nothing to anchor on: %v, want ErrNoLine", err)
 	}
-	do(Record{Origin: OriginRoot, Type: "line_init"})
+	do(lineInit())
 	do(Record{Origin: OriginRoot, Type: "operator_key_authorize", OperatorKey: "op1", Expect: Expect{RootRev: ptr(1)}})
 	do(enroll("credA", "nsA", "jr1"))
 	if c.HasKey(1) {

@@ -77,8 +77,9 @@ func (s State) CheckInvariants() []string {
 	if l.Generation == 0 {
 		// No line exists. Nothing else may.
 		if l.RootRev != 0 || l.AuthEpoch != 0 || l.AudienceRev != 0 || l.KeyEpoch != 0 || l.CallCount != 0 ||
+			l.RootKey != "" ||
 			len(l.Operators)+len(l.Credentials)+len(l.Readers)+len(l.Actors)+len(l.RegisterWriters) != 0 ||
-			len(l.Tombstones.Creds)+len(l.Tombstones.Actors)+len(l.Tombstones.JoinRequests) != 0 ||
+			len(l.Tombstones.Creds)+len(l.Tombstones.Actors)+len(l.Tombstones.JoinRequests)+len(l.Tombstones.OperatorKeys) != 0 ||
 			len(s.Calls)+len(s.Broadcasts) != 0 {
 			fail("generation 0 with line state present")
 		}
@@ -89,6 +90,38 @@ func (s State) CheckInvariants() []string {
 	set("tombstones.creds", l.Tombstones.Creds)
 	set("tombstones.actors", l.Tombstones.Actors)
 	set("tombstones.join_requests", l.Tombstones.JoinRequests)
+	set("tombstones.operator_keys", l.Tombstones.OperatorKeys)
+
+	// The key registry: every public key holds exactly one role, for life.
+	holder := map[string]string{}
+	hold := func(key, role string) {
+		switch other, dup := holder[key]; {
+		case key == "":
+			fail("%s has no key", role)
+		case dup:
+			fail("key %s is held by both %s and %s", key, other, role)
+		default:
+			holder[key] = role
+		}
+	}
+	hold(l.RootKey, "the root")
+	for _, k := range l.Operators {
+		hold(k, "operator "+k)
+	}
+	for _, k := range l.Tombstones.OperatorKeys {
+		hold(k, "revoked operator "+k)
+	}
+	for _, id := range sortedKeys(l.Credentials) {
+		hold(l.Credentials[id].SigningKey, "credential "+id+" (signing)")
+		hold(l.Credentials[id].EncryptionKey, "credential "+id+" (encryption)")
+	}
+	// A revoked credential keeps its entry: that entry is what reserves its
+	// keys and its namespace.
+	for _, id := range l.Tombstones.Creds {
+		if l.Credentials[id] == nil {
+			fail("tombstoned credential %s has no entry", id)
+		}
+	}
 
 	namespaces := map[string]string{}
 	for id, c := range l.Credentials {
@@ -231,4 +264,13 @@ func (s State) CheckInvariants() []string {
 
 	slices.Sort(bad)
 	return bad
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
 }

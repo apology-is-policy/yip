@@ -49,10 +49,27 @@ type Record struct {
 	Label            bool     `json:"label,omitempty"`
 	DefaultAddressed bool     `json:"default_addressed,omitempty"`
 	ToCred           string   `json:"to_cred,omitempty"`
-	JoinRequest      string   `json:"join_request,omitempty"`
 	Grant            *Grant   `json:"grant,omitempty"`
 	Manifest         []string `json:"manifest,omitempty"`
 	OperatorKey      string   `json:"operator_key,omitempty"`
+
+	// Enrollment. JoinRequest is the join request's identifier and
+	// JoinRequestDigest the digest of the request the joiner signed; the
+	// sequencer reserves the first and only carries the second. SigningKey
+	// and EncryptionKey are the credential's two public keys, as opaque
+	// strings: each stands for an algorithm identifier and that algorithm's
+	// one accepted public encoding.
+	JoinRequest       string `json:"join_request,omitempty"`
+	JoinRequestDigest string `json:"join_request_digest,omitempty"`
+	SigningKey        string `json:"signing_key,omitempty"`
+	EncryptionKey     string `json:"encryption_key,omitempty"`
+	// CredIDMismatch says that Cred is not the derivation of the two keys.
+	// The derivation is a hash, and this package computes none: like a
+	// signature, the fact is stated instead of checked.
+	CredIDMismatch bool `json:"cred_id_mismatch,omitempty"`
+
+	// RootKey is the root public key a line_init names.
+	RootKey string `json:"root_key,omitempty"`
 
 	// Registers.
 	Register    string `json:"register,omitempty"`

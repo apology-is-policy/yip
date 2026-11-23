@@ -234,12 +234,14 @@ func is(got *int64, want int64) bool { return got != nil && *got == want }
 
 func buildLineInit(p *plan, s *State, r *Record) {
 	l := &s.Line
+	p.require(rInvalidSyntax, func() bool { return r.RootKey != "" })
 	// The line already existing is a collision on the one identifier a log
 	// has: itself.
 	p.require(rConflict, func() bool { return l.Generation == 0 })
 	p.effect = func() {
 		*l = Line{
 			Generation:      1,
+			RootKey:         r.RootKey, // the first entry of the key registry
 			RootRev:         1,
 			RekeyPending:    true, // nothing payload-bearing commits before the first activation
 			Operators:       []string{},
@@ -254,7 +256,10 @@ func buildLineInit(p *plan, s *State, r *Record) {
 func buildOperatorKeyAuthorize(p *plan, s *State, r *Record) {
 	l := &s.Line
 	p.require(rInvalidSyntax, func() bool { return r.OperatorKey != "" && r.Expect.RootRev != nil })
-	p.require(rConflict, func() bool { return !slices.Contains(l.Operators, r.OperatorKey) })
+	// A key that has held any role is reserved for life. That covers a key
+	// already authorized, a revoked operator key, which is never authorized
+	// again, a credential's key, and the root key.
+	p.require(rConflict, func() bool { return !l.keyUsed(r.OperatorKey) })
 	p.require(rConflict, func() bool { return is(r.Expect.RootRev, l.RootRev) })
 	p.effect = func() {
 		l.Operators = addToSet(l.Operators, r.OperatorKey)
@@ -270,6 +275,9 @@ func buildOperatorKeyRevoke(p *plan, s *State, r *Record) {
 	p.require(rConflict, func() bool { return is(r.Expect.RootRev, l.RootRev) })
 	p.effect = func() {
 		l.Operators = slices.DeleteFunc(slices.Clone(l.Operators), func(k string) bool { return k == r.OperatorKey })
+		// The tombstone is what later tells this key from one that was never
+		// authorized, and what keeps it from being authorized again.
+		l.Tombstones.OperatorKeys = addToSet(l.Tombstones.OperatorKeys, r.OperatorKey)
 		p.inc(&l.RootRev)
 		p.inc(&l.AuthEpoch)
 	}
@@ -282,16 +290,29 @@ func buildCredentialEnroll(p *plan, s *State, r *Record) {
 	p.require(rInvalidSyntax, func() bool {
 		// A limit of zero is a reader-only grant: the credential can read
 		// and cannot declare actors.
-		return r.Cred != "" && r.JoinRequest != "" && r.Grant != nil &&
+		return r.Cred != "" && r.JoinRequest != "" && r.JoinRequestDigest != "" && r.Grant != nil &&
 			r.Grant.Namespace != "" && r.Grant.ActorLimit >= 0
 	})
-	// Three identifiers are reserved by an enrollment, and none may have been
-	// used before: the join request, the credential, and the namespace, which
-	// has exactly one declaration owner in phase 1.
+	// A credential is two different keys, and its identifier is their
+	// derivation. Both are wrong whatever the state, so they are malformed
+	// and not a collision.
+	p.require(rInvalidSyntax, func() bool {
+		return r.SigningKey != "" && r.EncryptionKey != "" && r.SigningKey != r.EncryptionKey
+	})
+	p.require(rInvalidSyntax, func() bool { return !r.CredIDMismatch })
+	// An enrollment reserves five things, and none may have been used before:
+	// the join request, the credential identifier, each of the two keys, and
+	// the namespace, which has exactly one declaration owner in phase 1.
 	p.require(rConflict, func() bool { return !slices.Contains(l.Tombstones.JoinRequests, r.JoinRequest) })
+	// With a sound derivation an identifier collides only when both keys do.
+	// The check stands on its own so that the rule does not rest on that.
 	p.require(rConflict, func() bool {
 		return l.Credentials[r.Cred] == nil && !slices.Contains(l.Tombstones.Creds, r.Cred)
 	})
+	// Each key separately: a used key cannot return with a fresh partner, in
+	// this role or another.
+	p.require(rConflict, func() bool { return !l.keyUsed(r.SigningKey) })
+	p.require(rConflict, func() bool { return !l.keyUsed(r.EncryptionKey) })
 	p.require(rConflict, func() bool {
 		for _, c := range l.Credentials {
 			if c.Namespace == r.Grant.Namespace {
@@ -302,9 +323,11 @@ func buildCredentialEnroll(p *plan, s *State, r *Record) {
 	})
 	p.effect = func() {
 		l.Credentials[r.Cred] = &Credential{
-			Namespace:  r.Grant.Namespace,
-			ActorLimit: r.Grant.ActorLimit,
-			Reader:     r.Grant.Reader,
+			SigningKey:    r.SigningKey,
+			EncryptionKey: r.EncryptionKey,
+			Namespace:     r.Grant.Namespace,
+			ActorLimit:    r.Grant.ActorLimit,
+			Reader:        r.Grant.Reader,
 		}
 		l.Tombstones.JoinRequests = addToSet(l.Tombstones.JoinRequests, r.JoinRequest)
 		p.inc(&l.AuthEpoch)

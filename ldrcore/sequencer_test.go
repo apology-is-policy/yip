@@ -152,8 +152,15 @@ func reopen(actor string, lifecycle, turns int64) Record {
 	return r
 }
 
+// lineInit is the root's first record. The root key is a name, as every key
+// in this package is.
+func lineInit() Record { return Record{Origin: OriginRoot, Type: "line_init", RootKey: "rootK"} }
+
+// enroll is an enrollment of cred with two keys of its own. The premise that
+// cred is the derivation of those keys is not modelled.
 func enroll(cred, ns, jr string) Record {
-	return Record{Origin: OriginOperator, Type: "credential_enroll", Operator: "op1", Cred: cred, JoinRequest: jr,
+	return Record{Origin: OriginOperator, Type: "credential_enroll", Operator: "op1", Cred: cred,
+		SigningKey: "sk-" + cred, EncryptionKey: "ek-" + cred, JoinRequest: jr, JoinRequestDigest: "digest-" + jr,
 		Grant: &Grant{Namespace: ns, ActorLimit: 4, Reader: true}}
 }
 
@@ -168,7 +175,7 @@ func revoke(cred string) Record {
 func newLine(t *testing.T) *env {
 	t.Helper()
 	e := newEnv(t)
-	e.commit(Record{Origin: OriginRoot, Type: "line_init"})
+	e.commit(lineInit())
 	e.commit(Record{Origin: OriginRoot, Type: "operator_key_authorize", OperatorKey: "op1", Expect: Expect{RootRev: ptr(1)}})
 	e.commit(enroll("credA", "nsA", "jr1"))
 	e.commit(Record{Origin: OriginOperator, Type: "key_epoch_activate", Operator: "op1", Manifest: []string{"credA"}, Expect: Expect{KeyEpoch: ptr(0)}})
@@ -644,6 +651,53 @@ var traceTests = map[string]func(*testing.T){
 		}
 		e.checkReplay()
 	},
+	"T40": func(t *testing.T) { // a revoked operator key is told it is revoked, and is never authorized again
+		e := newLine(t)
+		in, seq := e.commit(enroll("credC", "nsC", "jr3"))
+		unsent := e.intent(revoke("credC")) // signed by op1 before its revocation
+		e.commit(Record{Origin: OriginRoot, Type: "operator_key_revoke", OperatorKey: "op1", Expect: Expect{RootRev: ptr(2)}})
+		if got := e.q.State().Line.Tombstones.OperatorKeys; len(got) != 1 || got[0] != "op1" {
+			t.Fatalf("operator-key tombstones after the revocation: %v", got)
+		}
+		hot, logLen := e.q.HotEntries(), len(e.q.Log())
+
+		// The key is told that it is revoked. It is not told whether what it
+		// signed committed, not even for the enrollment that did.
+		e.want(e.submit(in), ClassUnresolved, "revoked")
+		e.want(e.submit(unsent), ClassUnresolved, "revoked")
+		e.want(e.q.Query(OperatorPrincipal("op1"), keyOf(in), in.Digest, At(e.now)), ClassUnresolved, "revoked")
+
+		// A key that never was an operator key is not told even that.
+		never := e.intent(Record{Origin: OriginOperator, Type: "credential_revoke", Operator: "op9", Cred: "credC"})
+		e.want(e.submit(never), ClassAdmission, "unknown_signer")
+		e.want(e.q.Query(OperatorPrincipal("op9"), keyOf(in), in.Digest, At(e.now)), ClassAdmission, "unknown_signer")
+
+		for _, key := range []string{"op1", "op9"} {
+			if _, _, wrote, a := e.q.AnchorRequest(OperatorPrincipal(key), At(e.now+3600000)); wrote || a.Code != "not_authorized" {
+				t.Fatalf("anchor request by %s: %s, wrote %t", key, showAnswer(a), wrote)
+			}
+		}
+		if e.q.HotEntries() != hot || len(e.q.Log()) != logLen {
+			t.Fatal("a refused key left an index entry or a record")
+		}
+
+		// The root cannot bring the key back. It authorizes a fresh one.
+		again := e.intent(Record{Origin: OriginRoot, Type: "operator_key_authorize", OperatorKey: "op1", Expect: Expect{RootRev: ptr(3)}})
+		e.wantOutcome(e.submit(again), Rejected, "conflict", false)
+		e.commit(Record{Origin: OriginRoot, Type: "operator_key_authorize", OperatorKey: "op2", Expect: Expect{RootRev: ptr(3)}})
+
+		// An active principal reconciles the revoked key's history by naming
+		// the operation and its digest. The signer of that history is unchanged.
+		for _, who := range []string{Root, OperatorPrincipal("op2")} {
+			a := e.q.Query(who, keyOf(in), in.Digest, At(e.now))
+			e.wantOutcome(a, Committed, "", true)
+			if a.Seq != seq || keyOf(in).Signer != OperatorPrincipal("op1") {
+				t.Fatalf("%s was shown seq %d for signer %s", who, a.Seq, keyOf(in).Signer)
+			}
+		}
+		e.want(e.q.Query(OperatorPrincipal("op2"), keyOf(unsent), unsent.Digest, At(e.now)), ClassUnknown, "outcome_unknown")
+		e.checkReplay()
+	},
 }
 
 func TestTraces(t *testing.T) {
@@ -670,21 +724,16 @@ func TestQueryIsNotCancellation(t *testing.T) {
 	e.want(e.q.Query(Root, keyOf(in), "other-bytes", At(e.now)), ClassMismatch, "")
 }
 
-// An operator key outside the active set gets an access refusal that
-// establishes nothing: the state keeps no history of operator keys, so the
-// model cannot tell a revoked key from one that never existed. An
-// independently authorized principal can still reconcile its history.
-func TestInactiveOperatorKeyEstablishesNothing(t *testing.T) {
+// A principal that is not a credential, an operator key or the root has no
+// standing at all, and is refused like a key nobody has heard of.
+func TestUnknownPrincipalKind(t *testing.T) {
 	e := newLine(t)
-	in, seq := e.commit(enroll("credC", "nsC", "jr3"))
-	e.commit(Record{Origin: OriginRoot, Type: "operator_key_revoke", OperatorKey: "op1", Expect: Expect{RootRev: ptr(2)}})
-	e.want(e.submit(in), ClassAdmission, "not_authorized")
-	never := e.intent(Record{Origin: OriginOperator, Type: "credential_revoke", Operator: "op9", Cred: "credC"})
-	e.want(e.submit(never), ClassAdmission, "not_authorized") // indistinguishable, by design
-	a := e.q.Query(Root, keyOf(in), in.Digest, At(e.now))
-	e.wantOutcome(a, Committed, "", true)
-	if a.Seq != seq {
-		t.Fatalf("got seq %d, want %d", a.Seq, seq)
+	in, _ := e.commit(turn("a1", 2))
+	for _, who := range []string{"", "cred:", "op:", "robot:x", "credA"} {
+		e.want(e.q.Query(who, keyOf(in), in.Digest, At(e.now)), ClassAdmission, "unknown_signer")
+		if _, _, wrote, a := e.q.AnchorRequest(who, At(e.now+3600000)); wrote || a.Code != "not_authorized" {
+			t.Fatalf("anchor request by %q: %s, wrote %t", who, showAnswer(a), wrote)
+		}
 	}
 }
 
@@ -724,7 +773,7 @@ func TestAdmissionRefusals(t *testing.T) {
 	e.wantOutcome(e.submit(greedy), Rejected, "invalid", false)
 	hot++
 	// A second line_init is refused definitively and changes nothing.
-	e.want(e.submit(e.intent(Record{Origin: OriginRoot, Type: "line_init"})), ClassRefusal, "line_exists")
+	e.want(e.submit(e.intent(lineInit())), ClassRefusal, "line_exists")
 	e.wantOutcome(e.submit(base), Committed, "", false)
 }
 
@@ -981,7 +1030,7 @@ func TestBootstrapContext(t *testing.T) {
 	e := newEnv(t)
 	genesis, _ := e.q.HeadAt(0)
 	init := func(mutate func(*Intent)) Intent {
-		in := e.intent(Record{Origin: OriginRoot, Type: "line_init"})
+		in := e.intent(lineInit())
 		mutate(&in)
 		return in
 	}
@@ -1016,12 +1065,14 @@ func TestBootstrapContext(t *testing.T) {
 // copy Log returns shares a pointer or a slice with it.
 func TestCommittedRecordsDoNotAlias(t *testing.T) {
 	e := newEnv(t)
-	e.commit(Record{Origin: OriginRoot, Type: "line_init"})
+	e.commit(lineInit())
 	rootRev := int64(1)
 	authorize := Record{Origin: OriginRoot, Type: "operator_key_authorize", OperatorKey: "op1", Expect: Expect{RootRev: &rootRev}}
 	e.commit(authorize)
 	grant := &Grant{Namespace: "nsA", ActorLimit: 4, Reader: true}
-	e.commit(Record{Origin: OriginOperator, Type: "credential_enroll", Operator: "op1", Cred: "credA", JoinRequest: "jr1", Grant: grant})
+	first := enroll("credA", "nsA", "jr1")
+	first.Grant = grant
+	e.commit(first)
 	manifest := []string{"credA"}
 	e.commit(Record{Origin: OriginOperator, Type: "key_epoch_activate", Operator: "op1", Manifest: manifest, Expect: Expect{KeyEpoch: ptr(0)}})
 	e.commit(Record{Origin: OriginCredential, Type: "actor_declare", Cred: "credA", Namespace: "nsA", Actor: "a1"})

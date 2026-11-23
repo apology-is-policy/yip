@@ -27,9 +27,13 @@ type State struct {
 // Line is membership, key and identity state. Generation 0 means no line
 // exists yet: only line_init can commit against it.
 type Line struct {
-	Generation      int64                      `json:"generation"`
-	HeadSeq         int64                      `json:"head_seq"`
-	HeadTime        int64                      `json:"head_time"`
+	Generation int64 `json:"generation"`
+	HeadSeq    int64 `json:"head_seq"`
+	HeadTime   int64 `json:"head_time"`
+	// RootKey is the line's root public key, fixed by line_init. Like every
+	// key in a State it is an opaque string standing for an algorithm
+	// identifier and that algorithm's one accepted public encoding.
+	RootKey         string                     `json:"root_key,omitempty"`
 	RootRev         int64                      `json:"root_rev"`
 	AuthEpoch       int64                      `json:"auth_epoch"`
 	AudienceRev     int64                      `json:"audience_rev"`
@@ -44,20 +48,28 @@ type Line struct {
 	RegisterWriters map[string]*RegisterWriter `json:"register_writers"`
 }
 
-// Credential is an enrolled isolation domain and its grants. In phase 1 a
-// namespace has exactly one declaration owner.
+// Credential is an enrolled isolation domain, its two public keys and its
+// grants. The credential's identifier is derived from the two keys, and
+// neither key is ever replaced. In phase 1 a namespace has exactly one
+// declaration owner. A revoked credential keeps its entry for good: the entry
+// is what reserves its keys and its namespace.
 type Credential struct {
-	Namespace  string `json:"namespace"`
-	ActorLimit int64  `json:"actor_limit"`
-	Reader     bool   `json:"reader"`
-	Revoked    bool   `json:"revoked"`
+	SigningKey    string `json:"signing_key"`
+	EncryptionKey string `json:"encryption_key"`
+	Namespace     string `json:"namespace"`
+	ActorLimit    int64  `json:"actor_limit"`
+	Reader        bool   `json:"reader"`
+	Revoked       bool   `json:"revoked"`
 }
 
-// Tombstones are identifiers that must never be used again.
+// Tombstones are identifiers that must never be used again. OperatorKeys
+// holds every operator key that was authorized and then revoked: it is what
+// tells a revoked operator key from one that never existed.
 type Tombstones struct {
 	Creds        []string `json:"creds"`
 	Actors       []string `json:"actors"`
 	JoinRequests []string `json:"join_requests"`
+	OperatorKeys []string `json:"operator_keys"`
 }
 
 // Actor is an immutable identity inside one namespace, bound to one
@@ -176,6 +188,23 @@ func (l *Line) DefaultAudience() []string {
 	return out
 }
 
+// keyUsed reports whether a public key has ever held a role on this line: the
+// root key, an operator key that is or was authorized, or either key of a
+// credential that is or was enrolled. Such a key is reserved for life. It
+// never takes a second role and never returns to its first. The registry is
+// derived, not stored: nothing that feeds it is ever deleted from a State.
+func (l *Line) keyUsed(k string) bool {
+	if k == l.RootKey || slices.Contains(l.Operators, k) || slices.Contains(l.Tombstones.OperatorKeys, k) {
+		return true
+	}
+	for _, c := range l.Credentials {
+		if c.SigningKey == k || c.EncryptionKey == k {
+			return true
+		}
+	}
+	return false
+}
+
 // liveInNamespace counts live actors in a namespace, whichever credential
 // currently holds them.
 func (l *Line) liveInNamespace(ns string) int64 {
@@ -236,6 +265,7 @@ func (l Line) clone() Line {
 		Creds:        slices.Clone(l.Tombstones.Creds),
 		Actors:       slices.Clone(l.Tombstones.Actors),
 		JoinRequests: slices.Clone(l.Tombstones.JoinRequests),
+		OperatorKeys: slices.Clone(l.Tombstones.OperatorKeys),
 	}
 	out.Actors = make(map[string]*Actor, len(l.Actors))
 	for id, a := range l.Actors {
@@ -260,6 +290,7 @@ func (s State) Canon() State {
 	l.Tombstones.Creds = canonSet(l.Tombstones.Creds)
 	l.Tombstones.Actors = canonSet(l.Tombstones.Actors)
 	l.Tombstones.JoinRequests = canonSet(l.Tombstones.JoinRequests)
+	l.Tombstones.OperatorKeys = canonSet(l.Tombstones.OperatorKeys)
 	for e, r := range l.Readers {
 		l.Readers[e] = canonSet(r)
 	}

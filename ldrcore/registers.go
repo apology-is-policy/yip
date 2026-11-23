@@ -4,13 +4,17 @@ package ldrcore
 // roadmap or a resource observation (spec section 9). Its body is ciphertext
 // under the line's scope and is not modelled. A signature is a boolean.
 type RegisterValue struct {
-	LineID      string
-	Generation  int64
-	Register    string
-	Actor       string
-	Cred        string
-	BindingGen  int64
-	WriterRev   int64
+	LineID     string
+	Generation int64
+	Register   string
+	Actor      string
+	Cred       string
+	BindingGen int64
+	WriterRev  int64
+	// Incarnation is the incarnation of the activation the value was written
+	// under. It is signed with the value, so a publisher that restarted with
+	// an uncertain counter cannot speak for an activation it did not make.
+	Incarnation string
 	KeyEpoch    int64
 	Counter     int64
 	SignatureOK bool
@@ -58,6 +62,9 @@ const (
 	// RegStaleWriter: the value is from an activation older than the current
 	// one. An older activation never regains precedence.
 	RegStaleWriter = "stale_writer"
+	// RegWrongIncarnation: the value names the current writer revision and an
+	// incarnation that is not the one committed with it.
+	RegWrongIncarnation = "wrong_incarnation"
 	// RegRekeyPending and RegStaleEpoch are the key gate of spec 6.3, applied
 	// to register bodies.
 	RegRekeyPending = "rekey_pending"
@@ -79,7 +86,7 @@ func (g *Registers) Publish(s State, v RegisterValue, now int64) string {
 		return RegWrongLine
 	case !registerTypes[v.Register]:
 		return RegUnknownType
-	case v.Counter < 0 || v.Counter > MaxCounter || v.WriterRev < 1 || v.WriterRev > MaxCounter:
+	case v.Counter < 0 || v.Counter > MaxCounter || v.WriterRev < 1 || v.WriterRev > MaxCounter || v.Incarnation == "":
 		return RegMalformed
 	}
 	switch c := l.Credentials[v.Cred]; {
@@ -106,6 +113,11 @@ func (g *Registers) Publish(s State, v RegisterValue, now int64) string {
 	case w.BindingGen != a.BindingGen:
 		// The activation belongs to an earlier binding generation.
 		return RegNoActivation
+	case v.Incarnation != w.Incarnation:
+		// A writer revision and its incarnation are committed together, so a
+		// value naming one without the other was not written under the
+		// current activation.
+		return RegWrongIncarnation
 	}
 	switch {
 	case l.RekeyPending:

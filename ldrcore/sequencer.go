@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"slices"
 )
 
 // Sequencer is an in-memory model of the shell around Apply: operation
@@ -236,18 +237,21 @@ const Root = "root"
 
 // Standings of a principal.
 const (
-	standingActive  = iota // may submit, query and request anchors
-	standingRevoked        // a credential known to be revoked
-	standingNever          // a credential that was never enrolled
-	// standingRefused is an operator key outside the active set. The state
-	// keeps no history of operator keys, so absence does not show whether the
-	// key was revoked or never existed. Nothing may be inferred from it: not
-	// that an earlier operation committed, not that it did not, and not that
-	// the key may be authorized again. That distinction is a gap in the
-	// specification.
-	standingRefused
+	standingActive = iota // may submit, query and request anchors
+	// standingRevoked is a credential that was revoked, or an operator key
+	// that was authorized and then revoked. The state keeps a tombstone for
+	// both, so the key is told that it is revoked and nothing more: not
+	// whether an earlier operation of its committed.
+	standingRevoked
+	// standingNever is a key that never held the role it claims: a credential
+	// that was never enrolled, an operator key that was never authorized.
+	standingNever
 )
 
+// standing is judged for a principal whose possession of the key is already
+// established: by the signature on a submission, or by the authenticated
+// session a query or an anchor request arrives on. Neither is modelled beyond
+// a boolean and a premise.
 func (q *Sequencer) standing(principal string) int {
 	l := &q.state.Line
 	switch {
@@ -263,13 +267,14 @@ func (q *Sequencer) standing(principal string) int {
 		}
 		return standingActive
 	case len(principal) > 3 && principal[:3] == "op:":
-		for _, k := range l.Operators {
-			if k == principal[3:] {
-				return standingActive
-			}
+		switch k := principal[3:]; {
+		case slices.Contains(l.Operators, k):
+			return standingActive
+		case slices.Contains(l.Tombstones.OperatorKeys, k):
+			return standingRevoked
 		}
 	}
-	return standingRefused
+	return standingNever
 }
 
 // access turns a standing into the answer a refused principal gets.
@@ -279,10 +284,8 @@ func access(standing int) (Answer, bool) {
 		return Answer{}, true
 	case standingRevoked:
 		return unresolved("revoked"), false
-	case standingNever:
-		return admission("unknown_signer"), false
 	}
-	return admission("not_authorized"), false
+	return admission("unknown_signer"), false
 }
 
 // tick takes the evaluation time from the injected clock. No evaluation uses

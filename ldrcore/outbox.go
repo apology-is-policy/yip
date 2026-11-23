@@ -21,7 +21,9 @@ import (
 //     every stored intent is asked about before anything new is composed.
 //  4. Only a durable outcome or a definitive refusal settles an intent.
 //  5. A refusal that resolves nothing marks the intent as needing
-//     reconciliation. It is never sent again, and it keeps its slot.
+//     reconciliation. It is never sent again, and it keeps its slot. The same
+//     holds for an admission error that sending again cannot change, such as
+//     an unknown signer: it is neither a reason to retry nor a non-commit.
 //  6. The result is stored with the action that caused it.
 type outbox struct {
 	entries     []*OutboxEntry
@@ -253,9 +255,27 @@ func (c *Client) settle(e *OutboxEntry, a Answer) {
 		// The relay holds other bytes under this identity. Nothing here can
 		// explain that, so nothing here may act on it.
 		e.Status = OutReconcile
+	case ClassAdmission:
+		// An admission error promises nothing, so it never closes an intent.
+		// A transient one leaves it pending: the same bytes may be sent
+		// again. Any other is the relay refusing these bytes or this signer,
+		// which sending them again cannot change. That is not an instruction
+		// to retry, and it is not evidence that nothing committed, so the
+		// intent waits for reconciliation and keeps its slot.
+		if !transientAdmission[a.Code] {
+			e.Status = OutReconcile
+		}
 	}
-	// An admission error or outcome_unknown promises nothing: the intent
-	// stays pending, to be sent again as the same bytes.
+	// outcome_unknown promises nothing either: the intent stays pending.
+}
+
+// transientAdmission lists the admission errors after which sending the same
+// bytes again can succeed. Whether and how often to send again is client
+// policy; nothing in this file sends on its own.
+var transientAdmission = map[string]bool{
+	"overloaded":      true,
+	"quota":           true,
+	"clock_uncertain": true,
 }
 
 // ResolveAll asks about every pending intent by query, without its bytes. It

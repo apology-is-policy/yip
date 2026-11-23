@@ -24,7 +24,7 @@ func (e *env) regValue(actor string, counter int64) RegisterValue {
 	v := RegisterValue{LineID: "L", Generation: l.Generation, Register: "presence", Actor: actor,
 		Cred: a.Cred, BindingGen: a.BindingGen, KeyEpoch: l.KeyEpoch, Counter: counter, SignatureOK: true}
 	if w := l.RegisterWriters[actor+"/presence"]; w != nil {
-		v.WriterRev = w.WriterRev
+		v.WriterRev, v.Incarnation = w.WriterRev, w.Incarnation
 	}
 	return v
 }
@@ -136,6 +136,40 @@ var registerTraceTests = map[string]func(*testing.T){
 			t.Fatalf("the new owner's value is not the current one: %+v", got)
 		}
 	},
+
+	"T41": func(t *testing.T) { // a register value is bound to the incarnation of its activation
+		e := newLine(t)
+		g := NewRegisters("L")
+		e.commit(regActivate("credA", "a1", "i1", 0))
+		first := e.regValue("a1", 1)
+		e.publish(g, first, "")
+
+		// A publisher restored from an old store: the writer revision it
+		// remembers is current, the incarnation it names was never committed.
+		restored := e.regValue("a1", 9)
+		restored.Incarnation = "i7"
+		e.publish(g, restored, RegWrongIncarnation)
+		if got, _, _ := g.Get("a1", "presence"); got != first {
+			t.Fatalf("a refused value replaced the cached one: %+v", got)
+		}
+
+		// It activates afresh. Order is by writer revision first, so its
+		// counter starts over without losing precedence.
+		e.commit(regActivate("credA", "a1", "i2", 1))
+		fresh := e.regValue("a1", 1)
+		if fresh.WriterRev != 2 || fresh.Incarnation != "i2" {
+			t.Fatalf("the value after the new activation: %+v", fresh)
+		}
+		e.publish(g, fresh, "")
+
+		// The current writer revision under the previous incarnation.
+		mixed := e.regValue("a1", 2)
+		mixed.Incarnation = "i1"
+		e.publish(g, mixed, RegWrongIncarnation)
+		if got, _, _ := g.Get("a1", "presence"); got != fresh {
+			t.Fatalf("a refused value replaced the cached one: %+v", got)
+		}
+	},
 }
 
 func TestRegisterTraces(t *testing.T) {
@@ -183,7 +217,7 @@ func TestRegisterRefusals(t *testing.T) {
 	g := NewRegisters("L")
 	e.publish(g, e.regValue("a1", 1), RegMalformed) // no activation yet, so writer_rev 0
 	v := e.regValue("a1", 1)
-	v.WriterRev = 1
+	v.WriterRev, v.Incarnation = 1, "i1"
 	e.publish(g, v, RegNoActivation)
 	e.commit(regActivate("credA", "a1", "i1", 0))
 
@@ -203,6 +237,10 @@ func TestRegisterRefusals(t *testing.T) {
 	bad(func(v *RegisterValue) { v.Cred = "credB" }, RegNotBound)
 	bad(func(v *RegisterValue) { v.BindingGen = 9 }, RegNotBound)
 	bad(func(v *RegisterValue) { v.WriterRev = 2 }, RegNoActivation)
+	bad(func(v *RegisterValue) { v.Incarnation = "" }, RegMalformed)
+	// The current writer revision under an incarnation that was never
+	// committed with it.
+	bad(func(v *RegisterValue) { v.Incarnation = "i9" }, RegWrongIncarnation)
 	if _, _, ok := g.Get("a1", "presence"); ok {
 		t.Fatal("a refused value was cached")
 	}
