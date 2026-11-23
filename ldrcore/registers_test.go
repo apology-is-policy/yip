@@ -232,6 +232,9 @@ func TestRegisterRefusals(t *testing.T) {
 	bad(func(v *RegisterValue) { v.Generation = 2 }, RegWrongLine)
 	bad(func(v *RegisterValue) { v.Register = "lease" }, RegUnknownType)
 	bad(func(v *RegisterValue) { v.Counter = -1 }, RegMalformed)
+	bad(func(v *RegisterValue) { v.Counter = MaxCounter + 1 }, RegMalformed)
+	bad(func(v *RegisterValue) { v.WriterRev = 0 }, RegMalformed)
+	bad(func(v *RegisterValue) { v.WriterRev = MaxCounter + 1 }, RegMalformed)
 	bad(func(v *RegisterValue) { v.Cred = "credZ" }, RegUnknownCred)
 	bad(func(v *RegisterValue) { v.Actor = "zz" }, RegNotLive)
 	bad(func(v *RegisterValue) { v.Cred = "credB" }, RegNotBound)
@@ -244,11 +247,28 @@ func TestRegisterRefusals(t *testing.T) {
 	if _, _, ok := g.Get("a1", "presence"); ok {
 		t.Fatal("a refused value was cached")
 	}
+	if g.Historical(e.q.State(), "a1", "presence") {
+		t.Fatal("a register with no cached value was called historical")
+	}
 
 	e.publish(g, e.regValue("a1", 5), "")
 	e.publish(g, e.regValue("a1", 5), RegStaleCounter)
 	e.publish(g, e.regValue("a1", 4), RegStaleCounter)
 	e.publish(g, e.regValue("a1", 6), "")
+	if g.Historical(e.q.State(), "a1", "presence") {
+		t.Fatal("the current writer's value was called historical")
+	}
+
+	// A newer activation makes the cached value historical until the new
+	// writer publishes.
+	e.commit(regActivate("credA", "a1", "i2", 1))
+	if !g.Historical(e.q.State(), "a1", "presence") {
+		t.Fatal("a value from an older activation must be shown as historical")
+	}
+	e.publish(g, e.regValue("a1", 1), "")
+	if g.Historical(e.q.State(), "a1", "presence") {
+		t.Fatal("the new writer's value was called historical")
+	}
 
 	// A removed actor publishes nothing.
 	e.commit(Record{Origin: OriginCredential, Type: "actor_remove", Cred: "credA", Actor: "a1", Expect: Expect{BindingGen: ptr(1)}})

@@ -284,15 +284,22 @@ var transientAdmission = map[string]bool{
 	"clock_uncertain": true,
 }
 
-// ResolveAll asks about every pending intent by query, without its bytes. It
-// evaluates nothing at the relay. An intent the relay has no outcome for
-// stays pending.
+// ResolveAll asks about every unsettled intent by query, without its bytes:
+// the pending ones, and the ones awaiting reconciliation, which a query may
+// still settle (spec 5.7 rules 3 and 5). It evaluates nothing at the relay,
+// and it never sends. An intent the relay has no outcome for keeps the status
+// it had. For one awaiting reconciliation, an answer that teaches nothing
+// also leaves the stored reason in place.
 func (c *Client) ResolveAll(q *Sequencer, clk Clock) {
 	for _, e := range c.out.entries {
-		if e.Status != OutPending {
+		if e.Status != OutPending && e.Status != OutReconcile {
 			continue
 		}
-		c.settle(e, q.Query(signerOf(&e.Intent.Record), opKey(e.Intent), e.Intent.Digest, clk))
+		a := q.Query(signerOf(&e.Intent.Record), opKey(e.Intent), e.Intent.Digest, clk)
+		if e.Status == OutReconcile && (a.Class == ClassUnknown || a.Class == ClassAdmission) {
+			continue
+		}
+		c.settle(e, a)
 	}
 	c.out.mustResolve = false
 }

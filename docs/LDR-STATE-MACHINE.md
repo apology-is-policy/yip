@@ -650,7 +650,10 @@ recognize them as one intention.
    call. This is client policy and not the wire dedup identity.
 3. On restart, or after a stale-checkpoint refusal, resolve every stored
    intent by query before constructing anything new. A timeout or a
-   cancellation is not evidence of non-commit.
+   cancellation is not evidence of non-commit. An intent marked
+   reconciliation-required is asked about as well: asking is not sending. An
+   answer that establishes nothing leaves it as it was, with the reason it
+   already had.
 4. Only a definitive refusal or a durable rejection closes the intent. The
    caller may then issue a deliberately new or corrected intent with a new
    `op_id`. Nothing is reissued automatically.
@@ -1576,8 +1579,30 @@ Measured on 2026-11-23:
   over three seeds, and requires it to end with exactly the files and notices
   of a client that never crashed, with no rebuild.
 - `go vet` and `go test -race` pass for the package.
-- **Not done: no mutation check of these three files, and no probe by
-  Codex.** Both earlier models looked finished at this stage and were not.
+- **Mutation check, run later the same day: 126 hand-chosen breaks of the
+  three files, beyond those of §14.5. 86 were caught, 36 were not, and 4 did
+  not compile** because the break was written wrongly. The 36 were in the
+  order of the reader-state checks, the projection's write rules, who is
+  notified, several outbox rules, and the bounds and history test of the
+  register model. That is far more than either earlier check left, and it is
+  the result for that chosen set only: a count of breaks caught is not a
+  measure of rules covered.
+- **After it:** tests were added in `client_rules_test.go` and
+  `registers_test.go`, the 4 were rewritten, and 4 breaks were added for the
+  model change below. The set of 130 was run again: 126 caught. One more
+  test was then written for an unreadable view and checked on its own
+  against its break, without a third full run. Three breaks remain uncaught,
+  and none is a rule a test can reach: a second disagreement after a rebuild
+  cannot happen in this model, because a rebuild starts from no files;
+  clearing an injected fault on restart belongs to the test harness; and the
+  register model's "revoked credential" test of history is implied by the
+  others, since revocation disables the credential's actors.
+- **One model change came out of it.** Resolving stored intents after a
+  restart now asks about those awaiting reconciliation as well as the
+  pending ones, which is §5.7 rule 3 read literally. Before, the restart
+  demanded a resolve that did nothing for them.
+- **No probe by Codex yet.** Both earlier models looked finished at this
+  stage and were not.
 
 Rules the models forced that this document had not stated, each needing
 review:
@@ -1605,6 +1630,16 @@ review:
 - Within one activation a register value must carry a higher counter than
   the cached one. A value naming a writer revision that does not exist yet is
   refused as having no activation.
+- Only `history_unavailable` raises the suspicion of a rollback. This
+  document does not say what a client that has been told `revoked` may still
+  compose before it has replayed its own revocation, and the model lets it.
+  That needs a rule.
+- A view file that carries a higher sequence number than the store would
+  give it, but not one beyond the checkpoint, is left in place by projection
+  and refused when it is read.
+- A sender is not notified of its own record, an actor that is no longer
+  live is not notified, and an operator's record on a call notifies both
+  participants.
 
 ### 14.5 Draft v7: the enrollment rules
 
@@ -1674,6 +1709,7 @@ Measured on 2026-11-23, after the change:
   no rule; they are listed at the top of this document.
 - **The client and register models have had no probe by Codex.** Each time
   before, such a probe found defects after every check above was green.
+  Their own mutation check is reported in §14.4.
 
 Rules this change forced that had not been stated, each needing review:
 
