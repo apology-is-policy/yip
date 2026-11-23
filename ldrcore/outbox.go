@@ -30,8 +30,9 @@ import (
 //     operation: it is neither a reason to retry nor a non-commit. A query
 //     may still settle the intent. This model has no way to resume sending.
 //  6. The result is stored with the action that caused it.
-//  7. A key that is revoked signs and submits nothing more, and asks nothing
-//     more either: a revoked key cannot obtain an outcome. The client learns
+//  7. A key that is revoked signs and submits nothing more, and makes no other
+//     request with that key either, neither a query nor an anchor request: a
+//     revoked key cannot obtain an outcome or an anchor. The client learns
 //     that from an authenticated `revoked` answer, or by verifying the
 //     revocation itself. Every unsettled intent the key signed keeps its slot
 //     and awaits reconciliation by a principal that is still authorized. This
@@ -55,7 +56,9 @@ type KeyStop struct {
 	// Told: an authenticated `revoked` answer about the key was accepted.
 	// Answer is the first such answer, and Seq and Head are the client's
 	// checkpoint when it arrived. They are evidence for whoever looks into
-	// it, and nothing alters them afterwards.
+	// it, and nothing alters them afterwards. They stand in for more than
+	// they are: real evidence is the authenticated response with what binds
+	// it to the request, the line and the key, and this is no audit trail.
 	//
 	// Told without Verified is a discrepancy to report, not a verdict. The
 	// records verified so far may simply end before the revocation, and a
@@ -486,7 +489,15 @@ func (c *Client) ClearSuspicion() { c.out.suspect = false }
 // is revoked stops it, like the same answer to a submission or a query. Any
 // other refusal stops nothing: an admission error is not evidence of a
 // revocation.
+//
+// A credential that has already stopped makes no request at all, whatever
+// relay it is offered: the stop is the client's, and it does not depend on
+// what one relay's state says. No other key the device holds is used in its
+// place.
 func (c *Client) Anchor(q *Sequencer, clk Clock) error {
+	if c.signsNoMore(CredentialPrincipal(c.Cred)) {
+		return ErrKeyRevoked
+	}
 	if _, _, _, a := q.AnchorRequest(CredentialPrincipal(c.Cred), clk); a.Class != "" {
 		if a.Class == ClassUnresolved && a.Code == "revoked" {
 			c.toldRevoked(CredentialPrincipal(c.Cred), a)

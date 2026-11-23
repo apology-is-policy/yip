@@ -504,6 +504,19 @@ func traceT47(t *testing.T) {
 		t.Fatalf("after a second answer: %+v", got)
 	}
 
+	// The stopped credential requests no anchor, even from the relay it had
+	// verified, which has no revocation and would serve it. This is finding
+	// C3: the stop is the client's and does not depend on one relay's state.
+	e.now += testProfile.FreshnessMS + 1
+	logLen := len(e.q.Log())
+	if err := ca.Anchor(e.q, At(e.now)); !errors.Is(err, ErrKeyRevoked) || len(e.q.Log()) != logLen {
+		t.Fatalf("a stopped credential's anchor request: err %v, relay log %d -> %d; want ErrKeyRevoked and no request",
+			err, logLen, len(e.q.Log()))
+	}
+	if got := ca.Stops(); !reflect.DeepEqual(got, []KeyStop{told}) {
+		t.Fatalf("after the refused request: %+v", got)
+	}
+
 	// An old outcome, obtained by an authorized principal, settles the
 	// intent. It is no reason to resume.
 	got := operatorAsks(e, ca, id)

@@ -701,9 +701,12 @@ recognize them as one intention.
    when its own policy says so. Stopping settles nothing: the intent still
    needs an outcome, a definitive refusal or reconciliation before its slot
    is free.
-8. A key that is revoked signs and submits nothing more, and asks nothing
-   more either: a query is signed too, and a revoked key cannot obtain an
-   outcome. The client stops a key when it accepts an authenticated
+8. A key that is revoked signs and submits nothing more, and makes no other
+   request with that key either, neither a query nor an anchor request:
+   those are authenticated too, and a revoked key cannot obtain an outcome
+   or an anchor. The stop is the client's own. It holds whatever relay the
+   client is talking to, including one whose state still lists the key as
+   active. The client stops a key when it accepts an authenticated
    `revoked` answer about that key, to a submission, a query or an anchor
    request, and when it verifies the revocation in the records. An admission
    error is never taken for that answer.
@@ -720,8 +723,11 @@ recognize them as one intention.
    - The stop is not a suspected rollback, and other keys held on the same
      device go on.
    - The stop stands if the records the client then verifies show no
-     revocation. The client keeps the answer and the checkpoint it held when
-     the answer arrived, and reports the difference. It does not make up a
+     revocation. The client keeps the first such answer and the checkpoint
+     it held when the answer arrived, unaltered, and reports the difference.
+     Real evidence is the authenticated response with what binds it to the
+     request, the line and the key; its format belongs to the authentication
+     design, and it is not an audit trail. The client does not make up a
      revocation, call the difference a rollback, or resume because a query
      returned an old outcome. A prefix that ends before a revocation does
      not disprove the answer, and a later head does not say which head the
@@ -730,8 +736,8 @@ recognize them as one intention.
      recovery procedure of its own, which nobody has designed. A key that
      really was revoked is never authorized again (§6.2).
 
-Rule 8 is Codex's proposal, with its clarifications (call 0003, turns 11 and
-13). Before it this document had no rule, and the model let a client that had
+Rule 8 is Codex's proposal, with its clarifications (call 0003, turns 11, 13
+and 15). Before it this document had no rule, and the model let a client that had
 been told `revoked` go on composing. It is design-review agreement between
 two agents and not operator approval.
 
@@ -1729,26 +1735,41 @@ Traces T43 to T47 re-enact the two findings and rule 8. All 47 traces have a
 test: 27 against the sequencer model, 13 against the client model, 4 against
 the register model, and 3 as a plain sequence of transitions.
 
+Codex then read rule 8, the new paragraph of §4.2 and the five traces, and
+asked for no change to their wording (turn 15). It accepted keeping only the
+first `revoked` answer per key as a bounded choice of the model, and it found
+a third defect:
+
+- **C3. A stopped credential still asked for an anchor.** `Anchor` called
+  the relay without looking at the stop. Told `revoked` by one relay, the
+  client then got an anchor from another relay whose state did not have the
+  revocation, and that relay wrote a `time_anchor` for it. The stop itself
+  was not lifted, and the second relay did nothing its own state forbade;
+  what failed was the client's rule that a stopped key makes no request.
+  `Anchor` now refuses locally. T47 has a step for it.
+
 Measured on 2026-11-23, after the clarifications:
 
-- Codex's five probes pass. They are its file, run here through a build
-  overlay and not copied into the package.
+- Codex's six probes pass, the one for C3 included. They are its files, run
+  here through a build overlay and not copied into the package.
 - A break check of the changed code only, 27 hand-chosen breaks at first.
   On the first run 23 were caught, 2 were not, and 2 did not compile. One of
   the 2 was a gap: no test checked that the record opening a call notifies
   the other participant. A test was added and the 2 were rewritten, and 26
   were caught.
 - After the clarifications the set grew to 41, and 40 were caught on the one
-  run made. The one left, both times, drops the comparison of credentials at
-  handoff. It changes nothing on the states this model can reach, where a
+  run made. With one more break for C3 it is 42, and 41 were caught. The one
+  left, every time, drops the comparison of credentials at handoff. It changes nothing on the states this model can reach, where a
   client's credential is fixed, actors are never redefined and every move
   raises the binding generation. The comparison stays, as the plain
   statement of ownership (Codex's wording of the limit).
 - `gofmt` and `go vet` are clean, and `go test -race` passes for the
   package.
 - As before, code, tests and breaks have one author, and a count of breaks
-  caught is not a measure of rules covered. Codex has seen the code as it
-  stood at `8a53f37`, not the clarifications or the five traces.
+  caught is not a measure of rules covered. Three rounds of the author's
+  tests each looked complete, and Codex's next probe found a defect each
+  time. Codex has seen the code as it stood at `7b79dd2`, not the fix for
+  C3.
 
 Rules the models forced that this document had not stated, each needing
 review:
