@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -1349,5 +1350,405 @@ func TestClientUnactivatedMemberBlocksAdminAttachedMutationsAndLegacyV1Config(t 
 		if _, err := OpenClient(dir); err == nil {
 			t.Fatalf("OpenClient accepted legacy v1 config.cbor without dir_kind!")
 		}
+	})
+}
+
+// TestAdminReaderCredentialPreservationAndResume verifies Codex Turn 12 Finding 1:
+//   - EnsureAdminReaderRequest creates cred.key + admin-reader.req.cbor create-only
+//     on first call, safely resumes with the EXACT same keys and signed JoinRequest
+//     on retry (including after a simulated --out output failure or reopen), refuses
+//     conflicting namespace/alg, and refuses once the reader credential is enrolled.
+//   - AttachAdminReaderKeys and EnsureAdminReaderRequest refuse silent replacement
+//     of any existing cred.key, including one that cannot be decoded, and OpenClient
+//     fails closed on an undecodable cred.key without touching it.
+func TestAdminReaderCredentialPreservationAndResume(t *testing.T) {
+	fx := startOnboardingFixture(t)
+	ctx := context.Background()
+
+	t.Run("create_resume_after_output_error_and_refuse_after_enrollment", func(t *testing.T) {
+		adminDir := t.TempDir()
+		adm, err := InitClientDir(InitDirOptions{
+			Dir: adminDir, DirKind: DirKindAdmin, SignedDescriptor: fx.env.rawDesc, Activated: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer adm.Close()
+
+		// 1. First-time creation (ECDSA P-256) creates cred.key + admin-reader.req.cbor.
+		req1, resumed1, err := adm.EnsureAdminReaderRequest("ns-admin-r", ldrcrypto.AlgECDSAP256)
+		if err != nil {
+			t.Fatalf("first EnsureAdminReaderRequest: %v", err)
+		}
+		if resumed1 {
+			t.Fatalf("expected resumed=false on first creation")
+		}
+		origKeyBytes, err := os.ReadFile(filepath.Join(adminDir, "cred.key"))
+		if err != nil {
+			t.Fatalf("read cred.key: %v", err)
+		}
+
+		// 2. Simulate --out output failure (parent path is a regular file!).
+		blocker := filepath.Join(t.TempDir(), "not-a-dir")
+		if err := os.WriteFile(blocker, []byte("file"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := SaveJoinRequest(filepath.Join(blocker, "out.req.cbor"), req1); err == nil {
+			t.Fatalf("expected SaveJoinRequest to fail under regular-file parent")
+		}
+
+		// 3. Retry with omitted alg ("") AND explicit matching alg -> resumes with EXACT same
+		//    keys and JoinRequest, leaving cred.key byte-for-byte untouched!
+		for _, retryAlg := range []string{"", ldrcrypto.AlgECDSAP256} {
+			req2, resumed2, err := adm.EnsureAdminReaderRequest("ns-admin-r", retryAlg)
+			if err != nil {
+				t.Fatalf("retry EnsureAdminReaderRequest(alg=%q): %v", retryAlg, err)
+			}
+			if !resumed2 {
+				t.Fatalf("expected resumed=true on retry(alg=%q)", retryAlg)
+			}
+			if req2.CredID != req1.CredID || !bytes.Equal(req2.RequestID, req1.RequestID) ||
+				!bytes.Equal(req2.BodyBytes, req1.BodyBytes) || !bytes.Equal(req2.Sig, req1.Sig) {
+				t.Fatalf("resumed request differs from original!")
+			}
+		}
+
+		// 4. Close and reopen admin dir -> still resumes with the exact same request!
+		if err := adm.Close(); err != nil {
+			t.Fatal(err)
+		}
+		adm, err = OpenClient(adminDir)
+		if err != nil {
+			t.Fatalf("reopen adminDir: %v", err)
+		}
+		defer adm.Close()
+		req3, resumed3, err := adm.EnsureAdminReaderRequest("ns-admin-r", "")
+		if err != nil || !resumed3 || req3.CredID != req1.CredID || !bytes.Equal(req3.Sig, req1.Sig) {
+			t.Fatalf("post-reopen resume mismatch: resumed=%v err=%v", resumed3, err)
+		}
+
+		// 5. Conflicting namespace or conflicting explicit alg MUST fail closed!
+		if _, _, err := adm.EnsureAdminReaderRequest("ns-other", ""); !errors.Is(err, ErrCredentialExists) {
+			t.Fatalf("conflicting namespace: got %v, want ErrCredentialExists", err)
+		}
+		if _, _, err := adm.EnsureAdminReaderRequest("ns-admin-r", ldrcrypto.AlgEd25519); !errors.Is(err, ErrCredentialExists) {
+			t.Fatalf("conflicting alg: got %v, want ErrCredentialExists", err)
+		}
+
+		// 6. Enroll that exact admin reader credential and sync adminDir -> repeated
+		//    EnsureAdminReaderRequest MUST fail with ErrCredentialExists!
+		admCred, err := LoadCredentialKeys(filepath.Join(adminDir, "cred.key"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		reqDig, err := ldrcrypto.VerifyJoinRequest(req1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fx.enrollRaw(t, admCred, req1.Grant, req1.RequestID, reqDig)
+		adm.AttachOperatorKey(fx.opKey)
+		sOp, err := adm.Dial(ctx, ldrcrypto.PrincipalOperator)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sOp.Close()
+		if _, err := adm.Sync(ctx, sOp); err != nil {
+			t.Fatalf("sync adminDir after enrollment: %v", err)
+		}
+		if _, _, err := adm.EnsureAdminReaderRequest("ns-admin-r", ""); !errors.Is(err, ErrCredentialExists) {
+			t.Fatalf("EnsureAdminReaderRequest after enrollment: got %v, want ErrCredentialExists", err)
+		}
+
+		// Verify original cred.key survived EVERY step byte-for-byte unchanged!
+		afterKeyBytes, err := os.ReadFile(filepath.Join(adminDir, "cred.key"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(origKeyBytes, afterKeyBytes) {
+			t.Fatalf("cred.key bytes changed across retries/errors/enrollment!")
+		}
+	})
+
+	t.Run("attach_and_undecodable_cred_key_never_silently_replaced", func(t *testing.T) {
+		// Case A: valid cred.key attached directly (no pending admin-reader.req.cbor).
+		dirA := t.TempDir()
+		admA, err := InitClientDir(InitDirOptions{
+			Dir: dirA, DirKind: DirKindAdmin, SignedDescriptor: fx.env.rawDesc, Activated: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer admA.Close()
+		k1, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+		k2, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+		if err := admA.AttachAdminReaderKeys(k1); err != nil {
+			t.Fatalf("first AttachAdminReaderKeys: %v", err)
+		}
+		origA, err := os.ReadFile(filepath.Join(dirA, "cred.key"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := admA.AttachAdminReaderKeys(k2); !errors.Is(err, ErrCredentialExists) {
+			t.Fatalf("second AttachAdminReaderKeys: got %v, want ErrCredentialExists", err)
+		}
+		if _, _, err := admA.EnsureAdminReaderRequest("ns-a", ""); !errors.Is(err, ErrCredentialExists) {
+			t.Fatalf("EnsureAdminReaderRequest without pending req file: got %v, want ErrCredentialExists", err)
+		}
+		afterA, _ := os.ReadFile(filepath.Join(dirA, "cred.key"))
+		if !bytes.Equal(origA, afterA) {
+			t.Fatalf("AttachAdminReaderKeys/EnsureAdminReaderRequest modified existing cred.key!")
+		}
+
+		// Case B: undecodable/corrupt cred.key present on disk!
+		dirB := t.TempDir()
+		admB, err := InitClientDir(InitDirOptions{
+			Dir: dirB, DirKind: DirKindAdmin, SignedDescriptor: fx.env.rawDesc, Activated: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		corruptBytes := []byte("corrupt-undecodable-credential-material-do-not-overwrite")
+		if err := os.WriteFile(filepath.Join(dirB, "cred.key"), corruptBytes, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// While open with c.credKeys == nil: BOTH AttachAdminReaderKeys and
+		// EnsureAdminReaderRequest MUST fail with ErrCredentialExists and preserve corrupt bytes!
+		if err := admB.AttachAdminReaderKeys(k2); !errors.Is(err, ErrCredentialExists) {
+			t.Fatalf("AttachAdminReaderKeys over undecodable cred.key: got %v, want ErrCredentialExists", err)
+		}
+		if _, _, err := admB.EnsureAdminReaderRequest("ns-b", ""); !errors.Is(err, ErrCredentialExists) {
+			t.Fatalf("EnsureAdminReaderRequest over undecodable cred.key: got %v, want ErrCredentialExists", err)
+		}
+		_ = admB.Close()
+		// On reopen: OpenClient MUST fail closed (ErrKeyFile) and preserve corrupt bytes!
+		if _, err := OpenClient(dirB); !errors.Is(err, ErrKeyFile) {
+			t.Fatalf("OpenClient with undecodable cred.key: got %v, want ErrKeyFile", err)
+		}
+		gotB, err := os.ReadFile(filepath.Join(dirB, "cred.key"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(corruptBytes, gotB) {
+			t.Fatalf("undecodable cred.key was modified or overwritten!")
+		}
+	})
+}
+
+// TestInitClientDirPreservesExistingPartialAndOpenDirectories verifies Codex Turn 12 Finding 2:
+//   - InitClientDir reserves a fresh directory under exclusive .client.lock BEFORE
+//     writing any artifacts, refusing already-open directories (ErrClientLocked),
+//     repeated initialization of closed directories (ErrDirInitialized), partially
+//     initialized directories (ErrDirInitialized), and legacy v1 directories
+//     (ErrDirInitialized) without modifying existing keys, outbox, config, or WAL.
+//   - Legacy v1 config error points users to a NEW client directory while preserving
+//     existing keys and outbox.
+func TestInitClientDirPreservesExistingPartialAndOpenDirectories(t *testing.T) {
+	fx := startOnboardingFixture(t)
+	ctx := context.Background()
+
+	snapshotDirFiles := func(t *testing.T, dir string, names ...string) map[string][]byte {
+		t.Helper()
+		snap := make(map[string][]byte, len(names))
+		for _, name := range names {
+			b, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil {
+				t.Fatalf("read %s: %v", name, err)
+			}
+			snap[name] = b
+		}
+		return snap
+	}
+	assertSnapshotUnchanged := func(t *testing.T, dir string, snap map[string][]byte) {
+		t.Helper()
+		for name, want := range snap {
+			got, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil {
+				t.Fatalf("re-read %s: %v", name, err)
+			}
+			if !bytes.Equal(want, got) {
+				t.Fatalf("file %s was modified by failed InitClientDir!", name)
+			}
+		}
+	}
+
+	t.Run("already_open_and_closed_existing_dir_with_pending_outbox_preserved", func(t *testing.T) {
+		keys, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+		grant := ldrcrypto.JoinGrant{NamespaceID: "ns-preserve", ActorLimit: 2, Reader: true}
+		reqID, reqDig := fx.enrollP3(t, keys, grant, 0x81)
+		fx.activateNextEpoch(t)
+
+		dir := t.TempDir()
+		cl, err := InitClientDir(InitDirOptions{
+			Dir: dir, DirKind: DirKindMember, SignedDescriptor: fx.env.rawDesc, CredKeys: keys,
+			ExpectedGrant: &grant, ExpectedJoinReq: reqID, ExpectedJoinReqDigest: &reqDig, Activated: false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sess, err := cl.Dial(ctx, ldrcrypto.PrincipalCredential)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cl.VerifyEnrollmentAndActivate(ctx, sess); err != nil {
+			t.Fatal(err)
+		}
+		sess.Close()
+
+		// Persist a pending outbox entry WITHOUT sending it!
+		pendingOp, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "pending_decl", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "p1"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-preserve"}},
+		})
+		if err != nil {
+			t.Fatalf("ComposeAndPersist: %v", err)
+		}
+		snap := snapshotDirFiles(t, dir, "cred.key", "config.cbor", "outbox.cbor", "verified.wal")
+
+		// 1. While cl is OPEN (holding .client.lock), InitClientDir MUST fail with
+		//    ErrClientLocked and leave every file 100% untouched!
+		otherKeys, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+		if _, err := InitClientDir(InitDirOptions{
+			Dir: dir, DirKind: DirKindAdmin, SignedDescriptor: fx.env.rawDesc, CredKeys: otherKeys, Activated: true,
+		}); !errors.Is(err, ErrClientLocked) {
+			t.Fatalf("InitClientDir on already-open dir: got %v, want ErrClientLocked", err)
+		}
+		assertSnapshotUnchanged(t, dir, snap)
+
+		// 2. After closing cl, repeated InitClientDir MUST fail with ErrDirInitialized
+		//    and leave cred.key, config.cbor, pending outbox.cbor, and verified.wal untouched!
+		if err := cl.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := InitClientDir(InitDirOptions{
+			Dir: dir, DirKind: DirKindAdmin, SignedDescriptor: fx.env.rawDesc, CredKeys: otherKeys, Activated: true,
+		}); !errors.Is(err, ErrDirInitialized) {
+			t.Fatalf("InitClientDir on closed existing dir: got %v, want ErrDirInitialized", err)
+		}
+		assertSnapshotUnchanged(t, dir, snap)
+
+		// 3. Reopening dir still sees original CredID and pending outbox entry!
+		reopened, err := OpenClient(dir)
+		if err != nil {
+			t.Fatalf("OpenClient after rejected re-init: %v", err)
+		}
+		defer reopened.Close()
+		cid, ok := reopened.CredID()
+		if !ok || cid != keys.CredID {
+			t.Fatalf("reopened CredID mismatch: ok=%v", ok)
+		}
+		ob := reopened.OutboxSnapshot()
+		if len(ob) != 1 || ob[0].OpID != pendingOp || ob[0].Status != ldrcore.OutPending {
+			t.Fatalf("pending outbox lost after rejected re-init: %+v", ob)
+		}
+	})
+
+	t.Run("partially_initialized_directories_refused_without_modification", func(t *testing.T) {
+		partials := []struct {
+			name    string
+			file    string
+			content []byte
+		}{
+			{name: "only_verified_wal", file: "verified.wal", content: []byte("existing-wal-marker")},
+			{name: "only_cred_key", file: "cred.key", content: []byte("existing-cred-marker")},
+			{name: "only_outbox", file: "outbox.cbor", content: []byte("existing-outbox-marker")},
+			{name: "stray_file", file: "notes.txt", content: []byte("do-not-clobber")},
+		}
+		for _, tc := range partials {
+			t.Run(tc.name, func(t *testing.T) {
+				dir := t.TempDir()
+				p := filepath.Join(dir, tc.file)
+				if err := os.WriteFile(p, tc.content, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := InitClientDir(InitDirOptions{
+					Dir: dir, DirKind: DirKindAdmin, SignedDescriptor: fx.env.rawDesc, Activated: true,
+				}); !errors.Is(err, ErrDirInitialized) {
+					t.Fatalf("InitClientDir on partial dir (%s): got %v, want ErrDirInitialized", tc.name, err)
+				}
+				got, err := os.ReadFile(p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(tc.content, got) {
+					t.Fatalf("partial dir file %s was altered!", tc.file)
+				}
+				for _, artifact := range []string{"config.cbor", "outbox.cbor", "verified.wal", "cred.key"} {
+					if artifact == tc.file {
+						continue
+					}
+					if _, err := os.Stat(filepath.Join(dir, artifact)); !os.IsNotExist(err) {
+						t.Fatalf("failed InitClientDir unexpectedly created %s in partial dir", artifact)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("legacy_v1_dir_guides_to_new_dir_and_refuses_in_place_reinit", func(t *testing.T) {
+		legacyDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(legacyDir, "sidecars"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := initEmptyVerifiedWAL(filepath.Join(legacyDir, "verified.wal")); err != nil {
+			t.Fatal(err)
+		}
+		legacyKeys, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+		if err := SaveCredentialKeysCreateOnly(filepath.Join(legacyDir, "cred.key"), legacyKeys); err != nil {
+			t.Fatal(err)
+		}
+		legacyCfg, err := ldrcrypto.MarshalCBOR(ldrcrypto.Map{
+			{Key: "cd", Value: fx.env.cd[:]},
+			{Key: "descriptor", Value: fx.env.rawDesc},
+			{Key: "genesis", Value: fx.env.genesis[:]},
+			{Key: "line_id", Value: fx.env.lineID},
+			{Key: "v", Value: uint64(1)},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ldrstore.AtomicWriteFile(filepath.Join(legacyDir, "config.cbor"), legacyCfg, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := saveOutbox(filepath.Join(legacyDir, "outbox.cbor"), persistedOutbox{
+			Activated: true,
+			KeyStops:  make(map[string]*KeyStop),
+			Entries: []*OutboxEntry{{
+				OpID: "legacy-pending-1", Action: "keep-me", Slot: "s1", Gen: 1,
+				Principal: ldrcrypto.CredentialPrincipal(legacyKeys.CredID),
+				Status:    ldrcore.OutPending, IntentBytes: []byte("raw"),
+			}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		snap := snapshotDirFiles(t, legacyDir, "cred.key", "config.cbor", "outbox.cbor", "verified.wal")
+
+		// 1. OpenClient rejects legacy v1 and explicitly advises initializing a NEW directory
+		//    while preserving existing keys and outbox!
+		_, err = OpenClient(legacyDir)
+		if err == nil {
+			t.Fatalf("expected OpenClient to reject legacy v1 dir")
+		}
+		if !strings.Contains(err.Error(), "NEW client directory") || !strings.Contains(err.Error(), "preserve existing keys and outbox") {
+			t.Fatalf("legacy v1 error should direct user to a new directory and preserve keys/outbox, got: %v", err)
+		}
+
+		// 2. Attempting InitClientDir in-place on legacyDir MUST fail with ErrDirInitialized
+		//    and leave legacy cred.key, config.cbor, outbox.cbor, and verified.wal untouched!
+		if _, err := InitClientDir(InitDirOptions{
+			Dir: legacyDir, DirKind: DirKindAdmin, SignedDescriptor: fx.env.rawDesc, Activated: true,
+		}); !errors.Is(err, ErrDirInitialized) {
+			t.Fatalf("InitClientDir in-place on legacy v1 dir: got %v, want ErrDirInitialized", err)
+		}
+		assertSnapshotUnchanged(t, legacyDir, snap)
+
+		// 3. Initializing a fresh NEW directory succeeds cleanly.
+		newDir := filepath.Join(t.TempDir(), "fresh-v2")
+		fresh, err := InitClientDir(InitDirOptions{
+			Dir: newDir, DirKind: DirKindAdmin, SignedDescriptor: fx.env.rawDesc, Activated: true,
+		})
+		if err != nil {
+			t.Fatalf("InitClientDir on fresh new dir: %v", err)
+		}
+		_ = fresh.Close()
 	})
 }

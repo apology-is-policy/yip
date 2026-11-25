@@ -29,6 +29,7 @@ const ldrUsage = `yip ldr -- Long Distance Relay client, equal-roots admin, and 
     yip ldr root init-line --dir <client-dir> --descriptor <desc.cbor> --root-key <file>
     yip ldr root authorize-operator --dir <client-dir> --root-key <file> --operator-pub <file>
     yip ldr root replace-root --dir <client-dir> --root-key <file> --old-root-pub <file> --new-root-pub <file>
+    yip ldr root reader-request --dir <admin-dir> --namespace <ns> [--alg ed25519|ecdsa-p256-sha256] --out <req.cbor>
 
   P3 KEY-FIRST ENROLLMENT & O25 FULL-REPLAY ONBOARDING
     yip ldr join request --dir <client-dir> --descriptor <desc.cbor> --namespace <ns> [--actor-limit 4] [--reader] --out <req.cbor>
@@ -79,7 +80,7 @@ func ldrTimeoutCtx() (context.Context, context.CancelFunc) {
 
 func ldrRootCLI(args []string, out io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: yip ldr root <keygen|descriptor|init-line|authorize-operator|replace-root>")
+		return errors.New("usage: yip ldr root <keygen|descriptor|init-line|authorize-operator|replace-root|reader-request>")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -393,7 +394,7 @@ func ldrRootCLI(args []string, out io.Writer) error {
 		var dir, ns, alg, outPath string
 		rest, dir = takeFlag(rest, "--dir", "")
 		rest, ns = takeFlag(rest, "--namespace", "")
-		rest, alg = takeFlag(rest, "--alg", ldrcrypto.AlgEd25519)
+		rest, alg = takeFlag(rest, "--alg", "")
 		rest, outPath = takeFlag(rest, "--out", "")
 		if dir == "" || ns == "" || outPath == "" {
 			return errors.New("root reader-request requires --dir, --namespace, --out")
@@ -403,27 +404,7 @@ func ldrRootCLI(args []string, out io.Writer) error {
 			return err
 		}
 		defer cl.Close()
-		desc, cd, _, _ := cl.Descriptor()
-		credKeys, err := ldrclient.GenerateCredentialKeys(alg)
-		if err != nil {
-			return err
-		}
-		if err := cl.AttachAdminReaderKeys(credKeys); err != nil {
-			return err
-		}
-		reqID := make([]byte, 16)
-		if _, err := io.ReadFull(rand.Reader, reqID); err != nil {
-			return err
-		}
-		grant := ldrcrypto.JoinGrant{NamespaceID: ns, ActorLimit: 0, Reader: true}
-		req, err := ldrcrypto.SignJoinRequest(credKeys.Signing.Signer, ldrcrypto.JoinRequest{
-			RequestID:        reqID,
-			LineID:           desc.LineID,
-			Generation:       1,
-			DescriptorDigest: cd,
-			EncryptionKey:    credKeys.Encryption.PublicKey(),
-			Grant:            grant,
-		})
+		req, resumed, err := cl.EnsureAdminReaderRequest(ns, alg)
 		if err != nil {
 			return err
 		}
@@ -431,10 +412,12 @@ func ldrRootCLI(args []string, out io.Writer) error {
 			return err
 		}
 		return json.NewEncoder(out).Encode(map[string]any{
-			"request":   outPath,
-			"cred_id":   hex.EncodeToString(req.CredID[:]),
-			"namespace": ns,
-			"reader":    true,
+			"request":    outPath,
+			"cred_id":    hex.EncodeToString(req.CredID[:]),
+			"request_id": hex.EncodeToString(req.RequestID),
+			"namespace":  ns,
+			"reader":     true,
+			"resumed":    resumed,
 		})
 
 	default:

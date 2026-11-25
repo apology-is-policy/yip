@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/apology-is-policy/yip/ldrcrypto"
@@ -26,8 +27,10 @@ import (
 )
 
 var (
-	ErrClientLocked = errors.New("ldrclient: client directory is locked by another process")
-	ErrKeyFile      = errors.New("ldrclient: invalid key file")
+	ErrClientLocked     = errors.New("ldrclient: client directory is locked by another process")
+	ErrKeyFile          = errors.New("ldrclient: invalid key file")
+	ErrCredentialExists = errors.New("ldrclient: credential key already exists in client directory")
+	ErrDirInitialized   = errors.New("ldrclient: client directory already initialized or non-empty; choose a fresh directory")
 )
 
 // SigningKeyMaterial holds a Profile v1 signing private key (Ed25519 or ECDSA P-256).
@@ -218,27 +221,26 @@ func GenerateCredentialKeys(sigAlg string) (*CredentialKeyBundle, error) {
 	return &CredentialKeyBundle{Signing: sig, Encryption: enc, CredID: cid}, nil
 }
 
-// SaveCredentialKeys writes a CredentialKeyBundle atomically with 0600 permissions.
-func SaveCredentialKeys(path string, b *CredentialKeyBundle) error {
+func marshalCredentialKeys(b *CredentialKeyBundle) ([]byte, error) {
 	if b == nil || b.Signing == nil || b.Encryption == nil {
-		return ErrKeyFile
+		return nil, ErrKeyFile
 	}
 	cid, err := ldrcrypto.DeriveCredID(b.Signing.Signer.PublicKey(), b.Encryption.PublicKey())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if cid != b.CredID {
-		return fmt.Errorf("%w: cred_id mismatch", ErrKeyFile)
+		return nil, fmt.Errorf("%w: cred_id mismatch", ErrKeyFile)
 	}
 	sigPub, err := b.Signing.Signer.PublicKey().ToCBOR()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	encPub, err := b.Encryption.PublicKey().ToCBOR()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	raw, err := ldrcrypto.MarshalCBOR(ldrcrypto.Map{
+	return ldrcrypto.MarshalCBOR(ldrcrypto.Map{
 		{Key: "cred_id", Value: cid[:]},
 		{Key: "enc_pub", Value: encPub},
 		{Key: "enc_secret", Value: b.Encryption.Bytes()},
@@ -248,10 +250,45 @@ func SaveCredentialKeys(path string, b *CredentialKeyBundle) error {
 		{Key: "sig_secret", Value: b.Signing.Secret},
 		{Key: "v", Value: uint64(1)},
 	})
+}
+
+// SaveCredentialKeys writes a CredentialKeyBundle atomically with 0600 permissions.
+func SaveCredentialKeys(path string, b *CredentialKeyBundle) error {
+	raw, err := marshalCredentialKeys(b)
 	if err != nil {
 		return err
 	}
 	return ldrstore.AtomicWriteFile(path, raw, 0o600)
+}
+
+// SaveCredentialKeysCreateOnly writes a CredentialKeyBundle strictly create-only
+// (O_CREATE|O_EXCL, 0600) so an existing cred.key — even one that cannot be
+// decoded — is never silently replaced.
+func SaveCredentialKeysCreateOnly(path string, b *CredentialKeyBundle) error {
+	raw, err := marshalCredentialKeys(b)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return ErrCredentialExists
+		}
+		return err
+	}
+	if _, err := f.Write(raw); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	if err := ldrstore.SyncFile(f); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return ldrstore.SyncDir(filepath.Dir(path))
 }
 
 // LoadCredentialKeys loads and re-verifies a saved CredentialKeyBundle.

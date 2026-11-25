@@ -125,20 +125,43 @@ type persistedEpochs struct {
 	BadWraps map[uint64]bool
 }
 
-func (c *Client) configPath() string  { return filepath.Join(c.dir, "config.cbor") }
-func (c *Client) walPath() string     { return filepath.Join(c.dir, "verified.wal") }
-func (c *Client) outboxPath() string  { return filepath.Join(c.dir, "outbox.cbor") }
-func (c *Client) epochsPath() string  { return filepath.Join(c.dir, "epochs.cbor") }
-func (c *Client) cursorsPath() string { return filepath.Join(c.dir, "cursors.cbor") }
-func (c *Client) projDir() string     { return filepath.Join(c.dir, "projection") }
-func (c *Client) sidecarsDir() string { return filepath.Join(c.dir, "sidecars") }
-func (c *Client) credKeyPath() string { return filepath.Join(c.dir, "cred.key") }
+func (c *Client) configPath() string         { return filepath.Join(c.dir, "config.cbor") }
+func (c *Client) walPath() string            { return filepath.Join(c.dir, "verified.wal") }
+func (c *Client) outboxPath() string         { return filepath.Join(c.dir, "outbox.cbor") }
+func (c *Client) epochsPath() string         { return filepath.Join(c.dir, "epochs.cbor") }
+func (c *Client) cursorsPath() string        { return filepath.Join(c.dir, "cursors.cbor") }
+func (c *Client) projDir() string            { return filepath.Join(c.dir, "projection") }
+func (c *Client) sidecarsDir() string        { return filepath.Join(c.dir, "sidecars") }
+func (c *Client) credKeyPath() string        { return filepath.Join(c.dir, "cred.key") }
+func (c *Client) adminReaderReqPath() string { return filepath.Join(c.dir, "admin-reader.req.cbor") }
+
+func createFileExclusive(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
+	if err != nil {
+		return err
+	}
+	if len(data) > 0 {
+		if _, err := f.Write(data); err != nil {
+			_ = f.Close()
+			_ = os.Remove(path)
+			return err
+		}
+	}
+	if err := ldrstore.SyncFile(f); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return ldrstore.SyncDir(filepath.Dir(path))
+}
 
 func (c *Client) sidecarCachePath(kind string, digest [32]byte) string {
 	return filepath.Join(c.sidecarsDir(), kind+"-"+hex.EncodeToString(digest[:]))
 }
 
-func saveConfig(path string, cfg persistedConfig) error {
+func marshalConfig(cfg persistedConfig) ([]byte, error) {
 	m := ldrcrypto.Map{
 		{Key: "cd", Value: cfg.DescriptorDigest[:]},
 		{Key: "descriptor", Value: cfg.SignedDescriptor},
@@ -171,11 +194,29 @@ func saveConfig(path string, cfg persistedConfig) error {
 	if cfg.ExpectedJoinReqDigest != nil {
 		m = append(m, ldrcrypto.MapEntry{Key: "expected_join_req_digest", Value: cfg.ExpectedJoinReqDigest[:]})
 	}
-	raw, err := ldrcrypto.MarshalCBOR(m)
+	return ldrcrypto.MarshalCBOR(m)
+}
+
+func saveConfig(path string, cfg persistedConfig) error {
+	raw, err := marshalConfig(cfg)
 	if err != nil {
 		return err
 	}
 	return ldrstore.AtomicWriteFile(path, raw, 0o600)
+}
+
+func saveConfigCreateOnly(path string, cfg persistedConfig) error {
+	raw, err := marshalConfig(cfg)
+	if err != nil {
+		return err
+	}
+	if err := createFileExclusive(path, raw, 0o600); err != nil {
+		if os.IsExist(err) {
+			return ErrDirInitialized
+		}
+		return err
+	}
+	return nil
 }
 
 func loadConfig(path string) (persistedConfig, error) {
@@ -196,7 +237,7 @@ func loadConfig(path string) (persistedConfig, error) {
 		return persistedConfig{}, fmt.Errorf("ldrclient: config.cbor missing version: %w", err)
 	}
 	if ver == 1 {
-		return persistedConfig{}, errors.New("ldrclient: unsupported legacy config.cbor v1 (pre-release format break: v2 requires explicit dir_kind and P3 join_request_digest; re-initialize client directory)")
+		return persistedConfig{}, errors.New("ldrclient: unsupported legacy config.cbor v1 (pre-release format break: v2 requires explicit dir_kind and P3 join_request_digest; initialize a NEW client directory and preserve existing keys and outbox from this directory)")
 	}
 	if ver != configSchemaVersion {
 		return persistedConfig{}, fmt.Errorf("ldrclient: unsupported config.cbor version %d (want %d)", ver, configSchemaVersion)
@@ -334,12 +375,16 @@ func appendVerifiedFrameWAL(path string, fr ldrrelay.ControlFrameWire) error {
 	return f.Close()
 }
 
-// initEmptyVerifiedWAL durably creates verified.wal during InitClientDir so
-// any initialized client directory always has a WAL file; a missing verified.wal
-// on later open or reconciliation is then unambiguously a lost WAL.
+// initEmptyVerifiedWAL durably creates verified.wal strictly create-only
+// (O_CREATE|O_EXCL) during InitClientDir so an existing WAL is never opened or
+// reused silently during initialization, and a missing verified.wal on later
+// open or reconciliation is unambiguously a lost WAL.
 func initEmptyVerifiedWAL(path string) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
+		if os.IsExist(err) {
+			return ErrDirInitialized
+		}
 		return err
 	}
 	if err := ldrstore.SyncFile(f); err != nil {
@@ -591,7 +636,29 @@ func saveOutbox(path string, ob persistedOutbox) error {
 	return saveOutboxWithHooks(path, ob, nil, nil)
 }
 
+func saveOutboxCreateOnly(path string, ob persistedOutbox) error {
+	raw, err := marshalOutbox(ob)
+	if err != nil {
+		return err
+	}
+	if err := createFileExclusive(path, raw, 0o600); err != nil {
+		if os.IsExist(err) {
+			return ErrDirInitialized
+		}
+		return err
+	}
+	return nil
+}
+
 func saveOutboxWithHooks(path string, ob persistedOutbox, syncFile func(*os.File) error, syncDir func(string) error) error {
+	raw, err := marshalOutbox(ob)
+	if err != nil {
+		return err
+	}
+	return atomicWriteFileWithHooks(path, raw, 0o600, syncFile, syncDir)
+}
+
+func marshalOutbox(ob persistedOutbox) ([]byte, error) {
 	stops := make([]any, 0, len(ob.KeyStops))
 	stopKeys := make([]string, 0, len(ob.KeyStops))
 	for k := range ob.KeyStops {
@@ -613,7 +680,7 @@ func saveOutboxWithHooks(path string, ob persistedOutbox, syncFile func(*os.File
 	for _, e := range ob.Entries {
 		pCBOR, err := e.Principal.ToCBOR()
 		if err != nil {
-			return fmt.Errorf("%w: %v", ldrstore.ErrPreWrite, err)
+			return nil, fmt.Errorf("%w: %v", ldrstore.ErrPreWrite, err)
 		}
 		ps := e.PayloadSidecar
 		if ps == nil {
@@ -665,9 +732,9 @@ func saveOutboxWithHooks(path string, ob persistedOutbox, syncFile func(*os.File
 		{Key: "v", Value: uint64(1)},
 	}, ldrcrypto.Limits{MaxBytes: 4 * 1024 * 1024, MaxDepth: 16, MaxItems: 32768})
 	if err != nil {
-		return fmt.Errorf("%w: %v", ldrstore.ErrPreWrite, err)
+		return nil, fmt.Errorf("%w: %v", ldrstore.ErrPreWrite, err)
 	}
-	return atomicWriteFileWithHooks(path, raw, 0o600, syncFile, syncDir)
+	return raw, nil
 }
 
 func loadOutbox(path string) (persistedOutbox, error) {

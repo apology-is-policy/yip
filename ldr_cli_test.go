@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -108,14 +109,62 @@ func TestLDRCLIEndToEndOverTLS13(t *testing.T) {
 
 	// 5. Enroll an admin reader credential inside the activated rootDir (P9) plus
 	//    full P3 key-first ceremonies for joining members Alice and Bob.
+	//    Also verify admin reader-request preserves cred.key across an --out write
+	//    failure, resumes cleanly with the exact same cred_id/request_id, and
+	//    refuses replacement after enrollment!
 	opReqF := filepath.Join(tmp, "admin-reader.req.cbor")
 	opChF := filepath.Join(tmp, "admin-reader.ch.cbor")
 	opSecF := filepath.Join(tmp, "admin-reader.sec.cbor")
 	opPrF := filepath.Join(tmp, "admin-reader.proof.cbor")
-	runLDR("root", "reader-request", "--dir", rootDir, "--namespace", "ns-admin", "--out", opReqF)
+
+	badParent := filepath.Join(tmp, "not-a-directory")
+	if err := os.WriteFile(badParent, []byte("blocker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var errOutBuf bytes.Buffer
+	if err := LDRCLI([]string{"root", "reader-request", "--dir", rootDir, "--namespace", "ns-admin", "--out", filepath.Join(badParent, "req.cbor")}, &errOutBuf); err == nil {
+		t.Fatalf("expected `yip ldr root reader-request` to fail when --out parent is a regular file")
+	}
+	rootCredBefore, err := os.ReadFile(filepath.Join(rootDir, "cred.key"))
+	if err != nil {
+		t.Fatalf("expected cred.key persisted on first reader-request before --out failure: %v", err)
+	}
+	resumedReq := runLDR("root", "reader-request", "--dir", rootDir, "--namespace", "ns-admin", "--out", opReqF)
+	if !resumedReq["resumed"].(bool) {
+		t.Fatalf("expected second `yip ldr root reader-request` after --out error to resume cleanly, got %+v", resumedReq)
+	}
+	rootCredResumed, err := os.ReadFile(filepath.Join(rootDir, "cred.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(rootCredBefore, rootCredResumed) {
+		t.Fatalf("`yip ldr root reader-request` resume overwrote cred.key!")
+	}
 	runLDR("join", "challenge", "--operator-key", opKey, "--request", opReqF, "--out-challenge", opChF, "--out-secret", opSecF)
 	runLDR("join", "prove", "--dir", rootDir, "--operator-pub", opPub, "--request", opReqF, "--challenge", opChF, "--out", opPrF)
 	runLDR("join", "enroll", "--dir", rootDir, "--operator-key", opKey, "--request", opReqF, "--challenge", opChF, "--secret", opSecF, "--proof", opPrF)
+
+	// After enrollment, repeating `yip ldr root reader-request` MUST fail without touching cred.key!
+	var repeatReqBuf bytes.Buffer
+	if err := LDRCLI([]string{"root", "reader-request", "--dir", rootDir, "--namespace", "ns-admin", "--out", filepath.Join(tmp, "dup.req.cbor")}, &repeatReqBuf); err == nil {
+		t.Fatalf("expected repeated `yip ldr root reader-request` after enrollment to fail")
+	}
+	rootCredAfter, err := os.ReadFile(filepath.Join(rootDir, "cred.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(rootCredBefore, rootCredAfter) {
+		t.Fatalf("repeated `yip ldr root reader-request` altered enrolled cred.key!")
+	}
+
+	// Repeated `yip ldr root init-line` against existing rootDir MUST fail without modifying files!
+	var reinitBuf bytes.Buffer
+	if err := LDRCLI([]string{"root", "init-line", "--dir", rootDir, "--descriptor", descFile, "--root-key", r1Key}, &reinitBuf); err == nil {
+		t.Fatalf("expected repeated `yip ldr root init-line` on existing rootDir to fail")
+	}
+	if got, err := os.ReadFile(filepath.Join(rootDir, "cred.key")); err != nil || !bytes.Equal(rootCredBefore, got) {
+		t.Fatalf("failed `yip ldr root init-line` altered rootDir/cred.key!")
+	}
 
 	p3Enroll := func(name, clientDir, ns string) {
 		reqF := filepath.Join(tmp, name+".req.cbor")
@@ -129,6 +178,20 @@ func TestLDRCLIEndToEndOverTLS13(t *testing.T) {
 	}
 	p3Enroll("alice", aliceDir, "ns-alice")
 	p3Enroll("bob", bobDir, "ns-bob")
+
+	// Repeated `yip ldr join request` against already-initialized aliceDir MUST fail
+	// without overwriting aliceDir/cred.key!
+	aliceCredBefore, err := os.ReadFile(filepath.Join(aliceDir, "cred.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dupJoinBuf bytes.Buffer
+	if err := LDRCLI([]string{"join", "request", "--dir", aliceDir, "--descriptor", descFile, "--namespace", "ns-alice", "--actor-limit", "2", "--reader", "--out", filepath.Join(tmp, "dup-alice.req.cbor")}, &dupJoinBuf); err == nil {
+		t.Fatalf("expected repeated `yip ldr join request` on existing aliceDir to fail")
+	}
+	if got, err := os.ReadFile(filepath.Join(aliceDir, "cred.key")); err != nil || !bytes.Equal(aliceCredBefore, got) {
+		t.Fatalf("failed `yip ldr join request` altered aliceDir/cred.key!")
+	}
 
 	// 6. Unactivated member directory aliceDir MUST NOT activate an epoch even with operator key!
 	//    P9 epoch activation runs on the activated admin directory rootDir holding an enrolled reader.

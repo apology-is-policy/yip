@@ -3,10 +3,12 @@ package ldrclient
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -198,7 +200,50 @@ func InitClientDir(opts InitDirOptions) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Join(opts.Dir, "sidecars"), 0o700); err != nil {
+	if opts.CredKeys != nil {
+		if _, err := marshalCredentialKeys(opts.CredKeys); err != nil {
+			return nil, err
+		}
+	}
+
+	// Reserve the fresh directory under an exclusive OS flock BEFORE writing
+	// any client artifacts so repeated initialization, partially initialized
+	// directories, legacy v1 directories, or an already-open directory fail
+	// closed without touching existing credentials, outbox, or history.
+	if err := os.MkdirAll(opts.Dir, 0o700); err != nil {
+		return nil, err
+	}
+	lockPath := filepath.Join(opts.Dir, ".client.lock")
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := flockExclusive(lf); err != nil {
+		_ = lf.Close()
+		return nil, err
+	}
+	cleanupLock := func() {
+		_ = funlock(lf)
+		_ = lf.Close()
+	}
+
+	entries, err := os.ReadDir(opts.Dir)
+	if err != nil {
+		cleanupLock()
+		return nil, err
+	}
+	for _, ent := range entries {
+		if ent.Name() != ".client.lock" {
+			cleanupLock()
+			return nil, fmt.Errorf("%w: found existing entry %q in %s", ErrDirInitialized, ent.Name(), opts.Dir)
+		}
+	}
+
+	if err := os.Mkdir(filepath.Join(opts.Dir, "sidecars"), 0o700); err != nil {
+		cleanupLock()
+		if os.IsExist(err) {
+			return nil, ErrDirInitialized
+		}
 		return nil, err
 	}
 	var reqDigCopy *[32]byte
@@ -219,25 +264,34 @@ func InitClientDir(opts InitDirOptions) (*Client, error) {
 	if opts.CredKeys != nil {
 		cid := opts.CredKeys.CredID
 		cfg.ExpectedCredID = &cid
-		if err := SaveCredentialKeys(filepath.Join(opts.Dir, "cred.key"), opts.CredKeys); err != nil {
+		if err := SaveCredentialKeysCreateOnly(filepath.Join(opts.Dir, "cred.key"), opts.CredKeys); err != nil {
+			cleanupLock()
 			return nil, err
 		}
 	}
-	// Durably create verified.wal BEFORE config.cbor/outbox.cbor so a missing
-	// verified.wal on an initialized directory always fails closed as a lost WAL.
+	// Durably create verified.wal (O_EXCL) BEFORE config.cbor/outbox.cbor so a
+	// missing verified.wal on an initialized directory always fails closed as a lost WAL.
 	if err := initEmptyVerifiedWAL(filepath.Join(opts.Dir, "verified.wal")); err != nil {
+		cleanupLock()
 		return nil, err
 	}
-	if err := saveConfig(filepath.Join(opts.Dir, "config.cbor"), cfg); err != nil {
+	if err := saveConfigCreateOnly(filepath.Join(opts.Dir, "config.cbor"), cfg); err != nil {
+		cleanupLock()
 		return nil, err
 	}
-	if err := saveOutbox(filepath.Join(opts.Dir, "outbox.cbor"), persistedOutbox{
+	if err := saveOutboxCreateOnly(filepath.Join(opts.Dir, "outbox.cbor"), persistedOutbox{
 		Activated: opts.Activated,
 		KeyStops:  make(map[string]*KeyStop),
 	}); err != nil {
+		cleanupLock()
 		return nil, err
 	}
-	return OpenClient(opts.Dir)
+	if err := ldrstore.SyncDir(opts.Dir); err != nil {
+		cleanupLock()
+		return nil, err
+	}
+	// Hand the already-held exclusive lock directly to openClientLocked (zero TOCTOU gap).
+	return openClientLocked(opts.Dir, lf, nil, nil)
 }
 
 // OpenClient opens an existing client directory, acquires its exclusive OS lock,
@@ -264,6 +318,10 @@ func OpenClientWithSyncHooks(dir string, syncFile func(*os.File) error, syncDir 
 		_ = lf.Close()
 		return nil, err
 	}
+	return openClientLocked(dir, lf, syncFile, syncDir)
+}
+
+func openClientLocked(dir string, lf *os.File, syncFile func(*os.File) error, syncDir func(string) error) (*Client, error) {
 	cleanupLock := func() {
 		_ = funlock(lf)
 		_ = lf.Close()
@@ -331,8 +389,18 @@ func OpenClientWithSyncHooks(dir string, syncFile func(*os.File) error, syncDir 
 		syncFileFn: syncFile,
 		syncDirFn:  syncDir,
 	}
-	if ck, err := LoadCredentialKeys(c.credKeyPath()); err == nil {
+	// If cred.key exists on disk, it MUST decode cleanly — never ignore a
+	// corrupt or unreadable cred.key (which could allow later replacement!).
+	if _, statErr := os.Stat(c.credKeyPath()); statErr == nil {
+		ck, err := LoadCredentialKeys(c.credKeyPath())
+		if err != nil {
+			cleanupLock()
+			return nil, fmt.Errorf("ldrclient: existing cred.key failed to decode: %w", err)
+		}
 		c.credKeys = ck
+	} else if !os.IsNotExist(statErr) {
+		cleanupLock()
+		return nil, statErr
 	}
 	if c.cfg.DirKind == DirKindMember {
 		if err := c.validateMemberCeremonyConfigLocked(); err != nil {
@@ -400,22 +468,136 @@ func (c *Client) Close() error {
 }
 
 // AttachAdminReaderKeys persists and attaches a reader credential key bundle
-// inside an existing administrative (DirKindAdmin) directory so P9 epoch
-// activation can run on an already-activated operator/admin directory.
+// strictly create-only inside an existing administrative (DirKindAdmin)
+// directory so P9 epoch activation can run on an already-activated admin
+// directory. Refuses with ErrCredentialExists if any cred.key already exists
+// (including one that cannot be decoded).
 func (c *Client) AttachAdminReaderKeys(ck *CredentialKeyBundle) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.outboxUncertain {
+		return ErrOutboxUncertain
+	}
+	if c.outbox.Halted != "" || c.outbox.Suspect {
+		return ErrFailClosed
+	}
 	if c.cfg.DirKind != DirKindAdmin {
 		return fmt.Errorf("%w: AttachAdminReaderKeys is only valid on DirKindAdmin directories", ErrEnrollmentCheck)
 	}
 	if ck == nil {
 		return errors.New("ldrclient: nil credential key bundle")
 	}
-	if err := SaveCredentialKeys(c.credKeyPath(), ck); err != nil {
+	if c.credKeys != nil {
+		return ErrCredentialExists
+	}
+	if _, err := os.Stat(c.credKeyPath()); err == nil {
+		return ErrCredentialExists
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := SaveCredentialKeysCreateOnly(c.credKeyPath(), ck); err != nil {
 		return err
 	}
 	c.credKeys = ck
 	return nil
+}
+
+// EnsureAdminReaderRequest creates (create-only) or safely resumes an in-progress
+// P3 reader-only (actor_limit=0, reader=true) JoinRequest for an administrative
+// (DirKindAdmin) directory. If a credential already exists and is enrolled, was
+// attached without a matching pending request, cannot be decoded, or disagrees
+// on namespace or explicit signing algorithm, refuses with ErrCredentialExists
+// without overwriting cred.key.
+func (c *Client) EnsureAdminReaderRequest(namespace, alg string) (ldrcrypto.JoinRequest, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.outboxUncertain {
+		return ldrcrypto.JoinRequest{}, false, ErrOutboxUncertain
+	}
+	if c.outbox.Halted != "" || c.outbox.Suspect {
+		return ldrcrypto.JoinRequest{}, false, ErrFailClosed
+	}
+	if c.cfg.DirKind != DirKindAdmin {
+		return ldrcrypto.JoinRequest{}, false, fmt.Errorf("%w: admin reader-request requires a DirKindAdmin directory", ErrEnrollmentCheck)
+	}
+	if namespace == "" {
+		return ldrcrypto.JoinRequest{}, false, errors.New("ldrclient: empty namespace")
+	}
+	reqPath := c.adminReaderReqPath()
+	_, keyStatErr := os.Stat(c.credKeyPath())
+	if c.credKeys != nil || keyStatErr == nil {
+		ck := c.credKeys
+		if ck == nil {
+			var err error
+			ck, err = LoadCredentialKeys(c.credKeyPath())
+			if err != nil {
+				return ldrcrypto.JoinRequest{}, false, fmt.Errorf("%w: existing cred.key cannot be decoded: %v", ErrCredentialExists, err)
+			}
+			c.credKeys = ck
+		}
+		tok := ldrrelay.CredToken(ck.CredID)
+		// Never reissue or replace once this credential is enrolled, tombstoned, or stopped.
+		if c.state.Line.Credentials[tok] != nil || slices.Contains(c.state.Line.Tombstones.Creds, tok) || c.signsNoMoreLocked("cred:"+tok) {
+			return ldrcrypto.JoinRequest{}, false, fmt.Errorf("%w: admin directory already has an enrolled or retired reader credential", ErrCredentialExists)
+		}
+		if alg != "" && ck.Signing.Alg != alg {
+			return ldrcrypto.JoinRequest{}, false, fmt.Errorf("%w: existing pending reader credential uses alg %s, not %s", ErrCredentialExists, ck.Signing.Alg, alg)
+		}
+		// Allow safe idempotent resume ONLY if a matching pending request artifact
+		// exists alongside cred.key for the exact same credential and namespace.
+		req, _, err := LoadJoinRequest(reqPath)
+		if err != nil {
+			return ldrcrypto.JoinRequest{}, false, fmt.Errorf("%w: existing cred.key has no valid resumable pending request", ErrCredentialExists)
+		}
+		if req.CredID != ck.CredID ||
+			!req.SigningKey.Equal(ck.Signing.Signer.PublicKey()) ||
+			!req.EncryptionKey.Equal(ck.Encryption.PublicKey()) ||
+			!bytes.Equal(req.LineID, c.cfg.LineID) ||
+			req.DescriptorDigest != c.cfg.DescriptorDigest ||
+			req.Grant.NamespaceID != namespace ||
+			req.Grant.ActorLimit != 0 ||
+			!req.Grant.Reader {
+			return ldrcrypto.JoinRequest{}, false, fmt.Errorf("%w: existing pending reader request disagrees with credential or requested namespace", ErrCredentialExists)
+		}
+		return req, true, nil
+	}
+	if !os.IsNotExist(keyStatErr) {
+		return ldrcrypto.JoinRequest{}, false, keyStatErr
+	}
+	if _, err := os.Stat(reqPath); err == nil {
+		return ldrcrypto.JoinRequest{}, false, fmt.Errorf("%w: orphaned pending admin reader request exists without cred.key", ErrCredentialExists)
+	} else if !os.IsNotExist(err) {
+		return ldrcrypto.JoinRequest{}, false, err
+	}
+
+	credKeys, err := GenerateCredentialKeys(alg)
+	if err != nil {
+		return ldrcrypto.JoinRequest{}, false, err
+	}
+	reqID := make([]byte, 16)
+	if _, err := io.ReadFull(rand.Reader, reqID); err != nil {
+		return ldrcrypto.JoinRequest{}, false, err
+	}
+	grant := ldrcrypto.JoinGrant{NamespaceID: namespace, ActorLimit: 0, Reader: true}
+	req, err := ldrcrypto.SignJoinRequest(credKeys.Signing.Signer, ldrcrypto.JoinRequest{
+		RequestID:        reqID,
+		LineID:           c.cfg.LineID,
+		Generation:       1,
+		DescriptorDigest: c.cfg.DescriptorDigest,
+		EncryptionKey:    credKeys.Encryption.PublicKey(),
+		Grant:            grant,
+	})
+	if err != nil {
+		return ldrcrypto.JoinRequest{}, false, err
+	}
+	if err := SaveCredentialKeysCreateOnly(c.credKeyPath(), credKeys); err != nil {
+		return ldrcrypto.JoinRequest{}, false, err
+	}
+	c.credKeys = credKeys
+	if err := saveJoinRequestCreateOnly(reqPath, req); err != nil {
+		return ldrcrypto.JoinRequest{}, false, err
+	}
+	return req, false, nil
 }
 
 // AttachOperatorKey attaches an in-memory operator signing key for admin actions.

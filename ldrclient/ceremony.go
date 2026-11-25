@@ -8,24 +8,23 @@ import (
 	"github.com/apology-is-policy/yip/ldrstore"
 )
 
-// SaveJoinRequest writes a signed P3 JoinRequest to path as canonical CBOR.
-func SaveJoinRequest(path string, req ldrcrypto.JoinRequest) error {
+func marshalJoinRequest(req ldrcrypto.JoinRequest) ([]byte, error) {
 	if _, err := ldrcrypto.VerifyJoinRequest(req); err != nil {
-		return err
+		return nil, err
 	}
 	sk, err := req.SigningKey.ToCBOR()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	ek, err := req.EncryptionKey.ToCBOR()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	caps := append([]string(nil), req.Grant.Capabilities...)
 	if caps == nil {
 		caps = []string{}
 	}
-	raw, err := ldrcrypto.MarshalCBOR(ldrcrypto.Map{
+	return ldrcrypto.MarshalCBOR(ldrcrypto.Map{
 		{Key: "body", Value: req.BodyBytes},
 		{Key: "context_auth_epoch", Value: req.ContextAuthEpoch},
 		{Key: "context_key_epoch", Value: req.ContextKeyEpoch},
@@ -47,10 +46,23 @@ func SaveJoinRequest(path string, req ldrcrypto.JoinRequest) error {
 		{Key: "signing_key", Value: sk},
 		{Key: "v", Value: uint64(1)},
 	})
+}
+
+// SaveJoinRequest writes a signed P3 JoinRequest to path as canonical CBOR.
+func SaveJoinRequest(path string, req ldrcrypto.JoinRequest) error {
+	raw, err := marshalJoinRequest(req)
 	if err != nil {
 		return err
 	}
 	return ldrstore.AtomicWriteFile(path, raw, 0o644)
+}
+
+func saveJoinRequestCreateOnly(path string, req ldrcrypto.JoinRequest) error {
+	raw, err := marshalJoinRequest(req)
+	if err != nil {
+		return err
+	}
+	return createFileExclusive(path, raw, 0o600)
 }
 
 // LoadJoinRequest loads and cryptographically verifies a saved P3 JoinRequest.
