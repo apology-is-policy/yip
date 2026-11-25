@@ -150,7 +150,8 @@ func (g *Registers) Historical(s State, actor, register string) bool {
 	}
 	l := &s.Line
 	c, a, w := l.Credentials[e.value.Cred], l.Actors[actor], l.RegisterWriters[actor+"/"+register]
-	return c == nil || c.Revoked || a == nil || !a.Live ||
+	return e.value.Generation != l.Generation ||
+		c == nil || c.Revoked || a == nil || !a.Live ||
 		a.Cred != e.value.Cred || a.BindingGen != e.value.BindingGen ||
 		w == nil || w.WriterRev != e.value.WriterRev
 }

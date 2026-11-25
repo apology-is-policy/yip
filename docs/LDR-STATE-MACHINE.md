@@ -1,6 +1,6 @@
-# LDR state machine and mutation/authority matrix — draft v8
+# LDR state machine and mutation/authority matrix — draft v9
 
-2026-11-25 · Fable (claude seat), updated to draft v8 by Gemini on `gemini/ldr` · Unapproved proposal. Not a specification,
+2026-11-25 · Fable (claude seat), updated to drafts v8–v9 by Gemini on `gemini/ldr` · Unapproved proposal. Not a specification,
 not an implementation plan, and not a deployment decision. Companion to
 [LDR-THREAT-MODEL.md](LDR-THREAT-MODEL.md) (Codex, draft v0),
 [LDR-SECURITY-REVIEW.md](LDR-SECURITY-REVIEW.md) (Codex) and
@@ -857,8 +857,9 @@ Nothing wraps:
 - A rejection or a no-op at an exhausted counter is reported exactly as it
   would be anywhere else, because neither advances anything.
 - When `head_seq` is at the maximum, no record can commit in that generation.
-  What continues the line after that is a recovery question, and whether
-  sequence numbers restart in a new generation is not yet decided (O23).
+  Continuing the line starts a new generation via `recovery_generation`, which
+  resets `seq` to 1 with generation-qualified coordinates `(gen, seq)` (O23-B,
+  decided 2026-11-25; [LDR-RECOVERY.md](LDR-RECOVERY.md)).
 - A sequencer-assigned time outside the domain, or a time anchor placed after
   the last sequence number, is a sequencer violation on replay.
 - A state holding a value outside the domain is not a coherent state.
@@ -1492,7 +1493,7 @@ one:
 | O20 | Small rules the reference checker forced | Listed in §14.1 | Codex: reasonable for the initial profile. The actor limit now allows zero (§6.1), changed after its review |
 | O21 | Default-audience broadcast: should the sequencer verify the list equals the default audience? | Yes: exact set equality at the named revision (§8). Codex's verdict; implemented | Agreed |
 | O22 | Operator key lifecycle | Draft v7, following Codex's P8: a revoked operator key leaves a tombstone, is never authorized again, and is told `revoked` once it has shown possession; a key never authorized gets an admission error (§5.4, §6.2) | Agreed in design review; not operator-approved |
-| O23 | Sequence numbering across generations | Whether `seq` restarts in a new generation is undecided; §5.9 depends on the answer. Gemini drafted an unapproved v0 recovery proposal favouring reset to 1 with generation-qualified coordinates ([LDR-RECOVERY.md](LDR-RECOVERY.md)) | Open: Codex + Claude + operator, with recovery |
+| O23 | Sequence numbering across generations | **Decided 2026-11-25: reset `seq` to 1 in generation `g+1` with generation-qualified `(gen, seq)` coordinates everywhere, full cross-generation replay `(1, 1..base_seq) -> (2, 1..head)`, and discarded `call_id` / `broadcast_id` tombstones** ([LDR-RECOVERY.md](LDR-RECOVERY.md)). Modelled in `ldrcore/recovery.go` (draft v9, §14.10; awaits Codex/Claude review) | Operator |
 | O24 | Questions this document leaves to the enrollment, control-bootstrap and envelope design | Listed in Appendix A.7 as Q1 to Q16. Where each stands after Codex's drafts v1 to v3 is in A.8. The four that were gaps in this document's own text or vectors (Q2, Q10, Q11, Q16) are closed in draft v7 | Partly closed; see A.8 |
 | O25 | Who vouches for a new member's starting state | **Decided 2026-11-25: full control-log replay from genesis before ordinary use.** Newly enrolled machines replay all control-only envelopes from genesis (no plaintext, no prior epoch keys); envelope-level control metadata is acceptable. Supersedes P4 (detached operator attestation) for phase 1 and archives §14.7 (`Profile.StateCommit`) as an unchosen exploration | Operator |
 | O26 | Root signing validity window and root key policy | **Decided 2026-11-25: fits within the provisional 10-minute validity window; equal 1-of-2 roots.** Root records keep ordinary validity (§4.4). Lines provision two distinct equal root keys (`root_keys`, threshold 1) with tagged principals `["root", key]`, permanent `tombstones.root_keys`, and `root_member_replace` (§6.1, §6.2) | Operator |
@@ -2452,6 +2453,35 @@ equal 1-of-2 roots:
   (54.783s), `GOMAXPROCS=2 go test -race -count=1 ./ldrcore/` PASS (37.306s).
   Awaiting Codex and Claude cross-review.
 
+### 14.10 Draft v9: recovery and generation transitions in `ldrcore/`
+
+Following the operator's 2026-11-25 approval of recovery modelling and O23-B
+([LDR-RECOVERY.md](LDR-RECOVERY.md)), `ldrcore/` now models generation
+transitions and rollback recovery:
+
+- **Generation-qualified coordinates:** `Receipt` carries `(ReadGen, ReadSeq)`,
+  `Entry` carries `Gen`, projection views carry `derived_gen` + `derived_seq`
+  with lexicographic ordering `(g1, s1) > (g2, s2)`, and `Notice` checks
+  `Gen == ckGen` so unacknowledged notices from superseded generations are
+  withheld.
+- **Discarded-tail object tombstones:** `Tombstones.Calls` and
+  `Tombstones.Broadcasts` prevent discarded call/broadcast IDs from colliding
+  with new objects in generation `g+1` (vectors `A233`–`A234`).
+- **`recovery_generation` transition (`ldrcore/recovery.go`):** pure
+  `ApplyRecovery`, fail-closed `BuildRecoveryFromWitness`,
+  `Sequencer.RollbackTo` + `Sequencer.CommitRecovery` + `Sequencer.FullLog`,
+  `ReplayVerifiedFull` across generations from genesis, and client-side
+  `applyRecoveryEntry` with mandatory fail-closed witness tail-reconciliation
+  checks, forensic `ArchivedTail`, outbox abandonment of prior generations,
+  and persistent Rule 8 key stops.
+- **Conformance suite:** expanded to **232 active apply vectors** (2 retired)
+  and **58 traces / 196 steps** (`T53`–`T58` in `ldrcore/recovery_test.go`).
+  Measured on 2026-11-25 under a held `mac` lease (Go 1.25.3, darwin/arm64):
+  `gofmt -l ldrcore/` clean, `go vet ./ldrcore/` clean,
+  `GOMAXPROCS=2 go test -count=1 ./ldrcore/` PASS (63.976s),
+  `GOMAXPROCS=2 go test -race -count=1 ./ldrcore/` PASS (34.947s).
+  Awaiting Codex and Claude cross-review.
+
 ## Appendix A. What this document requires from the enrollment, control-bootstrap and envelope design
 
 Added 2026-11-23 at Codex's request, as input to its draft and to the
@@ -2597,5 +2627,5 @@ approval, and no row rests on a cryptographic test.
 | Q12 | Agreed, as a stated limit: the device that generates an epoch key holds it, so it must be an enrolled reader (P9). The relay cannot check that. | Codex's draft §6 |
 | Q13 | Open: waits on the chosen cipher suite and its framing overhead. | §10.1 |
 | Q14 | Agreed in direction: queries and anchor requests are bound to a fresh session challenge, not to an anchor or a validity, and answers are bound to their request (P7). The transport mechanism is not chosen. | Codex's draft §7 |
-| Q15 | Open, with recovery (O23). Coordinates are generation-qualified meanwhile. | §5.9 |
+| Q15 | **Decided by the operator (2026-11-25, O23-B):** `seq` resets to 1 in a new generation (`recovery_generation` at `(g+1, 1)`), all coordinates and projection views are generation-qualified `(gen, seq)`, replay verifies `(1, 1..base_seq) -> (2, 1..head)` from genesis, and discarded tail `call_id` / `broadcast_id` values are tombstoned. Modelled in Draft v9 (`T53`–`T58`, `A233`–`A234`). | §5.9, §14.10 |
 | Q16 | Closed in this document: terminal. A vector pins it (A194). | §3, §6.2 |

@@ -83,6 +83,14 @@ func signatureOf(principal string, e *Entry) string {
 	fmt.Fprintf(h, "ldr.sig|%d|%s|%d|%s|%s|%s|",
 		e.Key.Generation, e.Key.Signer, e.Key.SeenSeq, e.Key.OpID, e.SeenHead, e.Digest)
 	h.Write(rec)
+	if e.Recovery != nil {
+		rb, err := json.Marshal(e.Recovery)
+		if err != nil {
+			panic("ldrcore: a recovery record does not encode: " + err.Error())
+		}
+		h.Write([]byte("|recovery:"))
+		h.Write(rb)
+	}
 	// The principal is carried in the value itself.
 	return fmt.Sprintf("%s/%016x", principal, h.Sum64())
 }
@@ -186,8 +194,7 @@ func (q *Sequencer) Entries(from, to int64) []Entry {
 	var out []Entry
 	for _, e := range q.log {
 		if e.Seq >= from && e.Seq <= to {
-			e.Record = e.Record.Clone()
-			out = append(out, e)
+			out = append(out, cloneEntry(e))
 		}
 	}
 	return out

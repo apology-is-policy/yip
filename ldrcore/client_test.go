@@ -640,7 +640,7 @@ func TestProjectionViews(t *testing.T) {
 		t.Fatal(err)
 	}
 	after, err := cb.ReadFile(view)
-	if err != nil || !strings.HasPrefix(after, fmt.Sprintf("derived_seq=%d\n", seq)) || !strings.Contains(after, "floor=b1\n") {
+	if err != nil || !strings.HasPrefix(after, fmt.Sprintf("derived_gen=1\nderived_seq=%d\n", seq)) || !strings.Contains(after, "floor=b1\n") {
 		t.Fatalf("view after the turn (%v):\n%s", err, after)
 	}
 
@@ -677,7 +677,7 @@ func TestProjectionViews(t *testing.T) {
 	if err := cb.Rebuild(); err != nil {
 		t.Fatal(err)
 	}
-	if got := cb.Files()["calls/c1/dispute-1/measure-a1"]; !strings.HasPrefix(got, fmt.Sprintf("derived_seq=%d\n", second)) {
+	if got := cb.Files()["calls/c1/dispute-1/measure-a1"]; !strings.HasPrefix(got, fmt.Sprintf("derived_gen=1\nderived_seq=%d\n", second)) {
 		t.Fatalf("the measurement view is not the latest:\n%s", got)
 	}
 }

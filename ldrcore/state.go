@@ -66,13 +66,17 @@ type Credential struct {
 // Tombstones are identifiers that must never be used again. OperatorKeys
 // holds every operator key that was authorized and then revoked, and RootKeys
 // holds every root key that was active and then replaced: each is what tells a
-// revoked or replaced key from one that never held the role.
+// revoked or replaced key from one that never held the role. Calls and
+// Broadcasts hold identifiers created in a discarded recovery tail so they
+// cannot collide with new objects in a later generation.
 type Tombstones struct {
 	Creds        []string `json:"creds"`
 	Actors       []string `json:"actors"`
 	JoinRequests []string `json:"join_requests"`
 	OperatorKeys []string `json:"operator_keys"`
 	RootKeys     []string `json:"root_keys"`
+	Calls        []string `json:"calls"`
+	Broadcasts   []string `json:"broadcasts"`
 }
 
 // Actor is an immutable identity inside one namespace, bound to one
@@ -137,8 +141,10 @@ type Broadcast struct {
 	ReplyCount      map[string]int64   `json:"reply_count"`
 }
 
-// Receipt names the record that first recorded a recipient's read.
+// Receipt names the generation-qualified coordinate (ReadGen, ReadSeq) that
+// first recorded a recipient's read.
 type Receipt struct {
+	ReadGen int64 `json:"read_gen"`
 	ReadSeq int64 `json:"read_seq"`
 }
 
@@ -273,6 +279,8 @@ func (l Line) clone() Line {
 		JoinRequests: slices.Clone(l.Tombstones.JoinRequests),
 		OperatorKeys: slices.Clone(l.Tombstones.OperatorKeys),
 		RootKeys:     slices.Clone(l.Tombstones.RootKeys),
+		Calls:        slices.Clone(l.Tombstones.Calls),
+		Broadcasts:   slices.Clone(l.Tombstones.Broadcasts),
 	}
 	out.Actors = make(map[string]*Actor, len(l.Actors))
 	for id, a := range l.Actors {
@@ -300,6 +308,8 @@ func (s State) Canon() State {
 	l.Tombstones.JoinRequests = canonSet(l.Tombstones.JoinRequests)
 	l.Tombstones.OperatorKeys = canonSet(l.Tombstones.OperatorKeys)
 	l.Tombstones.RootKeys = canonSet(l.Tombstones.RootKeys)
+	l.Tombstones.Calls = canonSet(l.Tombstones.Calls)
+	l.Tombstones.Broadcasts = canonSet(l.Tombstones.Broadcasts)
 	for e, r := range l.Readers {
 		l.Readers[e] = canonSet(r)
 	}

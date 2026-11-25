@@ -50,9 +50,9 @@ var rungReason = [numRungs]string{
 type plan struct {
 	checks [numRungs][]func() bool
 	// noop, when set, runs after every check passed. It reports whether the
-	// record has nothing to change and, if the state records it, which record
-	// already established that state.
-	noop   func() (refSeq int64, is bool)
+	// record has nothing to change and, if the state records it, which
+	// generation-qualified record already established that state.
+	noop   func() (refGen, refSeq int64, is bool)
 	effect func()
 	// exhausted is set by inc when an effect needed to advance a counter
 	// that was already at MaxCounter. The whole effect is then discarded.
@@ -115,8 +115,8 @@ func Apply(s State, r Record, seqTime int64, prof Profile) (State, Outcome) {
 		}
 	}
 	if p.noop != nil {
-		if ref, is := p.noop(); is {
-			return s, Outcome{Kind: Noop, RefSeq: ref}
+		if refGen, refSeq, is := p.noop(); is {
+			return s, Outcome{Kind: Noop, RefGen: refGen, RefSeq: refSeq}
 		}
 	}
 	// Exhaustion is the last rung: it applies only to a record that would
@@ -259,7 +259,7 @@ func buildLineInit(p *plan, s *State, r *Record) {
 			Operators:       []string{},
 			Credentials:     map[string]*Credential{},
 			Readers:         map[int64][]string{},
-			Tombstones:      Tombstones{Creds: []string{}, Actors: []string{}, JoinRequests: []string{}, OperatorKeys: []string{}, RootKeys: []string{}},
+			Tombstones:      Tombstones{Creds: []string{}, Actors: []string{}, JoinRequests: []string{}, OperatorKeys: []string{}, RootKeys: []string{}, Calls: []string{}, Broadcasts: []string{}},
 			Actors:          map[string]*Actor{},
 			RegisterWriters: map[string]*RegisterWriter{},
 		}
@@ -538,8 +538,10 @@ func buildCallOpen(p *plan, s *State, r *Record) {
 		to := l.Actors[r.To]
 		return to != nil && to.Live
 	})
-	// An existing call is never silently joined or reused.
-	p.require(rConflict, func() bool { return s.Calls[r.Call] == nil })
+	// An existing or tombstoned call ID is never silently joined or reused.
+	p.require(rConflict, func() bool {
+		return s.Calls[r.Call] == nil && !slices.Contains(l.Tombstones.Calls, r.Call)
+	})
 	p.effect = func() {
 		p.inc(&l.CallCount)
 		s.Calls[r.Call] = &Call{
@@ -582,7 +584,7 @@ func buildCallBye(p *plan, s *State, r *Record) {
 	p.require(rNotOpen, func() bool { return s.Calls[r.Call].Status() == "open" })
 	// A second bye from the same participant has nothing to change. The state
 	// does not record which record set the first, so no reference is given.
-	p.noop = func() (int64, bool) { return 0, slices.Contains(s.Calls[r.Call].Byes, r.Actor) }
+	p.noop = func() (int64, int64, bool) { return 0, 0, slices.Contains(s.Calls[r.Call].Byes, r.Actor) }
 	p.effect = func() {
 		c := s.Calls[r.Call]
 		c.Byes = addToSet(c.Byes, r.Actor)
@@ -746,7 +748,9 @@ func buildBroadcastCreate(p *plan, s *State, r *Record) {
 		}
 		return true
 	})
-	p.require(rConflict, func() bool { return s.Broadcasts[r.Broadcast] == nil })
+	p.require(rConflict, func() bool {
+		return s.Broadcasts[r.Broadcast] == nil && !slices.Contains(l.Tombstones.Broadcasts, r.Broadcast)
+	})
 	// Only a default-audience list conflicts on an audience change. An
 	// explicit list does not care about unrelated addressing changes.
 	p.require(rConflict, func() bool { return !r.DefaultAudience || is(r.Expect.AudienceRev, l.AudienceRev) })
@@ -780,12 +784,12 @@ func buildBroadcastRead(p *plan, s *State, r *Record) {
 	requireRecipient(p, s, r)
 	// A different read operation by the same recipient names the first read
 	// without pretending to be its receipt.
-	p.noop = func() (int64, bool) {
+	p.noop = func() (int64, int64, bool) {
 		rc, ok := s.Broadcasts[r.Broadcast].Receipts[r.Actor]
-		return rc.ReadSeq, ok
+		return rc.ReadGen, rc.ReadSeq, ok
 	}
 	p.effect = func() {
-		s.Broadcasts[r.Broadcast].Receipts[r.Actor] = Receipt{ReadSeq: s.Line.HeadSeq + 1}
+		s.Broadcasts[r.Broadcast].Receipts[r.Actor] = Receipt{ReadGen: s.Line.Generation, ReadSeq: s.Line.HeadSeq + 1}
 	}
 }
 
@@ -797,7 +801,7 @@ func buildBroadcastReply(p *plan, s *State, r *Record) {
 		p.inc(&replies)
 		b.ReplyCount[r.Actor] = replies
 		if _, ok := b.Receipts[r.Actor]; !ok {
-			b.Receipts[r.Actor] = Receipt{ReadSeq: s.Line.HeadSeq + 1}
+			b.Receipts[r.Actor] = Receipt{ReadGen: s.Line.Generation, ReadSeq: s.Line.HeadSeq + 1}
 		}
 	}
 }

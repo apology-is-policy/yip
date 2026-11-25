@@ -511,6 +511,17 @@ func (c *Client) Reconciled(id string, a Answer) error {
 	return nil
 }
 
+// abandonPriorGenerations marks every unsettled intent from a superseded
+// generation (< newGen) as awaiting reconciliation. It keeps their slots held
+// and never auto-replays them into the new generation.
+func (c *Client) abandonPriorGenerations(newGen int64) {
+	for _, e := range c.out.entries {
+		if e.Status == OutPending && e.Intent.Generation < newGen {
+			e.Status = OutReconcile
+		}
+	}
+}
+
 // ClearSuspicion records that a suspected rollback was looked into from
 // outside this model. Nothing in the model can clear it.
 func (c *Client) ClearSuspicion() { c.out.suspect = false }

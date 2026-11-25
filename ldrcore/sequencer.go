@@ -38,7 +38,9 @@ type Sequencer struct {
 	gen         int64
 	genStartSeq int64 // first sequence number of the current generation
 	state       State
-	log         []Entry             // records committed by this model, oldest first
+	log         []Entry             // records committed in the current generation, oldest first
+	priorLogs   [][]Entry           // finalized prefixes of earlier generations (1..base_seq)
+	priorProfs  map[int64]Profile   // immutable profile of each generation
 	heads       map[int64]string    // chain head after each known sequence number
 	times       map[int64]int64     // seq_time of each known sequence number
 	logIndex    map[OpKey]OpReceipt // committed operations, including retained earlier generations
@@ -60,12 +62,15 @@ type OpReceipt struct {
 
 // Entry is one committed record as the log holds it.
 type Entry struct {
+	Gen     int64
 	Seq     int64
 	SeqTime int64
 	Head    string
 	Key     OpKey // zero for a sequencer-origin record
 	Digest  string
 	Record  Record
+	// Recovery is non-nil only for a recovery_generation record at (g+1, 1).
+	Recovery *RecoveryRecord
 	// Payload travelled with the intent. The sequencer stores and serves it
 	// and never reads it.
 	Payload Payload
@@ -193,29 +198,38 @@ type Answer struct {
 // the generation.
 func NewSequencer(lineID string, prof Profile) *Sequencer {
 	return &Sequencer{
-		LineID:   lineID,
-		prof:     prof,
-		QuotaMax: 64,
-		heads:    map[int64]string{0: "genesis:" + lineID},
-		times:    map[int64]int64{},
-		logIndex: map[OpKey]OpReceipt{},
-		hot:      map[OpKey]hotEntry{},
-		quota:    map[string]int{},
+		LineID:     lineID,
+		prof:       prof,
+		QuotaMax:   64,
+		priorProfs: map[int64]Profile{1: prof},
+		heads:      map[int64]string{0: "genesis:" + lineID},
+		times:      map[int64]int64{},
+		logIndex:   map[OpKey]OpReceipt{},
+		hot:        map[OpKey]hotEntry{},
+		quota:      map[string]int{},
 	}
 }
 
 // State returns a copy of the current state.
 func (q *Sequencer) State() State { return q.state.Clone() }
 
-// Log returns a deep copy of the records this model committed. Nothing the
-// caller does to the result can reach the sequencer's own log.
+// Log returns a deep copy of the records this model committed in the current
+// generation. Nothing the caller does to the result can reach the sequencer's
+// own log.
 func (q *Sequencer) Log() []Entry {
 	out := make([]Entry, len(q.log))
 	for i, e := range q.log {
-		e.Record = e.Record.Clone()
-		out[i] = e
+		out[i] = cloneEntry(e)
 	}
 	return out
+}
+
+func cloneEntry(e Entry) Entry {
+	e.Record = e.Record.Clone()
+	if e.Recovery != nil {
+		e.Recovery = e.Recovery.Clone()
+	}
+	return e
 }
 
 // Head returns the current sequence number and chain head.
@@ -538,12 +552,18 @@ func (q *Sequencer) submitLineInit(in Intent, signer string, c Clock) Answer {
 
 // commit appends one record and adopts the state Apply returned.
 func (q *Sequencer) commit(next State, e Entry, t int64) {
+	e.Gen = next.Line.Generation
 	e.Seq = next.Line.HeadSeq
 	e.SeqTime = t
 	// The log owns its records: the caller keeps the pointers and slices of
 	// the intent it submitted, and must not be able to change history.
 	e.Record = e.Record.Clone()
-	e.Prev = q.heads[e.Seq-1]
+	if e.Recovery != nil {
+		e.Recovery = e.Recovery.Clone()
+	}
+	if e.Prev == "" {
+		e.Prev = q.heads[e.Seq-1]
+	}
 	if e.Record.Origin != OriginSequencer {
 		// Only an intent whose signature verified is admitted, so the log
 		// holds a signature that verifies. Computing it here stands for
@@ -575,10 +595,13 @@ func chainHead(prev string, seq, t int64, typ, digest string) string {
 }
 
 // frameHead is the head of the frame e describes: chainHead over e.Prev and
-// e's own fields, and over the state digest as well when the frame carries
-// one. A frame without a state digest has exactly the head it had before
-// state commitment existed.
+// e's own fields, and over the recovery body or state digest when the frame
+// carries one. A generation-1 frame without a state digest has exactly the
+// head it had before state commitment or recovery existed.
 func frameHead(e *Entry) string {
+	if e.Recovery != nil {
+		return recoveryFrameHead(e)
+	}
 	if e.StateDigest == "" {
 		return chainHead(e.Prev, e.Seq, e.SeqTime, e.Record.Type, e.Digest)
 	}

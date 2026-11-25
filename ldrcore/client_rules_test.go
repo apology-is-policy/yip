@@ -72,12 +72,12 @@ func TestClientStoreAndReaderRules(t *testing.T) {
 		_, addrSeq := e.commit(addr)
 		e.sync(cb)
 		got, err := cb.ReadFile(bview)
-		if err != nil || !strings.HasPrefix(got, fmt.Sprintf("derived_seq=%d\n", readSeq)) ||
-			!strings.Contains(got, fmt.Sprintf("receipt.b1=%d\n", readSeq)) {
+		if err != nil || !strings.HasPrefix(got, fmt.Sprintf("derived_gen=1\nderived_seq=%d\n", readSeq)) ||
+			!strings.Contains(got, fmt.Sprintf("receipt.b1=g1-s%d\n", readSeq)) {
 			t.Fatalf("the broadcast's view after the read (%v):\n%s", err, got)
 		}
 		got, err = cb.ReadFile(aview)
-		if err != nil || !strings.HasPrefix(got, fmt.Sprintf("derived_seq=%d\n", addrSeq)) ||
+		if err != nil || !strings.HasPrefix(got, fmt.Sprintf("derived_gen=1\nderived_seq=%d\n", addrSeq)) ||
 			!strings.Contains(got, fmt.Sprintf("addr_rev=%d\n", a2.AddrRev+1)) ||
 			!strings.Contains(got, fmt.Sprintf("default_addressed=%t\n", addressed)) {
 			t.Fatalf("the actor's view after the change (%v):\n%s", err, got)
@@ -157,7 +157,7 @@ func TestProjectionWriteRules(t *testing.T) {
 		e, cb, next := measured(t)
 		first := next(0)
 		e.commit(note("a1")) // so the store's checkpoint is past the tag below
-		foreign := fmt.Sprintf("derived_seq=%d\nnot what the store holds\n", first+1)
+		foreign := fmt.Sprintf("derived_gen=1\nderived_seq=%d\nnot what the store holds\n", first+1)
 		cb.EditFile(measure, foreign)
 		e.sync(cb)
 		if cb.Rebuilds() != 0 || cb.Files()[measure] != foreign {
@@ -176,10 +176,10 @@ func TestProjectionWriteRules(t *testing.T) {
 			t.Fatalf("the client did not die after writing the file: %v", err)
 		}
 		written := cb.Files()[measure]
-		if !strings.HasPrefix(written, fmt.Sprintf("derived_seq=%d\n", seq)) {
+		if !strings.HasPrefix(written, fmt.Sprintf("derived_gen=1\nderived_seq=%d\n", seq)) {
 			t.Fatalf("the view before the edit:\n%s", written)
 		}
-		cb.EditFile(measure, fmt.Sprintf("derived_seq=%d\nnot what the store holds\n", seq))
+		cb.EditFile(measure, fmt.Sprintf("derived_gen=1\nderived_seq=%d\nnot what the store holds\n", seq))
 		if err := cb.Restart(); err != nil {
 			t.Fatal(err)
 		}
@@ -198,7 +198,7 @@ func TestProjectionWriteRules(t *testing.T) {
 		if cb.Rebuilds() != 1 {
 			t.Fatalf("%d rebuilds, want 1", cb.Rebuilds())
 		}
-		if got := cb.Files()[measure]; !strings.HasPrefix(got, fmt.Sprintf("derived_seq=%d\n", second)) {
+		if got := cb.Files()[measure]; !strings.HasPrefix(got, fmt.Sprintf("derived_gen=1\nderived_seq=%d\n", second)) {
 			t.Fatalf("the view after the rebuild:\n%s", got)
 		}
 	})

@@ -67,6 +67,7 @@ func (s State) CheckInvariants() []string {
 	}
 	for id, b := range s.Broadcasts {
 		for who, rc := range b.Receipts {
+			domain("broadcast "+id+" receipt "+who+" gen", rc.ReadGen)
 			domain("broadcast "+id+" receipt "+who, rc.ReadSeq)
 		}
 		for who, n := range b.ReplyCount {
@@ -78,7 +79,7 @@ func (s State) CheckInvariants() []string {
 		// No line exists. Nothing else may.
 		if l.RootRev != 0 || l.AuthEpoch != 0 || l.AudienceRev != 0 || l.KeyEpoch != 0 || l.CallCount != 0 ||
 			len(l.RootKeys)+len(l.Operators)+len(l.Credentials)+len(l.Readers)+len(l.Actors)+len(l.RegisterWriters) != 0 ||
-			len(l.Tombstones.Creds)+len(l.Tombstones.Actors)+len(l.Tombstones.JoinRequests)+len(l.Tombstones.OperatorKeys)+len(l.Tombstones.RootKeys) != 0 ||
+			len(l.Tombstones.Creds)+len(l.Tombstones.Actors)+len(l.Tombstones.JoinRequests)+len(l.Tombstones.OperatorKeys)+len(l.Tombstones.RootKeys)+len(l.Tombstones.Calls)+len(l.Tombstones.Broadcasts) != 0 ||
 			len(s.Calls)+len(s.Broadcasts) != 0 {
 			fail("generation 0 with line state present")
 		}
@@ -102,6 +103,24 @@ func (s State) CheckInvariants() []string {
 	set("tombstones.join_requests", l.Tombstones.JoinRequests)
 	set("tombstones.operator_keys", l.Tombstones.OperatorKeys)
 	set("tombstones.root_keys", l.Tombstones.RootKeys)
+	set("tombstones.calls", l.Tombstones.Calls)
+	set("tombstones.broadcasts", l.Tombstones.Broadcasts)
+	for _, id := range l.Tombstones.Calls {
+		if id == "" {
+			fail("tombstones.calls has empty id")
+		}
+		if s.Calls[id] != nil {
+			fail("call %s is both active and tombstoned", id)
+		}
+	}
+	for _, id := range l.Tombstones.Broadcasts {
+		if id == "" {
+			fail("tombstones.broadcasts has empty id")
+		}
+		if s.Broadcasts[id] != nil {
+			fail("broadcast %s is both active and tombstoned", id)
+		}
+	}
 
 	// The key registry: every public key holds exactly one role, for life.
 	holder := map[string]string{}
@@ -186,7 +205,7 @@ func (s State) CheckInvariants() []string {
 		}
 	}
 
-	if l.KeyEpoch > 0 && len(l.Readers) == 0 {
+	if l.KeyEpoch > 0 && len(l.Readers) == 0 && !(l.Generation > 1 && l.RekeyPending) {
 		fail("key_epoch %d has no recorded readers", l.KeyEpoch)
 	}
 	for epoch, readers := range l.Readers {
@@ -298,8 +317,9 @@ func (s State) CheckInvariants() []string {
 			}
 		}
 		for who, rc := range b.Receipts {
-			if !slices.Contains(b.Recipients, who) || rc.ReadSeq < 1 || rc.ReadSeq > l.HeadSeq {
-				fail("broadcast %s: receipt for %s at seq %d (head %d)", id, who, rc.ReadSeq, l.HeadSeq)
+			if !slices.Contains(b.Recipients, who) || rc.ReadGen < 1 || rc.ReadGen > l.Generation || rc.ReadSeq < 1 ||
+				(rc.ReadGen == l.Generation && rc.ReadSeq > l.HeadSeq) {
+				fail("broadcast %s: receipt for %s at (%d,%d) (head (%d,%d))", id, who, rc.ReadGen, rc.ReadSeq, l.Generation, l.HeadSeq)
 			}
 		}
 		for who, n := range b.ReplyCount {

@@ -175,9 +175,10 @@ const (
 type Outcome struct {
 	Kind   string
 	Reason string // set when Kind is Rejected
-	// RefSeq names the record that already established the state, when Kind
-	// is Noop and the state records which one it was. Zero means the state
-	// does not record it.
+	// RefGen and RefSeq name the generation-qualified record that already
+	// established the state, when Kind is Noop and the state records which
+	// one it was. Zero means the state does not record it.
+	RefGen int64
 	RefSeq int64
 }
 

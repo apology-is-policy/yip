@@ -54,21 +54,24 @@ type Client struct {
 	// The verified local log store. A record, the state derived from it, the
 	// checkpoint and the indexes below advance together in one step (spec
 	// 11.2 rule 1). This is the local source of authority (spec 11.1).
-	store  []Entry
-	state  State
-	ckSeq  int64
-	ckHead string
+	store        []Entry
+	priorStores  map[int64][]Entry // verified prefixes of earlier generations (1..base_seq)
+	archivedTail []Entry           // forensic archive of discarded tails witnessed before recovery
+	state        State
+	ckGen        int64
+	ckSeq        int64
+	ckHead       string
 	// signed holds the unretired anchor heads and committed operation
 	// identities that frame verification checks on replay (commit.go).
 	// It advances in the same step as the rest of the store and prunes
 	// retired anchors as sequencer time advances.
 	signed    *signedContext
-	touchedBy [][]string        // per record: the objects it changed
-	touched   map[string]int64  // object -> the last record that changed it
-	source    map[string]int64  // record-derived file -> the record that defines it
-	viewOf    map[string]string // object-view file -> its object
-	owed      [][]Notice        // per record: the local notices it owes
-	halted    string            // set by a sequencer violation; the client fails closed
+	touchedBy [][]string           // per record in current gen: the objects it changed
+	touched   map[string]viewCoord // object -> last (gen, seq) that changed it
+	source    map[string]viewCoord // record-derived file -> (gen, seq) that defines it
+	viewOf    map[string]string    // object-view file -> its object
+	owed      [][]Notice           // per record in current gen: the local notices it owes
+	halted    string               // set by a sequencer violation; the client fails closed
 
 	// The projection: rebuildable files that follow a separate cursor (spec
 	// 11.2 rules 2 and 3). They hold no authority.
@@ -119,22 +122,23 @@ func (e *ViolationError) Error() string {
 // NewClient returns a client with an empty store, anchored on genesis.
 func NewClient(lineID, cred string, prof Profile) *Client {
 	return &Client{
-		signed:     newSignedContext(),
-		LineID:     lineID,
-		Cred:       cred,
-		ValidityMS: min(60000, prof.ValidityMaxMS),
-		prof:       prof,
-		ckHead:     genesisHead(lineID),
-		touched:    map[string]int64{},
-		source:     map[string]int64{},
-		viewOf:     map[string]string{},
-		files:      map[string]string{},
-		queue:      map[string]*Notice{},
-		paused:     map[string]bool{},
-		seen:       map[string]int64{},
-		badWrap:    map[int64]bool{},
-		corruptKey: map[int64]bool{},
-		out:        outbox{slots: map[string]string{}, told: map[string]*KeyStop{}},
+		signed:      newSignedContext(),
+		LineID:      lineID,
+		Cred:        cred,
+		ValidityMS:  min(60000, prof.ValidityMaxMS),
+		prof:        prof,
+		ckHead:      genesisHead(lineID),
+		priorStores: map[int64][]Entry{},
+		touched:     map[string]viewCoord{},
+		source:      map[string]viewCoord{},
+		viewOf:      map[string]string{},
+		files:       map[string]string{},
+		queue:       map[string]*Notice{},
+		paused:      map[string]bool{},
+		seen:        map[string]int64{},
+		badWrap:     map[int64]bool{},
+		corruptKey:  map[int64]bool{},
+		out:         outbox{slots: map[string]string{}, told: map[string]*KeyStop{}},
 	}
 }
 
@@ -145,7 +149,21 @@ func genesisHead(lineID string) string { return "genesis:" + lineID }
 // State returns a copy of the verified derived state.
 func (c *Client) State() State { return c.state.Clone() }
 
-// Checkpoint returns the verified checkpoint. It never regresses.
+// Generation returns the client's current verified generation.
+func (c *Client) Generation() int64 { return c.ckGen }
+
+// ArchivedTail returns a deep copy of any discarded-tail records the client
+// witnessed before accepting a recovery_generation transition.
+func (c *Client) ArchivedTail() []Entry {
+	out := make([]Entry, len(c.archivedTail))
+	for i, e := range c.archivedTail {
+		out[i] = cloneEntry(e)
+	}
+	return out
+}
+
+// Checkpoint returns the verified checkpoint. It never regresses within a
+// generation.
 func (c *Client) Checkpoint() (int64, string) { return c.ckSeq, c.ckHead }
 
 // ProjectedSeq returns the projection cursor.
@@ -178,6 +196,28 @@ func (c *Client) Sync(entries []Entry) error {
 		return &ViolationError{Seq: c.ckSeq, Reason: c.halted}
 	}
 	for _, e := range entries {
+		if e.Record.Type == "recovery_generation" {
+			if err := c.applyRecoveryEntry(e); err != nil {
+				return err
+			}
+			continue
+		}
+		eGen := e.Gen
+		if eGen == 0 {
+			eGen = max(c.ckGen, 1)
+		}
+		if c.ckGen > 0 && eGen < c.ckGen {
+			// Prior generation record in a full cross-generation stream: must
+			// match the finalized verified prefix if within it.
+			prior := c.priorStores[eGen]
+			if e.Seq < 1 || e.Seq > int64(len(prior)) || prior[e.Seq-1].Head != e.Head {
+				return c.halt(e.Seq, fmt.Sprintf("a different record is offered at prior generation (%d,%d)", eGen, e.Seq))
+			}
+			continue
+		}
+		if c.ckGen > 0 && eGen > c.ckGen {
+			return fmt.Errorf("ldrcore: record (%d,%d) offered while the client is at generation %d", eGen, e.Seq, c.ckGen)
+		}
 		if e.Seq <= c.ckSeq {
 			if e.Seq < 1 || c.store[e.Seq-1].Head != e.Head {
 				return c.halt(e.Seq, "a different record is offered at a sequence number already verified")
@@ -193,19 +233,21 @@ func (c *Client) Sync(entries []Entry) error {
 			return c.halt(e.Seq, err.Error())
 		}
 		// One durable step.
-		e.Record = e.Record.Clone()
+		e = cloneEntry(e)
+		e.Gen = next.Line.Generation
+		coord := viewCoord{gen: e.Gen, seq: e.Seq}
 		changed := changedObjects(c.state, next)
 		c.store = append(c.store, e)
 		c.touchedBy = append(c.touchedBy, changed)
 		for _, obj := range changed {
-			c.touched[obj] = e.Seq
+			c.touched[obj] = coord
 			c.viewOf[viewPath(obj)] = obj
 		}
 		for _, f := range recordFiles(e, "") {
-			c.source[f.path] = e.Seq
+			c.source[f.path] = coord
 		}
 		c.owed = append(c.owed, c.noticesFor(&next, e))
-		c.state, c.ckSeq, c.ckHead = next, e.Seq, e.Head
+		c.state, c.ckGen, c.ckSeq, c.ckHead = next, e.Gen, e.Seq, e.Head
 		c.signed.record(&e, e.Head)
 		c.signed.prune(e.SeqTime, c.prof.ValidityMaxMS)
 		// A key whose revocation this client has now verified signs nothing
@@ -288,13 +330,25 @@ func (c *Client) ReaderState(e Entry) string {
 	return ReadOK
 }
 
+// viewCoord is a generation-qualified coordinate (gen, seq) ordered
+// lexicographically: (g1, s1) > (g2, s2) iff g1 > g2 || (g1 == g2 && s1 > s2).
+type viewCoord struct {
+	gen int64
+	seq int64
+}
+
+func (a viewCoord) greater(b viewCoord) bool {
+	return a.gen > b.gen || (a.gen == b.gen && a.seq > b.seq)
+}
+
 // projFile is one file of the projection. An immutable file must be
-// byte-identical whenever it is written again. A view carries the sequence
-// number it was derived from and is replaced only by a higher one.
+// byte-identical whenever it is written again. A view carries the
+// generation-qualified coordinate it was derived from and is replaced only by
+// a higher one.
 type projFile struct {
 	path, content string
 	view          bool
-	tag           int64
+	tag           viewCoord
 }
 
 func lines(kv ...string) string {
@@ -307,21 +361,30 @@ func lines(kv ...string) string {
 
 func num(n int64) string { return fmt.Sprintf("%d", n) }
 
+func seqTag(e Entry) string {
+	if e.Gen > 1 {
+		return fmt.Sprintf("g%d-s%d", e.Gen, e.Seq)
+	}
+	return num(e.Seq)
+}
+
 // recordFiles renders the files one committed record defines. Their paths and
 // everything but the body line depend only on the record and the values the
 // sequencer assigned to it, never on later state. body is the reader state of
 // the payload.
 func recordFiles(e Entry, body string) []projFile {
 	r := e.Record
+	gen := max(e.Gen, 1)
 	head := []string{"type", r.Type, "seq", num(e.Seq), "at", num(e.SeqTime)}
 	file := func(path string, kv ...string) projFile {
 		return projFile{path: path, content: lines(append(head, kv...)...)}
 	}
 	view := func(path string, kv ...string) projFile {
-		all := append([]string{"derived_seq", num(e.Seq)}, append(head, kv...)...)
-		return projFile{path: path, content: lines(all...), view: true, tag: e.Seq}
+		all := append([]string{"derived_gen", num(gen), "derived_seq", num(e.Seq)}, append(head, kv...)...)
+		return projFile{path: path, content: lines(all...), view: true, tag: viewCoord{gen: gen, seq: e.Seq}}
 	}
 	call := "calls/" + r.Call + "/"
+	st := seqTag(e)
 	switch r.Type {
 	case "call_open":
 		return []projFile{
@@ -336,16 +399,16 @@ func recordFiles(e Entry, body string) []projFile {
 		return []projFile{file(call+"turn-"+num(n), "call", r.Call, "from", r.Actor, "turn", num(n),
 			"barge", fmt.Sprint(r.Barge), "body", body)}
 	case "call_note":
-		return []projFile{file(call+"note-"+num(e.Seq), "call", r.Call, "from", r.Actor, "body", body)}
+		return []projFile{file(call+"note-"+st, "call", r.Call, "from", r.Actor, "body", body)}
 	case "call_ratify":
-		return []projFile{file(call+"ratify-"+num(e.Seq), "call", r.Call, "operator", r.Operator, "body", body)}
+		return []projFile{file(call+"ratify-"+st, "call", r.Call, "operator", r.Operator, "body", body)}
 	case "call_attach":
-		return []projFile{file(call+"attach-"+num(e.Seq), "call", r.Call, "from", r.Actor, "body", body)}
+		return []projFile{file(call+"attach-"+st, "call", r.Call, "from", r.Actor, "body", body)}
 	case "call_status":
-		return []projFile{file(call+"status-"+num(e.Seq), "call", r.Call, "from", r.Actor, "state", r.State,
+		return []projFile{file(call+"status-"+st, "call", r.Call, "from", r.Actor, "state", r.State,
 			"related", r.Related, "reason", body)}
 	case "dispute_open":
-		return []projFile{file(call+"dispute-opened-"+num(e.Seq), "call", r.Call, "from", r.Actor, "claim", body)}
+		return []projFile{file(call+"dispute-opened-"+st, "call", r.Call, "from", r.Actor, "claim", body)}
 	case "dispute_measure":
 		return []projFile{view(call+"dispute-"+r.Dispute+"/measure-"+r.Actor, "call", r.Call, "from", r.Actor,
 			"measurement", body)}
@@ -359,7 +422,7 @@ func recordFiles(e Entry, body string) []projFile {
 		return []projFile{file("broadcasts/"+r.Broadcast+"/broadcast", "broadcast", r.Broadcast, "kind", r.Kind,
 			"recipients", strings.Join(r.Recipients, ","), "default_audience", fmt.Sprint(r.DefaultAudience), "body", body)}
 	case "broadcast_reply":
-		return []projFile{file("broadcasts/"+r.Broadcast+"/reply-"+num(e.Seq), "broadcast", r.Broadcast,
+		return []projFile{file("broadcasts/"+r.Broadcast+"/reply-"+st, "broadcast", r.Broadcast,
 			"from", r.Actor, "body", body)}
 	case "actor_declare":
 		return []projFile{file("actors/"+r.Actor+"/declared", "actor", r.Actor, "namespace", r.Namespace,
@@ -375,12 +438,12 @@ func viewPath(obj string) string {
 }
 
 // objectView renders the current verified state of one object. Its tag is the
-// last record that changed the object, so the content is a function of the
+// last (gen, seq) that changed the object, so the content is a function of the
 // store alone and rendering it twice gives the same bytes.
 func (c *Client) objectView(obj string) (projFile, bool) {
 	kind, id, _ := strings.Cut(obj, ":")
 	tag := c.touched[obj]
-	kv := []string{"derived_seq", num(tag)}
+	kv := []string{"derived_gen", num(tag.gen), "derived_seq", num(tag.seq)}
 	switch kind {
 	case "call":
 		v := c.state.Calls[id]
@@ -410,7 +473,7 @@ func (c *Client) objectView(obj string) (projFile, bool) {
 		for _, a := range canonSet(v.Recipients) {
 			read := "pending"
 			if rc, ok := v.Receipts[a]; ok {
-				read = num(rc.ReadSeq)
+				read = fmt.Sprintf("g%d-s%d", rc.ReadGen, rc.ReadSeq)
 			}
 			kv = append(kv, "receipt."+a, read, "replies."+a, num(v.ReplyCount[a]))
 		}
@@ -427,13 +490,20 @@ func (c *Client) objectView(obj string) (projFile, bool) {
 	return projFile{path: viewPath(obj), content: lines(kv...), view: true, tag: tag}, true
 }
 
-func viewTag(content string) (int64, bool) {
-	var n int64
-	first, _, _ := strings.Cut(content, "\n")
-	if _, err := fmt.Sscanf(first, "derived_seq=%d", &n); err != nil || first != "derived_seq="+num(n) {
-		return 0, false
+func viewTag(content string) (viewCoord, bool) {
+	first, rest, ok := strings.Cut(content, "\n")
+	if !ok {
+		return viewCoord{}, false
 	}
-	return n, true
+	second, _, _ := strings.Cut(rest, "\n")
+	var g, s int64
+	if _, err := fmt.Sscanf(first, "derived_gen=%d", &g); err != nil || first != "derived_gen="+num(g) || g < 1 {
+		return viewCoord{}, false
+	}
+	if _, err := fmt.Sscanf(second, "derived_seq=%d", &s); err != nil || second != "derived_seq="+num(s) || s < 1 {
+		return viewCoord{}, false
+	}
+	return viewCoord{gen: g, seq: s}, true
 }
 
 // writeFile applies the two write rules. It reports false when the directory
@@ -451,12 +521,13 @@ func (c *Client) writeFile(f projFile) bool {
 		return old == f.content
 	}
 	tag, ok := viewTag(old)
+	head := viewCoord{gen: c.ckGen, seq: c.ckSeq}
 	switch {
-	case !ok || tag > c.ckSeq:
+	case !ok || tag.greater(head):
 		// Unreadable, or derived from a record this store does not hold.
 		return false
-	case tag > f.tag:
-		return true // a view is replaced only by a higher one
+	case tag.greater(f.tag):
+		return true // a view is replaced only by a higher (gen, seq)
 	case tag == f.tag:
 		return old == f.content
 	}
@@ -464,8 +535,22 @@ func (c *Client) writeFile(f projFile) bool {
 	return true
 }
 
-// filesOf lists everything projecting one record writes: the record's own
-// files, then the views of the objects it changed.
+func (c *Client) entryAt(coord viewCoord) (Entry, bool) {
+	if coord.gen == c.ckGen {
+		if coord.seq < 1 || coord.seq > int64(len(c.store)) {
+			return Entry{}, false
+		}
+		return c.store[coord.seq-1], true
+	}
+	prior := c.priorStores[coord.gen]
+	if coord.seq < 1 || coord.seq > int64(len(prior)) {
+		return Entry{}, false
+	}
+	return prior[coord.seq-1], true
+}
+
+// filesOf lists everything projecting one record in the current generation
+// writes: the record's own files, then the views of the objects it changed.
 func (c *Client) filesOf(seq int64) []projFile {
 	e := c.store[seq-1]
 	out := recordFiles(e, c.ReaderState(e))
@@ -499,7 +584,7 @@ func (c *Client) Project() error {
 				return fmt.Errorf("ldrcore: the projection disagrees with the store at seq %d after a rebuild", seq)
 			}
 			rebuilt = true
-			c.wipe()
+			c.rebuildPrior()
 			continue
 		}
 		if c.takeFault(FaultAfterFileWrite) {
@@ -516,10 +601,28 @@ func (c *Client) wipe() {
 	c.rebuilds++
 }
 
+// rebuildPrior wipes the projection and re-materializes surviving prior
+// generation files and views before Project projects the current generation.
+func (c *Client) rebuildPrior() {
+	c.wipe()
+	for gen := int64(1); gen < c.ckGen; gen++ {
+		for _, e := range c.priorStores[gen] {
+			for _, f := range recordFiles(e, c.ReaderState(e)) {
+				c.writeFile(f)
+			}
+		}
+	}
+	for obj := range c.touched {
+		if f, ok := c.objectView(obj); ok {
+			c.writeFile(f)
+		}
+	}
+}
+
 // Rebuild discards the projection and writes it again from the verified
 // store.
 func (c *Client) Rebuild() error {
-	c.wipe()
+	c.rebuildPrior()
 	return c.Project()
 }
 
@@ -553,8 +656,11 @@ var (
 // some later rebuild.
 func (c *Client) ReadFile(path string) (string, error) {
 	var want projFile
-	if seq, ok := c.source[path]; ok {
-		e := c.store[seq-1]
+	if coord, ok := c.source[path]; ok {
+		e, found := c.entryAt(coord)
+		if !found {
+			return "", ErrNoAuthority
+		}
 		for _, f := range recordFiles(e, c.ReaderState(e)) {
 			if f.path == path {
 				want = f
@@ -572,7 +678,8 @@ func (c *Client) ReadFile(path string) (string, error) {
 	case !exists:
 		return "", ErrNotProjected
 	}
-	if tag, ok := viewTag(got); want.view && ok && tag < want.tag && c.projected < want.tag {
+	projCoord := viewCoord{gen: c.ckGen, seq: c.projected}
+	if tag, ok := viewTag(got); want.view && ok && want.tag.greater(tag) && want.tag.greater(projCoord) {
 		return "", ErrNotProjected
 	}
 	return "", ErrTainted
@@ -619,6 +726,7 @@ func (c *Client) Unread(actor, call string) int64 {
 // one. Attempts and acknowledgement never leave this host.
 type Notice struct {
 	ID         string
+	Gen        int64
 	Seq        int64
 	Actor      string
 	Kind       string
@@ -659,6 +767,7 @@ func (c *Client) noticesFor(s *State, e Entry) []Notice {
 		if v := s.Line.Actors[a]; v != nil && v.Live && v.Cred == c.Cred {
 			out = append(out, Notice{
 				ID:         fmt.Sprintf("g%d-s%d-%s", s.Line.Generation, e.Seq, a),
+				Gen:        s.Line.Generation,
 				Seq:        e.Seq,
 				Actor:      a,
 				Kind:       r.Type,
@@ -696,9 +805,13 @@ func (c *Client) Pause(actor string) { c.paused[actor] = true }
 func (c *Client) Resume(actor string) { delete(c.paused, actor) }
 
 // bound reports whether verified state still shows a notice's actor live, on
-// this credential, under the binding the notice was queued for. Being queued
-// is not enough: the actor may have been removed or moved since.
+// this credential, under the binding and generation the notice was queued for.
+// Being queued is not enough: the actor may have been removed or moved, or the
+// line may have transitioned to a newer generation since.
 func (c *Client) bound(n *Notice) bool {
+	if n.Gen != c.ckGen {
+		return false
+	}
 	a := c.state.Line.Actors[n.Actor]
 	return a != nil && a.Live && a.Cred == c.Cred && a.BindingGen == n.BindingGen
 }
