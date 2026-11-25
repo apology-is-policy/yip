@@ -85,17 +85,21 @@ func (s *RelayServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	statuses := s.engine.Status()
 	clockOK := true
+	quarantined := 0
 	for _, st := range statuses {
 		if !st.Clock.Trusted {
 			clockOK = false
-			break
+		}
+		if st.Quarantined {
+			quarantined++
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"ok":            true,
-		"clock_trusted": clockOK,
-		"lines":         len(statuses),
+		"ok":                quarantined == 0,
+		"clock_trusted":     clockOK,
+		"lines":             len(statuses),
+		"quarantined_lines": quarantined,
 	})
 }
 
@@ -319,6 +323,10 @@ func (s *RelayServer) handleAuth(w http.ResponseWriter, lineID []byte, cb [32]by
 	}
 	stg, curGen, err := s.engine.VerifySessionPrincipal(lineID, authMsg, sig)
 	if err != nil {
+		if errors.Is(err, ErrLineQuarantined) {
+			writeCBOR(w, http.StatusServiceUnavailable, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "storage_quarantined"}, {Key: "v", Value: uint64(1)}})
+			return
+		}
 		writeCBOR(w, http.StatusUnauthorized, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "unknown_signer"}, {Key: "v", Value: uint64(1)}})
 		return
 	}

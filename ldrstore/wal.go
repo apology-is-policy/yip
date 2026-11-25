@@ -295,16 +295,23 @@ func encodeWALFrame(kind byte, body []byte) ([]byte, error) {
 func (s *FileStore) appendWALLocked(hexID string, kind byte, body []byte) error {
 	frame, err := encodeWALFrame(kind, body)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrPreWrite, err)
 	}
 	f, err := s.openWALForAppendLocked(hexID)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrPreWrite, err)
 	}
 	if _, err := f.Write(frame); err != nil {
-		return err
+		_ = f.Close()
+		delete(s.walFiles, hexID)
+		return fmt.Errorf("%w: wal write: %v", ErrUncertainWrite, err)
 	}
-	return SyncFile(f)
+	if err := SyncFile(f); err != nil {
+		_ = f.Close()
+		delete(s.walFiles, hexID)
+		return fmt.Errorf("%w: wal sync: %v", ErrUncertainWrite, err)
+	}
+	return nil
 }
 
 // AppendCommit durably persists all referenced sidecars FIRST, then appends and
@@ -313,32 +320,33 @@ func (s *FileStore) AppendCommit(lineID []byte, frame CommittedFrame, sidecars m
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return errors.New("ldrstore: store closed")
+		return fmt.Errorf("%w: store closed", ErrPreWrite)
 	}
 	hexID, err := lineHex(lineID)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrPreWrite, err)
 	}
 	if _, err := os.Stat(s.provisionPath(hexID)); err != nil {
 		if os.IsNotExist(err) {
-			return ErrLineNotFound
+			return fmt.Errorf("%w: %v", ErrPreWrite, ErrLineNotFound)
 		}
-		return err
+		return fmt.Errorf("%w: %v", ErrPreWrite, err)
 	}
 	// Verify and persist every referenced sidecar BEFORE writing the WAL commit.
 	if frame.PayloadCommit != nil && frame.PayloadCommit.Length > 0 {
 		blob, ok := sidecars[frame.PayloadCommit.Digest]
 		if !ok || blob.Kind != SidecarPayload || uint64(len(blob.Data)) != frame.PayloadCommit.Length {
-			return fmt.Errorf("%w: missing or mismatched payload sidecar", ErrMissingSidecar)
+			return fmt.Errorf("%w: %v: missing or mismatched payload sidecar", ErrPreWrite, ErrMissingSidecar)
 		}
 	}
 	for _, wm := range frame.WrapCommits {
 		blob, ok := sidecars[wm.Commit.Digest]
 		if !ok || blob.Kind != SidecarWrap || uint64(len(blob.Data)) != wm.Commit.Length {
-			return fmt.Errorf("%w: missing or mismatched wrap sidecar", ErrMissingSidecar)
+			return fmt.Errorf("%w: %v: missing or mismatched wrap sidecar", ErrPreWrite, ErrMissingSidecar)
 		}
 	}
-	// Deterministic write order for sidecars.
+	// Deterministic write order for sidecars. Any sidecar failure occurs strictly
+	// before any WAL byte is written, so it is a clean pre-write refusal.
 	digests := make([][32]byte, 0, len(sidecars))
 	for d := range sidecars {
 		digests = append(digests, d)
@@ -346,12 +354,12 @@ func (s *FileStore) AppendCommit(lineID []byte, frame CommittedFrame, sidecars m
 	sort.Slice(digests, func(i, j int) bool { return bytes.Compare(digests[i][:], digests[j][:]) < 0 })
 	for _, d := range digests {
 		if err := s.writeSidecarLocked(hexID, d, sidecars[d]); err != nil {
-			return err
+			return fmt.Errorf("%w: %v", ErrPreWrite, err)
 		}
 	}
 	body, err := encodeCommitBody(frame, newFloor)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrPreWrite, err)
 	}
 	return s.appendWALLocked(hexID, walKindCommit, body)
 }
@@ -361,14 +369,14 @@ func (s *FileStore) AppendNonCommit(lineID []byte, entry HotEntry, newFloor uint
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return errors.New("ldrstore: store closed")
+		return fmt.Errorf("%w: store closed", ErrPreWrite)
 	}
 	hexID, err := lineHex(lineID)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrPreWrite, err)
 	}
 	if entry.Outcome.Kind != "rejected" && entry.Outcome.Kind != "noop" {
-		return fmt.Errorf("%w: non-commit outcome kind %q", ErrInvalidRecord, entry.Outcome.Kind)
+		return fmt.Errorf("%w: %v: non-commit outcome kind %q", ErrPreWrite, ErrInvalidRecord, entry.Outcome.Kind)
 	}
 	body, err := ldrcrypto.MarshalCBOR(ldrcrypto.Map{
 		{Key: "entry", Value: encodeHotEntryMap(entry)},
@@ -376,7 +384,7 @@ func (s *FileStore) AppendNonCommit(lineID []byte, entry HotEntry, newFloor uint
 		{Key: "v", Value: uint64(1)},
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrPreWrite, err)
 	}
 	return s.appendWALLocked(hexID, walKindNonCommit, body)
 }
@@ -386,11 +394,11 @@ func (s *FileStore) AppendCompact(lineID []byte, retired []StoredOpKey, newFloor
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return errors.New("ldrstore: store closed")
+		return fmt.Errorf("%w: store closed", ErrPreWrite)
 	}
 	hexID, err := lineHex(lineID)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrPreWrite, err)
 	}
 	keys := make([]any, len(retired))
 	for i, k := range retired {
@@ -402,7 +410,7 @@ func (s *FileStore) AppendCompact(lineID []byte, retired []StoredOpKey, newFloor
 		{Key: "v", Value: uint64(1)},
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrPreWrite, err)
 	}
 	return s.appendWALLocked(hexID, walKindCompact, body)
 }
@@ -617,8 +625,17 @@ func applyWALRecord(snap *LineSnapshot, kind byte, body []byte) error {
 		if err != nil {
 			return err
 		}
+		if floor < fr.SeqTime {
+			return fmt.Errorf("commit record time_floor %d < seq_time %d", floor, fr.SeqTime)
+		}
 		snap.Frames = append(snap.Frames, fr)
 		if fr.OpKey != nil {
+			if _, exists := snap.LogIndex[*fr.OpKey]; exists {
+				return fmt.Errorf("duplicate committed op_key %v", *fr.OpKey)
+			}
+			if _, exists := snap.Hot[*fr.OpKey]; exists {
+				return fmt.Errorf("committed op_key %v collides with existing hot entry", *fr.OpKey)
+			}
 			snap.LogIndex[*fr.OpKey] = CommittedReceipt{Seq: fr.Seq, Digest: fr.IntentDigest}
 			// line_init is not stored in hot (no anchor retirement), matching ldrcore.
 			if fr.OpType != "line_init" {
@@ -641,6 +658,15 @@ func applyWALRecord(snap *LineSnapshot, kind byte, body []byte) error {
 		he, err := decodeHotEntry(m["entry"])
 		if err != nil {
 			return err
+		}
+		if (he.Outcome.Kind != "rejected" && he.Outcome.Kind != "noop") || he.Outcome.Seq != 0 {
+			return fmt.Errorf("invalid non-commit hot entry kind=%q seq=%d", he.Outcome.Kind, he.Outcome.Seq)
+		}
+		if _, exists := snap.LogIndex[he.Key]; exists {
+			return fmt.Errorf("non-commit op_key %v collides with committed receipt", he.Key)
+		}
+		if _, exists := snap.Hot[he.Key]; exists {
+			return fmt.Errorf("duplicate hot op_key %v", he.Key)
 		}
 		snap.Hot[he.Key] = he
 		snap.Quota[he.Key.Signer]++

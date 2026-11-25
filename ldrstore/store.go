@@ -23,6 +23,13 @@ var (
 	ErrCorruptSidecar = errors.New("ldrstore: sidecar failed commitment verification")
 	ErrStoreLocked    = errors.New("ldrstore: store directory is locked by another process")
 	ErrInvalidRecord  = errors.New("ldrstore: invalid store record")
+	// ErrPreWrite marks a clean refusal that failed strictly BEFORE any bytes
+	// were written to the WAL; on-disk durable state is unchanged.
+	ErrPreWrite = errors.New("ldrstore: clean pre-write refusal")
+	// ErrUncertainWrite marks a WAL write or fsync failure whose on-disk
+	// durability is uncertain; the caller MUST quarantine the line and
+	// reconcile against validated durable state before accepting more work.
+	ErrUncertainWrite = errors.New("ldrstore: uncertain WAL write or sync failure")
 )
 
 // SidecarKind distinguishes domain-separated payload vs wrap sidecar verification.

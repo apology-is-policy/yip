@@ -19,6 +19,10 @@ const (
 	MaxLogPageSize  = 256
 )
 
+// ErrLineQuarantined is returned when a line is fenced after an uncertain
+// durable write/sync failure and awaits ReconcileLine.
+var ErrLineQuarantined = errors.New("ldrrelay: line quarantined after uncertain storage failure")
+
 const (
 	standingActive        = 0
 	standingRevoked       = 1
@@ -70,6 +74,8 @@ type LineStatus struct {
 	HotEntries        int         `json:"hot_entries"`
 	CommittedOps      int         `json:"committed_ops"`
 	RecoveredTornTail bool        `json:"recovered_torn_tail"`
+	Quarantined       bool        `json:"quarantined"`
+	QuarantineReason  string      `json:"quarantine_reason,omitempty"`
 	Clock             ClockStatus `json:"clock"`
 }
 
@@ -91,6 +97,20 @@ type lineRuntime struct {
 	quota             map[string]int
 	clock             *ClockGuard
 	recoveredTornTail bool
+	quarantined       bool
+	quarantineReason  string
+}
+
+// handleStoreErrorLocked distinguishes a clean pre-write refusal (ErrPreWrite)
+// from an uncertain durable write/sync failure. Any non-PreWrite error
+// immediately quarantines the line until ReconcileLine reloads and verifies
+// durable storage (LDR-GO-RELAY-DESIGN §3.1).
+func (rt *lineRuntime) handleStoreErrorLocked(err error) {
+	if err == nil || errors.Is(err, ldrstore.ErrPreWrite) {
+		return
+	}
+	rt.quarantined = true
+	rt.quarantineReason = err.Error()
 }
 
 // RelayEngine is the production multi-line LDR sequencer backed by ldrstore.Store,
@@ -145,6 +165,88 @@ func (e *RelayEngine) SetQuotaMax(n int) {
 	}
 }
 
+// Shared historical and live admission validators (used identically by both
+// live Submit and startup loadAndVerifyLine replay).
+
+// validateLineInitBootstrap verifies that a line_init intent binds the exact
+// provisioned generation-1 context, genesis anchor, descriptor digest, profile,
+// and canonical equal 1-of-2 root key set. Returns (class, code) or ("", "") if valid.
+func (rt *lineRuntime) validateLineInitBootstrap(dec *DecodedIntent) (string, string) {
+	if dec.Generation < 1 {
+		return ldrcore.ClassAdmission, "malformed"
+	}
+	if dec.Generation != 1 || dec.SeenSeq > 0 {
+		return ldrcore.ClassUnresolved, "history_unavailable"
+	}
+	if dec.SeenHead != rt.genesis {
+		return ldrcore.ClassRefusal, "unknown_anchor"
+	}
+	if dec.DescriptorDigest == nil || *dec.DescriptorDigest != rt.cd || dec.InitProfile == nil {
+		return ldrcore.ClassAdmission, "invalid_bootstrap"
+	}
+	initProfDig, err := dec.InitProfile.Digest()
+	if err != nil || initProfDig != rt.profDigest {
+		return ldrcore.ClassAdmission, "invalid_bootstrap"
+	}
+	wantR0, _ := KeyToken(rt.desc.RootKeys[0])
+	wantR1, _ := KeyToken(rt.desc.RootKeys[1])
+	if len(dec.Record.RootKeys) != 2 || dec.Record.RootKeys[0] != wantR0 || dec.Record.RootKeys[1] != wantR1 {
+		return ldrcore.ClassAdmission, "invalid_bootstrap"
+	}
+	return "", ""
+}
+
+// validateAnchorAndDeadline checks an ordinary intent's signed anchor reference
+// and inclusive validity deadline against the accepted chain at commitTime.
+// Returns (class, code) or ("", "") if valid.
+func validateAnchorAndDeadline(seenSeq uint64, seenHead [32]byte, validityMS, commitTime, curHeadSeq, maxValidityMS uint64, heads map[uint64][32]byte, times map[uint64]uint64) (string, string) {
+	if seenSeq > curHeadSeq {
+		return ldrcore.ClassUnresolved, "history_unavailable"
+	}
+	anchorHead, known := heads[seenSeq]
+	if seenSeq < 1 || !known || anchorHead != seenHead {
+		return ldrcore.ClassRefusal, "unknown_anchor"
+	}
+	effValidity := min(validityMS, maxValidityMS)
+	if commitTime > times[seenSeq]+effValidity {
+		return ldrcore.ClassRefusal, "expired"
+	}
+	return "", ""
+}
+
+// verifyFrameMetadataMatchesIntent checks that separately stored WAL frame
+// fields (OpKey, IntentDigest, Origin, OpType, sidecar commitments) agree
+// verbatim with the decoded signed envelope.
+func verifyFrameMetadataMatchesIntent(fr ldrstore.CommittedFrame, dec *DecodedIntent, actualOpKey ldrstore.StoredOpKey, actualDigest [32]byte) error {
+	if fr.Origin != dec.Origin || fr.OpType != dec.OpType {
+		return fmt.Errorf("%w: frame %d origin/op_type (%s/%s) disagrees with signed intent (%s/%s)",
+			ldrstore.ErrCorruptWAL, fr.Seq, fr.Origin, fr.OpType, dec.Origin, dec.OpType)
+	}
+	if fr.OpKey == nil || *fr.OpKey != actualOpKey {
+		return fmt.Errorf("%w: frame %d stored op_key disagrees with signed intent", ldrstore.ErrCorruptWAL, fr.Seq)
+	}
+	if fr.IntentDigest != actualDigest {
+		return fmt.Errorf("%w: frame %d stored intent_digest disagrees with signed envelope", ldrstore.ErrCorruptWAL, fr.Seq)
+	}
+	if dec.PayloadCommit.Length > 0 {
+		if fr.PayloadCommit == nil || !fr.PayloadCommit.Equal(dec.PayloadCommit) {
+			return fmt.Errorf("%w: frame %d stored payload_commit disagrees with signed intent", ldrstore.ErrCorruptWAL, fr.Seq)
+		}
+	} else if fr.PayloadCommit != nil && fr.PayloadCommit.Length > 0 {
+		return fmt.Errorf("%w: frame %d carries unexpected stored payload_commit", ldrstore.ErrCorruptWAL, fr.Seq)
+	}
+	if len(fr.WrapCommits) != len(dec.Manifest) {
+		return fmt.Errorf("%w: frame %d wrap commit count %d disagrees with manifest %d",
+			ldrstore.ErrCorruptWAL, fr.Seq, len(fr.WrapCommits), len(dec.Manifest))
+	}
+	for i := range dec.Manifest {
+		if fr.WrapCommits[i].CredID != dec.Manifest[i].CredID || !fr.WrapCommits[i].Commit.Equal(dec.Manifest[i].Commit) {
+			return fmt.Errorf("%w: frame %d wrap commit[%d] disagrees with signed manifest", ldrstore.ErrCorruptWAL, fr.Seq, i)
+		}
+	}
+	return nil
+}
+
 func (e *RelayEngine) loadAndVerifyLine(lineID []byte) (*lineRuntime, error) {
 	snap, err := e.store.LoadLine(lineID)
 	if err != nil {
@@ -173,17 +275,25 @@ func (e *RelayEngine) loadAndVerifyLine(lineID []byte) (*lineRuntime, error) {
 		frames:            make([]ldrstore.CommittedFrame, 0, len(snap.Frames)),
 		heads:             map[uint64][32]byte{0: genesis},
 		times:             map[uint64]uint64{},
-		logIndex:          snap.LogIndex,
-		hot:               snap.Hot,
-		quota:             snap.Quota,
+		logIndex:          make(map[ldrstore.StoredOpKey]ldrstore.CommittedReceipt),
+		hot:               make(map[ldrstore.StoredOpKey]ldrstore.HotEntry),
+		quota:             make(map[string]int),
 		clock:             NewClockGuard(snap.TimeFloor, e.clockCfg, e.nowFn),
 		recoveredTornTail: snap.RecoveredTornTail,
 	}
 
-	// Replay every committed frame from seq 1..N verifying real chain heads,
-	// real cryptographic signatures, and exact ldrcore.Apply transitions.
+	// Replay every committed frame from seq 1..N verifying:
+	//  - consecutive coordinates and prev_head linkage,
+	//  - real cryptographic chain heads and signatures,
+	//  - line_id, profile_digest, generation, origin, and WAL metadata parity,
+	//  - historical admission rules (line_init bootstrap OR anchor head,
+	//    recorded-commit-time validity deadline, and unique committed OpKey),
+	//  - exact ldrcore.Apply transitions.
 	lim := ldrcrypto.Limits{MaxBytes: int(desc.Profile.MaxRecordBytes), MaxDepth: 16, MaxItems: 4096}
 	prevHead := genesis
+	var maxCommitTime uint64
+	var lineInitKey *ldrstore.StoredOpKey
+
 	for i, fr := range snap.Frames {
 		wantSeq := uint64(i + 1)
 		if fr.Gen != 1 || fr.Seq != wantSeq {
@@ -192,8 +302,16 @@ func (e *RelayEngine) loadAndVerifyLine(lineID []byte) (*lineRuntime, error) {
 		if fr.PrevHead != prevHead {
 			return nil, fmt.Errorf("%w: frame %d prev_head mismatch", ldrstore.ErrCorruptWAL, fr.Seq)
 		}
+		if fr.SeqTime > uint64(ldrcore.MaxCounter) {
+			return nil, fmt.Errorf("%w: frame %d seq_time %d out of domain", ldrstore.ErrCorruptWAL, fr.Seq, fr.SeqTime)
+		}
+		if fr.SeqTime > maxCommitTime {
+			maxCommitTime = fr.SeqTime
+		}
+
 		if fr.Origin == ldrcore.OriginSequencer {
-			if fr.OpType != "time_anchor" || len(fr.IntentBytes) != 0 {
+			if fr.Seq == 1 || fr.OpType != "time_anchor" || len(fr.IntentBytes) != 0 ||
+				fr.OpKey != nil || fr.IntentDigest != ([32]byte{}) || fr.PayloadCommit != nil || len(fr.WrapCommits) != 0 {
 				return nil, fmt.Errorf("%w: invalid sequencer frame %d", ldrstore.ErrCorruptWAL, fr.Seq)
 			}
 			wantHead, err := ldrcrypto.AnchorChainHead(prevHead, profDigest, lineID, fr.Gen, fr.Seq, fr.SeqTime)
@@ -214,10 +332,51 @@ func (e *RelayEngine) loadAndVerifyLine(lineID []byte) (*lineRuntime, error) {
 			if err != nil {
 				return nil, fmt.Errorf("%w: frame %d body decode: %v", ldrstore.ErrCorruptWAL, fr.Seq, err)
 			}
-			pubKey, stg := rt.resolveSignerKeyLocked(dec.Principal)
-			if stg != standingActive && !(fr.Seq == 1 && dec.OpType == "line_init" && stg == standingBootstrapRoot) {
-				return nil, fmt.Errorf("%w: frame %d signer unauthorized on replay", ldrstore.ErrCorruptWAL, fr.Seq)
+			if !bytes.Equal(dec.LineID, rt.lineID) {
+				return nil, fmt.Errorf("%w: frame %d line_id mismatch", ldrstore.ErrCorruptWAL, fr.Seq)
 			}
+			if dec.ProfileDigest != rt.profDigest {
+				return nil, fmt.Errorf("%w: frame %d profile_digest mismatch", ldrstore.ErrCorruptWAL, fr.Seq)
+			}
+			if dec.Generation != fr.Gen {
+				return nil, fmt.Errorf("%w: frame %d generation %d != signed %d", ldrstore.ErrCorruptWAL, fr.Seq, fr.Gen, dec.Generation)
+			}
+			actualDigest, err := env.Digest()
+			if err != nil {
+				return nil, fmt.Errorf("%w: frame %d intent digest: %v", ldrstore.ErrCorruptWAL, fr.Seq, err)
+			}
+			actualOpKey := ldrstore.StoredOpKey{
+				Generation: dec.Generation,
+				Signer:     dec.PrincipalToken,
+				SeenSeq:    dec.SeenSeq,
+				OpID:       dec.OpID,
+			}
+			if err := verifyFrameMetadataMatchesIntent(fr, dec, actualOpKey, actualDigest); err != nil {
+				return nil, err
+			}
+			if prev, dup := rt.logIndex[actualOpKey]; dup {
+				return nil, fmt.Errorf("%w: frame %d duplicates committed op identity from seq %d", ldrstore.ErrCorruptWAL, fr.Seq, prev.Seq)
+			}
+
+			pubKey, stg := rt.resolveSignerKeyLocked(dec.Principal)
+			if dec.OpType == "line_init" {
+				if fr.Seq != 1 || stg != standingBootstrapRoot {
+					return nil, fmt.Errorf("%w: frame %d invalid line_init position or signer", ldrstore.ErrCorruptWAL, fr.Seq)
+				}
+				if cls, code := rt.validateLineInitBootstrap(dec); cls != "" {
+					return nil, fmt.Errorf("%w: frame %d line_init bootstrap failed (%s/%s)", ldrstore.ErrCorruptWAL, fr.Seq, cls, code)
+				}
+				kCopy := actualOpKey
+				lineInitKey = &kCopy
+			} else {
+				if fr.Seq == 1 || stg != standingActive {
+					return nil, fmt.Errorf("%w: frame %d signer unauthorized on replay", ldrstore.ErrCorruptWAL, fr.Seq)
+				}
+				if cls, code := validateAnchorAndDeadline(dec.SeenSeq, dec.SeenHead, dec.ValidityMS, fr.SeqTime, uint64(i), desc.Profile.MaxValidityMS, rt.heads, rt.times); cls != "" {
+					return nil, fmt.Errorf("%w: frame %d historical admission failed (%s/%s)", ldrstore.ErrCorruptWAL, fr.Seq, cls, code)
+				}
+			}
+
 			if err := env.Verify(pubKey); err != nil {
 				return nil, fmt.Errorf("%w: frame %d bad signature on replay: %v", ldrstore.ErrCorruptWAL, fr.Seq, err)
 			}
@@ -230,13 +389,120 @@ func (e *RelayEngine) loadAndVerifyLine(lineID []byte) (*lineRuntime, error) {
 				return nil, fmt.Errorf("%w: frame %d failed Apply (%s %s)", ldrstore.ErrCorruptWAL, fr.Seq, out.Kind, out.Reason)
 			}
 			rt.state = next
+			rt.logIndex[actualOpKey] = ldrstore.CommittedReceipt{Seq: fr.Seq, Digest: actualDigest}
 		}
 		rt.frames = append(rt.frames, fr)
 		rt.heads[fr.Seq] = fr.Head
 		rt.times[fr.Seq] = fr.SeqTime
 		prevHead = fr.Head
 	}
+
+	// Verify persisted time_floor never lags committed history.
+	if snap.TimeFloor < maxCommitTime {
+		return nil, fmt.Errorf("%w: persisted time_floor %d < highest committed seq_time %d", ldrstore.ErrCorruptWAL, snap.TimeFloor, maxCommitTime)
+	}
+
+	// Verify recovered snap.LogIndex agrees 100% with frame-derived rt.logIndex.
+	if len(snap.LogIndex) != len(rt.logIndex) {
+		return nil, fmt.Errorf("%w: recovered log_index size %d disagrees with verified frames %d", ldrstore.ErrCorruptWAL, len(snap.LogIndex), len(rt.logIndex))
+	}
+	for k, want := range rt.logIndex {
+		got, ok := snap.LogIndex[k]
+		if !ok || got != want {
+			return nil, fmt.Errorf("%w: recovered log_index entry for %v disagrees with verified frame", ldrstore.ErrCorruptWAL, k)
+		}
+	}
+
+	// Validate snap.Hot against verified committed receipts while preserving
+	// durable rejection/no-op records; derive quota strictly from validated hot.
+	if len(snap.Hot) > 0 && rt.state.Line.Generation == 0 {
+		return nil, fmt.Errorf("%w: hot index non-empty before line_init", ldrstore.ErrCorruptWAL)
+	}
+	for k, he := range snap.Hot {
+		if he.Key != k {
+			return nil, fmt.Errorf("%w: hot entry key mismatch for %v", ldrstore.ErrCorruptWAL, k)
+		}
+		if k.Generation < 1 || k.Generation > uint64(rt.state.Line.Generation) {
+			return nil, fmt.Errorf("%w: hot entry %v generation out of bounds", ldrstore.ErrCorruptWAL, k)
+		}
+		if k.Signer == "" || k.OpID == "" {
+			return nil, fmt.Errorf("%w: hot entry %v missing signer or op_id", ldrstore.ErrCorruptWAL, k)
+		}
+		if _, knownAnchor := rt.heads[k.SeenSeq]; k.SeenSeq < 1 || !knownAnchor {
+			return nil, fmt.Errorf("%w: hot entry %v references unknown anchor seq %d", ldrstore.ErrCorruptWAL, k, k.SeenSeq)
+		}
+		switch he.Outcome.Kind {
+		case ldrcore.Committed:
+			if lineInitKey != nil && k == *lineInitKey {
+				return nil, fmt.Errorf("%w: line_init must not appear in hot index", ldrstore.ErrCorruptWAL)
+			}
+			rec, ok := rt.logIndex[k]
+			if !ok || he.Outcome.Seq != rec.Seq || he.Digest != rec.Digest ||
+				he.Outcome.Reason != "" || he.Outcome.RefGen != 0 || he.Outcome.RefSeq != 0 {
+				return nil, fmt.Errorf("%w: hot committed entry %v disagrees with verified log_index", ldrstore.ErrCorruptWAL, k)
+			}
+		case ldrcore.Rejected, ldrcore.Noop:
+			if _, committed := rt.logIndex[k]; committed {
+				return nil, fmt.Errorf("%w: hot non-commit entry %v collides with committed receipt", ldrstore.ErrCorruptWAL, k)
+			}
+			if he.Outcome.Seq != 0 {
+				return nil, fmt.Errorf("%w: hot non-commit entry %v has non-zero seq %d", ldrstore.ErrCorruptWAL, k, he.Outcome.Seq)
+			}
+			if he.Outcome.Kind == ldrcore.Rejected && he.Outcome.Reason == "" {
+				return nil, fmt.Errorf("%w: hot rejected entry %v missing reason", ldrstore.ErrCorruptWAL, k)
+			}
+			rt.quota[k.Signer]++
+		default:
+			return nil, fmt.Errorf("%w: hot entry %v has invalid outcome kind %q", ldrstore.ErrCorruptWAL, k, he.Outcome.Kind)
+		}
+		rt.hot[k] = he
+	}
+	for signer, q := range snap.Quota {
+		if rt.quota[signer] != q {
+			return nil, fmt.Errorf("%w: recovered quota for %s (%d) disagrees with validated hot (%d)", ldrstore.ErrCorruptWAL, signer, q, rt.quota[signer])
+		}
+	}
+	for signer, q := range rt.quota {
+		if snap.Quota[signer] != q {
+			return nil, fmt.Errorf("%w: validated quota for %s (%d) disagrees with recovered (%d)", ldrstore.ErrCorruptWAL, signer, q, snap.Quota[signer])
+		}
+	}
+
 	return rt, nil
+}
+
+// ReconcileLine reloads and re-verifies lineID from durable storage, clearing
+// quarantine only if the durable WAL, sidecars, signatures, historical
+// admission rules, and derived indices verify cleanly (LDR-GO-RELAY-DESIGN §3.1).
+// State is updated in place under the line's mutex so concurrent callers never
+// observe a split-brain lineRuntime.
+func (e *RelayEngine) ReconcileLine(lineID []byte) error {
+	rt, ok := e.getLine(lineID)
+	if !ok {
+		return ldrstore.ErrLineNotFound
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+
+	fresh, err := e.loadAndVerifyLine(lineID)
+	if err != nil {
+		return err
+	}
+	if fresh.cd != rt.cd || fresh.genesis != rt.genesis || fresh.profDigest != rt.profDigest {
+		return fmt.Errorf("%w: provisioned descriptor changed during reconciliation", ldrstore.ErrCorruptWAL)
+	}
+	rt.state = fresh.state
+	rt.frames = fresh.frames
+	rt.heads = fresh.heads
+	rt.times = fresh.times
+	rt.logIndex = fresh.logIndex
+	rt.hot = fresh.hot
+	rt.quota = fresh.quota
+	rt.clock = fresh.clock
+	rt.recoveredTornTail = fresh.recoveredTornTail
+	rt.quarantined = false
+	rt.quarantineReason = ""
+	return nil
 }
 
 // Provision verifies a root-signed creation descriptor, installs it durably
@@ -287,12 +553,14 @@ func (e *RelayEngine) ClockGuardFor(lineID []byte) (*ClockGuard, bool) {
 	if !ok {
 		return nil, false
 	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 	return rt.clock, true
 }
 
 // VerifySessionPrincipal checks key possession via sig over SessionAuthMessage
 // and evaluates the principal's current standing inside the serialized line lock.
-// Returns (standing, gen, pubKey, err).
+// Returns (standing, gen, err).
 func (e *RelayEngine) VerifySessionPrincipal(lineID []byte, authMsg ldrcrypto.SessionAuthMessage, sig []byte) (int, uint64, error) {
 	rt, ok := e.getLine(lineID)
 	if !ok {
@@ -300,6 +568,10 @@ func (e *RelayEngine) VerifySessionPrincipal(lineID []byte, authMsg ldrcrypto.Se
 	}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+
+	if rt.quarantined {
+		return standingNever, 0, ErrLineQuarantined
+	}
 
 	if authMsg.ProfileDigest != rt.profDigest {
 		return standingNever, 0, errors.New("profile_digest mismatch")
@@ -476,6 +748,9 @@ func (e *RelayEngine) Submit(lineID []byte, authPrincipal ldrcrypto.Principal, i
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
+	if rt.quarantined {
+		return SubmitReply{Class: ldrcore.ClassAdmission, Code: "storage_quarantined"}
+	}
 	if dec.OpType != "line_init" && rt.state.Line.Generation == 0 {
 		return SubmitReply{Class: ldrcore.ClassAdmission, Code: "no_line"}
 	}
@@ -540,18 +815,10 @@ func (e *RelayEngine) Submit(lineID []byte, authPrincipal ldrcrypto.Principal, i
 		return SubmitReply{Class: ldrcore.ClassAdmission, Code: "clock_uncertain"}
 	}
 
-	// Anchor resolution and inclusive deadline check.
+	// Anchor resolution and inclusive deadline check (shared with startup replay).
 	curHeadSeq := uint64(rt.state.Line.HeadSeq)
-	if dec.SeenSeq > curHeadSeq {
-		return SubmitReply{Class: ldrcore.ClassUnresolved, Code: "history_unavailable"}
-	}
-	anchorHead, known := rt.heads[dec.SeenSeq]
-	if dec.SeenSeq < 1 || !known || anchorHead != dec.SeenHead {
-		return SubmitReply{Class: ldrcore.ClassRefusal, Code: "unknown_anchor"}
-	}
-	effValidity := min(dec.ValidityMS, rt.desc.Profile.MaxValidityMS)
-	if t > rt.times[dec.SeenSeq]+effValidity {
-		return SubmitReply{Class: ldrcore.ClassRefusal, Code: "expired"}
+	if cls, code := validateAnchorAndDeadline(dec.SeenSeq, dec.SeenHead, dec.ValidityMS, t, curHeadSeq, rt.desc.Profile.MaxValidityMS, rt.heads, rt.times); cls != "" {
+		return SubmitReply{Class: cls, Code: code}
 	}
 
 	// Admitted: evaluate state transition via ldrcore.Apply.
@@ -586,6 +853,7 @@ func (e *RelayEngine) Submit(lineID []byte, authPrincipal ldrcrypto.Principal, i
 		}
 		// Durable commit BEFORE updating any in-memory index or returning!
 		if err := e.store.AppendCommit(rt.lineID, fr, sidecars, t); err != nil {
+			rt.handleStoreErrorLocked(err)
 			return SubmitReply{Class: ldrcore.ClassAdmission, Code: "storage_error"}
 		}
 		rt.clock.AdvanceFloor(t)
@@ -613,6 +881,7 @@ func (e *RelayEngine) Submit(lineID []byte, authPrincipal ldrcrypto.Principal, i
 		}
 		he := ldrstore.HotEntry{Key: opKey, Digest: intentDigest, Outcome: outcome}
 		if err := e.store.AppendNonCommit(rt.lineID, he, t); err != nil {
+			rt.handleStoreErrorLocked(err)
 			return SubmitReply{Class: ldrcore.ClassAdmission, Code: "storage_error"}
 		}
 		rt.clock.AdvanceFloor(t)
@@ -632,28 +901,9 @@ func (e *RelayEngine) submitLineInitLocked(rt *lineRuntime, env ldrcrypto.Signed
 	if rt.state.Line.Generation != 0 {
 		return SubmitReply{Class: ldrcore.ClassRefusal, Code: "line_exists"}
 	}
-	if dec.Generation < 1 {
-		return SubmitReply{Class: ldrcore.ClassAdmission, Code: "malformed"}
-	}
-	if dec.Generation != 1 || dec.SeenSeq > 0 {
-		return SubmitReply{Class: ldrcore.ClassUnresolved, Code: "history_unavailable"}
-	}
-	if dec.SeenHead != rt.genesis {
-		return SubmitReply{Class: ldrcore.ClassRefusal, Code: "unknown_anchor"}
-	}
-	// Verify line_init matches the provisioned creation descriptor exactly (G2).
-	if dec.DescriptorDigest == nil || *dec.DescriptorDigest != rt.cd || dec.InitProfile == nil {
-		return SubmitReply{Class: ldrcore.ClassAdmission, Code: "invalid_bootstrap"}
-	}
-	initProfDig, err := dec.InitProfile.Digest()
-	if err != nil || initProfDig != rt.profDigest {
-		return SubmitReply{Class: ldrcore.ClassAdmission, Code: "invalid_bootstrap"}
-	}
-	// Verify root_keys match the provisioned descriptor's canonical root_keys.
-	wantR0, _ := KeyToken(rt.desc.RootKeys[0])
-	wantR1, _ := KeyToken(rt.desc.RootKeys[1])
-	if len(dec.Record.RootKeys) != 2 || dec.Record.RootKeys[0] != wantR0 || dec.Record.RootKeys[1] != wantR1 {
-		return SubmitReply{Class: ldrcore.ClassAdmission, Code: "invalid_bootstrap"}
+	// Verify line_init matches the provisioned creation descriptor (shared with startup replay).
+	if cls, code := rt.validateLineInitBootstrap(dec); cls != "" {
+		return SubmitReply{Class: cls, Code: code}
 	}
 
 	t, ok := rt.clock.Reading()
@@ -682,6 +932,7 @@ func (e *RelayEngine) submitLineInitLocked(rt *lineRuntime, env ldrcrypto.Signed
 		OpKey:        &keyCopy,
 	}
 	if err := e.store.AppendCommit(rt.lineID, fr, nil, t); err != nil {
+		rt.handleStoreErrorLocked(err)
 		return SubmitReply{Class: ldrcore.ClassAdmission, Code: "storage_error"}
 	}
 	rt.clock.AdvanceFloor(t)
@@ -712,6 +963,9 @@ func (e *RelayEngine) Query(lineID []byte, authPrincipal ldrcrypto.Principal, ke
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
+	if rt.quarantined {
+		return SubmitReply{Class: ldrcore.ClassAdmission, Code: "storage_quarantined"}
+	}
 	if rt.state.Line.Generation == 0 {
 		return SubmitReply{Class: ldrcore.ClassAdmission, Code: "no_line"}
 	}
@@ -758,6 +1012,9 @@ func (e *RelayEngine) AnchorRequest(lineID []byte, authPrincipal ldrcrypto.Princ
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
+	if rt.quarantined {
+		return AnchorReply{Class: ldrcore.ClassAdmission, Code: "storage_quarantined"}
+	}
 	if rt.state.Line.Generation == 0 {
 		return AnchorReply{Class: ldrcore.ClassAdmission, Code: "no_line"}
 	}
@@ -797,6 +1054,7 @@ func (e *RelayEngine) AnchorRequest(lineID []byte, authPrincipal ldrcrypto.Princ
 			OpType:   "time_anchor",
 		}
 		if err := e.store.AppendCommit(rt.lineID, fr, nil, t); err != nil {
+			rt.handleStoreErrorLocked(err)
 			return AnchorReply{Class: ldrcore.ClassAdmission, Code: "storage_error"}
 		}
 		rt.clock.AdvanceFloor(t)
@@ -827,6 +1085,9 @@ func (e *RelayEngine) Compact(lineID []byte) (int, error) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
+	if rt.quarantined {
+		return 0, errors.New("storage_quarantined")
+	}
 	t, trusted := rt.clock.Reading()
 	if !trusted {
 		return 0, errors.New("clock_uncertain")
@@ -842,6 +1103,7 @@ func (e *RelayEngine) Compact(lineID []byte) (int, error) {
 		return 0, nil
 	}
 	if err := e.store.AppendCompact(rt.lineID, retired, t); err != nil {
+		rt.handleStoreErrorLocked(err)
 		return 0, err
 	}
 	rt.clock.AdvanceFloor(t)
@@ -864,6 +1126,9 @@ func (e *RelayEngine) ControlLog(lineID []byte, authPrincipal ldrcrypto.Principa
 	}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+	if rt.quarantined {
+		return nil, "storage_quarantined"
+	}
 	if rt.state.Line.Generation == 0 {
 		return nil, "no_line"
 	}
@@ -912,6 +1177,10 @@ func (e *RelayEngine) FetchSidecar(lineID []byte, authPrincipal ldrcrypto.Princi
 		return nil, "wrong_line"
 	}
 	rt.mu.Lock()
+	if rt.quarantined {
+		rt.mu.Unlock()
+		return nil, "storage_quarantined"
+	}
 	if rt.state.Line.Generation == 0 {
 		rt.mu.Unlock()
 		return nil, "no_line"
@@ -950,7 +1219,11 @@ func (e *RelayEngine) Shutdown() error {
 	}
 	for _, rt := range rts {
 		rt.mu.Lock()
-		_ = e.store.RecordCleanShutdown(rt.lineID, rt.clock.Floor(), wall)
+		// Never append a clean-shutdown marker with stale in-memory floor onto a
+		// quarantined WAL whose durable tail/floor may be ahead or torn.
+		if !rt.quarantined {
+			_ = e.store.RecordCleanShutdown(rt.lineID, rt.clock.Floor(), wall)
+		}
 		rt.mu.Unlock()
 	}
 	return e.store.Close()
@@ -978,6 +1251,8 @@ func (e *RelayEngine) Status() []LineStatus {
 			HotEntries:        len(rt.hot),
 			CommittedOps:      len(rt.logIndex),
 			RecoveredTornTail: rt.recoveredTornTail,
+			Quarantined:       rt.quarantined,
+			QuarantineReason:  rt.quarantineReason,
 			Clock:             rt.clock.Status(),
 		})
 		rt.mu.Unlock()
