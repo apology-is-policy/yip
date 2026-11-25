@@ -1013,7 +1013,7 @@ func loadEpochs(path string) (persistedEpochs, error) {
 	return ep, nil
 }
 
-func saveCursors(path string, cur persistedCursors) error {
+func marshalCursors(cur persistedCursors) ([]byte, error) {
 	nIDs := make([]string, 0, len(cur.Notices))
 	for id := range cur.Notices {
 		nIDs = append(nIDs, id)
@@ -1041,9 +1041,21 @@ func saveCursors(path string, cur persistedCursors) error {
 		{Key: "v", Value: uint64(1)},
 	}, ldrcrypto.Limits{MaxBytes: 2 * 1024 * 1024, MaxDepth: 16, MaxItems: 32768})
 	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ldrstore.ErrPreWrite, err)
+	}
+	return raw, nil
+}
+
+func saveCursors(path string, cur persistedCursors) error {
+	return saveCursorsWithHooks(path, cur, nil, nil)
+}
+
+func saveCursorsWithHooks(path string, cur persistedCursors, syncFile func(*os.File) error, syncDir func(string) error) error {
+	raw, err := marshalCursors(cur)
+	if err != nil {
 		return err
 	}
-	return ldrstore.AtomicWriteFile(path, raw, 0o600)
+	return atomicWriteFileWithHooks(path, raw, 0o600, syncFile, syncDir)
 }
 
 func loadCursors(path string) (persistedCursors, error) {

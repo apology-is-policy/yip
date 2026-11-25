@@ -23,15 +23,16 @@ import (
 )
 
 var (
-	ErrSlotBusy        = errors.New("ldrclient: an unresolved intent already holds this slot")
-	ErrMustResolve     = errors.New("ldrclient: stored unsettled intents must be resolved before composing")
-	ErrFailClosed      = errors.New("ldrclient: client failed closed due to violation or suspected rollback")
-	ErrKeyRevoked      = errors.New("ldrclient: key is revoked and signs nothing more")
-	ErrNotActivated    = errors.New("ldrclient: member has not completed O25 enrollment verification")
-	ErrOutboxUncertain = errors.New("ldrclient: durable outbox state uncertain after persistence failure; reconcile required")
-	ErrNoEpochKey      = errors.New("ldrclient: no epoch key available for payload encryption")
-	ErrEnrollmentCheck = errors.New("ldrclient: committed enrollment disagrees with saved P3 request")
-	ErrViolation       = errors.New("ldrclient: sequencer violation detected on replay")
+	ErrSlotBusy         = errors.New("ldrclient: an unresolved intent already holds this slot")
+	ErrMustResolve      = errors.New("ldrclient: stored unsettled intents must be resolved before composing")
+	ErrFailClosed       = errors.New("ldrclient: client failed closed due to violation or suspected rollback")
+	ErrKeyRevoked       = errors.New("ldrclient: key is revoked and signs nothing more")
+	ErrNotActivated     = errors.New("ldrclient: member has not completed O25 enrollment verification")
+	ErrOutboxUncertain  = errors.New("ldrclient: durable outbox state uncertain after persistence failure; reconcile required")
+	ErrCursorsUncertain = errors.New("ldrclient: durable cursor state uncertain after persistence failure; reconcile required")
+	ErrNoEpochKey       = errors.New("ldrclient: no epoch key available for payload encryption")
+	ErrEnrollmentCheck  = errors.New("ldrclient: committed enrollment disagrees with saved P3 request")
+	ErrViolation        = errors.New("ldrclient: sequencer violation detected on replay")
 )
 
 var transientAdmission = map[string]bool{
@@ -117,12 +118,14 @@ type Client struct {
 	viewOf  map[string]string
 
 	// Durable outbox, epoch keys, and projection/delivery cursors.
-	outbox                persistedOutbox
-	outboxUncertain       bool
-	outboxUncertainReason string
-	slots                 map[string]string // slot -> unsettled op_id
-	epochs                persistedEpochs
-	cursors               persistedCursors
+	outbox                 persistedOutbox
+	outboxUncertain        bool
+	outboxUncertainReason  string
+	slots                  map[string]string // slot -> unsettled op_id
+	epochs                 persistedEpochs
+	cursors                persistedCursors
+	cursorsUncertain       bool
+	cursorsUncertainReason string
 
 	// Optional durability hooks (nil defaults to OS SyncFile/SyncDir).
 	syncFileFn func(*os.File) error
@@ -149,6 +152,30 @@ func (c *Client) markOutboxUncertainOnErrLocked(err error) {
 	}
 	c.outboxUncertain = true
 	c.outboxUncertainReason = err.Error()
+}
+
+func (c *Client) persistCursorsLocked(cur persistedCursors) error {
+	return saveCursorsWithHooks(c.cursorsPath(), cur, c.syncFileFn, c.syncDirFn)
+}
+
+func (c *Client) markCursorsUncertainOnErrLocked(err error) {
+	if err == nil || errors.Is(err, ldrstore.ErrPreWrite) {
+		return
+	}
+	c.cursorsUncertain = true
+	c.cursorsUncertainReason = err.Error()
+}
+
+func clonePersistedCursors(cur persistedCursors) persistedCursors {
+	cp := cur
+	cp.Notices = make(map[string]*LocalNotice, len(cur.Notices))
+	for id, n := range cur.Notices {
+		if n != nil {
+			nc := *n
+			cp.Notices[id] = &nc
+		}
+	}
+	return cp
 }
 
 // InitDirOptions configures initializing a fresh client directory for a pinned descriptor.
@@ -327,13 +354,17 @@ func openClientLocked(dir string, lf *os.File, syncFile func(*os.File) error, sy
 		_ = lf.Close()
 	}
 
-	// Enforce durability barriers on outbox.cbor and epochs.cbor (if present)
-	// before trusting persisted activation or key state on reopen.
+	// Enforce durability barriers on outbox.cbor, epochs.cbor, and cursors.cbor
+	// (if present) before trusting persisted activation, key, or cursor state on reopen.
 	if err := syncOutboxBarrier(filepath.Join(dir, "outbox.cbor"), syncFile, syncDir); err != nil {
 		cleanupLock()
 		return nil, err
 	}
 	if err := syncOutboxBarrier(filepath.Join(dir, "epochs.cbor"), syncFile, syncDir); err != nil {
+		cleanupLock()
+		return nil, err
+	}
+	if err := syncOutboxBarrier(filepath.Join(dir, "cursors.cbor"), syncFile, syncDir); err != nil {
 		cleanupLock()
 		return nil, err
 	}
@@ -445,6 +476,11 @@ func openClientLocked(dir string, lf *os.File, syncFile func(*os.File) error, sy
 			cleanupLock()
 			return nil, fmt.Errorf("ldrclient: verified.wal replay failed: %w", err)
 		}
+	}
+	if c.cursors.ScannedSeq > c.ckSeq || c.cursors.ProjectedSeq > c.ckSeq {
+		cleanupLock()
+		return nil, fmt.Errorf("%w: persisted cursors (scanned=%d projected=%d) exceed verified.wal seq %d",
+			ldrstore.ErrCorruptWAL, c.cursors.ScannedSeq, c.cursors.ProjectedSeq, c.ckSeq)
 	}
 	// Defense-in-depth: a reopened member directory claiming Activated=true
 	// MUST be backed by a verified credential_enroll record in verified.wal
@@ -684,25 +720,27 @@ func (c *Client) Stops() []KeyStop {
 
 // Status returns a concise JSON-friendly status summary (no private keys).
 type ClientStatus struct {
-	DirKind               string   `json:"dir_kind"`
-	LineID                string   `json:"line_id"`
-	CredID                string   `json:"cred_id,omitempty"`
-	Activated             bool     `json:"activated"`
-	OutboxUncertain       bool     `json:"outbox_uncertain,omitempty"`
-	OutboxUncertainReason string   `json:"outbox_uncertain_reason,omitempty"`
-	Generation            uint64   `json:"generation"`
-	CheckpointSeq         uint64   `json:"checkpoint_seq"`
-	CheckpointHd          string   `json:"checkpoint_head"`
-	KeyEpoch              int64    `json:"key_epoch"`
-	AuthEpoch             int64    `json:"auth_epoch"`
-	HasEpochKeys          []uint64 `json:"has_epoch_keys"`
-	ProjectedSeq          uint64   `json:"projected_seq"`
-	ScannedSeq            uint64   `json:"scanned_seq"`
-	MustResolve           bool     `json:"must_resolve"`
-	Suspect               bool     `json:"suspect"`
-	Halted                string   `json:"halted,omitempty"`
-	OutboxCount           int      `json:"outbox_count"`
-	StoppedKeys           []string `json:"stopped_keys,omitempty"`
+	DirKind                string   `json:"dir_kind"`
+	LineID                 string   `json:"line_id"`
+	CredID                 string   `json:"cred_id,omitempty"`
+	Activated              bool     `json:"activated"`
+	OutboxUncertain        bool     `json:"outbox_uncertain,omitempty"`
+	OutboxUncertainReason  string   `json:"outbox_uncertain_reason,omitempty"`
+	CursorsUncertain       bool     `json:"cursors_uncertain,omitempty"`
+	CursorsUncertainReason string   `json:"cursors_uncertain_reason,omitempty"`
+	Generation             uint64   `json:"generation"`
+	CheckpointSeq          uint64   `json:"checkpoint_seq"`
+	CheckpointHd           string   `json:"checkpoint_head"`
+	KeyEpoch               int64    `json:"key_epoch"`
+	AuthEpoch              int64    `json:"auth_epoch"`
+	HasEpochKeys           []uint64 `json:"has_epoch_keys"`
+	ProjectedSeq           uint64   `json:"projected_seq"`
+	ScannedSeq             uint64   `json:"scanned_seq"`
+	MustResolve            bool     `json:"must_resolve"`
+	Suspect                bool     `json:"suspect"`
+	Halted                 string   `json:"halted,omitempty"`
+	OutboxCount            int      `json:"outbox_count"`
+	StoppedKeys            []string `json:"stopped_keys,omitempty"`
 }
 
 func (c *Client) Status() ClientStatus {
@@ -724,25 +762,27 @@ func (c *Client) Status() ClientStatus {
 		}
 	}
 	return ClientStatus{
-		DirKind:               c.cfg.DirKind,
-		LineID:                hex.EncodeToString(c.cfg.LineID),
-		CredID:                cid,
-		Activated:             c.outbox.Activated,
-		OutboxUncertain:       c.outboxUncertain,
-		OutboxUncertainReason: c.outboxUncertainReason,
-		Generation:            c.ckGen,
-		CheckpointSeq:         c.ckSeq,
-		CheckpointHd:          hex.EncodeToString(c.ckHead[:]),
-		KeyEpoch:              c.state.Line.KeyEpoch,
-		AuthEpoch:             c.state.Line.AuthEpoch,
-		HasEpochKeys:          epKeys,
-		ProjectedSeq:          c.cursors.ProjectedSeq,
-		ScannedSeq:            c.cursors.ScannedSeq,
-		MustResolve:           c.outbox.MustResolve,
-		Suspect:               c.outbox.Suspect,
-		Halted:                c.outbox.Halted,
-		OutboxCount:           len(c.outbox.Entries),
-		StoppedKeys:           stopped,
+		DirKind:                c.cfg.DirKind,
+		LineID:                 hex.EncodeToString(c.cfg.LineID),
+		CredID:                 cid,
+		Activated:              c.outbox.Activated,
+		OutboxUncertain:        c.outboxUncertain,
+		OutboxUncertainReason:  c.outboxUncertainReason,
+		CursorsUncertain:       c.cursorsUncertain,
+		CursorsUncertainReason: c.cursorsUncertainReason,
+		Generation:             c.ckGen,
+		CheckpointSeq:          c.ckSeq,
+		CheckpointHd:           hex.EncodeToString(c.ckHead[:]),
+		KeyEpoch:               c.state.Line.KeyEpoch,
+		AuthEpoch:              c.state.Line.AuthEpoch,
+		HasEpochKeys:           epKeys,
+		ProjectedSeq:           c.cursors.ProjectedSeq,
+		ScannedSeq:             c.cursors.ScannedSeq,
+		MustResolve:            c.outbox.MustResolve,
+		Suspect:                c.outbox.Suspect,
+		Halted:                 c.outbox.Halted,
+		OutboxCount:            len(c.outbox.Entries),
+		StoppedKeys:            stopped,
 	}
 }
 
@@ -1064,10 +1104,11 @@ func verifyClientReconcilePreservesPrefixLocked(prev, cand *Client) error {
 }
 
 // ReconcileDurability enforces explicit file+directory durability barriers on
-// outbox.cbor, epochs.cbor, and verified.wal, reconstructs and verifies a fresh
-// candidate from the durable frames, requires the candidate to extend the last
-// verified checkpoint, validates activation evidence against the candidate, and
-// lifts outboxUncertain ONLY when every barrier and check succeeds.
+// outbox.cbor, epochs.cbor, cursors.cbor, and verified.wal, reconstructs and
+// verifies a fresh candidate from the durable frames, requires the candidate
+// and cursors to monotonically preserve previously published state, validates
+// activation evidence against the candidate, and lifts outboxUncertain and
+// cursorsUncertain ONLY when every barrier and check succeeds.
 func (c *Client) ReconcileDurability() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1076,6 +1117,9 @@ func (c *Client) ReconcileDurability() error {
 		return err
 	}
 	if err := syncOutboxBarrier(c.epochsPath(), c.syncFileFn, c.syncDirFn); err != nil {
+		return err
+	}
+	if err := syncOutboxBarrier(c.cursorsPath(), c.syncFileFn, c.syncDirFn); err != nil {
 		return err
 	}
 	ob, err := loadOutbox(c.outboxPath())
@@ -1091,6 +1135,28 @@ func (c *Client) ReconcileDurability() error {
 	ep, err := loadEpochs(c.epochsPath())
 	if err != nil {
 		return err
+	}
+	cur, err := loadCursors(c.cursorsPath())
+	if err != nil {
+		return err
+	}
+	if cur.ScannedSeq < c.cursors.ScannedSeq {
+		return fmt.Errorf("%w: reconciled scanned_seq %d regressed below %d", ldrstore.ErrCorruptWAL, cur.ScannedSeq, c.cursors.ScannedSeq)
+	}
+	if cur.Rebuilds < c.cursors.Rebuilds {
+		return fmt.Errorf("%w: reconciled rebuilds %d regressed below %d", ldrstore.ErrCorruptWAL, cur.Rebuilds, c.cursors.Rebuilds)
+	}
+	if cur.Rebuilds == c.cursors.Rebuilds && cur.ProjectedSeq < c.cursors.ProjectedSeq {
+		return fmt.Errorf("%w: reconciled projected_seq %d regressed below %d", ldrstore.ErrCorruptWAL, cur.ProjectedSeq, c.cursors.ProjectedSeq)
+	}
+	for id, prevNotice := range c.cursors.Notices {
+		gotNotice := cur.Notices[id]
+		if gotNotice == nil {
+			return fmt.Errorf("%w: reconciled cursors.cbor lost previously persisted notice %q", ldrstore.ErrCorruptWAL, id)
+		}
+		if prevNotice.Acked && !gotNotice.Acked {
+			return fmt.Errorf("%w: reconciled cursors.cbor regressed acknowledged notice %q", ldrstore.ErrCorruptWAL, id)
+		}
 	}
 	frames, err := loadVerifiedWAL(c.walPath(), c.syncFileFn, c.syncDirFn)
 	if err != nil {
@@ -1116,7 +1182,7 @@ func (c *Client) ReconcileDurability() error {
 		outbox:      ob,
 		slots:       make(map[string]string),
 		epochs:      ep,
-		cursors:     c.cursors,
+		cursors:     cur,
 	}
 	for _, fr := range frames {
 		if err := cand.verifyAndApplyFrameLocked(fr, false); err != nil {
@@ -1125,6 +1191,10 @@ func (c *Client) ReconcileDurability() error {
 	}
 	if err := verifyClientReconcilePreservesPrefixLocked(c, cand); err != nil {
 		return err
+	}
+	if cur.ScannedSeq > cand.ckSeq || cur.ProjectedSeq > cand.ckSeq {
+		return fmt.Errorf("%w: reconciled cursors (scanned=%d projected=%d) exceed durable verified.wal seq %d",
+			ldrstore.ErrCorruptWAL, cur.ScannedSeq, cur.ProjectedSeq, cand.ckSeq)
 	}
 	// Validate activation evidence against the DURABLY RECONSTRUCTED candidate
 	// (never against stale in-memory c.entries/c.state!).
@@ -1156,9 +1226,12 @@ func (c *Client) ReconcileDurability() error {
 	c.viewOf = cand.viewOf
 	c.epochs = ep
 	c.outbox = ob
+	c.cursors = cur
 	c.slots = slots
 	c.outboxUncertain = false
 	c.outboxUncertainReason = ""
+	c.cursorsUncertain = false
+	c.cursorsUncertainReason = ""
 	return nil
 }
 

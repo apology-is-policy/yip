@@ -232,7 +232,10 @@ func (c *Client) writeProjFileLocked(pf projFile) (bool, error) {
 
 // Project advances the rebuildable projection directory to ckSeq (separate
 // durable cursor ProjectedSeq, §11.2 rules 2–3). Enforces the O25 activation
-// and durability gate before publishing any file or advancing ProjectedSeq.
+// and durability gates before publishing any file or advancing ProjectedSeq.
+// ProjectedSeq is persisted via a staged candidate BEFORE publishing in memory
+// so definite pre-write failures are retried on the next call and ambiguous
+// writes fence cursor reliance until ReconcileDurability succeeds.
 // If any file on disk disagrees with the verified store (e.g., local edit/taint),
 // automatically wipes and rebuilds from verified.wal once.
 func (c *Client) Project(ctx context.Context, sess *ldrrelay.SessionClient) error {
@@ -242,6 +245,10 @@ func (c *Client) Project(ctx context.Context, sess *ldrrelay.SessionClient) erro
 		if c.outboxUncertain {
 			c.mu.Unlock()
 			return ErrOutboxUncertain
+		}
+		if c.cursorsUncertain {
+			c.mu.Unlock()
+			return ErrCursorsUncertain
 		}
 		if !c.outbox.Activated {
 			c.mu.Unlock()
@@ -269,6 +276,22 @@ func (c *Client) Project(ctx context.Context, sess *ldrrelay.SessionClient) erro
 		}
 
 		c.mu.Lock()
+		if c.outboxUncertain {
+			c.mu.Unlock()
+			return ErrOutboxUncertain
+		}
+		if c.cursorsUncertain {
+			c.mu.Unlock()
+			return ErrCursorsUncertain
+		}
+		if !c.outbox.Activated {
+			c.mu.Unlock()
+			return ErrNotActivated
+		}
+		if c.cursors.ProjectedSeq != seq-1 {
+			c.mu.Unlock()
+			continue
+		}
 		var files []projFile
 		if ve.decoded != nil {
 			files = append(files, recordProjFiles(ve.frame, ve.decoded.Record, bodyStr)...)
@@ -303,12 +326,15 @@ func (c *Client) Project(ctx context.Context, sess *ldrrelay.SessionClient) erro
 			c.mu.Unlock()
 			continue
 		}
-		c.cursors.ProjectedSeq = seq
-		err := saveCursors(c.cursorsPath(), c.cursors)
-		c.mu.Unlock()
-		if err != nil {
+		cand := clonePersistedCursors(c.cursors)
+		cand.ProjectedSeq = seq
+		if err := c.persistCursorsLocked(cand); err != nil {
+			c.markCursorsUncertainOnErrLocked(err)
+			c.mu.Unlock()
 			return err
 		}
+		c.cursors = cand
+		c.mu.Unlock()
 	}
 }
 
@@ -324,6 +350,10 @@ func (c *Client) Rebuild(ctx context.Context, sess *ldrrelay.SessionClient) erro
 		c.mu.Unlock()
 		return ErrOutboxUncertain
 	}
+	if c.cursorsUncertain {
+		c.mu.Unlock()
+		return ErrCursorsUncertain
+	}
 	if !c.outbox.Activated {
 		c.mu.Unlock()
 		return ErrNotActivated
@@ -337,13 +367,16 @@ func (c *Client) Rebuild(ctx context.Context, sess *ldrrelay.SessionClient) erro
 }
 
 func (c *Client) wipeProjectionLocked() error {
-	_ = os.RemoveAll(c.projDir())
-	if err := os.MkdirAll(c.projDir(), 0o700); err != nil {
+	cand := clonePersistedCursors(c.cursors)
+	cand.ProjectedSeq = 0
+	cand.Rebuilds++
+	if err := c.persistCursorsLocked(cand); err != nil {
+		c.markCursorsUncertainOnErrLocked(err)
 		return err
 	}
-	c.cursors.ProjectedSeq = 0
-	c.cursors.Rebuilds++
-	return saveCursors(c.cursorsPath(), c.cursors)
+	c.cursors = cand
+	_ = os.RemoveAll(c.projDir())
+	return os.MkdirAll(c.projDir(), 0o700)
 }
 
 // VerifiedRead reads a projected file ONLY after checking it against the
@@ -353,6 +386,10 @@ func (c *Client) VerifiedRead(ctx context.Context, sess *ldrrelay.SessionClient,
 	if c.outboxUncertain {
 		c.mu.Unlock()
 		return "", ErrOutboxUncertain
+	}
+	if c.cursorsUncertain {
+		c.mu.Unlock()
+		return "", ErrCursorsUncertain
 	}
 	if !c.outbox.Activated {
 		c.mu.Unlock()
@@ -474,44 +511,54 @@ func (c *Client) deriveOwedNoticesLocked(after *ldrcore.State, fr ldrrelay.Contr
 }
 
 // ScanDelivery advances the durable ScannedSeq cursor over verified.wal and
-// queues newly owed local notices (§11.3). Refuses before O25 activation or
-// while outbox durability is uncertain.
+// queues newly owed local notices (§11.3). Stages notice insertions and
+// ScannedSeq in a candidate persisted BEFORE publishing in memory; refuses
+// before O25 activation or while outbox/cursor durability is uncertain.
 func (c *Client) ScanDelivery() (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.outboxUncertain {
 		return 0, ErrOutboxUncertain
 	}
+	if c.cursorsUncertain {
+		return 0, ErrCursorsUncertain
+	}
 	if !c.outbox.Activated {
 		return 0, ErrNotActivated
 	}
+	if c.cursors.ScannedSeq >= c.ckSeq {
+		return 0, nil
+	}
+	cand := clonePersistedCursors(c.cursors)
 	added := 0
-	for c.cursors.ScannedSeq < c.ckSeq {
-		seq := c.cursors.ScannedSeq + 1
+	for cand.ScannedSeq < c.ckSeq {
+		seq := cand.ScannedSeq + 1
 		ve := c.entries[seq-1]
 		for _, n := range ve.owed {
-			if _, exists := c.cursors.Notices[n.ID]; !exists {
+			if _, exists := cand.Notices[n.ID]; !exists {
 				nc := n
-				c.cursors.Notices[n.ID] = &nc
+				cand.Notices[n.ID] = &nc
 				added++
 			}
 		}
-		c.cursors.ScannedSeq = seq
+		cand.ScannedSeq = seq
 	}
-	if err := saveCursors(c.cursorsPath(), c.cursors); err != nil {
-		return added, err
+	if err := c.persistCursorsLocked(cand); err != nil {
+		c.markCursorsUncertainOnErrLocked(err)
+		return 0, err
 	}
+	c.cursors = cand
 	return added, nil
 }
 
 // DeliverableNotices returns only unacknowledged notices whose actor is STILL
 // live, bound to this credential, at the exact binding generation, and in the
 // current generation (§11.3 / C2). Never exposes notices before O25 activation
-// or while outbox durability is uncertain.
+// or while outbox/cursor durability is uncertain.
 func (c *Client) DeliverableNotices() []LocalNotice {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.outboxUncertain || !c.outbox.Activated || c.credKeys == nil {
+	if c.outboxUncertain || c.cursorsUncertain || !c.outbox.Activated || c.credKeys == nil {
 		return nil
 	}
 	myTok := ldrrelay.CredToken(c.credKeys.CredID)
@@ -535,12 +582,16 @@ func (c *Client) DeliverableNotices() []LocalNotice {
 	return out
 }
 
-// AckNotice durably marks a local notice acknowledged.
+// AckNotice durably marks a local notice acknowledged before publishing Acked
+// in memory. Refuses while outbox/cursor durability is uncertain.
 func (c *Client) AckNotice(id string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.outboxUncertain {
 		return ErrOutboxUncertain
+	}
+	if c.cursorsUncertain {
+		return ErrCursorsUncertain
 	}
 	if !c.outbox.Activated {
 		return ErrNotActivated
@@ -549,8 +600,17 @@ func (c *Client) AckNotice(id string) error {
 	if !ok {
 		return fmt.Errorf("ldrclient: unknown notice %q", id)
 	}
-	n.Acked = true
-	return saveCursors(c.cursorsPath(), c.cursors)
+	if n.Acked {
+		return nil
+	}
+	cand := clonePersistedCursors(c.cursors)
+	cand.Notices[id].Acked = true
+	if err := c.persistCursorsLocked(cand); err != nil {
+		c.markCursorsUncertainOnErrLocked(err)
+		return err
+	}
+	c.cursors = cand
+	return nil
 }
 
 // Rebuilds returns how many times the projection was wiped and rebuilt.

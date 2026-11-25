@@ -2575,3 +2575,412 @@ func TestOutboxDelayedResponseAfterSlotReuse(t *testing.T) {
 		}
 	})
 }
+
+// TestClientCursorDurabilityPreWriteAndAmbiguousReconcile verifies Codex Turn 20 (Slice 4):
+// ScanDelivery, AckNotice, and Project stage cursor updates and publish them ONLY
+// after durable saveCursors succeeds:
+//   - Definite pre-write failures preserve prior ScannedSeq, Notices/Acked, and
+//     ProjectedSeq both in-process and after reopen (no unpersisted notice exposed,
+//     no unpersisted ack suppressing a notice, and projection tip retry re-persists).
+//   - Ambiguous post-rename dir-sync failures fence cursor reliance (ErrCursorsUncertain
+//     and nil DeliverableNotices) in-process and fail closed on reopen until the
+//     cursors.cbor durability barrier succeeds via ReconcileDurability or clean reopen.
+func TestClientCursorDurabilityPreWriteAndAmbiguousReconcile(t *testing.T) {
+	fx := startOnboardingFixture(t)
+	ctx := context.Background()
+
+	// Declare "alice-c" on Alice's credential.
+	_, _ = fx.alice.Sync(ctx, fx.sAlice)
+	opDeclAlice, err := fx.alice.ComposeAndPersist(ComposeParams{
+		Action: "decl_alice_c", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+		Fields: ldrcrypto.Map{{Key: "actor_id", Value: "alice-c"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: fx.aliceGrant.NamespaceID}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := fx.alice.Send(ctx, fx.sAlice, opDeclAlice); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+		t.Fatalf("decl alice-c: %+v err=%v", rep, err)
+	}
+	_, _ = fx.alice.Sync(ctx, fx.sAlice)
+
+	setupBob := func(t *testing.T, actorName, ns string, reqByte byte) (*Client, string, *ldrrelay.SessionClient) {
+		t.Helper()
+		bobKeys, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+		bobGrant := ldrcrypto.JoinGrant{NamespaceID: ns, ActorLimit: 4, Reader: true}
+		bobReqID, bobReqDig := fx.enrollP3(t, bobKeys, bobGrant, reqByte)
+		fx.activateNextEpoch(t)
+		dir := t.TempDir()
+		bob, err := InitClientDir(InitDirOptions{
+			Dir: dir, DirKind: DirKindMember, SignedDescriptor: fx.env.rawDesc, CredKeys: bobKeys,
+			ExpectedGrant: &bobGrant, ExpectedJoinReq: bobReqID, ExpectedJoinReqDigest: &bobReqDig, Activated: false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = bob.Close() })
+		sBob, err := bob.Dial(ctx, ldrcrypto.PrincipalCredential)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { sBob.Close() })
+		if err := bob.VerifyEnrollmentAndActivate(ctx, sBob); err != nil {
+			t.Fatal(err)
+		}
+		if actorName != "" {
+			opD, err := bob.ComposeAndPersist(ComposeParams{
+				Action: "decl_" + actorName, Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+				Fields: ldrcrypto.Map{{Key: "actor_id", Value: actorName}, {Key: "label", Value: false}, {Key: "namespace_id", Value: bobGrant.NamespaceID}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rep, err := bob.Send(ctx, sBob, opD); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+				t.Fatalf("decl %s: %+v err=%v", actorName, rep, err)
+			}
+			_, _ = bob.Sync(ctx, sBob)
+		}
+		return bob, dir, sBob
+	}
+
+	openCallTo := func(t *testing.T, callID, toActor, body string) uint64 {
+		t.Helper()
+		_, _ = fx.alice.Sync(ctx, fx.sAlice)
+		op, err := fx.alice.ComposeAndPersist(ComposeParams{
+			Action: "open_" + callID, Origin: ldrcore.OriginActor, OpType: "call_open", ActorID: "alice-c",
+			Fields:    ldrcrypto.Map{{Key: "call_id", Value: callID}, {Key: "to", Value: toActor}},
+			Plaintext: []byte(`{"subject":"` + callID + `","body":"` + body + `"}`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rep, err := fx.alice.Send(ctx, fx.sAlice, op)
+		if err != nil || rep.Outcome.Kind != ldrcore.Committed {
+			t.Fatalf("call_open %s: %+v err=%v", callID, rep, err)
+		}
+		return rep.Outcome.Seq
+	}
+
+	t.Run("scan_delivery_pre_write_and_ambiguous_reconcile", func(t *testing.T) {
+		bob, dir, sBob := setupBob(t, "bob-scan", "ns-cursor-scan", 0xd1)
+		openCallTo(t, "call-scan-1", "bob-scan", "first message")
+		if _, err := bob.Sync(ctx, sBob); err != nil {
+			t.Fatal(err)
+		}
+
+		// 1. Definite ErrPreWrite during ScanDelivery: MUST NOT advance ScannedSeq or expose notice!
+		bob.SetSyncHooks(func(*os.File) error {
+			return errors.New("injected cursors pre-write fsync failure")
+		}, nil)
+		added, err := bob.ScanDelivery()
+		if !errors.Is(err, ldrstore.ErrPreWrite) || added != 0 {
+			t.Fatalf("ScanDelivery pre-write failure: added=%d err=%v, want 0/ErrPreWrite", added, err)
+		}
+		if st := bob.Status(); st.ScannedSeq != 0 || st.CursorsUncertain {
+			t.Fatalf("ScanDelivery pre-write leaked ScannedSeq or fence: %+v", st)
+		}
+		if notices := bob.DeliverableNotices(); len(notices) != 0 {
+			t.Fatalf("ScanDelivery pre-write exposed unpersisted notice in-process: %+v", notices)
+		}
+
+		// Reopen agrees: zero scanned notices!
+		_ = bob.Close()
+		bob, err = OpenClient(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer bob.Close()
+		if st := bob.Status(); st.ScannedSeq != 0 || len(bob.DeliverableNotices()) != 0 {
+			t.Fatalf("reopen after ScanDelivery pre-write failure unexpected: st=%+v notices=%+v", st, bob.DeliverableNotices())
+		}
+
+		// Restore healthy sync -> retry succeeds both in-process and after reopen!
+		added, err = bob.ScanDelivery()
+		if err != nil || added != 1 {
+			t.Fatalf("retry ScanDelivery: added=%d err=%v, want 1/nil", added, err)
+		}
+		if notices := bob.DeliverableNotices(); len(notices) != 1 || notices[0].Target != "call-scan-1" {
+			t.Fatalf("DeliverableNotices after retry: %+v", notices)
+		}
+
+		// 2. Ambiguous post-rename dir sync failure during ScanDelivery (second call):
+		openCallTo(t, "call-scan-2", "bob-scan", "second message")
+		if _, err := bob.Sync(ctx, sBob); err != nil {
+			t.Fatal(err)
+		}
+		prevScanned := bob.Status().ScannedSeq
+		var syncMu sync.Mutex
+		dirSyncFails := true
+		dirHook := func(d string) error {
+			syncMu.Lock()
+			fail := dirSyncFails
+			syncMu.Unlock()
+			if fail {
+				return errors.New("injected cursors post-rename dir fsync failure")
+			}
+			return ldrstore.SyncDir(d)
+		}
+		bob.SetSyncHooks(nil, dirHook)
+
+		added, err = bob.ScanDelivery()
+		if !errors.Is(err, ldrstore.ErrUncertainWrite) || added != 0 {
+			t.Fatalf("ScanDelivery ambiguous write: added=%d err=%v, want 0/ErrUncertainWrite", added, err)
+		}
+		if st := bob.Status(); !st.CursorsUncertain || st.ScannedSeq != prevScanned {
+			t.Fatalf("expected CursorsUncertain=true and ScannedSeq=%d, got %+v", prevScanned, st)
+		}
+		// While uncertain, cursor-relying operations refuse and DeliverableNotices is withheld!
+		if notices := bob.DeliverableNotices(); len(notices) != 0 {
+			t.Fatalf("DeliverableNotices leaked notices while cursorsUncertain: %+v", notices)
+		}
+		if _, err := bob.ScanDelivery(); !errors.Is(err, ErrCursorsUncertain) {
+			t.Fatalf("ScanDelivery while uncertain: got %v, want ErrCursorsUncertain", err)
+		}
+		if err := bob.Project(ctx, sBob); !errors.Is(err, ErrCursorsUncertain) {
+			t.Fatalf("Project while uncertain: got %v, want ErrCursorsUncertain", err)
+		}
+		if err := bob.ReconcileDurability(); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("ReconcileDurability while dirSync still fails: got %v, want ErrUncertainWrite", err)
+		}
+
+		// Reopen while dirSync STILL fails MUST fail closed on cursors.cbor barrier!
+		_ = bob.Close()
+		if _, err := OpenClientWithSyncHooks(dir, nil, dirHook); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("OpenClientWithSyncHooks while cursors dirSync fails: got %v, want ErrUncertainWrite", err)
+		}
+
+		// Restore dirSync -> reopen succeeds and reflects durable notice #2!
+		syncMu.Lock()
+		dirSyncFails = false
+		syncMu.Unlock()
+		bob2, err := OpenClientWithSyncHooks(dir, nil, dirHook)
+		if err != nil {
+			t.Fatalf("OpenClient after cursors dirSync restored: %v", err)
+		}
+		defer bob2.Close()
+		if notices := bob2.DeliverableNotices(); len(notices) != 2 {
+			t.Fatalf("expected 2 durable notices after barrier-verified reopen, got %+v", notices)
+		}
+	})
+
+	t.Run("ack_notice_pre_write_and_ambiguous_reconcile", func(t *testing.T) {
+		bob, dir, sBob := setupBob(t, "bob-ack", "ns-cursor-ack", 0xd2)
+		openCallTo(t, "call-ack-1", "bob-ack", "ack test 1")
+		if _, err := bob.Sync(ctx, sBob); err != nil {
+			t.Fatal(err)
+		}
+		if added, err := bob.ScanDelivery(); err != nil || added != 1 {
+			t.Fatalf("initial ScanDelivery: added=%d err=%v", added, err)
+		}
+		nID1 := bob.DeliverableNotices()[0].ID
+
+		// 1. Definite ErrPreWrite during AckNotice: MUST NOT suppress notice in-process!
+		bob.SetSyncHooks(func(*os.File) error {
+			return errors.New("injected AckNotice pre-write failure")
+		}, nil)
+		if err := bob.AckNotice(nID1); !errors.Is(err, ldrstore.ErrPreWrite) {
+			t.Fatalf("AckNotice pre-write failure: got %v, want ErrPreWrite", err)
+		}
+		if bob.Status().CursorsUncertain {
+			t.Fatalf("clean pre-write AckNotice should not set CursorsUncertain")
+		}
+		// Notice MUST still be deliverable in-process (matching disk & reopen)!
+		if notices := bob.DeliverableNotices(); len(notices) != 1 || notices[0].ID != nID1 {
+			t.Fatalf("failed AckNotice suppressed notice in-process: %+v", notices)
+		}
+		_ = bob.Close()
+		bob, err := OpenClient(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer bob.Close()
+		if notices := bob.DeliverableNotices(); len(notices) != 1 || notices[0].ID != nID1 {
+			t.Fatalf("reopen after failed AckNotice mismatch: %+v", notices)
+		}
+		// Retry succeeds both in-process and after reopen!
+		if err := bob.AckNotice(nID1); err != nil {
+			t.Fatalf("retry AckNotice: %v", err)
+		}
+		if notices := bob.DeliverableNotices(); len(notices) != 0 {
+			t.Fatalf("notice still deliverable after durable AckNotice: %+v", notices)
+		}
+
+		// 2. Ambiguous post-rename dir sync failure during AckNotice -> fenced in-process,
+		//    same-process ReconcileDurability lifts fence and preserves durable Acked=true!
+		openCallTo(t, "call-ack-2", "bob-ack", "ack test 2")
+		if _, err := bob.Sync(ctx, sBob); err != nil {
+			t.Fatal(err)
+		}
+		if added, err := bob.ScanDelivery(); err != nil || added != 1 {
+			t.Fatalf("second ScanDelivery: added=%d err=%v", added, err)
+		}
+		nID2 := bob.DeliverableNotices()[0].ID
+
+		var syncMu sync.Mutex
+		dirSyncFails := true
+		bob.SetSyncHooks(nil, func(d string) error {
+			syncMu.Lock()
+			fail := dirSyncFails
+			syncMu.Unlock()
+			if fail {
+				return errors.New("injected AckNotice post-rename dir sync failure")
+			}
+			return ldrstore.SyncDir(d)
+		})
+		if err := bob.AckNotice(nID2); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("AckNotice ambiguous failure: got %v, want ErrUncertainWrite", err)
+		}
+		if !bob.Status().CursorsUncertain {
+			t.Fatalf("expected CursorsUncertain=true after ambiguous AckNotice")
+		}
+		if err := bob.AckNotice(nID2); !errors.Is(err, ErrCursorsUncertain) {
+			t.Fatalf("AckNotice while uncertain: got %v, want ErrCursorsUncertain", err)
+		}
+		// Restore dirSync -> same-process ReconcileDurability reconciles durable Acked=true!
+		syncMu.Lock()
+		dirSyncFails = false
+		syncMu.Unlock()
+		if err := bob.ReconcileDurability(); err != nil {
+			t.Fatalf("ReconcileDurability after AckNotice sync restored: %v", err)
+		}
+		if bob.Status().CursorsUncertain {
+			t.Fatalf("expected CursorsUncertain=false after ReconcileDurability")
+		}
+		if notices := bob.DeliverableNotices(); len(notices) != 0 {
+			t.Fatalf("expected nID2 durably acknowledged after ReconcileDurability, got %+v", notices)
+		}
+		// Reopen agrees!
+		_ = bob.Close()
+		bobReopened, err := OpenClient(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer bobReopened.Close()
+		if notices := bobReopened.DeliverableNotices(); len(notices) != 0 {
+			t.Fatalf("reopened notices after reconciled AckNotice: %+v", notices)
+		}
+	})
+
+	t.Run("project_pre_write_tip_retry_and_ambiguous_reconcile", func(t *testing.T) {
+		bob, dir, sBob := setupBob(t, "bob-proj", "ns-cursor-proj", 0xd3)
+		callSeq := openCallTo(t, "call-proj-1", "bob-proj", "proj test 1")
+		if _, err := bob.Sync(ctx, sBob); err != nil {
+			t.Fatal(err)
+		}
+		_, ckSeq, _ := bob.Checkpoint()
+		if ckSeq != callSeq {
+			t.Fatalf("expected tip ckSeq == callSeq (%d != %d)", ckSeq, callSeq)
+		}
+
+		// 1. Let Project advance cleanly through ckSeq-1, then inject definite ErrPreWrite
+		//    specifically on the tip cursor save (call #ckSeq)!
+		var tipFail atomic.Bool
+		tipFail.Store(true)
+		var writes atomic.Uint64
+		bob.SetSyncHooks(func(f *os.File) error {
+			n := writes.Add(1)
+			if tipFail.Load() && n >= ckSeq {
+				return errors.New("injected tip Project cursors pre-write failure")
+			}
+			return ldrstore.SyncFile(f)
+		}, nil)
+
+		if err := bob.Project(ctx, sBob); !errors.Is(err, ldrstore.ErrPreWrite) {
+			t.Fatalf("Project tip pre-write failure: got %v, want ErrPreWrite", err)
+		}
+		if st := bob.Status(); st.ProjectedSeq != ckSeq-1 || st.CursorsUncertain {
+			t.Fatalf("Project tip failure advanced ProjectedSeq or set uncertain: %+v (want %d)", st, ckSeq-1)
+		}
+		if _, err := bob.VerifiedRead(ctx, sBob, "calls/call-proj-1/turn-1"); !errors.Is(err, ErrNotProjected) {
+			t.Fatalf("VerifiedRead after failed tip Project: got %v, want ErrNotProjected", err)
+		}
+
+		// Immediate retry at the tip while write STILL fails MUST NOT falsely report nil!
+		if err := bob.Project(ctx, sBob); !errors.Is(err, ldrstore.ErrPreWrite) {
+			t.Fatalf("immediate retry Project while tip write still fails: got %v, want ErrPreWrite", err)
+		}
+		if bob.Status().ProjectedSeq != ckSeq-1 {
+			t.Fatalf("retry advanced ProjectedSeq despite ErrPreWrite: got %d, want %d", bob.Status().ProjectedSeq, ckSeq-1)
+		}
+
+		// Reopen agrees: ProjectedSeq == ckSeq-1 and VerifiedRead returns ErrNotProjected!
+		_ = bob.Close()
+		bob, err := OpenClient(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer bob.Close()
+		if bob.Status().ProjectedSeq != ckSeq-1 {
+			t.Fatalf("reopened ProjectedSeq=%d, want %d", bob.Status().ProjectedSeq, ckSeq-1)
+		}
+		if _, err := bob.VerifiedRead(ctx, sBob, "calls/call-proj-1/turn-1"); !errors.Is(err, ErrNotProjected) {
+			t.Fatalf("reopened VerifiedRead before tip retry: got %v, want ErrNotProjected", err)
+		}
+
+		// Retry with healthy disk succeeds at the tip both in-process and after reopen!
+		if err := bob.Project(ctx, sBob); err != nil {
+			t.Fatalf("retry Project with healthy disk: %v", err)
+		}
+		if bob.Status().ProjectedSeq != ckSeq {
+			t.Fatalf("expected ProjectedSeq=%d after retry, got %d", ckSeq, bob.Status().ProjectedSeq)
+		}
+		if _, err := bob.VerifiedRead(ctx, sBob, "calls/call-proj-1/turn-1"); err != nil {
+			t.Fatalf("VerifiedRead after healthy Project retry: %v", err)
+		}
+
+		// 2. Ambiguous post-rename dir sync failure at a new tip -> fenced until ReconcileDurability!
+		call2Seq := openCallTo(t, "call-proj-2", "bob-proj", "proj test 2")
+		if _, err := bob.Sync(ctx, sBob); err != nil {
+			t.Fatal(err)
+		}
+		var syncMu sync.Mutex
+		dirSyncFails := true
+		bob.SetSyncHooks(nil, func(d string) error {
+			syncMu.Lock()
+			fail := dirSyncFails
+			syncMu.Unlock()
+			if fail {
+				return errors.New("injected Project post-rename dir sync failure")
+			}
+			return ldrstore.SyncDir(d)
+		})
+		if err := bob.Project(ctx, sBob); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("Project ambiguous write: got %v, want ErrUncertainWrite", err)
+		}
+		if st := bob.Status(); !st.CursorsUncertain || st.ProjectedSeq != ckSeq {
+			t.Fatalf("expected CursorsUncertain=true ProjectedSeq=%d, got %+v", ckSeq, st)
+		}
+		if _, err := bob.VerifiedRead(ctx, sBob, "calls/call-proj-2/turn-1"); !errors.Is(err, ErrCursorsUncertain) {
+			t.Fatalf("VerifiedRead while cursorsUncertain: got %v, want ErrCursorsUncertain", err)
+		}
+		if err := bob.Rebuild(ctx, sBob); !errors.Is(err, ErrCursorsUncertain) {
+			t.Fatalf("Rebuild while cursorsUncertain: got %v, want ErrCursorsUncertain", err)
+		}
+
+		// Restore dirSync -> ReconcileDurability verifies cursors.cbor barrier, lifts fence,
+		// and exposes durable ProjectedSeq == call2Seq both in-process and after reopen!
+		syncMu.Lock()
+		dirSyncFails = false
+		syncMu.Unlock()
+		if err := bob.ReconcileDurability(); err != nil {
+			t.Fatalf("ReconcileDurability after Project sync restored: %v", err)
+		}
+		if st := bob.Status(); st.CursorsUncertain || st.ProjectedSeq != call2Seq {
+			t.Fatalf("expected CursorsUncertain=false ProjectedSeq=%d, got %+v", call2Seq, st)
+		}
+		if _, err := bob.VerifiedRead(ctx, sBob, "calls/call-proj-2/turn-1"); err != nil {
+			t.Fatalf("VerifiedRead after ReconcileDurability: %v", err)
+		}
+		_ = bob.Close()
+		bobFinal, err := OpenClient(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer bobFinal.Close()
+		if bobFinal.Status().ProjectedSeq != call2Seq {
+			t.Fatalf("reopened ProjectedSeq=%d, want %d", bobFinal.Status().ProjectedSeq, call2Seq)
+		}
+		if _, err := bobFinal.VerifiedRead(ctx, sBob, "calls/call-proj-2/turn-1"); err != nil {
+			t.Fatalf("reopened VerifiedRead after reconciled Project: %v", err)
+		}
+	})
+}
