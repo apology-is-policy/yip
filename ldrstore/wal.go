@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -33,11 +34,38 @@ var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 // FileStore implements Store using a zero-dependency CRC32C-framed append-only
 // WAL, content-addressed sidecars, and OS full-sync durability barriers.
 type FileStore struct {
-	mu       sync.Mutex
-	rootDir  string
-	lockFile *os.File
-	walFiles map[string]*os.File // hex(lineID) -> open append file
-	closed   bool
+	mu         sync.Mutex
+	rootDir    string
+	lockFile   *os.File
+	walFiles   map[string]*os.File // hex(lineID) -> open append file
+	syncFileFn func(*os.File) error
+	syncDirFn  func(string) error
+	closed     bool
+}
+
+// SetSyncHooks overrides the file/directory durability barriers used by
+// FileStore (nil restores the default OS SyncFile / SyncDir barriers).
+// Intended for fault-injection tests that independently control write
+// visibility and fsync outcomes.
+func (s *FileStore) SetSyncHooks(syncFile func(*os.File) error, syncDir func(string) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.syncFileFn = syncFile
+	s.syncDirFn = syncDir
+}
+
+func (s *FileStore) syncFile(f *os.File) error {
+	if s.syncFileFn != nil {
+		return s.syncFileFn(f)
+	}
+	return SyncFile(f)
+}
+
+func (s *FileStore) syncDir(dir string) error {
+	if s.syncDirFn != nil {
+		return s.syncDirFn(dir)
+	}
+	return SyncDir(dir)
 }
 
 // OpenFileStore opens or initializes a FileStore at rootDir and acquires an
@@ -75,7 +103,7 @@ func (s *FileStore) Close() error {
 	s.closed = true
 	var firstErr error
 	for k, f := range s.walFiles {
-		if err := SyncFile(f); err != nil && firstErr == nil {
+		if err := s.syncFile(f); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		if err := f.Close(); err != nil && firstErr == nil {
@@ -142,6 +170,33 @@ func (s *FileStore) ProvisionLine(p ProvisionedLine) error {
 	if err := os.MkdirAll(filepath.Join(dir, "sidecars"), 0o700); err != nil {
 		return err
 	}
+	// Create and durably sync the empty WAL BEFORE installing provision.cbor so
+	// provision.cbor is the atomic commit point of provisioning. Once
+	// provision.cbor exists, a missing wal.log is unambiguously a lost WAL
+	// rather than incomplete provisioning.
+	walPath := s.walPath(hexID)
+	if fi, err := os.Stat(walPath); err == nil {
+		if fi.Size() > 0 {
+			return fmt.Errorf("%w: non-empty WAL exists without provision.cbor", ErrCorruptWAL)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	wf, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := s.syncFile(wf); err != nil {
+		_ = wf.Close()
+		return err
+	}
+	if err := wf.Close(); err != nil {
+		return err
+	}
+	if err := s.syncDir(dir); err != nil {
+		return err
+	}
+
 	enc, err := ldrcrypto.MarshalCBOR(ldrcrypto.Map{
 		{Key: "cd", Value: cd[:]},
 		{Key: "descriptor", Value: p.SignedDescriptor},
@@ -155,22 +210,13 @@ func (s *FileStore) ProvisionLine(p ProvisionedLine) error {
 	if err := AtomicWriteFile(provPath, enc, 0o600); err != nil {
 		return err
 	}
-	// Create empty WAL file durably so startup always sees a clean WAL.
-	wf, err := os.OpenFile(s.walPath(hexID), os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return err
-	}
-	if err := SyncFile(wf); err != nil {
-		_ = wf.Close()
-		return err
-	}
-	if err := wf.Close(); err != nil {
-		return err
-	}
-	return SyncDir(dir)
+	return s.syncDir(dir)
 }
 
 // ListLines returns the sorted line IDs of all provisioned lines in the store.
+// Empty directories or 0-byte WAL leftovers without provision.cbor represent
+// incomplete provisioning and are ignored; a non-empty WAL missing its
+// provision.cbor fails closed with ErrCorruptWAL.
 func (s *FileStore) ListLines() ([][]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -184,7 +230,13 @@ func (s *FileStore) ListLines() ([][]byte, error) {
 			continue
 		}
 		if _, err := os.Stat(s.provisionPath(ent.Name())); err != nil {
-			continue
+			if os.IsNotExist(err) {
+				if fi, werr := os.Stat(s.walPath(ent.Name())); werr == nil && fi.Size() > 0 {
+					return nil, fmt.Errorf("%w: non-empty WAL without provision.cbor in %q", ErrCorruptWAL, ent.Name())
+				}
+				continue
+			}
+			return nil, err
 		}
 		id, err := hex.DecodeString(ent.Name())
 		if err != nil || len(id) < 16 || len(id) > 64 {
@@ -206,8 +258,12 @@ func (s *FileStore) openWALForAppendLocked(hexID string) (*os.File, error) {
 		}
 		return nil, err
 	}
-	f, err := os.OpenFile(s.walPath(hexID), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
+	// Never pass O_CREATE here: a provisioned line must already have wal.log.
+	f, err := os.OpenFile(s.walPath(hexID), os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%w: missing WAL file for provisioned line", ErrCorruptWAL)
+		}
 		return nil, err
 	}
 	s.walFiles[hexID] = f
@@ -299,6 +355,9 @@ func (s *FileStore) appendWALLocked(hexID string, kind byte, body []byte) error 
 	}
 	f, err := s.openWALForAppendLocked(hexID)
 	if err != nil {
+		if errors.Is(err, ErrCorruptWAL) {
+			return err
+		}
 		return fmt.Errorf("%w: %v", ErrPreWrite, err)
 	}
 	if _, err := f.Write(frame); err != nil {
@@ -306,7 +365,7 @@ func (s *FileStore) appendWALLocked(hexID string, kind byte, body []byte) error 
 		delete(s.walFiles, hexID)
 		return fmt.Errorf("%w: wal write: %v", ErrUncertainWrite, err)
 	}
-	if err := SyncFile(f); err != nil {
+	if err := s.syncFile(f); err != nil {
 		_ = f.Close()
 		delete(s.walFiles, hexID)
 		return fmt.Errorf("%w: wal sync: %v", ErrUncertainWrite, err)
@@ -437,9 +496,61 @@ func (s *FileStore) RecordCleanShutdown(lineID []byte, floor, wallMS uint64) err
 	return s.appendWALLocked(hexID, walKindCleanShutdown, body)
 }
 
+// SyncLine enforces a durability barrier on the provisioned line's WAL file
+// and directories (preventing un-synced OS page-cache bytes from being treated
+// as durable after an earlier failed sync).
+func (s *FileStore) SyncLine(lineID []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("ldrstore: store closed")
+	}
+	hexID, err := lineHex(lineID)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(s.provisionPath(hexID)); err != nil {
+		if os.IsNotExist(err) {
+			return ErrLineNotFound
+		}
+		return err
+	}
+	if wf, ok := s.walFiles[hexID]; ok {
+		if err := s.syncFile(wf); err != nil {
+			_ = wf.Close()
+			delete(s.walFiles, hexID)
+			return fmt.Errorf("%w: wal barrier sync: %v", ErrUncertainWrite, err)
+		}
+	} else {
+		wf, err := os.OpenFile(s.walPath(hexID), os.O_RDWR, 0o600)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("%w: missing WAL file for provisioned line", ErrCorruptWAL)
+			}
+			return err
+		}
+		if err := s.syncFile(wf); err != nil {
+			_ = wf.Close()
+			return fmt.Errorf("%w: wal barrier sync: %v", ErrUncertainWrite, err)
+		}
+		if err := wf.Close(); err != nil {
+			return fmt.Errorf("%w: wal barrier close: %v", ErrUncertainWrite, err)
+		}
+	}
+	if err := s.syncDir(s.lineDir(hexID)); err != nil {
+		return fmt.Errorf("%w: line dir barrier sync: %v", ErrUncertainWrite, err)
+	}
+	if err := s.syncDir(filepath.Join(s.lineDir(hexID), "sidecars")); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("%w: sidecars dir barrier sync: %v", ErrUncertainWrite, err)
+	}
+	return nil
+}
+
 // LoadLine scans and verifies provision.cbor, the entire CRC32C WAL, and every
-// referenced sidecar commitment. Partial/zeroed EOF tails are truncated cleanly;
-// any mid-file or complete-record CRC corruption fails closed with ErrCorruptWAL.
+// referenced sidecar commitment, then executes an explicit durability barrier
+// (SyncFile + SyncDir) on the recovered WAL state before returning. Partial or
+// zeroed EOF tails are truncated cleanly; a missing WAL beside provision.cbor
+// or any mid-file/complete-record corruption fails closed with ErrCorruptWAL.
 func (s *FileStore) LoadLine(lineID []byte) (*LineSnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -465,20 +576,27 @@ func (s *FileStore) LoadLine(lineID []byte) (*LineSnapshot, error) {
 		return nil, fmt.Errorf("%w: provision.cbor line_id mismatch", ErrCorruptWAL)
 	}
 
-	// Close any cached append handle before scanning/truncating.
+	// Close any cached append handle before scanning/truncating/syncing.
 	if wf, ok := s.walFiles[hexID]; ok {
 		_ = wf.Close()
 		delete(s.walFiles, hexID)
 	}
 
+	// Because ProvisionLine durably creates wal.log BEFORE installing
+	// provision.cbor, a missing wal.log beside provision.cbor is a lost WAL
+	// (never an empty line) and MUST fail closed.
 	walFilePath := s.walPath(hexID)
-	data, err := os.ReadFile(walFilePath)
+	wf, err := os.OpenFile(walFilePath, os.O_RDWR, 0o600)
 	if err != nil {
 		if os.IsNotExist(err) {
-			data = nil
-		} else {
-			return nil, err
+			return nil, fmt.Errorf("%w: missing WAL file for provisioned line", ErrCorruptWAL)
 		}
+		return nil, err
+	}
+	data, err := io.ReadAll(wf)
+	if err != nil {
+		_ = wf.Close()
+		return nil, err
 	}
 
 	snap := &LineSnapshot{
@@ -493,7 +611,8 @@ func (s *FileStore) LoadLine(lineID []byte) (*LineSnapshot, error) {
 		rem := len(data) - offset
 		// All-zero trailing bytes at EOF indicate a torn zero-filled tail.
 		if isAllZero(data[offset:]) {
-			if err := truncateWAL(walFilePath, int64(offset)); err != nil {
+			if err := wf.Truncate(int64(offset)); err != nil {
+				_ = wf.Close()
 				return nil, err
 			}
 			snap.RecoveredTornTail = true
@@ -501,7 +620,8 @@ func (s *FileStore) LoadLine(lineID []byte) (*LineSnapshot, error) {
 		}
 		// Partial header at EOF -> torn write tail, safely truncate.
 		if rem < walHeaderSize {
-			if err := truncateWAL(walFilePath, int64(offset)); err != nil {
+			if err := wf.Truncate(int64(offset)); err != nil {
+				_ = wf.Close()
 				return nil, err
 			}
 			snap.RecoveredTornTail = true
@@ -509,17 +629,20 @@ func (s *FileStore) LoadLine(lineID []byte) (*LineSnapshot, error) {
 		}
 		hdr := data[offset : offset+walHeaderSize]
 		if string(hdr[0:4]) != walMagic || hdr[4] != walVersion || hdr[6] != 0 || hdr[7] != 0 {
+			_ = wf.Close()
 			return nil, fmt.Errorf("%w: invalid WAL header at offset %d", ErrCorruptWAL, offset)
 		}
 		kind := hdr[5]
 		bodyLen := int(binary.BigEndian.Uint32(hdr[8:12]))
 		if bodyLen == 0 || bodyLen > walMaxBodyLen {
+			_ = wf.Close()
 			return nil, fmt.Errorf("%w: invalid WAL body length %d at offset %d", ErrCorruptWAL, bodyLen, offset)
 		}
 		frameLen := walHeaderSize + bodyLen + walCRCSize
 		// Partial body/CRC strictly at EOF -> torn write tail, safely truncate.
 		if offset+frameLen > len(data) {
-			if err := truncateWAL(walFilePath, int64(offset)); err != nil {
+			if err := wf.Truncate(int64(offset)); err != nil {
+				_ = wf.Close()
 				return nil, err
 			}
 			snap.RecoveredTornTail = true
@@ -529,13 +652,32 @@ func (s *FileStore) LoadLine(lineID []byte) (*LineSnapshot, error) {
 		wantCRC := binary.BigEndian.Uint32(frameBytes[walHeaderSize+bodyLen:])
 		gotCRC := crc32.Checksum(frameBytes[:walHeaderSize+bodyLen], castagnoliTable)
 		if gotCRC != wantCRC {
+			_ = wf.Close()
 			return nil, fmt.Errorf("%w: CRC32C mismatch at offset %d", ErrCorruptWAL, offset)
 		}
 		body := frameBytes[walHeaderSize : walHeaderSize+bodyLen]
 		if err := applyWALRecord(snap, kind, body); err != nil {
+			_ = wf.Close()
 			return nil, fmt.Errorf("%w: offset %d: %v", ErrCorruptWAL, offset, err)
 		}
 		offset += frameLen
+	}
+
+	// Enforce an explicit durability barrier on the recovered WAL (even when no
+	// torn tail was truncated!) so un-synced page-cache bytes from an earlier
+	// failed SyncFile are NEVER treated as durable on restart or reconciliation.
+	if err := s.syncFile(wf); err != nil {
+		_ = wf.Close()
+		return nil, fmt.Errorf("%w: recovery wal sync: %v", ErrUncertainWrite, err)
+	}
+	if err := wf.Close(); err != nil {
+		return nil, fmt.Errorf("%w: recovery wal close: %v", ErrUncertainWrite, err)
+	}
+	if err := s.syncDir(s.lineDir(hexID)); err != nil {
+		return nil, fmt.Errorf("%w: recovery dir sync: %v", ErrUncertainWrite, err)
+	}
+	if err := s.syncDir(filepath.Join(s.lineDir(hexID), "sidecars")); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("%w: recovery sidecars dir sync: %v", ErrUncertainWrite, err)
 	}
 
 	// Verify every committed frame's sidecars exist and pass commitment verification.
@@ -578,22 +720,6 @@ func isAllZero(b []byte) bool {
 		}
 	}
 	return true
-}
-
-func truncateWAL(path string, size int64) error {
-	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
-	if err != nil {
-		return err
-	}
-	if err := f.Truncate(size); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := SyncFile(f); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
 }
 
 func applyWALRecord(snap *LineSnapshot, kind byte, body []byte) error {

@@ -117,7 +117,13 @@ type LineSnapshot struct {
 type Store interface {
 	ProvisionLine(p ProvisionedLine) error
 	ListLines() ([][]byte, error)
+	// LoadLine scans, verifies, and durably flushes any recovered WAL state
+	// (including torn-tail truncation) before returning a LineSnapshot.
 	LoadLine(lineID []byte) (*LineSnapshot, error)
+	// SyncLine enforces an explicit backend durability barrier for lineID's
+	// recovered WAL and metadata. Startup and quarantine reconciliation MUST
+	// pass this barrier before treating recovered state as durable.
+	SyncLine(lineID []byte) error
 
 	// AppendCommit durably persists all referenced sidecars BEFORE committing the
 	// single atomic log/hot/index/floor record.

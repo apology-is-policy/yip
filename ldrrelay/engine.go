@@ -468,14 +468,93 @@ func (e *RelayEngine) loadAndVerifyLine(lineID []byte) (*lineRuntime, error) {
 		}
 	}
 
+	// Enforce an explicit backend durability barrier on the recovered state
+	// before either startup (NewRelayEngine) or quarantine lift (ReconcileLine)
+	// accepts any recovered frames or outcomes as durable.
+	if err := e.store.SyncLine(lineID); err != nil {
+		return nil, err
+	}
+
 	return rt, nil
 }
 
-// ReconcileLine reloads and re-verifies lineID from durable storage, clearing
-// quarantine only if the durable WAL, sidecars, signatures, historical
-// admission rules, and derived indices verify cleanly (LDR-GO-RELAY-DESIGN §3.1).
-// State is updated in place under the line's mutex so concurrent callers never
-// observe a split-brain lineRuntime.
+// verifyReconcilePreservesAcknowledgedLocked ensures recovered durable state
+// monotonically extends the last acknowledged history, preserves durable
+// time_floor, retains every permanent receipt, and preserves every previously
+// promised hot outcome unless removed by valid expiry compaction.
+func verifyReconcilePreservesAcknowledgedLocked(prev, fresh *lineRuntime) error {
+	if fresh.cd != prev.cd || fresh.genesis != prev.genesis || fresh.profDigest != prev.profDigest {
+		return fmt.Errorf("%w: provisioned descriptor changed during reconciliation", ldrstore.ErrCorruptWAL)
+	}
+	if fresh.state.Line.Generation < prev.state.Line.Generation {
+		return fmt.Errorf("%w: reconciled generation %d regressed below acknowledged %d",
+			ldrstore.ErrCorruptWAL, fresh.state.Line.Generation, prev.state.Line.Generation)
+	}
+	if len(fresh.frames) < len(prev.frames) {
+		return fmt.Errorf("%w: reconciled log length %d shorter than acknowledged prefix %d",
+			ldrstore.ErrCorruptWAL, len(fresh.frames), len(prev.frames))
+	}
+	for i, oldFr := range prev.frames {
+		newFr := fresh.frames[i]
+		sameKey := (oldFr.OpKey == nil && newFr.OpKey == nil) ||
+			(oldFr.OpKey != nil && newFr.OpKey != nil && *oldFr.OpKey == *newFr.OpKey)
+		if newFr.Gen != oldFr.Gen ||
+			newFr.Seq != oldFr.Seq ||
+			newFr.SeqTime != oldFr.SeqTime ||
+			newFr.PrevHead != oldFr.PrevHead ||
+			newFr.Head != oldFr.Head ||
+			newFr.Origin != oldFr.Origin ||
+			newFr.OpType != oldFr.OpType ||
+			newFr.IntentDigest != oldFr.IntentDigest ||
+			!sameKey ||
+			!bytes.Equal(newFr.IntentBytes, oldFr.IntentBytes) {
+			return fmt.Errorf("%w: reconciled frame %d diverged from acknowledged prefix", ldrstore.ErrCorruptWAL, oldFr.Seq)
+		}
+	}
+	oldHeadSeq := uint64(prev.state.Line.HeadSeq)
+	if fresh.heads[oldHeadSeq] != prev.heads[oldHeadSeq] {
+		return fmt.Errorf("%w: reconciled head at seq %d diverged from acknowledged head", ldrstore.ErrCorruptWAL, oldHeadSeq)
+	}
+	oldFloor := prev.clock.Floor()
+	freshFloor := fresh.clock.Floor()
+	if freshFloor < oldFloor {
+		return fmt.Errorf("%w: reconciled time_floor %d regressed below acknowledged %d",
+			ldrstore.ErrCorruptWAL, freshFloor, oldFloor)
+	}
+	for k, oldRec := range prev.logIndex {
+		newRec, ok := fresh.logIndex[k]
+		if !ok || newRec != oldRec {
+			return fmt.Errorf("%w: reconciled permanent receipt for %v missing or altered", ldrstore.ErrCorruptWAL, k)
+		}
+	}
+	freshGen := uint64(fresh.state.Line.Generation)
+	maxVal := prev.desc.Profile.MaxValidityMS
+	for k, oldHe := range prev.hot {
+		if newHe, ok := fresh.hot[k]; ok {
+			if newHe != oldHe {
+				return fmt.Errorf("%w: reconciled hot outcome for %v altered from promised outcome", ldrstore.ErrCorruptWAL, k)
+			}
+			continue
+		}
+		// Missing from fresh.hot is permitted ONLY when validly compacted
+		// (earlier generation OR anchor strictly expired at the durable floor).
+		if k.Generation < freshGen {
+			continue
+		}
+		anchorTime, known := fresh.times[k.SeenSeq]
+		if !known || freshFloor <= anchorTime+maxVal {
+			return fmt.Errorf("%w: promised hot outcome %v missing without valid expiry compaction (floor=%d anchor=%d max_validity=%d)",
+				ldrstore.ErrCorruptWAL, k, freshFloor, anchorTime, maxVal)
+		}
+	}
+	return nil
+}
+
+// ReconcileLine reloads, re-verifies, and durably syncs lineID from storage,
+// verifying that recovered state extends the last acknowledged prefix, floor,
+// and promised outcomes (allowing only valid compaction) before clearing
+// quarantine (LDR-GO-RELAY-DESIGN §3.1). State is updated in place under the
+// line's mutex so concurrent callers never observe a split-brain lineRuntime.
 func (e *RelayEngine) ReconcileLine(lineID []byte) error {
 	rt, ok := e.getLine(lineID)
 	if !ok {
@@ -488,8 +567,8 @@ func (e *RelayEngine) ReconcileLine(lineID []byte) error {
 	if err != nil {
 		return err
 	}
-	if fresh.cd != rt.cd || fresh.genesis != rt.genesis || fresh.profDigest != rt.profDigest {
-		return fmt.Errorf("%w: provisioned descriptor changed during reconciliation", ldrstore.ErrCorruptWAL)
+	if err := verifyReconcilePreservesAcknowledgedLocked(rt, fresh); err != nil {
+		return err
 	}
 	rt.state = fresh.state
 	rt.frames = fresh.frames
@@ -498,8 +577,14 @@ func (e *RelayEngine) ReconcileLine(lineID []byte) error {
 	rt.logIndex = fresh.logIndex
 	rt.hot = fresh.hot
 	rt.quota = fresh.quota
-	rt.clock = fresh.clock
-	rt.recoveredTornTail = fresh.recoveredTornTail
+	// Advance floor monotonically without accidentally clearing an unrelated
+	// clock_uncertain trip; if the recovered floor tripped the fresh guard,
+	// adopt the untrusted guard.
+	rt.clock.AdvanceFloor(fresh.clock.Floor())
+	if !fresh.clock.Status().Trusted {
+		rt.clock = fresh.clock
+	}
+	rt.recoveredTornTail = rt.recoveredTornTail || fresh.recoveredTornTail
 	rt.quarantined = false
 	rt.quarantineReason = ""
 	return nil

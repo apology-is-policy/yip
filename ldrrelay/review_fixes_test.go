@@ -2,11 +2,14 @@ package ldrrelay
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -18,12 +21,13 @@ import (
 // faultStore wraps a real ldrstore.Store so tests can:
 //  1. Intercept LoadLine to return mutated LineSnapshots for Finding 1 & 2 tests.
 //  2. Inject clean ErrPreWrite vs uncertain post-write ErrUncertainWrite faults
-//     on AppendCommit / AppendNonCommit / AppendCompact for Finding 3 tests.
+//     on AppendCommit / AppendNonCommit / AppendCompact / SyncLine for Finding 3 tests.
 type faultStore struct {
 	base ldrstore.Store
 
 	mu              sync.Mutex
 	loadMutator     func(*ldrstore.LineSnapshot) error
+	syncFault       func([]byte) error
 	commitFault     func(lineID []byte, fr ldrstore.CommittedFrame, sidecars map[[32]byte]ldrstore.SidecarBlob, floor uint64) error
 	nonCommitFault  func(lineID []byte, entry ldrstore.HotEntry, floor uint64) error
 	compactFault    func(lineID []byte, retired []ldrstore.StoredOpKey, floor uint64) error
@@ -51,6 +55,15 @@ func (f *faultStore) LoadLine(lineID []byte) (*ldrstore.LineSnapshot, error) {
 		}
 	}
 	return snap, nil
+}
+func (f *faultStore) SyncLine(lineID []byte) error {
+	f.mu.Lock()
+	fn := f.syncFault
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(lineID)
+	}
+	return f.base.SyncLine(lineID)
 }
 func (f *faultStore) AppendCommit(lineID []byte, frame ldrstore.CommittedFrame, sidecars map[[32]byte]ldrstore.SidecarBlob, newFloor uint64) error {
 	f.mu.Lock()
@@ -1158,6 +1171,503 @@ func TestStorageErrorQuarantineAndReconcile(t *testing.T) {
 		rig.fs.mu.Unlock()
 		if calls != 0 {
 			t.Fatalf("Shutdown wrote RecordCleanShutdown (%d times) to a quarantined line!", calls)
+		}
+	})
+}
+
+// TestUncertainWriteSyncBarrierOnReconcileAndRestart verifies that quarantine
+// lift and process restart BOTH require a fresh backend durability barrier
+// (SyncFile/SyncDir + Store.SyncLine) even when un-synced bytes remain
+// readable from the OS page cache.
+func TestUncertainWriteSyncBarrierOnReconcileAndRestart(t *testing.T) {
+	makeAuthOp := func(t *testing.T, rig *engineTestRig, opID string, authEpoch, rootRev, seenSeq uint64, seenHead [32]byte) (ldrcrypto.Principal, ldrcrypto.SignedIntent, ldrstore.StoredOpKey, [32]byte) {
+		t.Helper()
+		root2Prin := ldrcrypto.RootPrincipal(rig.root2.PublicKey())
+		extraOp, _ := ldrcrypto.GenerateEd25519Key()
+		extraCBOR, _ := extraOp.PublicKey().ToCBOR()
+		env, k, dig := rig.signOp(t, rig.root2, WireIntentInput{
+			ProfileDigest: rig.profDigest, LineID: rig.lineID, Generation: 1,
+			Origin: ldrcore.OriginRoot, Principal: root2Prin,
+			OpID: opID, OpType: "operator_key_authorize",
+			AuthEpoch: authEpoch, SeenSeq: seenSeq, SeenHead: seenHead, ValidityMS: 60_000,
+			PayloadCommit: ldrcrypto.EmptyPayloadCommit(),
+			Expect:        ldrcrypto.ExpectMap{"root_rev": rootRev},
+			Fields:        ldrcrypto.Map{{Key: "operator_key", Value: extraCBOR}},
+		})
+		return root2Prin, env, k, dig
+	}
+
+	t.Run("real_filestore_read_visible_but_sync_failing_blocks_reconcile_and_restart", func(t *testing.T) {
+		rig := newEngineTestRig(t)
+		walPath := filepath.Join(rig.dir, "lines", hex.EncodeToString(rig.lineID), "wal.log")
+		beforeInfo, err := os.Stat(walPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Control FileStore.SyncFile independently of write/read visibility!
+		var syncMu sync.Mutex
+		syncFails := true
+		rig.baseStore.SetSyncHooks(func(f *os.File) error {
+			syncMu.Lock()
+			fail := syncFails
+			syncMu.Unlock()
+			if fail {
+				return errors.New("injected disk flush EIO")
+			}
+			return ldrstore.SyncFile(f)
+		}, nil)
+
+		rig.clock.wall += 1000
+		rig.clock.mono += 1000
+		root2Prin, env3, key3, dig3 := makeAuthOp(t, rig, "auth-real-sync-fail", 1, 2, 2, rig.head2)
+		rep := rig.engine.Submit(rig.lineID, root2Prin, env3.RawBytes, nil, nil)
+		if rep.Class != ldrcore.ClassAdmission || rep.Code != "storage_error" {
+			t.Fatalf("expected storage_error on real sync failure, got %+v", rep)
+		}
+		if !rig.engine.Status()[0].Quarantined {
+			t.Fatalf("expected line quarantined after real sync failure")
+		}
+
+		// Independently verify seq 3 bytes WERE written to wal.log (read-visible = TRUE).
+		afterInfo, err := os.Stat(walPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if afterInfo.Size() <= beforeInfo.Size() {
+			t.Fatalf("expected seq 3 bytes to be visible in wal.log (size %d <= %d)", afterInfo.Size(), beforeInfo.Size())
+		}
+
+		// While sync STILL fails (read-visible = TRUE, sync = FALSE):
+		//  1. ReconcileLine MUST fail and KEEP quarantine active.
+		if err := rig.engine.ReconcileLine(rig.lineID); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("ReconcileLine with failing sync barrier: got %v, want ErrUncertainWrite", err)
+		}
+		if !rig.engine.Status()[0].Quarantined {
+			t.Fatalf("quarantine MUST remain active when durability barrier fails")
+		}
+		//  2. Process restart (NewRelayEngine) MUST ALSO fail closed!
+		if _, err := NewRelayEngine(rig.fs, DefaultClockConfig(), rig.clock.source()); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("restart NewRelayEngine with failing sync barrier: got %v, want ErrUncertainWrite", err)
+		}
+
+		// Now restore sync success (read-visible = TRUE, sync = TRUE):
+		syncMu.Lock()
+		syncFails = false
+		syncMu.Unlock()
+
+		// ReconcileLine passes the durability barrier, lifts quarantine, and recovers seq 3!
+		if err := rig.engine.ReconcileLine(rig.lineID); err != nil {
+			t.Fatalf("ReconcileLine after sync restored: %v", err)
+		}
+		st := rig.engine.Status()[0]
+		if st.Quarantined || st.HeadSeq != 3 {
+			t.Fatalf("expected unquarantined HeadSeq=3, got %+v", st)
+		}
+		q := rig.engine.Query(rig.lineID, root2Prin, key3, dig3)
+		if q.Class != ldrcore.ClassOutcome || q.Outcome.Kind != ldrcore.Committed || q.Outcome.Seq != 3 || !q.Original {
+			t.Fatalf("recovered Query mismatch: %+v", q)
+		}
+		// Fresh restart also succeeds cleanly now that WAL is synced!
+		restarted, err := NewRelayEngine(rig.fs, DefaultClockConfig(), rig.clock.source())
+		if err != nil {
+			t.Fatalf("restart after sync restored: %v", err)
+		}
+		if restarted.Status()[0].HeadSeq != 3 {
+			t.Fatalf("restarted HeadSeq=%d, want 3", restarted.Status()[0].HeadSeq)
+		}
+	})
+
+	t.Run("independent_store_syncline_barrier_blocks_reconcile_and_restart", func(t *testing.T) {
+		rig := newEngineTestRig(t)
+
+		// Quarantine the line with an uncertain write that DID write bytes readable by LoadLine.
+		rig.fs.mu.Lock()
+		rig.fs.commitFault = func(lineID []byte, fr ldrstore.CommittedFrame, sidecars map[[32]byte]ldrstore.SidecarBlob, floor uint64) error {
+			if err := rig.baseStore.AppendCommit(lineID, fr, sidecars, floor); err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: ambiguous sync", ldrstore.ErrUncertainWrite)
+		}
+		rig.fs.syncFault = func([]byte) error {
+			return fmt.Errorf("%w: SyncLine barrier failed", ldrstore.ErrUncertainWrite)
+		}
+		rig.fs.mu.Unlock()
+
+		rig.clock.wall += 1000
+		rig.clock.mono += 1000
+		root2Prin, env3, _, _ := makeAuthOp(t, rig, "auth-syncline-barrier", 1, 2, 2, rig.head2)
+		_ = rig.engine.Submit(rig.lineID, root2Prin, env3.RawBytes, nil, nil)
+		if !rig.engine.Status()[0].Quarantined {
+			t.Fatalf("expected quarantined line")
+		}
+
+		// LoadLine succeeds (read-visible!), but SyncLine fails -> BOTH ReconcileLine AND restart fail!
+		if err := rig.engine.ReconcileLine(rig.lineID); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("ReconcileLine with failing SyncLine: got %v, want ErrUncertainWrite", err)
+		}
+		if !rig.engine.Status()[0].Quarantined {
+			t.Fatalf("quarantine must stay active when SyncLine fails")
+		}
+		if _, err := NewRelayEngine(rig.fs, DefaultClockConfig(), rig.clock.source()); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("restart with failing SyncLine: got %v, want ErrUncertainWrite", err)
+		}
+
+		// Clear SyncLine fault -> ReconcileLine lifts quarantine cleanly.
+		rig.fs.mu.Lock()
+		rig.fs.commitFault = nil
+		rig.fs.syncFault = nil
+		rig.fs.mu.Unlock()
+		if err := rig.engine.ReconcileLine(rig.lineID); err != nil {
+			t.Fatalf("ReconcileLine after SyncLine restored: %v", err)
+		}
+		if st := rig.engine.Status()[0]; st.Quarantined || st.HeadSeq != 3 {
+			t.Fatalf("expected unquarantined HeadSeq=3, got %+v", st)
+		}
+	})
+
+	t.Run("torn_tail_not_visible_with_failing_sync_then_recovery", func(t *testing.T) {
+		rig := newEngineTestRig(t)
+		walPath := filepath.Join(rig.dir, "lines", hex.EncodeToString(rig.lineID), "wal.log")
+		cleanInfo, err := os.Stat(walPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Simulate a torn write (partial 6-byte header) + uncertain error + failing sync.
+		rig.fs.mu.Lock()
+		rig.fs.commitFault = func([]byte, ldrstore.CommittedFrame, map[[32]byte]ldrstore.SidecarBlob, uint64) error {
+			raw, err := os.ReadFile(walPath)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(walPath, append(raw, 'L', 'D', 'R', 'W', 1, 1), 0o600); err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: torn write", ldrstore.ErrUncertainWrite)
+		}
+		rig.fs.mu.Unlock()
+
+		var syncMu sync.Mutex
+		syncFails := true
+		rig.baseStore.SetSyncHooks(func(f *os.File) error {
+			syncMu.Lock()
+			fail := syncFails
+			syncMu.Unlock()
+			if fail {
+				return errors.New("sync still failing during torn recovery")
+			}
+			return ldrstore.SyncFile(f)
+		}, nil)
+
+		rig.clock.wall += 1000
+		rig.clock.mono += 1000
+		root2Prin, env3, _, _ := makeAuthOp(t, rig, "auth-torn", 1, 2, 2, rig.head2)
+		_ = rig.engine.Submit(rig.lineID, root2Prin, env3.RawBytes, nil, nil)
+		if !rig.engine.Status()[0].Quarantined {
+			t.Fatalf("expected quarantine after torn write")
+		}
+		rig.fs.mu.Lock()
+		rig.fs.commitFault = nil
+		rig.fs.mu.Unlock()
+
+		// While sync fails, torn-tail truncation cannot be durably confirmed -> stays quarantined!
+		if err := rig.engine.ReconcileLine(rig.lineID); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("ReconcileLine on torn tail while sync fails: got %v, want ErrUncertainWrite", err)
+		}
+		if !rig.engine.Status()[0].Quarantined {
+			t.Fatalf("expected quarantine to remain active while sync fails")
+		}
+
+		// Restore sync -> truncation is durably synced, quarantine lifted, WAL back to clean size, head stays at seq 2.
+		syncMu.Lock()
+		syncFails = false
+		syncMu.Unlock()
+		if err := rig.engine.ReconcileLine(rig.lineID); err != nil {
+			t.Fatalf("ReconcileLine on torn tail after sync restored: %v", err)
+		}
+		afterInfo, err := os.Stat(walPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if afterInfo.Size() != cleanInfo.Size() {
+			t.Fatalf("expected torn tail truncated back to %d bytes, got %d", cleanInfo.Size(), afterInfo.Size())
+		}
+		st := rig.engine.Status()[0]
+		if st.Quarantined || st.HeadSeq != 2 {
+			t.Fatalf("expected unquarantined HeadSeq=2, got %+v", st)
+		}
+
+		// Also verify direct torn-tail recovery with sync succeeding reports RecoveredTornTail=true.
+		rig.fs.mu.Lock()
+		rig.fs.commitFault = func([]byte, ldrstore.CommittedFrame, map[[32]byte]ldrstore.SidecarBlob, uint64) error {
+			raw, err := os.ReadFile(walPath)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(walPath, append(raw, make([]byte, 16)...), 0o600); err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: zeroed torn tail", ldrstore.ErrUncertainWrite)
+		}
+		rig.fs.mu.Unlock()
+		rig.clock.wall += 1000
+		rig.clock.mono += 1000
+		_, env3b, _, _ := makeAuthOp(t, rig, "auth-torn-2", 1, 2, 2, rig.head2)
+		_ = rig.engine.Submit(rig.lineID, root2Prin, env3b.RawBytes, nil, nil)
+		rig.fs.mu.Lock()
+		rig.fs.commitFault = nil
+		rig.fs.mu.Unlock()
+		if err := rig.engine.ReconcileLine(rig.lineID); err != nil {
+			t.Fatalf("ReconcileLine on zeroed torn tail: %v", err)
+		}
+		if st2 := rig.engine.Status()[0]; st2.Quarantined || st2.HeadSeq != 2 || !st2.RecoveredTornTail {
+			t.Fatalf("expected unquarantined HeadSeq=2 RecoveredTornTail=true, got %+v", st2)
+		}
+	})
+}
+
+// TestReconcileLineProtectsAcknowledgedPrefixFloorAndOutcomes verifies that
+// in-process ReconcileLine fails closed and keeps quarantine if recovered
+// storage rolls back the acknowledged prefix, diverges from acknowledged heads,
+// regresses durable time_floor, drops/alters unexpired promised outcomes, or
+// loses wal.log beside provision.cbor, while still permitting valid compaction.
+func TestReconcileLineProtectsAcknowledgedPrefixFloorAndOutcomes(t *testing.T) {
+	makeAuthOp := func(t *testing.T, rig *engineTestRig, opID string, authEpoch, rootRev, seenSeq uint64, seenHead [32]byte) (ldrcrypto.Principal, ldrcrypto.SignedIntent, ldrstore.StoredOpKey, [32]byte) {
+		t.Helper()
+		root2Prin := ldrcrypto.RootPrincipal(rig.root2.PublicKey())
+		extraOp, _ := ldrcrypto.GenerateEd25519Key()
+		extraCBOR, _ := extraOp.PublicKey().ToCBOR()
+		env, k, dig := rig.signOp(t, rig.root2, WireIntentInput{
+			ProfileDigest: rig.profDigest, LineID: rig.lineID, Generation: 1,
+			Origin: ldrcore.OriginRoot, Principal: root2Prin,
+			OpID: opID, OpType: "operator_key_authorize",
+			AuthEpoch: authEpoch, SeenSeq: seenSeq, SeenHead: seenHead, ValidityMS: 60_000,
+			PayloadCommit: ldrcrypto.EmptyPayloadCommit(),
+			Expect:        ldrcrypto.ExpectMap{"root_rev": rootRev},
+			Fields:        ldrcrypto.Map{{Key: "operator_key", Value: extraCBOR}},
+		})
+		return root2Prin, env, k, dig
+	}
+
+	// Helper: advance rig to 3 acknowledged commits + 1 promised unexpired Rejection,
+	// snapshot the intact 2-frame prefix BEFORE seq 3, then quarantine on seq 4.
+	setupRigWithPrefixAndRejection := func(t *testing.T) (*engineTestRig, *ldrstore.LineSnapshot, ldrstore.StoredOpKey, [32]byte, [32]byte) {
+		t.Helper()
+		rig := newEngineTestRig(t)
+
+		// Capture an intact, self-consistent 2-frame snapshot before seq 3!
+		shortSnap, err := rig.baseStore.LoadLine(rig.lineID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		shortSnap = cloneSnapshot(shortSnap)
+
+		// Acknowledge seq 3!
+		rig.clock.wall += 1000
+		rig.clock.mono += 1000
+		root2Prin, env3, _, _ := makeAuthOp(t, rig, "auth-seq-3", 1, 2, 2, rig.head2)
+		rep3 := rig.engine.Submit(rig.lineID, root2Prin, env3.RawBytes, nil, nil)
+		if rep3.Outcome.Kind != ldrcore.Committed || rep3.Outcome.Seq != 3 {
+			t.Fatalf("seq 3 commit failed: %+v", rep3)
+		}
+
+		// Promise an unexpired durable Rejection (advances time_floor by +5000 ms above seq 3's SeqTime!).
+		rig.clock.wall += 5000
+		rig.clock.mono += 5000
+		_, rejEnv, rejKey, rejDig := makeAuthOp(t, rig, "rej-promised", 2, 0, 3, rep3.Head)
+		repRej := rig.engine.Submit(rig.lineID, root2Prin, rejEnv.RawBytes, nil, nil)
+		if repRej.Outcome.Kind != ldrcore.Rejected {
+			t.Fatalf("expected Rejected, got %+v", repRej)
+		}
+
+		// Trigger quarantine via an uncertain write fault on seq 4.
+		rig.fs.mu.Lock()
+		rig.fs.commitFault = func([]byte, ldrstore.CommittedFrame, map[[32]byte]ldrstore.SidecarBlob, uint64) error {
+			return fmt.Errorf("%w: uncertain write on seq 4", ldrstore.ErrUncertainWrite)
+		}
+		rig.fs.mu.Unlock()
+		rig.clock.wall += 1000
+		rig.clock.mono += 1000
+		_, env4, _, _ := makeAuthOp(t, rig, "auth-seq-4-quarantine", 2, 3, 3, rep3.Head)
+		_ = rig.engine.Submit(rig.lineID, root2Prin, env4.RawBytes, nil, nil)
+		if !rig.engine.Status()[0].Quarantined {
+			t.Fatalf("expected quarantined line")
+		}
+		rig.fs.mu.Lock()
+		rig.fs.commitFault = nil
+		rig.fs.mu.Unlock()
+
+		return rig, shortSnap, rejKey, rejDig, rep3.Head
+	}
+
+	t.Run("intact_but_shorter_recovered_prefix_fails_closed", func(t *testing.T) {
+		rig, shortSnap, _, _, _ := setupRigWithPrefixAndRejection(t)
+
+		// Return a completely valid, intact 2-frame snapshot (missing acknowledged seq 3!).
+		rig.fs.mu.Lock()
+		rig.fs.loadMutator = func(snap *ldrstore.LineSnapshot) error {
+			*snap = *cloneSnapshot(shortSnap)
+			return nil
+		}
+		rig.fs.mu.Unlock()
+
+		if err := rig.engine.ReconcileLine(rig.lineID); !errors.Is(err, ldrstore.ErrCorruptWAL) {
+			t.Fatalf("ReconcileLine on shorter intact prefix: got %v, want ErrCorruptWAL", err)
+		}
+		if st := rig.engine.Status()[0]; !st.Quarantined || st.HeadSeq != 3 {
+			t.Fatalf("quarantine must remain active at HeadSeq=3, got %+v", st)
+		}
+	})
+
+	t.Run("divergent_prefix_head_same_length_fails_closed", func(t *testing.T) {
+		rig, _, _, _, _ := setupRigWithPrefixAndRejection(t)
+
+		// Replace seq 3 with a DIFFERENT valid signed op (same length=3, valid signatures & chain heads!).
+		_, altEnv3, altKey3, altDig3 := makeAuthOp(t, rig, "auth-seq-3-forked", 1, 2, 2, rig.head2)
+		rig.fs.mu.Lock()
+		rig.fs.loadMutator = func(snap *ldrstore.LineSnapshot) error {
+			oldKey3 := *snap.Frames[2].OpKey
+			delete(snap.LogIndex, oldKey3)
+			delete(snap.Hot, oldKey3)
+			snap.Frames[2].IntentBytes = altEnv3.RawBytes
+			snap.Frames[2].IntentDigest = altDig3
+			snap.Frames[2].OpKey = &altKey3
+			snap.LogIndex[altKey3] = ldrstore.CommittedReceipt{Seq: 3, Digest: altDig3}
+			snap.Hot[altKey3] = ldrstore.HotEntry{
+				Key: altKey3, Digest: altDig3,
+				Outcome: ldrstore.StoredOutcome{Kind: ldrcore.Committed, Seq: 3},
+			}
+			recomputeChainHeads(t, snap, rig.profDigest)
+			return nil
+		}
+		rig.fs.mu.Unlock()
+
+		if err := rig.engine.ReconcileLine(rig.lineID); !errors.Is(err, ldrstore.ErrCorruptWAL) {
+			t.Fatalf("ReconcileLine on divergent prefix: got %v, want ErrCorruptWAL", err)
+		}
+		if !rig.engine.Status()[0].Quarantined {
+			t.Fatalf("quarantine must remain active on divergent prefix")
+		}
+	})
+
+	t.Run("time_floor_regression_fails_closed", func(t *testing.T) {
+		rig, _, _, _, _ := setupRigWithPrefixAndRejection(t)
+
+		// Regress recovered TimeFloor below the acknowledged floor (still >= maxCommitTime
+		// because the promised Rejection raised floor by +5000ms above seq 3's SeqTime!).
+		rig.fs.mu.Lock()
+		rig.fs.loadMutator = func(snap *ldrstore.LineSnapshot) error {
+			snap.TimeFloor = snap.Frames[2].SeqTime // valid for startup, but regressed below acknowledged floor!
+			return nil
+		}
+		rig.fs.mu.Unlock()
+
+		if err := rig.engine.ReconcileLine(rig.lineID); !errors.Is(err, ldrstore.ErrCorruptWAL) {
+			t.Fatalf("ReconcileLine on regressed time_floor: got %v, want ErrCorruptWAL", err)
+		}
+		if !rig.engine.Status()[0].Quarantined {
+			t.Fatalf("quarantine must remain active on time_floor regression")
+		}
+	})
+
+	t.Run("dropped_unexpired_promised_rejection_fails_closed", func(t *testing.T) {
+		rig, _, rejKey, _, _ := setupRigWithPrefixAndRejection(t)
+
+		// Remove the unexpired promised Rejection from recovered Hot & Quota.
+		rig.fs.mu.Lock()
+		rig.fs.loadMutator = func(snap *ldrstore.LineSnapshot) error {
+			delete(snap.Hot, rejKey)
+			snap.Quota[rejKey.Signer]--
+			if snap.Quota[rejKey.Signer] == 0 {
+				delete(snap.Quota, rejKey.Signer)
+			}
+			return nil
+		}
+		rig.fs.mu.Unlock()
+
+		if err := rig.engine.ReconcileLine(rig.lineID); !errors.Is(err, ldrstore.ErrCorruptWAL) {
+			t.Fatalf("ReconcileLine on dropped unexpired promised rejection: got %v, want ErrCorruptWAL", err)
+		}
+		if !rig.engine.Status()[0].Quarantined {
+			t.Fatalf("quarantine must remain active when unexpired promised outcome is lost")
+		}
+	})
+
+	t.Run("mutated_promised_rejection_outcome_fails_closed", func(t *testing.T) {
+		rig, _, rejKey, _, _ := setupRigWithPrefixAndRejection(t)
+
+		rig.fs.mu.Lock()
+		rig.fs.loadMutator = func(snap *ldrstore.LineSnapshot) error {
+			he := snap.Hot[rejKey]
+			he.Outcome.Reason = "unauthorized" // changed from "conflict"!
+			snap.Hot[rejKey] = he
+			return nil
+		}
+		rig.fs.mu.Unlock()
+
+		if err := rig.engine.ReconcileLine(rig.lineID); !errors.Is(err, ldrstore.ErrCorruptWAL) {
+			t.Fatalf("ReconcileLine on mutated promised outcome: got %v, want ErrCorruptWAL", err)
+		}
+		if !rig.engine.Status()[0].Quarantined {
+			t.Fatalf("quarantine must remain active when promised outcome mutated")
+		}
+	})
+
+	t.Run("valid_compaction_of_expired_outcome_allowed_on_reconcile", func(t *testing.T) {
+		rig, _, rejKey, _, _ := setupRigWithPrefixAndRejection(t)
+		// First lift quarantine cleanly so we can run an uncertain AppendCompact after expiry.
+		if err := rig.engine.ReconcileLine(rig.lineID); err != nil {
+			t.Fatalf("initial ReconcileLine: %v", err)
+		}
+
+		// Advance clock past MaxValidityMS so rejKey's anchor (seq 3) is strictly expired!
+		rig.clock.wall += int64(rig.desc.Profile.MaxValidityMS) + 10_000
+		rig.clock.mono += int64(rig.desc.Profile.MaxValidityMS) + 10_000
+
+		rig.fs.mu.Lock()
+		rig.fs.compactFault = func(lineID []byte, retired []ldrstore.StoredOpKey, floor uint64) error {
+			if err := rig.baseStore.AppendCompact(lineID, retired, floor); err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: compact sync failed", ldrstore.ErrUncertainWrite)
+		}
+		rig.fs.mu.Unlock()
+		if _, err := rig.engine.Compact(rig.lineID); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("expected ErrUncertainWrite on compact, got %v", err)
+		}
+		if !rig.engine.Status()[0].Quarantined {
+			t.Fatalf("expected quarantine after uncertain compact")
+		}
+		rig.fs.mu.Lock()
+		rig.fs.compactFault = nil
+		rig.fs.mu.Unlock()
+
+		// ReconcileLine MUST allow the validly compacted expired entries!
+		if err := rig.engine.ReconcileLine(rig.lineID); err != nil {
+			t.Fatalf("ReconcileLine rejected valid expiry compaction: %v", err)
+		}
+		st := rig.engine.Status()[0]
+		if st.Quarantined || st.HotEntries != 0 || st.CommittedOps != 3 {
+			t.Fatalf("expected unquarantined HotEntries=0 CommittedOps=3, got %+v", st)
+		}
+		_ = rejKey
+	})
+
+	t.Run("lost_wal_beside_provision_fails_reconcile_and_restart", func(t *testing.T) {
+		rig, _, _, _, _ := setupRigWithPrefixAndRejection(t)
+		walPath := filepath.Join(rig.dir, "lines", hex.EncodeToString(rig.lineID), "wal.log")
+		if err := os.Remove(walPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := rig.engine.ReconcileLine(rig.lineID); !errors.Is(err, ldrstore.ErrCorruptWAL) {
+			t.Fatalf("ReconcileLine with lost WAL: got %v, want ErrCorruptWAL", err)
+		}
+		if !rig.engine.Status()[0].Quarantined {
+			t.Fatalf("quarantine must stay active when WAL is missing")
+		}
+		if _, err := NewRelayEngine(rig.fs, DefaultClockConfig(), rig.clock.source()); !errors.Is(err, ldrstore.ErrCorruptWAL) {
+			t.Fatalf("restart with lost WAL: got %v, want ErrCorruptWAL", err)
 		}
 	})
 }
