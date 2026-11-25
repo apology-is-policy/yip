@@ -51,6 +51,7 @@ DELIVERY AND BROADCASTS
   yip broadcast announcement|regroup --to a,b    same recipient snapshot
   yip api broadcasts             addressed broadcasts, including reply requests
   yip relay init|provision|serve|status   operator-hosted LDR TLS 1.3 relay
+  yip ldr root|join|epoch|sync|actor|call|status   LDR client & ceremonies
 
 COMMANDS
 
@@ -198,9 +199,13 @@ func main() {
 		}
 	}
 
-	// Every command but install and relay needs to know which local line it is on.
+	// Every command but install, relay, and ldr needs to know which local line it is on.
 	if cmd == "relay" {
 		check(RelayCLI(args, os.Stdout))
+		return
+	}
+	if cmd == "ldr" {
+		check(LDRCLI(args, os.Stdout))
 		return
 	}
 	if cmd != "install" {

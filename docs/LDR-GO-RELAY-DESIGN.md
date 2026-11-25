@@ -2,9 +2,9 @@
 
 2026-11-25 · Gemini · Architecture and design specification on `gemini/ldr`
 reflecting the operator's 2026-11-25 selections (Draft v9 `ldrcore/` recovery,
-Phase A `ldrcrypto/`, and Phase B `ldrstore/` + `ldrrelay/` + `yip relay` CLI
-approved and implemented; Phase C `ldrclient/` + MCP wiring remains gated on
-review):
+Phase A `ldrcrypto/`, Phase B `ldrstore/` + `ldrrelay/` + `yip relay` CLI, and
+Phase C `ldrclient/` + `yip ldr` CLI approved and implemented; awaiting peer
+cross-review by Codex & Claude):
 
 - **Hosting:** **Go relay first** — runs identically on local networks, closed
   corporate networks, and public custom VMs, while keeping **Cloudflare
@@ -745,12 +745,34 @@ Connecting directly to [LDR-RECOVERY.md](LDR-RECOVERY.md) (draft v0):
        (`0.520s`, `-race` `2.140s`), `ldrcrypto/` `-race` PASS (`2.113s`),
        `TestRelayCLI` PASS (`0.358s`, `-race` `1.464s`), full root `yip`
        regression suite PASS (`23.912s`).
-- **Awaiting peer cross-review (Codex & Claude) and operator go-ahead:**
-  - **Phase C (`ldrclient/` + CLI/MCP wiring):** local durable verified log
-    store + outbox persist-before-send + full-replay joiner (`§6`); P3
-    key-first enrollment CLI ceremony; equal-roots management CLI; projection
-    materializer and delivery scan cursor wired into `yip` while keeping
-    host-local resource leases untouched.
+  4. **Phase C (`ldrclient/`, `ldr_cli.go`, `main.go`):**
+     - `ldrclient/`: isolated `0600` key custody (`Ed25519`, `ECDSA P-256`,
+       `X25519`, `CredID` re-verification, display fingerprints); exclusive
+       OS-locked local client directory; CRC32C-framed `verified.wal` with full
+       startup replay (chain heads, real signatures, `signedContext`,
+       `ldrcore.Apply`); atomic persist-before-send `outbox.cbor` (`F_FULLFSYNC`)
+       enforcing restart `MustResolve`, `ResolveAll`, slot exclusivity, and
+       persistent Rule 8 per-key stops; O25 full-replay onboarding gate
+       (`VerifyEnrollmentAndActivate`) verifying committed keys & grant against
+       saved P3 request and unwrapping HPKE epoch wraps; P9 reader-enforced
+       `ComposeEpochActivate`; 3-state §10.2 payload reader (`ReadNone`,
+       `ReadNoKey`, `ReadUndecryptable`, `ReadMalformed`, `ReadOK`);
+       rebuildable `projection/` materializer with `VerifiedRead` taint
+       detection and automatic/explicit `Rebuild`; durable `ScannedSeq` local
+       delivery scan cursor with C2 withholding on `actor_move`/removal,
+       leaving host-local resource leases completely untouched.
+     - `yip ldr` CLI (`root`, `join`, `epoch`, `sync`, `actor`, `call`,
+       `status`) + live localhost TLS 1.3 end-to-end CLI test.
+     - Verified under held `mac` lease (Go 1.25.3, `darwin/arm64`): `gofmt`
+       clean, `go vet ./ldrclient/ ./ldrrelay/ ./ldrstore/ ./ldrcrypto/ ./`
+       clean; `ldrclient/` PASS (`2.341s`, `-race` `6.113s`), `TestLDRCLI` +
+       `TestRelayCLI` PASS (`1.462s`, `-race` `5.934s`), `-race` across
+       `ldrrelay/` (`2.340s`), `ldrstore/` (`1.865s`), `ldrcrypto/` (`2.396s`),
+       and full root `yip` regression suite PASS (`27.322s`).
+- **Awaiting peer cross-review (Codex & Claude) and optional future phases:**
+  - **MCP transport/tool wiring & production hardening:** wiring `yip serve`
+    attached-line mode into `ldrclient` once Codex/Claude cross-review
+    Phases A–C.
   - **Optional future backend:** Cloudflare Worker / Durable Object backend
     implementing the same `Store` / wire protocol with
     `session_binding: "app_authenticated_session"`.
