@@ -106,7 +106,17 @@ func TestLDRCLIEndToEndOverTLS13(t *testing.T) {
 	runLDR("root", "init-line", "--dir", rootDir, "--descriptor", descFile, "--root-key", r1Key)
 	runLDR("root", "authorize-operator", "--dir", rootDir, "--root-key", r2Key, "--operator-pub", opPub)
 
-	// 5. Full P3 key-first ceremony for Alice (reader) and Bob (reader).
+	// 5. Enroll an admin reader credential inside the activated rootDir (P9) plus
+	//    full P3 key-first ceremonies for joining members Alice and Bob.
+	opReqF := filepath.Join(tmp, "admin-reader.req.cbor")
+	opChF := filepath.Join(tmp, "admin-reader.ch.cbor")
+	opSecF := filepath.Join(tmp, "admin-reader.sec.cbor")
+	opPrF := filepath.Join(tmp, "admin-reader.proof.cbor")
+	runLDR("root", "reader-request", "--dir", rootDir, "--namespace", "ns-admin", "--out", opReqF)
+	runLDR("join", "challenge", "--operator-key", opKey, "--request", opReqF, "--out-challenge", opChF, "--out-secret", opSecF)
+	runLDR("join", "prove", "--dir", rootDir, "--operator-pub", opPub, "--request", opReqF, "--challenge", opChF, "--out", opPrF)
+	runLDR("join", "enroll", "--dir", rootDir, "--operator-key", opKey, "--request", opReqF, "--challenge", opChF, "--secret", opSecF, "--proof", opPrF)
+
 	p3Enroll := func(name, clientDir, ns string) {
 		reqF := filepath.Join(tmp, name+".req.cbor")
 		chF := filepath.Join(tmp, name+".ch.cbor")
@@ -120,8 +130,13 @@ func TestLDRCLIEndToEndOverTLS13(t *testing.T) {
 	p3Enroll("alice", aliceDir, "ns-alice")
 	p3Enroll("bob", bobDir, "ns-bob")
 
-	// 6. P9 epoch activation runs on enrolled reader Alice's dir with operator key!
-	runLDR("epoch", "activate", "--dir", aliceDir, "--operator-key", opKey)
+	// 6. Unactivated member directory aliceDir MUST NOT activate an epoch even with operator key!
+	//    P9 epoch activation runs on the activated admin directory rootDir holding an enrolled reader.
+	var badEpochBuf bytes.Buffer
+	if err := LDRCLI([]string{"epoch", "activate", "--dir", aliceDir, "--operator-key", opKey}, &badEpochBuf); err == nil {
+		t.Fatalf("expected `yip ldr epoch activate` to refuse on unactivated member dir aliceDir")
+	}
+	runLDR("epoch", "activate", "--dir", rootDir, "--operator-key", opKey)
 
 	// 6b. Before O25 activation, `yip ldr sync --project` and `--scan` MUST fail
 	//     with ErrNotActivated, while plain provisional `sync` succeeds and exposes

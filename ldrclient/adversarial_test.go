@@ -177,7 +177,9 @@ func TestClientAdversarialSecurityBoundaries(t *testing.T) {
 
 	// 5. 3-state payload diagnostics (§10.2): ReadMalformed on call_status with empty reason,
 	//    and ReadUndecryptable when local epoch key is corrupted — neither stops replay!
-	//    Re-use Bob's enrolled reader with matching grant to activate epoch 1 and commit call_status.
+	//    First confirm an unactivated member dir with attached operator key CANNOT
+	//    bypass activation via ComposeEpochActivate; then activate epoch 1 from the
+	//    activated admin directory holding an enrolled reader credential.
 	bobOKDir := t.TempDir()
 	actualGrant := ldrcrypto.JoinGrant{NamespaceID: "ns-bob", ActorLimit: 99, Reader: true}
 	bobOK, err := InitClientDir(InitDirOptions{
@@ -197,13 +199,47 @@ func TestClientAdversarialSecurityBoundaries(t *testing.T) {
 	if _, err := bobOK.Anchor(ctx, sOpBob); err != nil {
 		t.Fatal(err)
 	}
-	actOp, _, err := bobOK.ComposeEpochActivate("act1")
-	if err != nil {
-		t.Fatalf("ComposeEpochActivate on enrolled reader: %v", err)
+	if _, _, err := bobOK.ComposeEpochActivate("unactivated_member_must_refuse"); !errors.Is(err, ErrNotActivated) {
+		t.Fatalf("expected ErrNotActivated for ComposeEpochActivate on unactivated member dir, got %v", err)
 	}
-	if rep, err := bobOK.Send(ctx, sOpBob, actOp); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+
+	// Enroll admin's own reader credential in adminNoCred (DirKindAdmin, Activated=true) and activate epoch 1!
+	adminReaderKeys, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	if err := adminNoCred.AttachAdminReaderKeys(adminReaderKeys); err != nil {
+		t.Fatal(err)
+	}
+	arSkC, _ := adminReaderKeys.Signing.Signer.PublicKey().ToCBOR()
+	arEkC, _ := adminReaderKeys.Encryption.PublicKey().ToCBOR()
+	opEnrollAdminReader, err := adminNoCred.ComposeAndPersist(ComposeParams{
+		Action: "enroll_admin_reader", Origin: ldrcore.OriginOperator, OpType: "credential_enroll",
+		Fields: ldrcrypto.Map{
+			{Key: "cred_id", Value: adminReaderKeys.CredID[:]},
+			{Key: "encryption_key", Value: arEkC},
+			{Key: "grant", Value: ldrcrypto.Map{
+				{Key: "actor_limit", Value: uint64(0)},
+				{Key: "namespace_id", Value: "ns-admin-reader"},
+				{Key: "reader", Value: true},
+			}},
+			{Key: "join_request_digest", Value: bytes.Repeat([]byte{0x22}, 32)},
+			{Key: "join_request_id", Value: bytes.Repeat([]byte{0x22}, 16)},
+			{Key: "signing_key", Value: arSkC},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := adminNoCred.Send(ctx, sOp, opEnrollAdminReader); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+		t.Fatalf("enroll admin reader: %+v, err=%v", rep, err)
+	}
+	_, _ = adminNoCred.Sync(ctx, sOp)
+	actOp, _, err := adminNoCred.ComposeEpochActivate("act1")
+	if err != nil {
+		t.Fatalf("ComposeEpochActivate on activated admin reader: %v", err)
+	}
+	if rep, err := adminNoCred.Send(ctx, sOp, actOp); err != nil || rep.Outcome.Kind != ldrcore.Committed {
 		t.Fatalf("Send(act1): %+v, err=%v", rep, err)
 	}
+	_, _ = adminNoCred.Sync(ctx, sOp)
 	sBobOK, err := bobOK.Dial(ctx, ldrcrypto.PrincipalCredential)
 	if err != nil {
 		t.Fatal(err)

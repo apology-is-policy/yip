@@ -1068,3 +1068,286 @@ func TestClientActivationPersistenceFailureAndAmbiguousWriteReconcile(t *testing
 		}
 	})
 }
+
+// TestClientReconcileDurabilityCandidateReplayAndPrefixProtection verifies Codex Turn 10 Finding 1:
+// ReconcileDurability reconstructs and verifies a candidate from durable verified.wal frames,
+// compares against the previously verified head, validates activation evidence against the
+// candidate (never stale in-memory state), and preserves the fence on missing or shorter WALs.
+func TestClientReconcileDurabilityCandidateReplayAndPrefixProtection(t *testing.T) {
+	fx := startOnboardingFixture(t)
+	ctx := context.Background()
+
+	// Helper: set up a member fenced by an ambiguous post-rename dir sync failure on activation,
+	// with dirSyncHook restored to succeed afterward so we test WAL integrity directly!
+	setupFencedMember := func(t *testing.T, ns string, reqByte byte) (*Client, *ldrrelay.SessionClient, string, []byte) {
+		t.Helper()
+		keys, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+		grant := ldrcrypto.JoinGrant{NamespaceID: ns, ActorLimit: 2, Reader: true}
+		reqID, reqDig := fx.enrollP3(t, keys, grant, reqByte)
+		fx.activateNextEpoch(t)
+
+		dir := t.TempDir()
+		cl, err := InitClientDir(InitDirOptions{
+			Dir: dir, DirKind: DirKindMember, SignedDescriptor: fx.env.rawDesc, CredKeys: keys,
+			ExpectedGrant: &grant, ExpectedJoinReq: reqID, ExpectedJoinReqDigest: &reqDig, Activated: false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = cl.Close() })
+		sess, err := cl.Dial(ctx, ldrcrypto.PrincipalCredential)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { sess.Close() })
+
+		var syncMu sync.Mutex
+		dirSyncFails := true
+		cl.SetSyncHooks(nil, func(d string) error {
+			syncMu.Lock()
+			fail := dirSyncFails
+			syncMu.Unlock()
+			if fail {
+				return errors.New("injected post-rename dir sync EIO")
+			}
+			return ldrstore.SyncDir(d)
+		})
+		if err := cl.VerifyEnrollmentAndActivate(ctx, sess); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("expected ErrUncertainWrite, got %v", err)
+		}
+		// Restore sync so subsequent failures come strictly from WAL state!
+		syncMu.Lock()
+		dirSyncFails = false
+		syncMu.Unlock()
+
+		fullWAL, err := os.ReadFile(filepath.Join(dir, "verified.wal"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cl, sess, dir, fullWAL
+	}
+
+	// rewriteWALWithPrefix rewrites verified.wal keeping only the first keepFrames valid frames.
+	rewriteWALWithPrefix := func(t *testing.T, dir string, keepFrames int) {
+		t.Helper()
+		walPath := filepath.Join(dir, "verified.wal")
+		frames, err := loadVerifiedWAL(walPath, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if keepFrames >= len(frames) {
+			t.Fatalf("keepFrames=%d must be < len(frames)=%d", keepFrames, len(frames))
+		}
+		if err := os.Remove(walPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := initEmptyVerifiedWAL(walPath); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < keepFrames; i++ {
+			if err := appendVerifiedFrameWAL(walPath, frames[i]); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	t.Run("positive_control_intact_wal_lifts_fence_same_process_and_reopen", func(t *testing.T) {
+		cl, _, dir, _ := setupFencedMember(t, "ns-pos-ctrl", 0x61)
+		if err := cl.ReconcileDurability(); err != nil {
+			t.Fatalf("positive control ReconcileDurability failed: %v", err)
+		}
+		if st := cl.Status(); !st.Activated || st.OutboxUncertain {
+			t.Fatalf("expected Activated=true OutboxUncertain=false, got %+v", st)
+		}
+		_ = cl.Close()
+		cl2, err := OpenClient(dir)
+		if err != nil {
+			t.Fatalf("positive control reopen failed: %v", err)
+		}
+		defer cl2.Close()
+		if !cl2.Status().Activated {
+			t.Fatalf("expected reopened Activated=true")
+		}
+	})
+
+	t.Run("missing_verified_wal_keeps_fence_same_process_and_fails_reopen", func(t *testing.T) {
+		cl, _, dir, _ := setupFencedMember(t, "ns-missing-wal", 0x62)
+		if err := os.Remove(filepath.Join(dir, "verified.wal")); err != nil {
+			t.Fatal(err)
+		}
+		// Same-process ReconcileDurability MUST fail closed and preserve fence!
+		if err := cl.ReconcileDurability(); !errors.Is(err, ldrstore.ErrCorruptWAL) {
+			t.Fatalf("ReconcileDurability with missing verified.wal: got %v, want ErrCorruptWAL", err)
+		}
+		if st := cl.Status(); st.Activated || !st.OutboxUncertain {
+			t.Fatalf("fence must remain active with missing verified.wal, got %+v", st)
+		}
+		// Reopen MUST ALSO fail closed!
+		_ = cl.Close()
+		if _, err := OpenClient(dir); !errors.Is(err, ldrstore.ErrCorruptWAL) {
+			t.Fatalf("OpenClient with missing verified.wal: got %v, want ErrCorruptWAL", err)
+		}
+	})
+
+	t.Run("shorter_wal_dropping_enrollment_keeps_fence_and_fails_reopen", func(t *testing.T) {
+		cl, _, dir, _ := setupFencedMember(t, "ns-short-no-enroll", 0x63)
+		// Keep only seq 1..2 (line_init + operator_key_authorize), dropping enrollment!
+		rewriteWALWithPrefix(t, dir, 2)
+
+		if err := cl.ReconcileDurability(); !errors.Is(err, ldrstore.ErrCorruptWAL) {
+			t.Fatalf("ReconcileDurability with shorter WAL dropping enrollment: got %v, want ErrCorruptWAL", err)
+		}
+		if st := cl.Status(); st.Activated || !st.OutboxUncertain {
+			t.Fatalf("fence must remain active on shorter WAL, got %+v", st)
+		}
+		// Reopen MUST ALSO fail closed (Activated=true on disk lacks verified enrollment in shorter WAL!).
+		_ = cl.Close()
+		if _, err := OpenClient(dir); !errors.Is(err, ErrEnrollmentCheck) {
+			t.Fatalf("OpenClient with shorter WAL missing enrollment: got %v, want ErrEnrollmentCheck", err)
+		}
+	})
+
+	t.Run("shorter_wal_still_containing_enrollment_but_below_checkpoint_keeps_fence", func(t *testing.T) {
+		cl, _, dir, fullWAL := setupFencedMember(t, "ns-short-below-ck", 0x64)
+		_, ckSeq, _ := cl.Checkpoint()
+		// Truncate strictly 1 frame off the end (enrollment is earlier, epoch_activate was last!):
+		// WAL is intact and still contains enrollment, yet is shorter than accepted checkpoint ckSeq!
+		rewriteWALWithPrefix(t, dir, int(ckSeq-1))
+
+		if err := cl.ReconcileDurability(); !errors.Is(err, ldrstore.ErrCorruptWAL) {
+			t.Fatalf("ReconcileDurability with intact shorter WAL (%d < %d): got %v, want ErrCorruptWAL", ckSeq-1, ckSeq, err)
+		}
+		if st := cl.Status(); st.Activated || !st.OutboxUncertain {
+			t.Fatalf("fence must remain active when durable WAL regressed below verified checkpoint, got %+v", st)
+		}
+		// Restoring intact WAL allows ReconcileDurability to succeed!
+		if err := os.WriteFile(filepath.Join(dir, "verified.wal"), fullWAL, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := cl.ReconcileDurability(); err != nil {
+			t.Fatalf("ReconcileDurability after restoring intact WAL: %v", err)
+		}
+		if st := cl.Status(); !st.Activated || st.OutboxUncertain {
+			t.Fatalf("expected clean activation after restoring intact WAL, got %+v", st)
+		}
+	})
+}
+
+// TestClientUnactivatedMemberBlocksAdminAttachedMutationsAndLegacyV1Config verifies
+// Codex Turn 10 Finding 2 & Compatibility Note:
+//   - An unactivated DirKindMember directory refuses ComposeAndPersist (even for
+//     root/operator origins), ComposeEpochActivate (even with an attached operator
+//     key and enrolled reader cred), Send (even for a pre-staged entry), and ResolveAll.
+//   - A separate DirKindAdmin directory starts Activated=true and allows admin mutations.
+//   - A legacy v1 config.cbor (without dir_kind) fails closed explicitly even when
+//     outbox.cbor says Activated=true, never inferring administrative authority.
+func TestClientUnactivatedMemberBlocksAdminAttachedMutationsAndLegacyV1Config(t *testing.T) {
+	fx := startOnboardingFixture(t)
+	ctx := context.Background()
+
+	t.Run("unactivated_member_with_attached_root_and_operator_keys_blocks_all_mutations", func(t *testing.T) {
+		keys, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+		grant := ldrcrypto.JoinGrant{NamespaceID: "ns-gated-admin", ActorLimit: 2, Reader: true}
+		reqID, reqDig := fx.enrollP3(t, keys, grant, 0x71)
+		fx.activateNextEpoch(t)
+
+		dir := t.TempDir()
+		cl, err := InitClientDir(InitDirOptions{
+			Dir: dir, DirKind: DirKindMember, SignedDescriptor: fx.env.rawDesc, CredKeys: keys,
+			ExpectedGrant: &grant, ExpectedJoinReq: reqID, ExpectedJoinReqDigest: &reqDig, Activated: false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cl.Close()
+
+		// Attach BOTH root and operator signing keys to this provisional member directory!
+		cl.AttachRootKey(fx.env.root1)
+		cl.AttachOperatorKey(fx.opKey)
+
+		// Provisional control sync succeeds (replay + wrap verification allowed before activation).
+		sOp, err := cl.Dial(ctx, ldrcrypto.PrincipalOperator)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sOp.Close()
+		if _, err := cl.Sync(ctx, sOp); err != nil {
+			t.Fatalf("provisional Sync failed: %v", err)
+		}
+
+		// 1. ComposeAndPersist with OriginRoot MUST fail with ErrNotActivated!
+		extraOp, _ := GenerateSigningKey(ldrcrypto.AlgEd25519)
+		extraOpCBOR, _ := extraOp.Signer.PublicKey().ToCBOR()
+		if _, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "root_on_unactivated_member", Origin: ldrcore.OriginRoot, OpType: "operator_key_authorize",
+			Expect: ldrcrypto.ExpectMap{"root_rev": uint64(cl.State().Line.RootRev)},
+			Fields: ldrcrypto.Map{{Key: "operator_key", Value: extraOpCBOR}},
+		}); !errors.Is(err, ErrNotActivated) {
+			t.Fatalf("ComposeAndPersist(OriginRoot) on unactivated member: got %v, want ErrNotActivated", err)
+		}
+
+		// 2. ComposeAndPersist with OriginOperator MUST fail with ErrNotActivated!
+		if _, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "op_on_unactivated_member", Origin: ldrcore.OriginOperator, OpType: "credential_revoke",
+			Fields: ldrcrypto.Map{{Key: "cred_id", Value: keys.CredID[:]}},
+		}); !errors.Is(err, ErrNotActivated) {
+			t.Fatalf("ComposeAndPersist(OriginOperator) on unactivated member: got %v, want ErrNotActivated", err)
+		}
+
+		// 3. ComposeEpochActivate MUST fail with ErrNotActivated even though cred IS an entitled reader!
+		if _, _, err := cl.ComposeEpochActivate("epoch_on_unactivated_member"); !errors.Is(err, ErrNotActivated) {
+			t.Fatalf("ComposeEpochActivate on unactivated member: got %v, want ErrNotActivated", err)
+		}
+
+		// 4. Send MUST fail with ErrNotActivated even if an outbox entry exists in memory!
+		cl.mu.Lock()
+		cl.outbox.Entries = append(cl.outbox.Entries, &OutboxEntry{
+			OpID: "staged-pre-act", Status: ldrcore.OutPending, SignerToken: "op:test",
+		})
+		cl.mu.Unlock()
+		if _, err := cl.Send(ctx, sOp, "staged-pre-act"); !errors.Is(err, ErrNotActivated) {
+			t.Fatalf("Send on unactivated member: got %v, want ErrNotActivated", err)
+		}
+		if cl.OutboxSnapshot()[0].Sends != 0 {
+			t.Fatalf("Send mutated Sends counter on unactivated member")
+		}
+
+		// 5. ResolveAll MUST fail with ErrNotActivated!
+		if err := cl.ResolveAll(ctx, sOp, ldrcrypto.OperatorPrincipal(fx.opKey.Signer.PublicKey())); !errors.Is(err, ErrNotActivated) {
+			t.Fatalf("ResolveAll on unactivated member: got %v, want ErrNotActivated", err)
+		}
+	})
+
+	t.Run("legacy_v1_config_without_dir_kind_fails_closed_even_if_activated_true", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dir, "sidecars"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := initEmptyVerifiedWAL(filepath.Join(dir, "verified.wal")); err != nil {
+			t.Fatal(err)
+		}
+		// Write a pre-release v1 config.cbor (no dir_kind, v=1) paired with outbox.cbor Activated=true!
+		legacyCfg, err := ldrcrypto.MarshalCBOR(ldrcrypto.Map{
+			{Key: "cd", Value: fx.env.cd[:]},
+			{Key: "descriptor", Value: fx.env.rawDesc},
+			{Key: "genesis", Value: fx.env.genesis[:]},
+			{Key: "line_id", Value: fx.env.lineID},
+			{Key: "v", Value: uint64(1)},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ldrstore.AtomicWriteFile(filepath.Join(dir, "config.cbor"), legacyCfg, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := saveOutbox(filepath.Join(dir, "outbox.cbor"), persistedOutbox{
+			Activated: true,
+			KeyStops:  make(map[string]*KeyStop),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := OpenClient(dir); err == nil {
+			t.Fatalf("OpenClient accepted legacy v1 config.cbor without dir_kind!")
+		}
+	})
+}

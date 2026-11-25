@@ -30,6 +30,12 @@ const (
 func p256Curve() elliptic.Curve { return elliptic.P256() }
 
 const (
+	// configSchemaVersion 2 introduces required dir_kind ("admin"|"member") and
+	// optional expected_join_req_digest for P3 ceremony verification. Pre-release
+	// v1 config.cbor files fail closed explicitly rather than inferring authority
+	// from an old Activated flag.
+	configSchemaVersion = uint64(2)
+
 	clientWALMagic   = "LDCW"
 	clientWALVersion = byte(1)
 	clientWALHdrSize = 10 // 4B magic + 1B ver + 1B flags + 4B len
@@ -139,7 +145,7 @@ func saveConfig(path string, cfg persistedConfig) error {
 		{Key: "dir_kind", Value: cfg.DirKind},
 		{Key: "genesis", Value: cfg.GenesisAnchor[:]},
 		{Key: "line_id", Value: cfg.LineID},
-		{Key: "v", Value: uint64(1)},
+		{Key: "v", Value: configSchemaVersion},
 	}
 	if cfg.ExpectedCredID != nil {
 		m = append(m, ldrcrypto.MapEntry{Key: "expected_cred_id", Value: cfg.ExpectedCredID[:]})
@@ -184,6 +190,16 @@ func loadConfig(path string) (persistedConfig, error) {
 	m, ok := dec.(map[string]any)
 	if !ok {
 		return persistedConfig{}, errors.New("ldrclient: invalid config.cbor")
+	}
+	ver, err := ldrcrypto.MapUint(m, "v")
+	if err != nil {
+		return persistedConfig{}, fmt.Errorf("ldrclient: config.cbor missing version: %w", err)
+	}
+	if ver == 1 {
+		return persistedConfig{}, errors.New("ldrclient: unsupported legacy config.cbor v1 (pre-release format break: v2 requires explicit dir_kind and P3 join_request_digest; re-initialize client directory)")
+	}
+	if ver != configSchemaVersion {
+		return persistedConfig{}, fmt.Errorf("ldrclient: unsupported config.cbor version %d (want %d)", ver, configSchemaVersion)
 	}
 	if err := ldrcrypto.RequireExactKeys(m, []string{"cd", "descriptor", "dir_kind", "genesis", "line_id", "v"},
 		"expected_cred_id", "expected_grant", "expected_join_req_digest", "expected_join_req_id"); err != nil {
@@ -318,6 +334,24 @@ func appendVerifiedFrameWAL(path string, fr ldrrelay.ControlFrameWire) error {
 	return f.Close()
 }
 
+// initEmptyVerifiedWAL durably creates verified.wal during InitClientDir so
+// any initialized client directory always has a WAL file; a missing verified.wal
+// on later open or reconciliation is then unambiguously a lost WAL.
+func initEmptyVerifiedWAL(path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := ldrstore.SyncFile(f); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return ldrstore.SyncDir(filepath.Dir(path))
+}
+
 func loadVerifiedWAL(path string, syncFile func(*os.File) error, syncDir func(string) error) ([]ldrrelay.ControlFrameWire, error) {
 	if syncFile == nil {
 		syncFile = ldrstore.SyncFile
@@ -328,7 +362,7 @@ func loadVerifiedWAL(path string, syncFile func(*os.File) error, syncDir func(st
 	wf, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, fmt.Errorf("%w: missing verified.wal", ldrstore.ErrCorruptWAL)
 		}
 		return nil, err
 	}

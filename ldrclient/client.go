@@ -223,6 +223,11 @@ func InitClientDir(opts InitDirOptions) (*Client, error) {
 			return nil, err
 		}
 	}
+	// Durably create verified.wal BEFORE config.cbor/outbox.cbor so a missing
+	// verified.wal on an initialized directory always fails closed as a lost WAL.
+	if err := initEmptyVerifiedWAL(filepath.Join(opts.Dir, "verified.wal")); err != nil {
+		return nil, err
+	}
 	if err := saveConfig(filepath.Join(opts.Dir, "config.cbor"), cfg); err != nil {
 		return nil, err
 	}
@@ -264,9 +269,13 @@ func OpenClientWithSyncHooks(dir string, syncFile func(*os.File) error, syncDir 
 		_ = lf.Close()
 	}
 
-	// Enforce a durability barrier on outbox.cbor before trusting any persisted
-	// activation or outbox state on reopen.
+	// Enforce durability barriers on outbox.cbor and epochs.cbor (if present)
+	// before trusting persisted activation or key state on reopen.
 	if err := syncOutboxBarrier(filepath.Join(dir, "outbox.cbor"), syncFile, syncDir); err != nil {
+		cleanupLock()
+		return nil, err
+	}
+	if err := syncOutboxBarrier(filepath.Join(dir, "epochs.cbor"), syncFile, syncDir); err != nil {
 		cleanupLock()
 		return nil, err
 	}
@@ -387,6 +396,25 @@ func (c *Client) Close() error {
 		c.lockFile = nil
 		return err
 	}
+	return nil
+}
+
+// AttachAdminReaderKeys persists and attaches a reader credential key bundle
+// inside an existing administrative (DirKindAdmin) directory so P9 epoch
+// activation can run on an already-activated operator/admin directory.
+func (c *Client) AttachAdminReaderKeys(ck *CredentialKeyBundle) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.DirKind != DirKindAdmin {
+		return fmt.Errorf("%w: AttachAdminReaderKeys is only valid on DirKindAdmin directories", ErrEnrollmentCheck)
+	}
+	if ck == nil {
+		return errors.New("ldrclient: nil credential key bundle")
+	}
+	if err := SaveCredentialKeys(c.credKeyPath(), ck); err != nil {
+		return err
+	}
+	c.credKeys = ck
 	return nil
 }
 
@@ -815,10 +843,39 @@ func (c *Client) VerifyEnrollmentAndActivate(ctx context.Context, sess *ldrrelay
 	return nil
 }
 
+// verifyClientReconcilePreservesPrefixLocked verifies that a freshly replayed
+// candidate from durable verified.wal monotonically extends the previously
+// verified checkpoint and frames without truncating or diverging from history.
+func verifyClientReconcilePreservesPrefixLocked(prev, cand *Client) error {
+	if cand.ckSeq < prev.ckSeq || len(cand.entries) < len(prev.entries) {
+		return fmt.Errorf("%w: durable verified.wal length %d shorter than verified checkpoint %d",
+			ldrstore.ErrCorruptWAL, len(cand.entries), prev.ckSeq)
+	}
+	for i, oldEntry := range prev.entries {
+		oldFr := oldEntry.frame
+		newFr := cand.entries[i].frame
+		if newFr.Gen != oldFr.Gen ||
+			newFr.Seq != oldFr.Seq ||
+			newFr.SeqTime != oldFr.SeqTime ||
+			newFr.PrevHead != oldFr.PrevHead ||
+			newFr.Head != oldFr.Head ||
+			newFr.Origin != oldFr.Origin ||
+			newFr.OpType != oldFr.OpType ||
+			!bytes.Equal(newFr.IntentBytes, oldFr.IntentBytes) {
+			return fmt.Errorf("%w: durable verified.wal frame %d diverged from verified history", ldrstore.ErrCorruptWAL, oldFr.Seq)
+		}
+	}
+	if prev.ckSeq > 0 && cand.entries[prev.ckSeq-1].frame.Head != prev.ckHead {
+		return fmt.Errorf("%w: durable verified.wal head at seq %d diverged from verified checkpoint", ldrstore.ErrCorruptWAL, prev.ckSeq)
+	}
+	return nil
+}
+
 // ReconcileDurability enforces explicit file+directory durability barriers on
-// outbox.cbor and verified.wal, reloads durable outbox state from disk, verifies
-// enrollment backing if Activated=true on a member directory, and lifts
-// outboxUncertain only when all barriers and checks succeed.
+// outbox.cbor, epochs.cbor, and verified.wal, reconstructs and verifies a fresh
+// candidate from the durable frames, requires the candidate to extend the last
+// verified checkpoint, validates activation evidence against the candidate, and
+// lifts outboxUncertain ONLY when every barrier and check succeeds.
 func (c *Client) ReconcileDurability() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -826,11 +883,7 @@ func (c *Client) ReconcileDurability() error {
 	if err := syncOutboxBarrier(c.outboxPath(), c.syncFileFn, c.syncDirFn); err != nil {
 		return err
 	}
-	if _, err := os.Stat(c.walPath()); err == nil {
-		if _, err := loadVerifiedWAL(c.walPath(), c.syncFileFn, c.syncDirFn); err != nil {
-			return err
-		}
-	} else if !os.IsNotExist(err) {
+	if err := syncOutboxBarrier(c.epochsPath(), c.syncFileFn, c.syncDirFn); err != nil {
 		return err
 	}
 	ob, err := loadOutbox(c.outboxPath())
@@ -840,9 +893,55 @@ func (c *Client) ReconcileDurability() error {
 	if ob.NextOp < c.outbox.NextOp {
 		return fmt.Errorf("%w: reconciled outbox next_op %d regressed below %d", ldrstore.ErrCorruptWAL, ob.NextOp, c.outbox.NextOp)
 	}
+	ep, err := loadEpochs(c.epochsPath())
+	if err != nil {
+		return err
+	}
+	frames, err := loadVerifiedWAL(c.walPath(), c.syncFileFn, c.syncDirFn)
+	if err != nil {
+		return err
+	}
+
+	// Reconstruct and verify a fresh candidate strictly from durable WAL frames.
+	cand := &Client{
+		dir:         c.dir,
+		cfg:         c.cfg,
+		desc:        c.desc,
+		profDigest:  c.profDigest,
+		coreProf:    c.coreProf,
+		validityMS:  c.validityMS,
+		credKeys:    c.credKeys,
+		operatorKey: c.operatorKey,
+		rootKey:     c.rootKey,
+		ckHead:      c.cfg.GenesisAnchor,
+		rctx:        newReplayContext(),
+		touched:     make(map[string]projCoord),
+		source:      make(map[string]projCoord),
+		viewOf:      make(map[string]string),
+		outbox:      ob,
+		slots:       make(map[string]string),
+		epochs:      ep,
+		cursors:     c.cursors,
+	}
+	for _, fr := range frames {
+		if err := cand.verifyAndApplyFrameLocked(fr, false); err != nil {
+			return fmt.Errorf("%w: durable verified.wal replay failed: %v", ldrstore.ErrCorruptWAL, err)
+		}
+	}
+	if err := verifyClientReconcilePreservesPrefixLocked(c, cand); err != nil {
+		return err
+	}
+	// Validate activation evidence against the DURABLY RECONSTRUCTED candidate
+	// (never against stale in-memory c.entries/c.state!).
 	if c.cfg.DirKind == DirKindMember && ob.Activated {
-		if err := c.verifyEnrolledMemberLocked(false, true); err != nil {
-			return err
+		if !c.outbox.Activated {
+			if err := cand.verifyEnrolledMemberLocked(true, false); err != nil {
+				return err
+			}
+		} else {
+			if err := cand.verifyEnrolledMemberLocked(false, true); err != nil {
+				return err
+			}
 		}
 	}
 	slots := make(map[string]string)
@@ -851,6 +950,16 @@ func (c *Client) ReconcileDurability() error {
 			slots[e.Slot] = e.OpID
 		}
 	}
+	c.state = cand.state
+	c.entries = cand.entries
+	c.ckGen = cand.ckGen
+	c.ckSeq = cand.ckSeq
+	c.ckHead = cand.ckHead
+	c.rctx = cand.rctx
+	c.touched = cand.touched
+	c.source = cand.source
+	c.viewOf = cand.viewOf
+	c.epochs = ep
 	c.outbox = ob
 	c.slots = slots
 	c.outboxUncertain = false
@@ -1384,7 +1493,10 @@ func (c *Client) ComposeAndPersist(p ComposeParams) (string, error) {
 	if c.outbox.MustResolve {
 		return "", ErrMustResolve
 	}
-	if !c.outbox.Activated && p.Origin != ldrcore.OriginRoot && p.Origin != ldrcore.OriginOperator {
+	// Provisional unactivated member directories may not sign or stage ANY
+	// mutation, even if an administrative key happens to be attached. Separate
+	// administrative directories (DirKindAdmin) start Activated=true.
+	if !c.outbox.Activated {
 		return "", ErrNotActivated
 	}
 
@@ -1529,6 +1641,9 @@ func (c *Client) ComposeEpochActivate(action string) (string, []byte, error) {
 	}
 	if c.outbox.MustResolve {
 		return "", nil, ErrMustResolve
+	}
+	if !c.outbox.Activated {
+		return "", nil, ErrNotActivated
 	}
 	if c.operatorKey == nil {
 		return "", nil, errors.New("ldrclient: operator key required for key_epoch_activate")
@@ -1689,6 +1804,10 @@ func (c *Client) Send(ctx context.Context, sess *ldrrelay.SessionClient, opID st
 		c.mu.Unlock()
 		return ldrrelay.SubmitReply{}, ErrOutboxUncertain
 	}
+	if !c.outbox.Activated {
+		c.mu.Unlock()
+		return ldrrelay.SubmitReply{}, ErrNotActivated
+	}
 	e := c.findOutboxLocked(opID)
 	if e == nil {
 		c.mu.Unlock()
@@ -1752,6 +1871,10 @@ func (c *Client) ResolveAll(ctx context.Context, sess *ldrrelay.SessionClient, s
 	if c.outboxUncertain {
 		c.mu.Unlock()
 		return ErrOutboxUncertain
+	}
+	if !c.outbox.Activated {
+		c.mu.Unlock()
+		return ErrNotActivated
 	}
 	var todo []*OutboxEntry
 	for _, e := range c.outbox.Entries {

@@ -389,6 +389,54 @@ func ldrRootCLI(args []string, out io.Writer) error {
 		_, _ = cl.Sync(ctx, sess)
 		return json.NewEncoder(out).Encode(map[string]any{"op_id": opID, "seq": rep.Outcome.Seq})
 
+	case "reader-request":
+		var dir, ns, alg, outPath string
+		rest, dir = takeFlag(rest, "--dir", "")
+		rest, ns = takeFlag(rest, "--namespace", "")
+		rest, alg = takeFlag(rest, "--alg", ldrcrypto.AlgEd25519)
+		rest, outPath = takeFlag(rest, "--out", "")
+		if dir == "" || ns == "" || outPath == "" {
+			return errors.New("root reader-request requires --dir, --namespace, --out")
+		}
+		cl, err := ldrclient.OpenClient(dir)
+		if err != nil {
+			return err
+		}
+		defer cl.Close()
+		desc, cd, _, _ := cl.Descriptor()
+		credKeys, err := ldrclient.GenerateCredentialKeys(alg)
+		if err != nil {
+			return err
+		}
+		if err := cl.AttachAdminReaderKeys(credKeys); err != nil {
+			return err
+		}
+		reqID := make([]byte, 16)
+		if _, err := io.ReadFull(rand.Reader, reqID); err != nil {
+			return err
+		}
+		grant := ldrcrypto.JoinGrant{NamespaceID: ns, ActorLimit: 0, Reader: true}
+		req, err := ldrcrypto.SignJoinRequest(credKeys.Signing.Signer, ldrcrypto.JoinRequest{
+			RequestID:        reqID,
+			LineID:           desc.LineID,
+			Generation:       1,
+			DescriptorDigest: cd,
+			EncryptionKey:    credKeys.Encryption.PublicKey(),
+			Grant:            grant,
+		})
+		if err != nil {
+			return err
+		}
+		if err := ldrclient.SaveJoinRequest(outPath, req); err != nil {
+			return err
+		}
+		return json.NewEncoder(out).Encode(map[string]any{
+			"request":   outPath,
+			"cred_id":   hex.EncodeToString(req.CredID[:]),
+			"namespace": ns,
+			"reader":    true,
+		})
+
 	default:
 		return fmt.Errorf("unknown root subcommand %q", sub)
 	}
