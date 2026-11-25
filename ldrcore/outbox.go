@@ -442,6 +442,7 @@ var transientAdmission = map[string]bool{
 // back the device's other keys. A key can also learn that it is revoked from
 // its first query here; its remaining intents are then not asked about.
 func (c *Client) ResolveAll(q *Sequencer, clk Clock) {
+	incomplete := false
 	for _, e := range c.out.entries {
 		if e.Status != OutPending && e.Status != OutReconcile {
 			continue
@@ -450,12 +451,21 @@ func (c *Client) ResolveAll(q *Sequencer, clk Clock) {
 			continue
 		}
 		a := q.Query(signerOf(&e.Intent.Record), opKey(e.Intent), e.Intent.Digest, clk)
-		if e.Status == OutReconcile && (a.Class == ClassUnknown || a.Class == ClassAdmission) {
+		if a.Class == ClassAdmission {
+			// An admission error (such as clock_uncertain) means the relay did
+			// not answer this query, so the resolve pass is not complete.
+			incomplete = true
+			if e.Status == OutReconcile {
+				continue
+			}
+		} else if e.Status == OutReconcile && a.Class == ClassUnknown {
 			continue
 		}
 		c.settle(e, a)
 	}
-	c.out.mustResolve = false
+	if !incomplete {
+		c.out.mustResolve = false
+	}
 }
 
 // Reconciled records the answer an authorized principal obtained for an
@@ -495,7 +505,12 @@ func (c *Client) ClearSuspicion() { c.out.suspect = false }
 // what one relay's state says. No other key the device holds is used in its
 // place.
 func (c *Client) Anchor(q *Sequencer, clk Clock) error {
-	if c.signsNoMore(CredentialPrincipal(c.Cred)) {
+	switch {
+	case c.halted != "":
+		return fmt.Errorf("%w: %s", ErrFailClosed, c.halted)
+	case c.out.suspect:
+		return fmt.Errorf("%w: a rollback is suspected", ErrFailClosed)
+	case c.signsNoMore(CredentialPrincipal(c.Cred)):
 		return ErrKeyRevoked
 	}
 	if _, _, _, a := q.AnchorRequest(CredentialPrincipal(c.Cred), clk); a.Class != "" {

@@ -5,16 +5,16 @@
   "author": "Fable (claude seat), for cross-review by Codex",
 
   "coverage": {
-    "apply_vectors": 209,
+    "apply_vectors": 210,
     "retired_vectors": 2,
-    "traces": 47,
-    "trace_steps": 153,
+    "traces": 50,
+    "trace_steps": 165,
     "checked_by": "A structural lint, and since draft v6 the reference checker in ldrcore/ for apply vectors (not traces). The lint checks: identifiers unique and sequential, fixtures resolve, premises declared, reasons and types from the declared sets, these counts correct. The lint computes no outcome and establishes none. Codex's static review of the first 95 vectors and 29 traces is docs/LDR-CONFORMANCE-REVIEW.md; it did not execute anything either.",
-    "reviewed_statically": "Codex also read A105-A125 and T03, T16, T27, T32, T33, T37 statically (call 0002 turn 16), then A126-A130 and T38 (turn 18). A131-A145 and T39 are newer than any review. A174-A211 and T40-T42 (draft v7) have not been reviewed by anyone. T43-T47 follow Codex's independent probe of the client model (call 0003, turns 11 and 13): Codex read the texts of T43-T47 as they stood at 7b79dd2 and asked for no change (turn 15); it ran TestClientTraces at that commit. T47 then gained a step about a stopped credential's anchor request; Codex ran the traces again at af39840 and accepted T47's wording (turn 17). The expectations of T11 and T40 about a revoked key's anchor request changed with the same review.",
-    "executed": "ldrcore/apply_test.go runs every active apply vector. A134-A145 were added after a mutation check of that package showed eleven rules that no earlier vector pinned; their expected results were still written from the draft, not copied from the implementation. A146-A162 follow Codex's independent run of the checker (docs/LDR-CHECKER-REVIEW.md), which found three behaviours no vector covered: an oversize turn committed, a record other than line_init committed on an empty log, and a subset committed as the default audience. A163-A173 follow its second probe, which showed counters wrapping at the top of their range. A174-A211 came with draft v7, which follows Codex's enrollment, bootstrap and envelope draft v1: A174-A194 cover a credential's two keys, the key registry across roles, operator-key tombstones, a line_init without a root key, and a disabled actor that cannot be moved; A195-A211 pin that an absent required expectation is malformed, one vector per required expectation. Draft v7 also changed vectors that already existed, because the rules changed: enrollment records and credential state carry two keys and a request digest (A77-A79, A130, A135, A136, A158, A159, A167 and the fixtures), line_init names a root key (A122, A123), a revoked operator key leaves a tombstone (A120's resulting state, A124's starting state), and A135 and A136 were restated for derived identifiers. No expected outcome changed.",
+    "reviewed_statically": "Codex also read A105-A125 and T03, T16, T27, T32, T33, T37 statically (call 0002 turn 16), then A126-A130 and T38 (turn 18). A131-A145 and T39 are newer than any review. A174-A211 and T40-T42 (draft v7) have not been reviewed by anyone. T43-T47 follow Codex's independent probe of the client model (call 0003, turns 11 and 13): Codex read the texts of T43-T47 as they stood at 7b79dd2 and asked for no change (turn 15); it ran TestClientTraces at that commit. T47 then gained a step about a stopped credential's anchor request; Codex ran the traces again at af39840 and accepted T47's wording (turn 17). The expectations of T11 and T40 about a revoked key's anchor request changed with the same review. A212 and T48-T50 were added by Gemini on 2026-11-25 after independently probing 2062b74 and have not yet been reviewed by Codex or Claude.",
+    "executed": "ldrcore/apply_test.go runs every active apply vector. A134-A145 were added after a mutation check of that package showed eleven rules that no earlier vector pinned; their expected results were still written from the draft, not copied from the implementation. A146-A162 follow Codex's independent run of the checker (docs/LDR-CHECKER-REVIEW.md), which found three behaviours no vector covered: an oversize turn committed, a record other than line_init committed on an empty log, and a subset committed as the default audience. A163-A173 follow its second probe, which showed counters wrapping at the top of their range. A174-A211 came with draft v7, which follows Codex's enrollment, bootstrap and envelope draft v1: A174-A194 cover a credential's two keys, the key registry across roles, operator-key tombstones, a line_init without a root key, and a disabled actor that cannot be moved; A195-A211 pin that an absent required expectation is malformed, one vector per required expectation. A212 pins that negative validity_ms is syntactic invalid (Gemini probe G4). Draft v7 also changed vectors that already existed, because the rules changed: enrollment records and credential state carry two keys and a request digest (A77-A79, A130, A135, A136, A158, A159, A167 and the fixtures), line_init names a root key (A122, A123), a revoked operator key leaves a tombstone (A120's resulting state, A124's starting state), and A135 and A136 were restated for derived identifiers. No expected outcome changed.",
     "not_covered": "recovery_generation has no apply vector: its effect is a rebuild from a base, not a patch. It appears in traces T15 and T28 only. Root and bootstrap coverage (A116-A123) is a handful of semantic cases, not a complete suite, and models no cryptographic proof.",
-    "traces_are": "Reviewable scenarios in prose with symbolic intents and often without explicit times. They are not executable inputs. Each trace has a run label saying whether a Go test in ldrcore/ re-enacts it with explicit inputs: 27 against the sequencer model, 13 against the client model, 4 against the register model, and 3 as a sequence of Apply calls only.",
-    "traces_by_scope": {"sequencer model": 27, "client model": 13, "register model": 4, "apply-only part": 3}
+    "traces_are": "Reviewable scenarios in prose with symbolic intents and often without explicit times. They are not executable inputs. Each trace has a run label saying whether a Go test in ldrcore/ re-enacts it with explicit inputs: 27 against the sequencer model, 16 against the client model, 4 against the register model, and 3 as a sequence of Apply calls only.",
+    "traces_by_scope": {"sequencer model": 27, "client model": 16, "register model": 4, "apply-only part": 3}
   },
 
   "conventions": {
@@ -874,6 +874,9 @@
      "expect": {"outcome": "rejected", "reason": "invalid"}},
     {"id": "A211", "spec": "5.8, 8", "title": "A default-audience broadcast that leaves out the audience revision",
      "record": {"origin": "operator", "type": "broadcast_create", "operator": "op1", "broadcast": "bc2", "kind": "announcement", "recipients": ["a1", "a2", "b1"], "default_audience": true},
+     "expect": {"outcome": "rejected", "reason": "invalid"}},
+    {"id": "A212", "spec": "5.3, 5.8", "title": "A record carrying negative validity_ms is syntactically invalid",
+     "record": {"origin": "actor", "type": "call_note", "cred": "credA", "actor": "a1", "call": "c1", "validity_ms": -1},
      "expect": {"outcome": "rejected", "reason": "invalid"}}
   ],
 
@@ -1133,6 +1136,27 @@
        {"do": "a second revoked answer arrives", "expect": "the evidence of the first is unchanged"},
        {"do": "the client is asked to request an anchor from the relay it had verified, whose head is older than F and whose state still lists credA as active", "expect": "refused by the client itself: no request is made as credA, that relay writes no time_anchor, and no other held key is used instead. Finding C3 of Codex's probe (turn 15)"},
        {"do": "the turn had committed at the first relay; the operator's query returns its outcome and the answer is handed to the client", "expect": "the turn is settled. credA still signs nothing: an old outcome is no reason to resume"},
-       {"do": "the revocation is later committed and the client verifies it", "expect": "the stop is reported as verified as well; the evidence of the earlier answer is unchanged"}]}
+       {"do": "the revocation is later committed and the client verifies it", "expect": "the stop is reported as verified as well; the evidence of the earlier answer is unchanged"}]},
+    {"id": "T48", "run": {"scope": "client model", "test": "TestClientTraces/T48"}, "spec": "5.7", "title": "An admission error during the resolve pass does not clear mustResolve",
+     "note": "Finding G1 of Gemini's independent probe of 2062b74 (2026-11-25). Draft proposal awaiting Codex/Claude review.",
+     "steps": [
+       {"do": "credA's client stores two unsettled intents and restarts", "expect": "composing a new action is refused with must-resolve"},
+       {"do": "the client runs the resolve pass while the relay's clock is untrusted (clock_uncertain)", "expect": "queries fail with admission errors; the pass is incomplete and composing remains refused"},
+       {"do": "one stored intent commits in the log index (answerable without the clock) while the other still receives clock_uncertain during another pass", "expect": "the committed intent settles, the unanswered intent stays pending, and composing remains refused"},
+       {"do": "the relay's clock recovers and the resolve pass runs again", "expect": "every active unsettled intent receives a non-admission answer, completing the pass so composing on a free slot succeeds"}]},
+    {"id": "T49", "run": {"scope": "client model", "test": "TestClientTraces/T49"}, "spec": "4.2, 5.7, 11.2", "title": "A halted or rollback-suspecting client requests no anchor",
+     "note": "Finding G2 of Gemini's independent probe of 2062b74 (2026-11-25). Draft proposal awaiting Codex/Claude review.",
+     "steps": [
+       {"do": "a client halts on a sequencer violation during replay and is asked to request an anchor after F has elapsed", "expect": "refused locally with fail-closed; no authenticated anchor request is sent and the relay writes no time_anchor"},
+       {"do": "another client receives history_unavailable (suspected rollback) and is asked to request an anchor after F has elapsed", "expect": "refused locally with fail-closed; no authenticated anchor request is sent and the relay writes no time_anchor"},
+       {"do": "rollback suspicion is cleared from outside and the client requests an anchor", "expect": "succeeds normally"}]},
+    {"id": "T50", "run": {"scope": "client model", "test": "TestClientTraces/T50"}, "spec": "5.6, 11.2", "title": "Ordinary replay enforces signed-context rules (J1-J3) and prunes retired anchors",
+     "note": "Draft proposal from call 0003 turn 28 (Fable) implemented and tested by Gemini (2026-11-25). Awaits Codex/Claude review.",
+     "steps": [
+       {"do": "under the ordinary profile (no state commitment), the relay serves a record signed for another generation", "expect": "client halts with a sequencer violation"},
+       {"do": "under the ordinary profile, the relay serves a record committed after its signed deadline relative to its anchor's recorded time", "expect": "client halts with a sequencer violation"},
+       {"do": "under the ordinary profile, the relay commits the same operation identity twice", "expect": "client halts with a sequencer violation"},
+       {"do": "under the ordinary profile, the relay serves a record naming an anchor head not on the verified chain", "expect": "client halts with a sequencer violation"},
+       {"do": "sequencer time advances past an anchor's retirement (seq_time + validity_max); the client drops that anchor and its committed identities, and the relay later serves a record naming that retired anchor", "expect": "the retired anchor and identities are pruned from memory, and the late record is still refused as a sequencer violation"}]}
   ]
 }

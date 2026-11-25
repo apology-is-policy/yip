@@ -86,6 +86,13 @@ func (s State) CheckInvariants() []string {
 		return bad
 	}
 
+	if l.RootRev < 1 {
+		fail("generation %d has root_rev %d", l.Generation, l.RootRev)
+	}
+	if l.KeyEpoch == 0 && !l.RekeyPending {
+		fail("key_epoch 0 with rekey_pending false")
+	}
+
 	set("operators", l.Operators)
 	set("tombstones.creds", l.Tombstones.Creds)
 	set("tombstones.actors", l.Tombstones.Actors)
@@ -125,6 +132,12 @@ func (s State) CheckInvariants() []string {
 
 	namespaces := map[string]string{}
 	for id, c := range l.Credentials {
+		if id == "" {
+			fail("credential has empty id")
+		}
+		if c.Namespace == "" {
+			fail("credential %s has empty namespace", id)
+		}
 		if c.ActorLimit < 0 {
 			fail("credential %s has a negative actor limit", id)
 		}
@@ -143,6 +156,9 @@ func (s State) CheckInvariants() []string {
 	}
 
 	for id, a := range l.Actors {
+		if id == "" {
+			fail("actor has empty id")
+		}
 		c := l.Credentials[a.Cred]
 		switch {
 		case c == nil:
@@ -161,10 +177,16 @@ func (s State) CheckInvariants() []string {
 		}
 	}
 
+	if l.KeyEpoch > 0 && len(l.Readers) == 0 {
+		fail("key_epoch %d has no recorded readers", l.KeyEpoch)
+	}
 	for epoch, readers := range l.Readers {
 		set(fmt.Sprintf("readers[%d]", epoch), readers)
 		if epoch < 1 || epoch > l.KeyEpoch {
 			fail("readers recorded for epoch %d while key_epoch is %d", epoch, l.KeyEpoch)
+		}
+		if len(readers) == 0 {
+			fail("epoch %d has no readers", epoch)
 		}
 		for _, r := range readers {
 			if l.Credentials[r] == nil {
@@ -174,10 +196,10 @@ func (s State) CheckInvariants() []string {
 	}
 
 	for key, w := range l.RegisterWriters {
-		actor, _, ok := strings.Cut(key, "/")
+		actor, reg, ok := strings.Cut(key, "/")
 		a := l.Actors[actor]
-		if !ok || a == nil {
-			fail("register writer %s has no actor", key)
+		if !ok || a == nil || !registerTypes[reg] {
+			fail("register writer %s has no valid actor/register", key)
 			continue
 		}
 		set("register writer "+key+" used", w.Used)
@@ -191,6 +213,9 @@ func (s State) CheckInvariants() []string {
 
 	callNos := map[int64]string{}
 	for id, c := range s.Calls {
+		if id == "" {
+			fail("call has empty id")
+		}
 		if other, dup := callNos[c.CallNo]; dup {
 			fail("calls %s and %s share call_no %d", other, id, c.CallNo)
 		}
@@ -237,10 +262,23 @@ func (s State) CheckInvariants() []string {
 			if d.Resolved != (d.Resolution != nil) {
 				fail("call %s dispute %s: resolved=%v but resolution present=%v", id, did, d.Resolved, d.Resolution != nil)
 			}
+			if d.Resolution != nil {
+				switch d.Resolution.Kind {
+				case "measured", "withdrawn", "human":
+				default:
+					fail("call %s dispute %s: invalid resolution kind %q", id, did, d.Resolution.Kind)
+				}
+				if d.Resolution.By == "" {
+					fail("call %s dispute %s: resolution has empty author", id, did)
+				}
+			}
 		}
 	}
 
 	for id, b := range s.Broadcasts {
+		if id == "" {
+			fail("broadcast has empty id")
+		}
 		set("broadcast "+id+" recipients", b.Recipients)
 		if len(b.Recipients) == 0 || !broadcastKinds[b.Kind] {
 			fail("broadcast %s: kind %q, %d recipients", id, b.Kind, len(b.Recipients))

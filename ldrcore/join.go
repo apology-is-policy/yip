@@ -299,7 +299,7 @@ func Join(pin JoinPin, relay JoinRelay, snaps SnapshotSource, clk Clock) (*Joine
 	prov := Provenance{Operator: pin.Operator, EndorsedSeq: at, EndorsedHead: en.SeenHead, WindowSeq: from, EnrollSeq: en.Seq}
 	head := en.SeenHead
 	for _, e := range run[1:] {
-		next, err := verifyFrame(pin.LineID, prof, state, head, ctx, e)
+		next, err := verifyFrame(pin.LineID, prof, state, head, ctx, e, true)
 		if err != nil {
 			return nil, &JoinError{Reason: "the records after the endorsed head do not verify", Err: err}
 		}
@@ -311,6 +311,7 @@ func Join(pin JoinPin, relay JoinRelay, snaps SnapshotSource, clk Clock) (*Joine
 		}
 		state, head = next, e.Head
 		ctx.record(&e, head)
+		ctx.prune(e.SeqTime, prof.ValidityMaxMS)
 	}
 	// The count and the numbering were checked above, so the last record is
 	// the one numbered fseq. What is left is whether it has the head named.
@@ -364,6 +365,9 @@ func Join(pin JoinPin, relay JoinRelay, snaps SnapshotSource, clk Clock) (*Joine
 // It returns the context for verifying the records after the endorsed head,
 // and the number of the oldest record it opened.
 func openWindow(pin *JoinPin, relay JoinRelay, frame Entry, head string) (*signedContext, int64, error) {
+	if pin.MaxWindowRecords < 0 {
+		return nil, 0, &JoinError{Reason: "the live window before the endorsed head is over this joiner's budget", Err: ErrWindowTooLarge}
+	}
 	budget := pin.MaxWindowRecords
 	if budget == 0 {
 		budget = DefaultWindowBudget
@@ -372,28 +376,48 @@ func openWindow(pin *JoinPin, relay JoinRelay, frame Entry, head string) (*signe
 	ctx := newSignedContext()
 	e := frame
 	for n := 1; ; n++ {
+		if e.StateDigest == "" {
+			return nil, 0, joinRefused("the record at %d, in the live window, carries no state commitment", e.Seq)
+		}
+		if e.SeqTime < 0 || e.SeqTime > MaxCounter {
+			return nil, 0, joinRefused("the record at %d, in the live window, has an out-of-domain timestamp", e.Seq)
+		}
 		// The type is under the head and the origin is not, and a type has one
 		// origin. Without this a relay could show a member's record as its own
 		// and keep the identity out of the index.
-		if e.Record.Origin != recordOrigin[e.Record.Type] {
+		if e.Record.Origin == "" || e.Record.Origin != recordOrigin[e.Record.Type] {
 			return nil, 0, joinRefused("the record at %d, in the live window, is a %s of %s origin", e.Seq, e.Record.Type, e.Record.Origin)
 		}
-		if e.Record.Origin != OriginSequencer && !signedBy(&e, signerOf(&e.Record)) {
-			return nil, 0, joinRefused("the record at %d, in the live window, is not what its signer signed", e.Seq)
+		if e.Record.Origin == OriginSequencer {
+			if e.Sig != "" || e.SeenHead != "" || e.Key != (OpKey{}) || e.Digest != "" {
+				return nil, 0, joinRefused("the record at %d, in the live window, is sequencer-origin and carries a signer's fields", e.Seq)
+			}
+		} else {
+			signer := signerOf(&e.Record)
+			if !signedBy(&e, signer) {
+				return nil, 0, joinRefused("the record at %d, in the live window, is not what its signer signed", e.Seq)
+			}
+			if e.Key.Signer != signer || e.Key.Generation != pin.Generation || e.Key.SeenSeq < 0 || e.Key.SeenSeq >= e.Seq || e.Key.OpID == "" || e.Digest == "" {
+				return nil, 0, joinRefused("the record at %d, in the live window, has an operation identity that does not fit it", e.Seq)
+			}
+		}
+		if e.SeqTime < oldest {
+			// Too old to be named by anything after the endorsed head, and so
+			// is everything before it: the window is complete. Like a
+			// verifier that prunes retired anchors, we do not retain it.
+			return ctx, e.Seq, nil
 		}
 		ctx.record(&e, head)
 		switch {
-		case e.SeqTime < oldest:
-			// Too old to be named by anything after the endorsed head, and so
-			// is everything before it: the window is complete.
-			return ctx, e.Seq, nil
 		case e.Seq == 1:
+			if e.Record.Type != "line_init" {
+				return nil, 0, joinRefused("the first record of the line is %s, not line_init", e.Record.Type)
+			}
 			if e.Prev != genesisHead(pin.LineID) {
 				return nil, 0, joinRefused("the first record does not stand on this line's genesis")
 			}
 			return ctx, 1, nil
 		case n >= budget:
-			// A budget below one, which no joiner means, opens nothing.
 			return nil, 0, &JoinError{Reason: "the live window before the endorsed head is over this joiner's budget", Err: ErrWindowTooLarge}
 		}
 		older := relay.Entries(e.Seq-1, e.Seq-1)
@@ -403,6 +427,9 @@ func openWindow(pin *JoinPin, relay JoinRelay, frame Entry, head string) (*signe
 		p := older[0]
 		if p.Seq != e.Seq-1 || frameHead(&p) != e.Prev {
 			return nil, 0, joinRefused("the record offered at %d does not open the head before the record at %d", e.Seq-1, e.Seq)
+		}
+		if p.SeqTime > e.SeqTime {
+			return nil, 0, joinRefused("the record at %d, in the live window, is stamped later than record %d", p.Seq, e.Seq)
 		}
 		head, e = e.Prev, p
 	}

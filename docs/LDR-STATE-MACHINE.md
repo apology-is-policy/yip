@@ -88,6 +88,15 @@ unchanged, and nobody has chosen it. Codex probed the model and found three
 missing checks and one unexercised premise; the section says what they were
 and what changed.
 
+§14.8 was added on 2026-11-25 on branch `gemini/ldr` after Gemini
+independently probed `claude/ldr` commit `2062b74`
+([LDR-GEMINI-REVIEW.md](LDR-GEMINI-REVIEW.md)). It records five findings
+(G1–G5) closed in `ldrcore/` and the draft adoption of Fable's §11.2 replay
+verification proposal (J1–J3 on every profile plus retired-anchor pruning),
+awaiting Codex, Claude and operator review. A companion draft recovery
+proposal (O23 / `recovery_generation`) lives in
+[LDR-RECOVERY.md](LDR-RECOVERY.md).
+
 This document owns: record types, authority, preconditions, effects, time
 rules, the sequencer-visible field allowlist, retry and dedup behaviour, and
 materialization. It does not own cryptographic constructions, enrollment
@@ -679,7 +688,11 @@ recognize them as one intention.
    call. This is client policy and not the wire dedup identity.
 3. On restart, or after a stale-checkpoint refusal, resolve every stored
    intent by query before constructing anything new. A timeout or a
-   cancellation is not evidence of non-commit. An intent marked
+   cancellation is not evidence of non-commit. An admission error on a query
+   (such as `clock_uncertain`) means that intent was not answered and does not
+   complete the pass; composing stays blocked until every active key's
+   unsettled intents receive a non-admission answer (or the key stops on
+   `revoked`). An intent marked
    reconciliation-required is asked about as well: asking is not sending. An
    answer that establishes nothing leaves it as it was, with the reason it
    already had. The intents of a key that has stopped (rule 8) are the
@@ -1291,7 +1304,18 @@ projection file merely because an edit would be noticed at a later rebuild.
 
 1. Append verified committed records to the local log store in `seq` order,
    re-deriving each outcome. Record, derived state and checkpoint advance in
-   one durable step of that store.
+   one durable step of that store. *Proposed amendment (call 0003 turn 28;
+   implemented on `gemini/ldr` pending Codex/operator review):* verifying each
+   committed record also checks what admission decided from recorded values —
+   that the signed generation matches the line's, that its named anchor head is
+   held on this chain (or genesis for `line_init` alone), that `seq_time -
+   anchor.seq_time <= validity` (against recorded commit time, never replay
+   time), and that its operation identity has not committed before. A client
+   may prune an anchor and its committed identities once `head_time` strictly
+   exceeds `anchor.seq_time + validity_max` (§5.6); any later record naming
+   that pruned anchor is still refused because the anchor is no longer held.
+   A client that halts on a sequencer violation or suspects a rollback fails
+   closed and makes no new authenticated `anchor_request` either.
 2. Projections follow from a separate, durable `projected_seq` cursor.
    Projection is idempotent and may lag or be rebuilt.
 3. Projection files are of two kinds. *Immutable* files (turns, notes, call
@@ -1426,7 +1450,7 @@ one:
 | O20 | Small rules the reference checker forced | Listed in §14.1 | Codex: reasonable for the initial profile. The actor limit now allows zero (§6.1), changed after its review |
 | O21 | Default-audience broadcast: should the sequencer verify the list equals the default audience? | Yes: exact set equality at the named revision (§8). Codex's verdict; implemented | Agreed |
 | O22 | Operator key lifecycle | Draft v7, following Codex's P8: a revoked operator key leaves a tombstone, is never authorized again, and is told `revoked` once it has shown possession; a key never authorized gets an admission error (§5.4, §6.2) | Agreed in design review; not operator-approved |
-| O23 | Sequence numbering across generations | Whether `seq` restarts in a new generation is undecided; §5.9 depends on the answer | Open, Codex, with recovery |
+| O23 | Sequence numbering across generations | Whether `seq` restarts in a new generation is undecided; §5.9 depends on the answer. Gemini drafted an unapproved v0 recovery proposal favouring reset to 1 with generation-qualified coordinates ([LDR-RECOVERY.md](LDR-RECOVERY.md)) | Open: Codex + Claude + operator, with recovery |
 | O24 | Questions this document leaves to the enrollment, control-bootstrap and envelope design | Listed in Appendix A.7 as Q1 to Q16. Where each stands after Codex's drafts v1 to v3 is in A.8. The four that were gaps in this document's own text or vectors (Q2, Q10, Q11, Q16) are closed in draft v7 | Partly closed; see A.8 |
 | O25 | Who vouches for a new member's starting state | Codex's draft (P4) proposes that the enrolling operator's device attests the complete control state at the enrollment's commit, and that the joiner verifies every record after it. That trusts the operator's verified store and signing path for everything before the join. If the records the joiner verifies revoke that operator's key before the joiner has accepted its starting state, the joiner stops, and a currently authorized operator must attest afresh for the same credential; that is not a second enrollment (draft v2, §4.2). The alternative is to replay every control record from genesis, which needs no such trust and grows with the line's age. Neither changes a rule in this document. The operator asked on 2026-11-23 for a better way than either. A third route is explored in §14.7: the chain commits to the state, and the operator's signature on the enrollment is the endorsement. It would change the chain frame, and it is not chosen | Open: operator, asked 2026-11-23, unanswered |
 | O26 | Whether the root key can sign inside a validity window | §4.4 gives root records ordinary validity, 10 minutes at most on the provisional numbers. Whether a protected or offline root key can catch up and sign in that time is to be found by a dry run. If it cannot, root records need a validity rule this document does not have | Open: operator, asked 2026-11-23, unanswered |
@@ -2294,6 +2318,55 @@ and the digest is FNV; neither is a proposal.
   breaks have one author; a count of breaks caught is not a measure of rules
   covered, and every round of Codex's probes, this one included, found what
   the author's tests had not.
+
+### 14.8 Gemini's independent probe of `2062b74` and §11.2 replay checks
+
+On 2026-11-25 Gemini independently reviewed and probed `claude/ldr` commit
+`2062b74` through a read-only Go overlay (recorded in
+[LDR-GEMINI-REVIEW.md](LDR-GEMINI-REVIEW.md)), while Codex and Claude were
+temporarily unavailable. All existing `ldrcore/` tests passed with `-race`.
+Five independent probes reproduced defects in the model:
+
+- **G1 (`ResolveAll` clears `mustResolve` on admission errors).** Running
+  `ResolveAll` while the relay returned `admission_error / clock_uncertain`
+  (leaving unsettled intents unanswered) unconditionally cleared
+  `mustResolve`, allowing `Compose` on a free slot to succeed immediately.
+  *Closed:* `ResolveAll` tracks whether any active key's query returned
+  `ClassAdmission` and clears `mustResolve` only when the pass completes
+  (trace T48).
+- **G2 (`Client.Anchor` contacts the relay while failed closed).** A client
+  that had halted on a sequencer violation or suspected a rollback
+  (`history_unavailable`) still sent an authenticated `AnchorRequest` (writing
+  a `time_anchor` at the relay), and in the rollback-suspected case `Anchor`
+  returned `nil`. *Closed:* `Anchor` returns `ErrFailClosed` before contacting
+  the relay whenever `halted` or `suspect` is set (trace T49).
+- **G3 (`openWindow` structural and budget gaps).** Against a dishonest relay
+  holding no keys under an honest endorser, Claude's live-window completeness
+  argument held up under audit. Against malformed or colluding prefixes,
+  `openWindow` missed non-decreasing timestamp checks (`p.SeqTime <=
+  e.SeqTime`), allowed empty `StateDigest` on prior window frames under
+  `StateCommit`, allowed signer fields on `OriginSequencer` frames, allowed a
+  non-`line_init` record at sequence 1, and evaluated `e.Seq == 1` before
+  rejecting a negative `MaxWindowRecords` budget. *Closed* in `join.go`.
+- **G4 (`verifyFrame` and `Apply` admission-field gaps).** `Apply` accepted
+  negative `ValidityMS` (passing on `line_init` in `ReplayVerified`), and
+  `verifyFrame` accepted empty `OpID` or `Digest` on signed records and
+  non-empty `Digest` on `time_anchor`. *Closed* in `apply.go` (vector A212)
+  and `commit.go`.
+- **G5 (`DecodeState` / `CheckInvariants` unreachable snapshots).**
+  `CheckInvariants` accepted generation-1 states with `root_rev == 0`,
+  `key_epoch == 0` with `rekey_pending == false`, an empty `readers` map or
+  empty reader list for an active epoch, invalid register names in
+  `register_writers`, empty map IDs, and invalid dispute resolution kinds.
+  *Closed* in `invariants.go`.
+
+In addition, Gemini adopted Fable's turn 28 proposal for §11.2 on `gemini/ldr`
+(draft, awaiting Codex/Claude/operator review): `Client.Sync` now runs
+signed-context replay verification (J1–J3 and anchor-on-chain) on every
+profile while preserving the signature-as-premise boundary on the ordinary
+profile, and `signedContext.prune` drops retired anchors and their committed
+operation identities once `head_time > anchor.seq_time + validity_max`
+(trace T50). Vectors: 210 active (2 retired), 50 traces (165 steps).
 
 ## Appendix A. What this document requires from the enrollment, control-bootstrap and envelope design
 

@@ -18,13 +18,14 @@ import (
 // What it leaves out, and what stands in:
 //
 //   - No transport. Records are handed to Sync by the test.
-//   - No cryptography. A signature is a premise, the chain head is the same
-//     non-cryptographic stand-in the sequencer model uses, and whether a
-//     payload decrypts is a flag on Payload. The premise covers the signed
-//     context as well: Sync does not check a record's generation, the head
-//     it was signed over, its deadline, or that its operation identity had
-//     not committed before. Under a profile that commits state, and only
-//     there, Sync checks all of that and the signature stand-in (commit.go).
+//   - No cryptography. Under the ordinary profile a signature is a premise,
+//     the chain head is the same non-cryptographic stand-in the sequencer
+//     model uses, and whether a payload decrypts is a flag on Payload.
+//     Signed-context replay rules (generation, anchor on chain, historical
+//     deadline against recorded times, and unique committed operation
+//     identity, with retired anchor pruning) run on every profile (spec 11.2).
+//     Under a profile that commits state, Sync additionally verifies the
+//     signature stand-in and state commitment (commit.go).
 //   - No disk. Every field below is durable by definition. A crash is
 //     modelled as a procedure stopping between two durable steps (Fault), so
 //     the only thing a crash can lose is the rest of that procedure.
@@ -57,9 +58,10 @@ type Client struct {
 	state  State
 	ckSeq  int64
 	ckHead string
-	// signed is set only under a profile that commits state (commit.go): the
-	// heads and operation identities the frame verification refers back to.
-	// It advances in the same step as the rest of the store.
+	// signed holds the unretired anchor heads and committed operation
+	// identities that frame verification checks on replay (commit.go).
+	// It advances in the same step as the rest of the store and prunes
+	// retired anchors as sequencer time advances.
 	signed    *signedContext
 	touchedBy [][]string        // per record: the objects it changed
 	touched   map[string]int64  // object -> the last record that changed it
@@ -116,12 +118,8 @@ func (e *ViolationError) Error() string {
 
 // NewClient returns a client with an empty store, anchored on genesis.
 func NewClient(lineID, cred string, prof Profile) *Client {
-	var signed *signedContext
-	if prof.StateCommit {
-		signed = newSignedContext()
-	}
 	return &Client{
-		signed:     signed,
+		signed:     newSignedContext(),
 		LineID:     lineID,
 		Cred:       cred,
 		ValidityMS: min(60000, prof.ValidityMaxMS),
@@ -190,36 +188,9 @@ func (c *Client) Sync(entries []Entry) error {
 			// Out of order is a transport matter, not a verdict on anyone.
 			return fmt.Errorf("ldrcore: record %d offered while the checkpoint is at %d", e.Seq, c.ckSeq)
 		}
-		var next State
-		if c.signed != nil {
-			// Under a profile that commits state, a signature made from this
-			// checkpoint may be what a joiner takes its whole starting state
-			// on (join.go). So here the signature is not a premise: the client
-			// runs the full frame verification, signed context included, and
-			// signs nothing on a head it has not verified that way. A
-			// difference in the committed state does not say which side is
-			// right; the client stops on it all the same.
-			n, err := verifyFrame(c.LineID, c.prof, c.state, c.ckHead, c.signed, e)
-			if err != nil {
-				return c.halt(e.Seq, err.Error())
-			}
-			next = n
-		} else {
-			if e.StateDigest != "" {
-				return c.halt(e.Seq, "the frame carries a state digest that this profile does not define")
-			}
-			// The head is computed from the head this client verified, never
-			// from the predecessor a frame claims for itself.
-			linked := e
-			linked.Prev = c.ckHead
-			if frameHead(&linked) != e.Head {
-				return c.halt(e.Seq, "the record does not chain onto the verified head")
-			}
-			n, out := Apply(c.state, e.Record, e.SeqTime, c.prof)
-			if out.Kind != Committed {
-				return c.halt(e.Seq, fmt.Sprintf("%s does not commit on replay: %s %s", e.Record.Type, out.Kind, out.Reason))
-			}
-			next = n
+		next, err := verifyFrame(c.LineID, c.prof, c.state, c.ckHead, c.signed, e, c.prof.StateCommit)
+		if err != nil {
+			return c.halt(e.Seq, err.Error())
 		}
 		// One durable step.
 		e.Record = e.Record.Clone()
@@ -235,9 +206,8 @@ func (c *Client) Sync(entries []Entry) error {
 		}
 		c.owed = append(c.owed, c.noticesFor(&next, e))
 		c.state, c.ckSeq, c.ckHead = next, e.Seq, e.Head
-		if c.signed != nil {
-			c.signed.record(&e, e.Head)
-		}
+		c.signed.record(&e, e.Head)
+		c.signed.prune(e.SeqTime, c.prof.ValidityMaxMS)
 		// A key whose revocation this client has now verified signs nothing
 		// more (outbox.go).
 		c.stopRevoked()

@@ -154,7 +154,7 @@ func buildCommon(p *plan, s *State, r *Record, prof Profile) {
 	want, known := recordOrigin[r.Type]
 
 	p.require(rInvalidSyntax, func() bool { return known })
-	p.require(rInvalidSyntax, func() bool { return r.ValidityMS <= prof.ValidityMaxMS })
+	p.require(rInvalidSyntax, func() bool { return r.ValidityMS >= 0 && r.ValidityMS <= prof.ValidityMaxMS })
 	p.require(rInvalidSyntax, func() bool { return !r.UnexpectedLineCiphertext || r.carriesLineCiphertext() })
 
 	// Record-specific content limit. It applies to every record that carries

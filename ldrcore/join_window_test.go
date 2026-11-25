@@ -274,26 +274,23 @@ func TestTheLiveWindow(t *testing.T) {
 	})
 
 	t.Run("a record anchored before the window was not admissible", func(t *testing.T) {
-		// The relay commits the old note signed over 12, which the window
-		// does not reach. Replay from genesis holds that head and refuses the
-		// note on its deadline.
+		// The relay commits the old note signed over 12, which retired before
+		// record 14. Both Join (window ends at 13) and ReplayVerified (pruned
+		// retired anchors at 14) no longer hold 12 and refuse it.
 		e, over12, _, en := aged(t)
 		f := forgeOnto(t, e.q.Log(), e.q.State())
 		f.frame(over12, e.now)
 		f.frame(en, e.now)
-		wantRefused(t, joinErr(t, pin, f, e.q, e.now), "record 15 (call_note) is anchored at 12, which is not a head this verifier holds")
-		if _, _, err := ReplayVerified("L", f.entries, commitProfile); err == nil ||
-			!strings.Contains(err.Error(), "record 15 (call_note) committed 601002 ms after its anchor at 12") {
-			t.Fatalf("replay from genesis: %v, want a refusal on the deadline", err)
-		}
+		bothRefuse(t, pin, e, f, "record 15 (call_note) is anchored at 12, which is not a head this verifier holds")
 	})
 
-	t.Run("a record anchored on the window's oldest record is past its deadline", func(t *testing.T) {
+	t.Run("a record anchored on the window's oldest retired record is refused", func(t *testing.T) {
+		// Record 13 retired before record 14, so neither verifier retains it.
 		e, _, over13, en := aged(t)
 		f := forgeOnto(t, e.q.Log(), e.q.State())
 		f.frame(over13, e.now)
 		f.frame(en, e.now)
-		bothRefuse(t, pin, e, f, "record 15 (call_note) committed 601001 ms after its anchor at 13")
+		bothRefuse(t, pin, e, f, "record 15 (call_note) is anchored at 13, which is not a head this verifier holds")
 	})
 
 	t.Run("a member that was shown another history before the endorsed head", func(t *testing.T) {

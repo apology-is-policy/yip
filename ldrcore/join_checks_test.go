@@ -443,8 +443,23 @@ func chainOf(t *testing.T, prev string, n int64) *forger {
 	s.Line.HeadSeq = n
 	f := &forger{t: t, snaps: snapshots{n: EncodeState(s)}, state: s, head: prev}
 	for seq := int64(1); seq <= n; seq++ {
-		e := Entry{Seq: seq, SeqTime: s.Line.HeadTime, Prev: f.head,
-			Record: Record{Origin: OriginSequencer, Type: "time_anchor"}, StateDigest: "0000000000000000"}
+		var e Entry
+		if seq == 1 {
+			e = Entry{
+				Seq: 1, SeqTime: s.Line.HeadTime, Prev: f.head, SeenHead: prev,
+				Key:         OpKey{Generation: 1, Signer: Root, SeenSeq: 0, OpID: "init"},
+				Digest:      "init",
+				Record:      lineInit(),
+				StateDigest: "0000000000000000",
+			}
+			e.Sig = signatureOf(Root, &e)
+		} else {
+			e = Entry{
+				Seq: seq, SeqTime: s.Line.HeadTime, Prev: f.head,
+				Record:      Record{Origin: OriginSequencer, Type: "time_anchor"},
+				StateDigest: "0000000000000000",
+			}
+		}
 		if seq == n {
 			e.StateDigest = StateDigest("L", commitProfile, s)
 		}

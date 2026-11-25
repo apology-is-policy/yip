@@ -221,12 +221,13 @@ func ReplayVerified(lineID string, log []Entry, prof Profile) (State, string, er
 	head := genesisHead(lineID)
 	ctx := newSignedContext()
 	for _, e := range log {
-		next, err := verifyFrame(lineID, prof, s, head, ctx, e)
+		next, err := verifyFrame(lineID, prof, s, head, ctx, e, true)
 		if err != nil {
 			return State{}, "", err
 		}
 		s, head = next, e.Head
 		ctx.record(&e, head)
+		ctx.prune(e.SeqTime, prof.ValidityMaxMS)
 	}
 	return s, head, nil
 }
@@ -238,10 +239,11 @@ func ReplayVerified(lineID string, log []Entry, prof Profile) (State, string, er
 // them out would take whatever a relay chose to admit. Codex's probe of the
 // first version of this file showed exactly that (call 0003, turn 27).
 //
-// It keeps everything it is given. A verifier that runs for long would drop
-// what has retired: an anchor older than the head by more than the maximum
-// validity can be named by nothing that is still admissible, and the
-// identities under it can no longer be repeated.
+// Once headTime passes an anchor's seq_time plus the generation's maximum
+// validity, nothing anchored there can ever be admitted again (spec 5.6), so
+// prune drops the retired anchor and every committed operation identity under
+// it. Any later record naming that retired anchor is refused because the
+// anchor is no longer held.
 type signedContext struct {
 	anchors map[int64]anchor
 	ops     map[OpKey]int64
@@ -263,6 +265,30 @@ func (x *signedContext) record(e *Entry, head string) {
 	x.anchors[e.Seq] = anchor{head: head, time: e.SeqTime}
 	if e.Record.Origin != OriginSequencer {
 		x.ops[e.Key] = e.Seq
+	}
+}
+
+// prune drops anchors whose identity space has retired under the strict rule
+// of spec 5.6 (headTime > anchor.time + validityMaxMS), together with all
+// committed operation identities anchored on them.
+func (x *signedContext) prune(headTime, validityMaxMS int64) {
+	var retired map[int64]bool
+	for seq, a := range x.anchors {
+		if headTime > a.time+validityMaxMS {
+			if retired == nil {
+				retired = map[int64]bool{}
+			}
+			retired[seq] = true
+			delete(x.anchors, seq)
+		}
+	}
+	if len(retired) == 0 {
+		return
+	}
+	for k := range x.ops {
+		if retired[k.SeenSeq] {
+			delete(x.ops, k)
+		}
 	}
 }
 
@@ -288,7 +314,8 @@ func (x *signedContext) admitted(lineID string, e *Entry) error {
 	a, held := x.anchors[e.Key.SeenSeq]
 	switch {
 	case !held:
-		// Genesis is never held: only line_init is signed over it.
+		// Genesis is never held: only line_init is signed over it. A retired
+		// anchor that prune dropped also lands here.
 		return fmt.Errorf("record %d (%s) is anchored at %d, which is not a head this verifier holds", e.Seq, e.Record.Type, e.Key.SeenSeq)
 	case a.head != e.SeenHead:
 		// Evidence of divergent histories (spec 5.2).
@@ -307,28 +334,44 @@ func (x *signedContext) admitted(lineID string, e *Entry) error {
 // verifyFrame checks one frame against the state and the head before it and
 // against what ctx holds, and returns the state after it. It changes nothing:
 // the caller takes the frame into ctx once it has accepted it. It is the step
-// Join, ReplayVerified and a member under a profile that commits state share.
-func verifyFrame(lineID string, prof Profile, s State, head string, ctx *signedContext, e Entry) (State, error) {
+// Join, ReplayVerified and Client.Sync share.
+//
+// When checkSig is true (ReplayVerified, Join, and Client.Sync under
+// Profile.StateCommit), the frame's Prev field and signature stand-in are
+// checked. When checkSig is false (Client.Sync under the ordinary profile),
+// signature verification remains a stated premise and the head is computed
+// directly from the client's verified predecessor head; signed-context replay
+// rules (generation, anchor on chain, historical deadline, unique committed
+// operation identity) still run unconditionally.
+func verifyFrame(lineID string, prof Profile, s State, head string, ctx *signedContext, e Entry, checkSig bool) (State, error) {
 	if e.Seq != s.Line.HeadSeq+1 {
 		return State{}, fmt.Errorf("a record numbered %d follows the record numbered %d", e.Seq, s.Line.HeadSeq)
 	}
-	if e.Prev != head {
-		return State{}, fmt.Errorf("record %d does not name the head before it", e.Seq)
-	}
-	if frameHead(&e) != e.Head {
-		return State{}, fmt.Errorf("record %d does not chain onto the head before it", e.Seq)
+	if checkSig {
+		if e.Prev != head {
+			return State{}, fmt.Errorf("record %d does not name the head before it", e.Seq)
+		}
+		if frameHead(&e) != e.Head {
+			return State{}, fmt.Errorf("record %d does not chain onto the head before it", e.Seq)
+		}
+	} else {
+		linked := e
+		linked.Prev = head
+		if frameHead(&linked) != e.Head {
+			return State{}, fmt.Errorf("record %d does not chain onto the verified head", e.Seq)
+		}
 	}
 	signed := e.Record.Origin != OriginSequencer
 	if !signed {
-		if e.Sig != "" || e.SeenHead != "" || e.Key != (OpKey{}) {
+		if e.Sig != "" || e.SeenHead != "" || e.Key != (OpKey{}) || e.Digest != "" {
 			return State{}, fmt.Errorf("record %d is sequencer-origin and carries a signer's fields", e.Seq)
 		}
 	} else {
 		signer := signerOf(&e.Record)
-		if !signedBy(&e, signer) {
+		if checkSig && !signedBy(&e, signer) {
 			return State{}, fmt.Errorf("record %d (%s) does not carry the signature of %q", e.Seq, e.Record.Type, signer)
 		}
-		if e.Key.Signer != signer || e.Key.SeenSeq >= e.Seq || e.Key.SeenSeq < 0 {
+		if e.Key.Signer != signer || e.Key.SeenSeq >= e.Seq || e.Key.SeenSeq < 0 || e.Key.OpID == "" || e.Digest == "" {
 			return State{}, fmt.Errorf("record %d (%s) has an operation identity that does not fit it", e.Seq, e.Record.Type)
 		}
 		if err := ctx.admitted(lineID, &e); err != nil {
