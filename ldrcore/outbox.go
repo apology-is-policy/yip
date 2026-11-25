@@ -122,17 +122,26 @@ var (
 func (c *Client) principalOf(origin string) string {
 	switch origin {
 	case OriginActor, OriginCredential:
+		if c.Cred == "" {
+			return ""
+		}
 		return CredentialPrincipal(c.Cred)
 	case OriginOperator:
+		if c.OperatorKey == "" {
+			return ""
+		}
 		return OperatorPrincipal(c.OperatorKey)
 	case OriginRoot:
-		return Root
+		if c.RootKey == "" {
+			return ""
+		}
+		return RootPrincipal(c.RootKey)
 	}
 	return ""
 }
 
 // revokedInRecords reports whether the records this client has verified
-// revoke principal p.
+// revoke or replace principal p.
 func (c *Client) revokedInRecords(p string) bool {
 	l := &c.state.Line
 	switch {
@@ -141,6 +150,8 @@ func (c *Client) revokedInRecords(p string) bool {
 		return cr != nil && cr.Revoked
 	case strings.HasPrefix(p, "op:"):
 		return slices.Contains(l.Tombstones.OperatorKeys, strings.TrimPrefix(p, "op:"))
+	case strings.HasPrefix(p, "root:"):
+		return slices.Contains(l.Tombstones.RootKeys, strings.TrimPrefix(p, "root:"))
 	}
 	return false
 }
@@ -182,10 +193,19 @@ func (c *Client) stopRevoked() {
 	}
 }
 
-// deviceKeys names the keys of this device that can be revoked. The root key
-// is not among them: nothing in this design revokes it.
+// deviceKeys names the keys of this device that can be revoked or replaced.
 func (c *Client) deviceKeys() []string {
-	return []string{CredentialPrincipal(c.Cred), OperatorPrincipal(c.OperatorKey)}
+	var out []string
+	if c.Cred != "" {
+		out = append(out, CredentialPrincipal(c.Cred))
+	}
+	if c.OperatorKey != "" {
+		out = append(out, OperatorPrincipal(c.OperatorKey))
+	}
+	if c.RootKey != "" {
+		out = append(out, RootPrincipal(c.RootKey))
+	}
+	return out
 }
 
 // Stopped returns the keys of this device that sign nothing more.
@@ -266,10 +286,11 @@ func (c *Client) acting(r *Record) (string, error) {
 		r.Operator = c.OperatorKey
 		return "op:" + c.OperatorKey, nil
 	case OriginRoot:
-		if !c.Root {
+		if c.RootKey == "" || (r.RootKey != "" && r.RootKey != c.RootKey) {
 			return "", ErrNotSigner
 		}
-		return Root, nil
+		r.RootKey = c.RootKey
+		return RootPrincipal(c.RootKey), nil
 	}
 	return "", ErrNotSigner
 }
@@ -284,6 +305,8 @@ func targetOf(r *Record) string {
 		return "line"
 	case "operator_key_authorize", "operator_key_revoke":
 		return "operator_key:" + r.OperatorKey
+	case "root_member_replace":
+		return "root_key:" + r.OldRootKey
 	case "credential_enroll", "credential_revoke":
 		return "cred:" + r.Cred
 	case "key_epoch_activate":

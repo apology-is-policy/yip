@@ -157,9 +157,11 @@ func reopen(actor string, lifecycle, turns int64) Record {
 	return r
 }
 
-// lineInit is the root's first record. The root key is a name, as every key
-// in this package is.
-func lineInit() Record { return Record{Origin: OriginRoot, Type: "line_init", RootKey: "rootK"} }
+// lineInit is the root's first record. Equal 1-of-2 roots: two distinct root
+// keys are provisioned, and one of them signs the record.
+func lineInit() Record {
+	return Record{Origin: OriginRoot, Type: "line_init", RootKey: "rootK1", RootKeys: []string{"rootK1", "rootK2"}}
+}
 
 // enroll is an enrollment of cred with two keys of its own. The premise that
 // cred is the derivation of those keys is not modelled.
@@ -187,7 +189,7 @@ func newLineWith(t *testing.T, prof Profile) *env {
 	t.Helper()
 	e := newEnvWith(t, prof)
 	e.commit(lineInit())
-	e.commit(Record{Origin: OriginRoot, Type: "operator_key_authorize", OperatorKey: "op1", Expect: Expect{RootRev: ptr(1)}})
+	e.commit(Record{Origin: OriginRoot, Type: "operator_key_authorize", RootKey: "rootK1", OperatorKey: "op1", Expect: Expect{RootRev: ptr(1)}})
 	e.commit(enroll("credA", "nsA", "jr1"))
 	e.commit(Record{Origin: OriginOperator, Type: "key_epoch_activate", Operator: "op1", Manifest: []string{"credA"}, Expect: Expect{KeyEpoch: ptr(0)}})
 	e.commit(enroll("credB", "nsB", "jr2"))
@@ -668,7 +670,7 @@ var traceTests = map[string]func(*testing.T){
 		e := newLine(t)
 		in, seq := e.commit(enroll("credC", "nsC", "jr3"))
 		unsent := e.intent(revoke("credC")) // signed by op1 before its revocation
-		e.commit(Record{Origin: OriginRoot, Type: "operator_key_revoke", OperatorKey: "op1", Expect: Expect{RootRev: ptr(2)}})
+		e.commit(Record{Origin: OriginRoot, Type: "operator_key_revoke", RootKey: "rootK1", OperatorKey: "op1", Expect: Expect{RootRev: ptr(2)}})
 		if got := e.q.State().Line.Tombstones.OperatorKeys; len(got) != 1 || got[0] != "op1" {
 			t.Fatalf("operator-key tombstones after the revocation: %v", got)
 		}
@@ -696,13 +698,13 @@ var traceTests = map[string]func(*testing.T){
 		}
 
 		// The root cannot bring the key back. It authorizes a fresh one.
-		again := e.intent(Record{Origin: OriginRoot, Type: "operator_key_authorize", OperatorKey: "op1", Expect: Expect{RootRev: ptr(3)}})
+		again := e.intent(Record{Origin: OriginRoot, Type: "operator_key_authorize", RootKey: "rootK1", OperatorKey: "op1", Expect: Expect{RootRev: ptr(3)}})
 		e.wantOutcome(e.submit(again), Rejected, "conflict", false)
-		e.commit(Record{Origin: OriginRoot, Type: "operator_key_authorize", OperatorKey: "op2", Expect: Expect{RootRev: ptr(3)}})
+		e.commit(Record{Origin: OriginRoot, Type: "operator_key_authorize", RootKey: "rootK2", OperatorKey: "op2", Expect: Expect{RootRev: ptr(3)}})
 
 		// An active principal reconciles the revoked key's history by naming
 		// the operation and its digest. The signer of that history is unchanged.
-		for _, who := range []string{Root, OperatorPrincipal("op2")} {
+		for _, who := range []string{RootPrincipal("rootK1"), RootPrincipal("rootK2"), OperatorPrincipal("op2")} {
 			a := e.q.Query(who, keyOf(in), in.Digest, At(e.now))
 			e.wantOutcome(a, Committed, "", true)
 			if a.Seq != seq || keyOf(in).Signer != OperatorPrincipal("op1") {
@@ -727,23 +729,23 @@ func TestQueryIsNotCancellation(t *testing.T) {
 	e := newLine(t)
 	in := e.intent(turn("a1", 2))
 	hot, logLen := e.q.HotEntries(), len(e.q.Log())
-	for _, who := range []string{CredentialPrincipal("credA"), OperatorPrincipal("op1"), Root} {
+	for _, who := range []string{CredentialPrincipal("credA"), OperatorPrincipal("op1"), RootPrincipal("rootK1"), RootPrincipal("rootK2")} {
 		e.want(e.q.Query(who, keyOf(in), in.Digest, At(e.now)), ClassUnknown, "outcome_unknown")
 	}
 	if e.q.HotEntries() != hot || len(e.q.Log()) != logLen {
 		t.Fatal("a query changed sequencer state")
 	}
 	e.wantOutcome(e.submit(in), Committed, "", false)
-	e.wantOutcome(e.q.Query(Root, keyOf(in), in.Digest, At(e.now)), Committed, "", true)
-	e.want(e.q.Query(Root, keyOf(in), "other-bytes", At(e.now)), ClassMismatch, "")
+	e.wantOutcome(e.q.Query(RootPrincipal("rootK1"), keyOf(in), in.Digest, At(e.now)), Committed, "", true)
+	e.want(e.q.Query(RootPrincipal("rootK2"), keyOf(in), "other-bytes", At(e.now)), ClassMismatch, "")
 }
 
-// A principal that is not a credential, an operator key or the root has no
-// standing at all, and is refused like a key nobody has heard of.
+// A principal that is not a credential, an operator key or an active root has
+// no standing at all, and is refused like a key nobody has heard of.
 func TestUnknownPrincipalKind(t *testing.T) {
 	e := newLine(t)
 	in, _ := e.commit(turn("a1", 2))
-	for _, who := range []string{"", "cred:", "op:", "robot:x", "credA"} {
+	for _, who := range []string{"", "cred:", "op:", "root", "root:", "root:rootX", "robot:x", "credA"} {
 		e.want(e.q.Query(who, keyOf(in), in.Digest, At(e.now)), ClassAdmission, "unknown_signer")
 		if _, _, wrote, a := e.q.AnchorRequest(who, At(e.now+3600000)); wrote || a.Code != "not_authorized" {
 			t.Fatalf("anchor request by %q: %s, wrote %t", who, showAnswer(a), wrote)
@@ -904,7 +906,7 @@ func TestSequencerRandomWalk(t *testing.T) {
 				in, was := sent[k].in, sent[k].answer
 				hot, logLen := e.q.HotEntries(), len(e.q.Log())
 				before := e.q.TimeFloor()
-				a := e.q.Query(Root, keyOf(in), in.Digest, clock)
+				a := e.q.Query(RootPrincipal("rootK1"), keyOf(in), in.Digest, clock)
 				if e.q.HotEntries() != hot || len(e.q.Log()) != logLen || e.q.TimeFloor() != before {
 					t.Fatalf("seed %d step %d: a query changed sequencer state", seed, i)
 				}
@@ -912,7 +914,7 @@ func TestSequencerRandomWalk(t *testing.T) {
 					t.Fatalf("seed %d step %d: query of a committed operation answered %s", seed, i, showAnswer(a))
 				}
 			case op < 17:
-				e.q.AnchorRequest([]string{CredentialPrincipal("credA"), OperatorPrincipal("op1"), Root}[rng.Intn(3)], clock)
+				e.q.AnchorRequest([]string{CredentialPrincipal("credA"), OperatorPrincipal("op1"), RootPrincipal("rootK1"), RootPrincipal("rootK2")}[rng.Intn(4)], clock)
 			case op < 18:
 				e.q.Compact(clock)
 			default: // time passes: usually a little, sometimes past a deadline or a retirement
@@ -1079,9 +1081,10 @@ func TestBootstrapContext(t *testing.T) {
 // copy Log returns shares a pointer or a slice with it.
 func TestCommittedRecordsDoNotAlias(t *testing.T) {
 	e := newEnv(t)
-	e.commit(lineInit())
+	initRec := lineInit()
+	e.commit(initRec)
 	rootRev := int64(1)
-	authorize := Record{Origin: OriginRoot, Type: "operator_key_authorize", OperatorKey: "op1", Expect: Expect{RootRev: &rootRev}}
+	authorize := Record{Origin: OriginRoot, Type: "operator_key_authorize", RootKey: "rootK1", OperatorKey: "op1", Expect: Expect{RootRev: &rootRev}}
 	e.commit(authorize)
 	grant := &Grant{Namespace: "nsA", ActorLimit: 4, Reader: true}
 	first := enroll("credA", "nsA", "jr1")
@@ -1095,18 +1098,20 @@ func TestCommittedRecordsDoNotAlias(t *testing.T) {
 	e.checkReplay()
 
 	// The caller scribbles on everything it still holds.
+	initRec.RootKeys[0] = "rootEvil"
 	rootRev, grant.Namespace, grant.ActorLimit, manifest[0], recipients[0] = 99, "nsEvil", 0, "credEvil", "zz"
 	e.checkReplay()
 
 	// And on everything Log handed back.
 	got := e.q.Log()
+	got[0].Record.RootKeys[0] = "rootEvil"
 	*got[1].Record.Expect.RootRev = 77
 	got[2].Record.Grant.Namespace = "nsEvil"
 	got[3].Record.Manifest[0] = "credEvil"
 	got[5].Record.Recipients[0] = "zz"
 	got[0].Record.Type = "tampered"
 	e.checkReplay()
-	if again := e.q.Log(); *again[1].Record.Expect.RootRev != 1 || again[2].Record.Grant.Namespace != "nsA" ||
+	if again := e.q.Log(); again[0].Record.RootKeys[0] != "rootK1" || *again[1].Record.Expect.RootRev != 1 || again[2].Record.Grant.Namespace != "nsA" ||
 		again[3].Record.Manifest[0] != "credA" || again[5].Record.Recipients[0] != "a1" || again[0].Record.Type != "line_init" {
 		t.Fatal("the sequencer's log was changed through a returned copy")
 	}

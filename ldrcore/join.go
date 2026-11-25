@@ -65,14 +65,14 @@ import (
 // accepted a checkpoint, and a generation change.
 
 // JoinPin is what a joining device fixed before it was handed any state: the
-// line, the profile and the root key from the creation descriptor, the
+// line, the profile and the root keys from the creation descriptor, the
 // enrolling operator's key, and its own request. How each reaches the device
 // is the ceremony's business and a premise here.
 type JoinPin struct {
 	LineID     string
 	Generation int64
 	Profile    Profile
-	RootKey    string
+	RootKeys   []string
 	// Operator is the key of the operator the joiner expects to enroll it.
 	Operator string
 
@@ -279,8 +279,8 @@ func Join(pin JoinPin, relay JoinRelay, snaps SnapshotSource, clk Clock) (*Joine
 	switch {
 	case l.Generation != pin.Generation || l.HeadSeq != at || l.HeadTime != frame.SeqTime:
 		return nil, joinRefused("the snapshot is a state of another coordinate than the endorsed head")
-	case l.RootKey != pin.RootKey:
-		return nil, joinRefused("the snapshot names another root key than the one pinned")
+	case len(pin.RootKeys) != 2 || hasDuplicates(pin.RootKeys) || !sameSet(l.RootKeys, pin.RootKeys):
+		return nil, joinRefused("the snapshot names other root keys than the ones pinned")
 	case !slices.Contains(l.Operators, pin.Operator):
 		return nil, joinRefused("the pinned operator is not authorized in the endorsed state")
 	}

@@ -239,15 +239,24 @@ func (q *Sequencer) TimeFloor() int64 { return q.floor }
 func (q *Sequencer) HotEntries() int { return len(q.hot) }
 
 // signerOf names the key that signs a record, in a namespace that keeps
-// credentials, operator keys and the root apart.
+// credentials, operator keys and root keys apart.
 func signerOf(r *Record) string {
 	switch r.Origin {
 	case OriginActor, OriginCredential:
-		return "cred:" + r.Cred
+		if r.Cred == "" {
+			return ""
+		}
+		return CredentialPrincipal(r.Cred)
 	case OriginOperator:
-		return "op:" + r.Operator
+		if r.Operator == "" {
+			return ""
+		}
+		return OperatorPrincipal(r.Operator)
 	case OriginRoot:
-		return "root"
+		if r.RootKey == "" {
+			return ""
+		}
+		return RootPrincipal(r.RootKey)
 	}
 	return ""
 }
@@ -259,19 +268,21 @@ func CredentialPrincipal(id string) string { return "cred:" + id }
 // OperatorPrincipal names an operator key as a principal.
 func OperatorPrincipal(id string) string { return "op:" + id }
 
-// Root is the root principal.
-const Root = "root"
+// RootPrincipal names a root key as a principal.
+func RootPrincipal(key string) string { return "root:" + key }
 
 // Standings of a principal.
 const (
 	standingActive = iota // may submit, query and request anchors
-	// standingRevoked is a credential that was revoked, or an operator key
-	// that was authorized and then revoked. The state keeps a tombstone for
-	// both, so the key is told that it is revoked and nothing more: not
-	// whether an earlier operation of its committed.
+	// standingRevoked is a credential that was revoked, an operator key that
+	// was authorized and then revoked, or a root key that was active and then
+	// replaced. The state keeps a tombstone for each, so the key is told that
+	// it is revoked and nothing more: not whether an earlier operation of its
+	// committed.
 	standingRevoked
 	// standingNever is a key that never held the role it claims: a credential
-	// that was never enrolled, an operator key that was never authorized.
+	// that was never enrolled, an operator key that was never authorized, or a
+	// root key that was never active.
 	standingNever
 )
 
@@ -282,8 +293,13 @@ const (
 func (q *Sequencer) standing(principal string) int {
 	l := &q.state.Line
 	switch {
-	case principal == Root:
-		return standingActive
+	case len(principal) > 5 && principal[:5] == "root:":
+		switch k := principal[5:]; {
+		case slices.Contains(l.RootKeys, k):
+			return standingActive
+		case slices.Contains(l.Tombstones.RootKeys, k):
+			return standingRevoked
+		}
 	case len(principal) > 5 && principal[:5] == "cred:":
 		c := l.Credentials[principal[5:]]
 		switch {
@@ -392,6 +408,9 @@ func (q *Sequencer) Submit(in Intent, c Clock) Answer {
 	if in.ValidityMS < 0 || in.SeenSeq < 0 || in.OpID == "" || in.Digest == "" {
 		return admission("malformed")
 	}
+	if in.Record.Type != "line_init" && q.gen == 0 {
+		return admission("no_line")
+	}
 	signer := signerOf(&in.Record)
 	if signer == "" {
 		return admission("malformed")
@@ -400,9 +419,6 @@ func (q *Sequencer) Submit(in Intent, c Clock) Answer {
 	// line_init is the bootstrap exception: no prior checkpoint, no validity.
 	if in.Record.Type == "line_init" {
 		return q.submitLineInit(in, signer, c)
-	}
-	if q.gen == 0 {
-		return admission("no_line")
 	}
 
 	// Authorization to learn an outcome comes before any lookup. A revoked
@@ -467,6 +483,13 @@ func (q *Sequencer) Submit(in Intent, c Clock) Answer {
 
 func (q *Sequencer) submitLineInit(in Intent, signer string, c Clock) Answer {
 	key := OpKey{Generation: in.Generation, Signer: signer, SeenSeq: in.SeenSeq, OpID: in.OpID}
+	// Once a line exists, standing is checked before any receipt lookup so a
+	// replaced root key cannot probe its earlier line_init receipt.
+	if q.gen != 0 {
+		if a, ok := access(q.standing(signer)); !ok {
+			return a
+		}
+	}
 	// A retry of the line_init that created this line gets its receipt, and
 	// changed bytes under that identity are a mismatch. Only a recorded
 	// outcome is looked up here: before the line exists there is no current
@@ -620,7 +643,7 @@ func (q *Sequencer) Query(principal string, key OpKey, digest string, c Clock) A
 	if a, ok := access(q.standing(principal)); !ok {
 		return a
 	}
-	reconciler := principal == Root || (len(principal) > 3 && principal[:3] == "op:")
+	reconciler := (len(principal) > 5 && principal[:5] == "root:") || (len(principal) > 3 && principal[:3] == "op:")
 	if principal != key.Signer && !reconciler {
 		// Refused before any index lookup.
 		return admission("not_authorized")

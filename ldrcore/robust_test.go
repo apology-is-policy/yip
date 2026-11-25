@@ -41,9 +41,13 @@ func TestHostileRecords(t *testing.T) {
 	actors := []string{"a1", "a2", "b1", "zz", ""}
 	operators := []string{"op1", "op9"}
 	// One knob moves every target field together: existing, missing, empty.
-	targets := []struct{ call, related, to, dispute, broadcast, toCred, namespace, register, key, sk, ek string }{
-		{"c1", "c2", "b1", "1", "bc1", "credB", "nsA", "presence", "op1", "skA", "ekB"},
-		{"c9", "c9", "zz", "9", "bc9", "credZ", "nsZ", "bogus", "op9", "skZ", "ekZ"},
+	targets := []struct {
+		call, related, to, dispute, broadcast, toCred, namespace, register, key, sk, ek string
+		rootKey, oldRoot, newRoot                                                       string
+		rootKeys                                                                        []string
+	}{
+		{"c1", "c2", "b1", "1", "bc1", "credB", "nsA", "presence", "op1", "skA", "ekB", "rootK1", "rootK2", "rootK9", []string{"rootK1", "rootK2"}},
+		{"c9", "c9", "zz", "9", "bc9", "credZ", "nsZ", "bogus", "op9", "skZ", "ekZ", "rootK9", "rootK9", "op1", []string{"rootK9"}},
 		{},
 	}
 	zero, one, two, three := int64(0), int64(1), int64(2), int64(3)
@@ -117,7 +121,8 @@ func TestHostileRecords(t *testing.T) {
 										Call: tg.call, Related: tg.related, To: tg.to, Dispute: tg.dispute, Broadcast: tg.broadcast,
 										ToCred: tg.toCred, Namespace: tg.namespace, Register: tg.register, OperatorKey: tg.key,
 										State: "linked", Kind: "withdrawn", Incarnation: "z9", JoinRequest: "jr9", JoinRequestDigest: "jd9",
-										SigningKey: tg.sk, EncryptionKey: tg.ek, RootKey: tg.key,
+										SigningKey: tg.sk, EncryptionKey: tg.ek,
+										RootKey: tg.rootKey, RootKeys: tg.rootKeys, OldRootKey: tg.oldRoot, NewRootKey: tg.newRoot,
 										Recipients: []string{tg.to}, Manifest: []string{cred},
 										Grant: &Grant{Namespace: tg.namespace, ActorLimit: 1},
 									}

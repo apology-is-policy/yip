@@ -183,6 +183,10 @@ func buildCommon(p *plan, s *State, r *Record, prof Profile) {
 		})
 	case OriginOperator:
 		p.require(rUnauthOrigin, func() bool { return slices.Contains(l.Operators, r.Operator) })
+	case OriginRoot:
+		if r.Type != "line_init" {
+			p.require(rUnauthOrigin, func() bool { return slices.Contains(l.RootKeys, r.RootKey) })
+		}
 	}
 
 	// line_init has no prior state to hold an epoch.
@@ -204,6 +208,7 @@ var builders = map[string]func(p *plan, s *State, r *Record){
 	"line_init":              buildLineInit,
 	"operator_key_authorize": buildOperatorKeyAuthorize,
 	"operator_key_revoke":    buildOperatorKeyRevoke,
+	"root_member_replace":    buildRootMemberReplace,
 	"credential_enroll":      buildCredentialEnroll,
 	"credential_revoke":      buildCredentialRevoke,
 	"key_epoch_activate":     buildKeyEpochActivate,
@@ -234,19 +239,27 @@ func is(got *int64, want int64) bool { return got != nil && *got == want }
 
 func buildLineInit(p *plan, s *State, r *Record) {
 	l := &s.Line
-	p.require(rInvalidSyntax, func() bool { return r.RootKey != "" })
+	// Equal 1-of-2 roots: line_init provisions exactly two distinct root keys
+	// and is signed by one of them.
+	p.require(rInvalidSyntax, func() bool {
+		return len(r.RootKeys) == 2 &&
+			r.RootKeys[0] != "" && r.RootKeys[1] != "" &&
+			r.RootKeys[0] != r.RootKeys[1] &&
+			r.RootKey != "" && slices.Contains(r.RootKeys, r.RootKey)
+	})
 	// The line already existing is a collision on the one identifier a log
 	// has: itself.
 	p.require(rConflict, func() bool { return l.Generation == 0 })
 	p.effect = func() {
 		*l = Line{
 			Generation:      1,
-			RootKey:         r.RootKey, // the first entry of the key registry
+			RootKeys:        canonSet(r.RootKeys), // the first two entries of the key registry
 			RootRev:         1,
 			RekeyPending:    true, // nothing payload-bearing commits before the first activation
 			Operators:       []string{},
 			Credentials:     map[string]*Credential{},
 			Readers:         map[int64][]string{},
+			Tombstones:      Tombstones{Creds: []string{}, Actors: []string{}, JoinRequests: []string{}, OperatorKeys: []string{}, RootKeys: []string{}},
 			Actors:          map[string]*Actor{},
 			RegisterWriters: map[string]*RegisterWriter{},
 		}
@@ -258,7 +271,7 @@ func buildOperatorKeyAuthorize(p *plan, s *State, r *Record) {
 	p.require(rInvalidSyntax, func() bool { return r.OperatorKey != "" && r.Expect.RootRev != nil })
 	// A key that has held any role is reserved for life. That covers a key
 	// already authorized, a revoked operator key, which is never authorized
-	// again, a credential's key, and the root key.
+	// again, a credential's key, and an active or replaced root key.
 	p.require(rConflict, func() bool { return !l.keyUsed(r.OperatorKey) })
 	p.require(rConflict, func() bool { return is(r.Expect.RootRev, l.RootRev) })
 	p.effect = func() {
@@ -278,6 +291,30 @@ func buildOperatorKeyRevoke(p *plan, s *State, r *Record) {
 		// The tombstone is what later tells this key from one that was never
 		// authorized, and what keeps it from being authorized again.
 		l.Tombstones.OperatorKeys = addToSet(l.Tombstones.OperatorKeys, r.OperatorKey)
+		p.inc(&l.RootRev)
+		p.inc(&l.AuthEpoch)
+	}
+}
+
+func buildRootMemberReplace(p *plan, s *State, r *Record) {
+	l := &s.Line
+	// Threshold (1) and set size (2) stay fixed: an active root replaces the
+	// other active root with a fresh key, never itself, and never with itself
+	// or with the key being replaced.
+	p.require(rInvalidSyntax, func() bool {
+		return r.OldRootKey != "" && r.NewRootKey != "" &&
+			r.OldRootKey != r.NewRootKey &&
+			r.OldRootKey != r.RootKey &&
+			r.NewRootKey != r.RootKey &&
+			r.Expect.RootRev != nil
+	})
+	p.require(rUnknownTarget, func() bool { return slices.Contains(l.RootKeys, r.OldRootKey) })
+	p.require(rConflict, func() bool { return !l.keyUsed(r.NewRootKey) })
+	p.require(rConflict, func() bool { return is(r.Expect.RootRev, l.RootRev) })
+	p.effect = func() {
+		l.RootKeys = slices.DeleteFunc(slices.Clone(l.RootKeys), func(k string) bool { return k == r.OldRootKey })
+		l.RootKeys = addToSet(l.RootKeys, r.NewRootKey)
+		l.Tombstones.RootKeys = addToSet(l.Tombstones.RootKeys, r.OldRootKey)
 		p.inc(&l.RootRev)
 		p.inc(&l.AuthEpoch)
 	}

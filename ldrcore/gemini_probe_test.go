@@ -333,7 +333,7 @@ func TestGeminiProbeRegressions(t *testing.T) {
 	t.Run("G4 verifyFrame rejects negative line_init validity, empty OpID/Digest, and time_anchor Digest", func(t *testing.T) {
 		log := newLineWith(t, commitProfile).q.Log()
 		log[0].Record.ValidityMS = -5
-		log[0].Sig = signatureOf(Root, &log[0])
+		log[0].Sig = signatureOf(RootPrincipal("rootK1"), &log[0])
 		if _, _, err := ReplayVerified("L", log, commitProfile); err == nil || !strings.Contains(err.Error(), "rejected invalid") {
 			t.Fatalf("negative line_init validity: got %v", err)
 		}

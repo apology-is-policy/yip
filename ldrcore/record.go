@@ -11,9 +11,9 @@ type Record struct {
 
 	// Signer. For actor and credential origin, Cred signs; for actor origin
 	// it signs on behalf of Actor at BindingGen. For operator origin,
-	// Operator signs. On credential_enroll and credential_revoke, Cred is the
-	// target, and on credential-origin and actor_move records Actor is the
-	// target.
+	// Operator signs. For root origin, RootKey signs. On credential_enroll
+	// and credential_revoke, Cred is the target, and on credential-origin and
+	// actor_move records Actor is the target.
 	Cred       string `json:"cred,omitempty"`
 	Actor      string `json:"actor,omitempty"`
 	BindingGen int64  `json:"binding_gen,omitempty"`
@@ -70,8 +70,14 @@ type Record struct {
 	// the derivation and takes no sender's word for it.
 	CredIDMismatch bool `json:"cred_id_mismatch,omitempty"`
 
-	// RootKey is the root public key a line_init names.
-	RootKey string `json:"root_key,omitempty"`
+	// RootKey is the signing root public key on every root-origin record.
+	// RootKeys is the two-member equal root set provisioned by line_init.
+	// OldRootKey and NewRootKey are the replaced and replacement keys of
+	// root_member_replace.
+	RootKey    string   `json:"root_key,omitempty"`
+	RootKeys   []string `json:"root_keys,omitempty"`
+	OldRootKey string   `json:"old_root_key,omitempty"`
+	NewRootKey string   `json:"new_root_key,omitempty"`
 
 	// Registers.
 	Register    string `json:"register,omitempty"`
@@ -84,11 +90,15 @@ func (r Record) Clone() Record {
 	out := r
 	out.Recipients = append([]string(nil), r.Recipients...)
 	out.Manifest = append([]string(nil), r.Manifest...)
+	out.RootKeys = append([]string(nil), r.RootKeys...)
 	if r.Recipients == nil {
 		out.Recipients = nil
 	}
 	if r.Manifest == nil {
 		out.Manifest = nil
+	}
+	if r.RootKeys == nil {
+		out.RootKeys = nil
 	}
 	if r.Grant != nil {
 		g := *r.Grant
@@ -187,6 +197,7 @@ var recordOrigin = map[string]string{
 	"line_init":              OriginRoot,
 	"operator_key_authorize": OriginRoot,
 	"operator_key_revoke":    OriginRoot,
+	"root_member_replace":    OriginRoot,
 	"credential_enroll":      OriginOperator,
 	"credential_revoke":      OriginOperator,
 	"key_epoch_activate":     OriginOperator,

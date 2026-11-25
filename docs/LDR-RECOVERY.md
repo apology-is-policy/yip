@@ -92,9 +92,10 @@ In addition to standard envelope metadata (protocol version, `line_id`,
 | `new_relay_origin` | Pinned HTTPS relay origin and server-auth policy for generation `g + 1` (closes the endpoint-migration gap in `LDR-ENROLLMENT-BOOTSTRAP-ENVELOPE.md` §2.1) |
 | `min_time_floor` | Floor carried forward (`>= seq_time(g, base_seq)`); prevents clock rollback below the accepted base or an operator-observed higher floor |
 | `reconciled_revoked_operators` | Normalized operator public keys revoked after `base_seq` (or precautionary revocations during the incident) |
+| `reconciled_root_replacements` | Any `root_member_replace` transitions from `(base_seq, tail]` (resulting active 2-member `root_keys` and additional replaced keys in `tombstones.root_keys`) so a root key replaced in the discarded tail can never silently regain authority |
 | `reconciled_revoked_creds` | `cred_id` entries revoked after `base_seq` (including any credentials enrolled in the discarded tail that are also being tombstoned, carrying their normalized public keys and namespaces so key/namespace reservations survive) |
 | `reconciled_removed_actors` | `actor_id` entries removed after `base_seq` |
-| `reconciled_tombstones` | Additional `creds`, `actors`, `join_requests`, `operator_keys`, `reserved_keys`, `reserved_namespaces`, and per-writer `used_incarnations` learned from external witnesses |
+| `reconciled_tombstones` | Additional `creds`, `actors`, `join_requests`, `operator_keys`, `root_keys`, `reserved_keys`, `reserved_namespaces`, and per-writer `used_incarnations` learned from external witnesses |
 | `reconciled_epoch_floors` | Minimum post-recovery values for `root_rev`, `auth_epoch`, `audience_rev`, `key_epoch`, per-actor `binding_gen`, and per-writer `writer_rev` so no counter regresses below any value observed in the discarded tail |
 | `reconciled_evidence_digests` | Optional list of digests of retained signed revocation/enrollment/removal envelopes from `(base_seq, tail]` backing the delta |
 | `reconciled_state_digest` | Commitment to the complete reconciled post-recovery state at `(g+1, 1)` (useful even if ordinary frames do not carry per-record commitments) |
@@ -105,9 +106,9 @@ In addition to standard envelope metadata (protocol version, `line_id`,
    `generation == prior_generation + 1`. Because committing immediately
    advances `Line.Generation` to `g + 1`, the same `recovery_generation` can
    never apply twice.
-2. Root signature verifies under the active root key(s) authorized at
-   `(g, base_seq)` (subject to whatever two-key root policy is later selected
-   under O26).
+2. Root signature verifies under one of the two active equal root keys
+   (`["root", root_key]`, O26 decided 2026-11-25) authorized at `(g, base_seq)`
+   and NOT replaced by `reconciled_root_replacements`.
 3. `(g, base_seq, base_head)` matches the accepted generation `g` chain at
    `base_seq`.
 4. `seq_time(g+1, 1) >= max(seq_time(g, base_seq), min_time_floor)` and within
@@ -203,51 +204,55 @@ When a client receives `recovery_generation` at `(g+1, 1)` anchored on
 
 ## 7. Proposed fault scenarios and conformance traces (prose only)
 
-These are proposed traces for review; none is implemented in `ldrcore/` yet:
+These are proposed traces for review; none is implemented in `ldrcore/` yet
+(numbered from `T53` following Draft v8's `T51`–`T52` for equal 1-of-2 roots):
 
-- **T51 (Reconciled rollback recovery):** `credB` is revoked at `(1, 45)`. The
-  relay rolls back to `(1, 40)` and root commits `recovery_generation` at
-  `(2, 1)` carrying `credB`'s revocation and tombstones. Result: `credB`
+- **T53 (Reconciled rollback recovery):** `credB` is revoked at `(1, 45)`. The
+  relay rolls back to `(1, 40)` and an active root commits `recovery_generation`
+  at `(2, 1)` carrying `credB`'s revocation and tombstones. Result: `credB`
   remains revoked and tombstoned in generation 2; an intent committed at
   `(1, 39)` returns its original receipt; an intent from `(1, 42)` returns
   `unresolved / abandoned(1)` (never `expired`); `rekey_pending` is true.
-- **T52 (Incomplete reconciliation caught by tail witness):** `credA` synced
-  through `(1, 45)` (verifying `credB`'s revocation) before rollback to
-  `(1, 40)`. Root signs a `recovery_generation` omitting `credB`'s revocation.
-  `credA` checks its archived discarded tail `(1, 41..45]`, detects the missing
-  revocation, halts fail-closed, and signs nothing in generation 2.
-- **T53 (Replay and mismatch protection on `recovery_generation`):** submitting
+- **T54 (Incomplete reconciliation caught by tail witness):** `credA` synced
+  through `(1, 45)` (verifying `credB`'s revocation or a `root_member_replace`)
+  before rollback to `(1, 40)`. Root signs a `recovery_generation` omitting
+  that revocation/replacement. `credA` checks its archived discarded tail
+  `(1, 41..45]`, detects the missing security transition, halts fail-closed,
+  and signs nothing in generation 2.
+- **T55 (Replay and mismatch protection on `recovery_generation`):** submitting
   the same `recovery_generation` again once generation 2 is active is rejected;
   a `recovery_generation` naming a wrong `prior_generation` or wrong
   `base_head` is refused.
-- **T54 (Mandatory rekey gate after recovery):** immediately after `(2, 1)`
+- **T56 (Mandatory rekey gate after recovery):** immediately after `(2, 1)`
   commits, a payload-bearing `call_turn` and an advisory register publication
   are both rejected (`rekey_pending` / wrong generation) until an active
   operator commits `key_epoch_activate` naming only the reconciled entitled
   readers (excluding `credB`).
-- **T55 (Generation-qualified receipts and view tags across `seq` reset):** a
+- **T57 (Generation-qualified receipts and view tags across `seq` reset):** a
   broadcast read receipt recorded at `(1, 40)` survives into `(2, 1)` under
   `(1, 40)` without violating invariants; a call update at `(2, 2)` replaces a
   projection view previously tagged `(1, 45)` because `(2, 2) > (1, 45)`.
-- **T56 (Unreconcilable loss):** when no external witness can establish whether
+- **T58 (Unreconcilable loss):** when no external witness can establish whether
   revocations occurred during a rollback gap, operator tooling refuses to
   construct `recovery_generation` and requires explicit migration to a new
   `line_id`.
 
 ## 8. Open questions for Codex, Claude and the operator
 
-1. **New-member bootstrap into generation `g > 1` (interaction with O25):**
-   under full control replay, must a joiner enrolled in generation 2 replay
-   generation 1 up to `base_seq` and then generation 2 from `(2, 1)`, or may
-   `(2, 1)` act as a root-signed base checkpoint? Replaying `(1, 1..base_seq)`
-   + `(2, 1..head)` preserves the exact trust boundary of full replay (root
-   cannot invent honest-member actions before `base_seq` without detection);
-   treating `(2, 1)` as a new genesis shifts trust in the pre-recovery state to
-   the root key.
-2. **Interaction with O26 (two-key root policy):** if a two-key root policy is
-   adopted, should `recovery_generation` carry the same active-root authority as
-   other root records, or require special treatment when recovering from an
-   active-root compromise?
+1. **New-member bootstrap into generation `g > 1` (with O25 decided as full
+   control-log replay on 2026-11-25):** must a joiner enrolled in generation 2
+   replay generation 1 up to `base_seq` and then generation 2 from `(2, 1)`, or
+   may `(2, 1)` act as a root-signed base checkpoint? Replaying
+   `(1, 1..base_seq)` + `(2, 1..head)` preserves the exact trust boundary of
+   full replay (root cannot invent honest-member actions before `base_seq`
+   without detection); treating `(2, 1)` as a new genesis shifts trust in the
+   pre-recovery state to the root key.
+2. **Interaction with equal 1-of-2 roots (O26 decided 2026-11-25):** if a root
+   key was replaced in `(base_seq, tail]` via `root_member_replace`, a
+   reconciled `recovery_generation` must carry that replacement forward and be
+   signed by a root key still active after reconciliation; if one of the two
+   roots was compromised, recovery cannot guarantee winning a race against the
+   compromised root (consistent with equal 1-of-2 trade-offs).
 3. **Discarded-tail call/broadcast state:** this draft rolls conversation state
    back to `(g, base_seq)` while carrying forward *security* tombstones from
    `(base_seq, tail]`. That means a `call_id` or `broadcast_id` first created

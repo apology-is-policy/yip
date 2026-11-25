@@ -40,10 +40,10 @@ import (
 type Client struct {
 	LineID string
 	Cred   string
-	// OperatorKey and Root say which other keys this device may sign with.
+	// OperatorKey and RootKey say which other keys this device may sign with.
 	// They grant nothing on the line: the sequencer decides that.
 	OperatorKey string
-	Root        bool
+	RootKey     string
 	// ValidityMS is the validity a composed intent claims.
 	ValidityMS int64
 	// Fault names the point at which the next procedure dies. It fires once.

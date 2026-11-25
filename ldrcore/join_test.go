@@ -30,14 +30,14 @@ func activate(expect int64, readers ...string) Record {
 }
 
 func revokeOperator(key string, rootRev int64) Record {
-	return Record{Origin: OriginRoot, Type: "operator_key_revoke", OperatorKey: key, Expect: Expect{RootRev: ptr(rootRev)}}
+	return Record{Origin: OriginRoot, Type: "operator_key_revoke", RootKey: "rootK1", OperatorKey: key, Expect: Expect{RootRev: ptr(rootRev)}}
 }
 
 // pinFor is what a device that asked to be enrolled as cred, by op1, holds
 // before it is handed anything. It matches the enroll helper.
 func pinFor(cred, ns, jr string) JoinPin {
 	return JoinPin{
-		LineID: "L", Generation: 1, Profile: commitProfile, RootKey: "rootK", Operator: "op1",
+		LineID: "L", Generation: 1, Profile: commitProfile, RootKeys: []string{"rootK1", "rootK2"}, Operator: "op1",
 		Cred: cred, SigningKey: "sk-" + cred, EncryptionKey: "ek-" + cred,
 		Grant:       Grant{Namespace: ns, ActorLimit: 4, Reader: true},
 		JoinRequest: jr, JoinRequestDigest: "digest-" + jr,
@@ -546,7 +546,7 @@ func TestJoin(t *testing.T) {
 			"another actor limit":            {func(p *JoinPin) { p.Grant.ActorLimit = 5 }, "grants something other"},
 			"no reader grant":                {func(p *JoinPin) { p.Grant.Reader = false }, "grants something other"},
 			"another generation":             {func(p *JoinPin) { p.Generation = 2 }, "another generation"},
-			"another root key":               {func(p *JoinPin) { p.RootKey = "rootX" }, "another root key"},
+			"other root keys":                {func(p *JoinPin) { p.RootKeys = []string{"rootK1", "rootX"} }, "other root keys"},
 			"another line":                   {func(p *JoinPin) { p.LineID = "M" }, "not the state the endorsed head commits to"},
 			"a profile that commits nothing": {func(p *JoinPin) { p.Profile = testProfile }, "does not commit state"},
 		}

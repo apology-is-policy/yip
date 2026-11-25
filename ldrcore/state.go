@@ -30,10 +30,11 @@ type Line struct {
 	Generation int64 `json:"generation"`
 	HeadSeq    int64 `json:"head_seq"`
 	HeadTime   int64 `json:"head_time"`
-	// RootKey is the line's root public key, fixed by line_init. Like every
-	// key in a State it is an opaque string standing for an algorithm
+	// RootKeys is the line's active equal 1-of-2 root public key set, initially
+	// fixed by line_init and updated only by root_member_replace. Like every
+	// key in a State each entry is an opaque string standing for an algorithm
 	// identifier and that algorithm's one accepted public encoding.
-	RootKey         string                     `json:"root_key,omitempty"`
+	RootKeys        []string                   `json:"root_keys"`
 	RootRev         int64                      `json:"root_rev"`
 	AuthEpoch       int64                      `json:"auth_epoch"`
 	AudienceRev     int64                      `json:"audience_rev"`
@@ -63,13 +64,15 @@ type Credential struct {
 }
 
 // Tombstones are identifiers that must never be used again. OperatorKeys
-// holds every operator key that was authorized and then revoked: it is what
-// tells a revoked operator key from one that never existed.
+// holds every operator key that was authorized and then revoked, and RootKeys
+// holds every root key that was active and then replaced: each is what tells a
+// revoked or replaced key from one that never held the role.
 type Tombstones struct {
 	Creds        []string `json:"creds"`
 	Actors       []string `json:"actors"`
 	JoinRequests []string `json:"join_requests"`
 	OperatorKeys []string `json:"operator_keys"`
+	RootKeys     []string `json:"root_keys"`
 }
 
 // Actor is an immutable identity inside one namespace, bound to one
@@ -188,13 +191,15 @@ func (l *Line) DefaultAudience() []string {
 	return out
 }
 
-// keyUsed reports whether a public key has ever held a role on this line: the
-// root key, an operator key that is or was authorized, or either key of a
-// credential that is or was enrolled. Such a key is reserved for life. It
-// never takes a second role and never returns to its first. The registry is
-// derived, not stored: nothing that feeds it is ever deleted from a State.
+// keyUsed reports whether a public key has ever held a role on this line: an
+// active or replaced root key, an operator key that is or was authorized, or
+// either key of a credential that is or was enrolled. Such a key is reserved
+// for life. It never takes a second role and never returns to its first. The
+// registry is derived, not stored: nothing that feeds it is ever deleted from
+// a State.
 func (l *Line) keyUsed(k string) bool {
-	if k == l.RootKey || slices.Contains(l.Operators, k) || slices.Contains(l.Tombstones.OperatorKeys, k) {
+	if slices.Contains(l.RootKeys, k) || slices.Contains(l.Tombstones.RootKeys, k) ||
+		slices.Contains(l.Operators, k) || slices.Contains(l.Tombstones.OperatorKeys, k) {
 		return true
 	}
 	for _, c := range l.Credentials {
@@ -251,6 +256,7 @@ func (s State) Clone() State {
 
 func (l Line) clone() Line {
 	out := l
+	out.RootKeys = slices.Clone(l.RootKeys)
 	out.Operators = slices.Clone(l.Operators)
 	out.Credentials = make(map[string]*Credential, len(l.Credentials))
 	for id, c := range l.Credentials {
@@ -266,6 +272,7 @@ func (l Line) clone() Line {
 		Actors:       slices.Clone(l.Tombstones.Actors),
 		JoinRequests: slices.Clone(l.Tombstones.JoinRequests),
 		OperatorKeys: slices.Clone(l.Tombstones.OperatorKeys),
+		RootKeys:     slices.Clone(l.Tombstones.RootKeys),
 	}
 	out.Actors = make(map[string]*Actor, len(l.Actors))
 	for id, a := range l.Actors {
@@ -286,11 +293,13 @@ func (l Line) clone() Line {
 func (s State) Canon() State {
 	out := s.Clone()
 	l := &out.Line
+	l.RootKeys = canonSet(l.RootKeys)
 	l.Operators = canonSet(l.Operators)
 	l.Tombstones.Creds = canonSet(l.Tombstones.Creds)
 	l.Tombstones.Actors = canonSet(l.Tombstones.Actors)
 	l.Tombstones.JoinRequests = canonSet(l.Tombstones.JoinRequests)
 	l.Tombstones.OperatorKeys = canonSet(l.Tombstones.OperatorKeys)
+	l.Tombstones.RootKeys = canonSet(l.Tombstones.RootKeys)
 	for e, r := range l.Readers {
 		l.Readers[e] = canonSet(r)
 	}

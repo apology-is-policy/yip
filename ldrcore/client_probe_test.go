@@ -546,7 +546,7 @@ func TestARevokedKeySignsNothingMore(t *testing.T) {
 			ca.OperatorKey = "op1"
 			asOperator, _ := ca.Compose("revoke credB", revoke("credB"), Payload{})
 			asCred, _ := ca.Compose("activate", activatePresence, Payload{})
-			e.commit(Record{Origin: OriginRoot, Type: "operator_key_revoke", OperatorKey: "op1",
+			e.commit(Record{Origin: OriginRoot, Type: "operator_key_revoke", RootKey: "rootK1", OperatorKey: "op1",
 				Expect: Expect{RootRev: ptr(e.q.State().Line.RootRev)}})
 			if how == "told" {
 				a, _ := ca.Send(e.q, asOperator, At(e.now))

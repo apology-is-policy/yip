@@ -148,7 +148,7 @@ func TestJoinOnAnHonestRelay(t *testing.T) {
 		r.Operator = "op2"
 		in := e.intent(r)
 		in.Record.AuthEpoch++
-		e.commit(Record{Origin: OriginRoot, Type: "operator_key_authorize", OperatorKey: "op2", Expect: Expect{RootRev: ptr(2)}})
+		e.commit(Record{Origin: OriginRoot, Type: "operator_key_authorize", RootKey: "rootK1", OperatorKey: "op2", Expect: Expect{RootRev: ptr(2)}})
 		e.now++
 		e.wantOutcome(e.submit(in), Committed, "", false)
 		e.commit(activate(2, "credA", "credB", "credC"))
@@ -447,12 +447,12 @@ func chainOf(t *testing.T, prev string, n int64) *forger {
 		if seq == 1 {
 			e = Entry{
 				Seq: 1, SeqTime: s.Line.HeadTime, Prev: f.head, SeenHead: prev,
-				Key:         OpKey{Generation: 1, Signer: Root, SeenSeq: 0, OpID: "init"},
+				Key:         OpKey{Generation: 1, Signer: RootPrincipal("rootK1"), SeenSeq: 0, OpID: "init"},
 				Digest:      "init",
 				Record:      lineInit(),
 				StateDigest: "0000000000000000",
 			}
-			e.Sig = signatureOf(Root, &e)
+			e.Sig = signatureOf(RootPrincipal("rootK1"), &e)
 		} else {
 			e = Entry{
 				Seq: seq, SeqTime: s.Line.HeadTime, Prev: f.head,

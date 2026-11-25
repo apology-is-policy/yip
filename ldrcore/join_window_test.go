@@ -96,7 +96,7 @@ func TestWhatAdmissionDecidedIsCheckedAgain(t *testing.T) {
 	t.Run("a line_init that is not signed over genesis", func(t *testing.T) {
 		log := newLineWith(t, commitProfile).q.Log()
 		log[0].SeenHead = "0123456789abcdef"
-		log[0].Sig = signatureOf(Root, &log[0]) // as the root would have signed it
+		log[0].Sig = signatureOf(RootPrincipal("rootK1"), &log[0]) // as the root would have signed it
 		if _, _, err := ReplayVerified("L", log, commitProfile); err == nil ||
 			!strings.Contains(err.Error(), "record 1 (line_init) is not signed over genesis") {
 			t.Fatalf("got %v", err)
@@ -107,7 +107,7 @@ func TestWhatAdmissionDecidedIsCheckedAgain(t *testing.T) {
 		// Only line_init anchors on genesis.
 		log := newLineWith(t, commitProfile).q.Log()
 		log[1].Key.SeenSeq, log[1].SeenHead = 0, genesisHead("L")
-		log[1].Sig = signatureOf(Root, &log[1])
+		log[1].Sig = signatureOf(RootPrincipal("rootK1"), &log[1])
 		if _, _, err := ReplayVerified("L", log, commitProfile); err == nil ||
 			!strings.Contains(err.Error(), "record 2 (operator_key_authorize) is anchored at 0, which is not a head this verifier holds") {
 			t.Fatalf("got %v", err)

@@ -194,7 +194,7 @@ var clientTraceTests = map[string]func(*testing.T){
 	"T24": func(t *testing.T) { // three unreadable states, and replay continues past each
 		e := newEnv(t)
 		e.commit(lineInit())
-		e.commit(Record{Origin: OriginRoot, Type: "operator_key_authorize", OperatorKey: "op1", Expect: Expect{RootRev: ptr(1)}})
+		e.commit(Record{Origin: OriginRoot, Type: "operator_key_authorize", RootKey: "rootK1", OperatorKey: "op1", Expect: Expect{RootRev: ptr(1)}})
 		e.commit(enroll("credA", "nsA", "jr1"))
 		e.commit(Record{Origin: OriginOperator, Type: "key_epoch_activate", Operator: "op1", Manifest: []string{"credA"}, Expect: Expect{KeyEpoch: ptr(0)}})
 		e.commit(Record{Origin: OriginCredential, Type: "actor_declare", Cred: "credA", Namespace: "nsA", Actor: "a1"})
@@ -900,7 +900,7 @@ func TestOutboxDiscipline(t *testing.T) {
 			"an actor bound to another credential": noteOn("b1", "c1"),
 			"another credential":                   {Origin: OriginCredential, Type: "actor_declare", Cred: "credB", Namespace: "nsB", Actor: "b9"},
 			"an operator key it does not hold":     revoke("credB"),
-			"the root":                             {Origin: OriginRoot, Type: "operator_key_authorize", OperatorKey: "op2", Expect: Expect{RootRev: ptr(2)}},
+			"a root key it does not hold":          {Origin: OriginRoot, Type: "operator_key_authorize", RootKey: "rootK1", OperatorKey: "op2", Expect: Expect{RootRev: ptr(2)}},
 		} {
 			if _, err := ca.Compose(name, r, Payload{}); !errors.Is(err, ErrNotSigner) {
 				t.Errorf("%s: %v, want ErrNotSigner", name, err)
@@ -913,12 +913,12 @@ func TestOutboxDiscipline(t *testing.T) {
 	})
 }
 
-// A client that holds the root and an operator key can bring a line up from
+// A client that holds a root key and an operator key can bring a line up from
 // nothing through its own outbox, anchoring only on what it has verified.
 func TestClientBootstrapsALine(t *testing.T) {
 	e := newEnv(t)
 	c := NewClient("L", "credA", testProfile)
-	c.Root, c.OperatorKey = true, "op1"
+	c.RootKey, c.OperatorKey = "rootK1", "op1"
 	do := func(r Record) {
 		t.Helper()
 		id, err := c.Compose(r.Type, r, Payload{})
@@ -935,6 +935,10 @@ func TestClientBootstrapsALine(t *testing.T) {
 		t.Fatalf("an ordinary intent with nothing to anchor on: %v, want ErrNoLine", err)
 	}
 	do(lineInit())
+	if _, err := c.Compose("other root", Record{Origin: OriginRoot, Type: "operator_key_authorize", RootKey: "rootK2",
+		OperatorKey: "op1", Expect: Expect{RootRev: ptr(1)}}, Payload{}); !errors.Is(err, ErrNotSigner) {
+		t.Fatalf("signing as the other root key: %v, want ErrNotSigner", err)
+	}
 	do(Record{Origin: OriginRoot, Type: "operator_key_authorize", OperatorKey: "op1", Expect: Expect{RootRev: ptr(1)}})
 	do(enroll("credA", "nsA", "jr1"))
 	if c.HasKey(1) {

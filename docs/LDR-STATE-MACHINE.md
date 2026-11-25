@@ -1,6 +1,6 @@
-# LDR state machine and mutation/authority matrix — draft v7
+# LDR state machine and mutation/authority matrix — draft v8
 
-2026-11-23 · Fable (claude seat) · Unapproved proposal. Not a specification,
+2026-11-25 · Fable (claude seat), updated to draft v8 by Gemini on `gemini/ldr` · Unapproved proposal. Not a specification,
 not an implementation plan, and not a deployment decision. Companion to
 [LDR-THREAT-MODEL.md](LDR-THREAT-MODEL.md) (Codex, draft v0),
 [LDR-SECURITY-REVIEW.md](LDR-SECURITY-REVIEW.md) (Codex) and
@@ -97,6 +97,25 @@ awaiting Codex, Claude and operator review. A companion draft recovery
 proposal (O23 / `recovery_generation`) lives in
 [LDR-RECOVERY.md](LDR-RECOVERY.md).
 
+Draft v8 (2026-11-25, on `gemini/ldr`) records the operator's 2026-11-25
+decisions and updates the state machine and reference models accordingly
+(§14.9), awaiting Codex and Claude cross-review:
+
+- **Hosting:** operator-hosted Go relay (LAN and closed corporate networks),
+  not Cloudflare Durable Objects. A draft architecture lives in
+  [LDR-GO-RELAY-DESIGN.md](LDR-GO-RELAY-DESIGN.md).
+- **O25 (new-member control bootstrap):** full control-log replay from genesis
+  before ordinary use (envelope-level control metadata without plaintext or
+  prior epoch keys is acceptable to newly enrolled machines). P4 (detached
+  operator attestation) is superseded for phase 1, and §14.7 (`Profile.StateCommit`)
+  is archived as an unchosen exploration.
+- **O26 (root ceremony and two-key policy):** root signing fits within the
+  provisional 10-minute validity window (keeping ordinary validity on root
+  records, §4.4), and lines use **equal 1-of-2 roots** — two distinct active
+  root keys provisioned at `line_init`, tagged root principals
+  `["root", key]`, permanent `tombstones.root_keys`, and `root_member_replace`
+  (§2, §4.4, §5.1, §5.7, §6.1, §6.2).
+
 This document owns: record types, authority, preconditions, effects, time
 rules, the sequencer-visible field allowlist, retry and dedup behaviour, and
 materialization. It does not own cryptographic constructions, enrollment
@@ -113,9 +132,9 @@ from them.
 | Line confidentiality policy | **Decided by the operator, 2026-11-23:** 3A — everyone enrolled on the line can read everything on it. 3B is out of scope and not drafted. |
 | History for a newly enrolled account | **Decided by the operator, 2026-11-23: none.** A new account reads only what is written after it joins; the operator arranges a briefing for the new agent. The stated reason is practical — history gets long on multi-month projects — not confidentiality. `history_grant` is therefore removed from phase 1 (§6.3). |
 | Reference checker | **Operator go-ahead, 2026-11-23,** for a small Go implementation of the rule-checking core only: no crypto, no network, no relay. Later the same day the operator also approved an in-memory model of the relay-side bookkeeping (retries, expiry, clock handling), under the same limits, so that the scenario traces can run. A third go-ahead the same day covers a model of the agent's own machine and of register publication (§14.4). All of it lives in `ldrcore/`, and draft v7's rules are in it (§14.5). Results are in §14. Recovery is not modelled. The exploration of §14.7 is in the same package, behind a switch. Its author took it to fall under the go-ahead for reference models and told the operator so before writing it; the operator has not been asked to approve it separately. |
-| Enrollment, control bootstrap and envelope | Codex's draft (v3 as of 2026-11-23) is a proposal under cross-review. The rules in this document that follow it carry design-review agreement only. Two points in it are the operator's to accept; they were put to the operator on 2026-11-23 and are unanswered (§13, O25 and O26). |
-| What those decisions are not | They are scope and policy choices. They do not approve a cipher, an enrollment ceremony, a deployment, or implementation. |
-| Sequencer deployment (Durable Object, Go relay, other) | Open. This draft must not depend on it. |
+| Enrollment, control bootstrap and envelope | Codex's draft (v3 as of 2026-11-23) is a proposal under cross-review. The rules in this document that follow it carry design-review agreement only. The two operator questions (§13, O25 and O26) were **decided by the operator on 2026-11-25:** full control-log replay from genesis before ordinary use (O25), and ordinary 10-minute validity with equal 1-of-2 roots (O26). |
+| What those decisions are not | They are scope, hosting and policy choices. They do not approve a cipher, an enrollment ceremony, or relay/crypto implementation. |
+| Sequencer deployment | **Decided by the operator, 2026-11-25: operator-hosted Go relay** (for local networks and closed corporate networks). Draft architecture in [LDR-GO-RELAY-DESIGN.md](LDR-GO-RELAY-DESIGN.md). |
 | Time anchors (§4.2) | Supported by Codex as the preferred proposal, with corrections folded in. Not operator-approved. |
 | Every rule below | Draft. Open choices are collected in §13. |
 
@@ -159,7 +178,7 @@ A record has one of five **origins**:
 | `actor` | A credential, on behalf of an actor currently bound to it | Conversation and actor-state records |
 | `credential` | A credential, with no actor binding required | Actor declaration, register-writer activation |
 | `operator` | The operational operator key, action-scoped | Membership, key lifecycle, ratification, arbitration, broadcasts |
-| `root` | The root key | Line creation, operator-key authorization, recovery generation |
+| `root` | Any active root key in the 1-of-2 root set | Line creation, operator-key authorization/revocation, peer root replacement (`root_member_replace`), recovery generation |
 | `sequencer` | Nobody; a typed internal transition | `time_anchor` only (§4.2) |
 
 The state machine is a pure function with no I/O:
@@ -365,30 +384,33 @@ demand-driven; no timer fires. The deferred resource phase needs more (§12).
 
 - The relay is provisioned before any record exists. Whoever administers the
   deployment installs the line's complete root-signed creation descriptor:
-  the line identity, the root key, the relay's origin, generation 1 and the
-  whole profile. The genesis constant is derived from the line identity, the
-  root key and the descriptor's digest. It is therefore fixed by what was
-  provisioned, and not chosen by whichever `line_init` arrives. Presenting a
-  self-signed descriptor neither creates nor reserves a line; who may
-  provision one is a deployment obligation (Appendix A, Q1).
+  the line identity, the initial two-member equal root key set (threshold 1),
+  the relay's origin, generation 1 and the whole profile. The genesis constant
+  is derived from the line identity, the canonical initial root key set and
+  the descriptor's digest. It is therefore fixed by what was provisioned, and
+  not chosen by whichever `line_init` arrives. Presenting a self-signed
+  descriptor neither creates nor reserves a line; who may provision one is a
+  deployment obligation (Appendix A, Q1).
 - `line_init` has no prior checkpoint. It anchors on that genesis constant,
-  names the root key, commits the descriptor's digest and the complete
-  profile, is exempt from validity, and can commit only into an empty log.
-  The profile is immutable for the generation: `F` and the maximum validity
-  are read from it, by the relay and by every replaying client.
+  names the two distinct initial root keys (`root_keys`), is signed by one of
+  them (`root_key`), commits the descriptor's digest and the complete profile,
+  is exempt from validity, and can commit only into an empty log. The profile
+  is immutable for the generation: `F` and the maximum validity are read from
+  it, by the relay and by every replaying client.
 - `line_init` is exempt from validity, not from its context. It names
   generation 1 and anchors on genesis. One that names a later generation, or a
   sequence number an empty log has never had, comes from a client that is
   ahead of this relay and is answered `history_unavailable`, as in the
   ordinary case; one that names a different genesis is `unknown_anchor`. One
-  that anchors on the right genesis and states a root key, a descriptor
-  digest or a profile other than the provisioned ones is refused as invalid
-  bootstrap input.
+  that anchors on the right genesis and states root keys, a descriptor digest
+  or a profile other than the provisioned ones is refused as invalid bootstrap
+  input.
 - An input the transition function refuses on an empty log, for instance a
   malformed or wrongly signed `line_init`, is refused as invalid bootstrap
   input with nothing recorded. It is never reported as "a line exists",
   because a refusal is not evidence of one. That answer is given only when a
-  line does exist, and only after the retry and mismatch lookup.
+  line does exist, and only after standing, retry and mismatch lookup (so a
+  replaced root key cannot probe its earlier `line_init` receipt).
 - Conversely, the first record of an empty log can only be `line_init`. An
   empty log has no head to anchor on and no predecessor, so no other intent
   can have been admitted and no time anchor can be legal. A replaying client
@@ -398,10 +420,13 @@ demand-driven; no timer fires. The deferred resource phase needs more (§12).
   prior generation and the accepted base `seq` and `head`, is exempt from
   validity, and can commit only while the named prior generation is current,
   so it cannot apply twice.
-- Every other root record (`operator_key_authorize`, `operator_key_revoke`)
-  uses the ordinary envelope and ordinary validity.
+- Every other root record (`operator_key_authorize`, `operator_key_revoke`,
+  `root_member_replace`) uses the ordinary envelope and ordinary validity
+  (confirmed practical within the provisional 10-minute window by the operator
+  on 2026-11-25, O26).
 - The first ordinary intent in a generation anchors on that generation's
-  first record or on a later anchor, which operator and root may request.
+  first record or on a later anchor, which operator and active root keys may
+  request.
 
 ## 5. Intents, outcomes, retries
 
@@ -414,9 +439,9 @@ Every `actor`, `credential`, `operator` and `root` intent signs, at minimum:
 | `version` | Protocol version; unknown is rejected, never downgraded |
 | `profile` | Digest of the profile of the generation the intent names (§4.4). An intent that states another is refused before admission, like an unknown version. The comparison is with that generation's profile, never with a later generation's (§5.5) |
 | `line_id`, `generation` | No cross-line or cross-generation replay |
-| `origin`, signing principal | Who signs, tagged by role: a credential (its `cred_id`), an operator key, or the root key. Actor and credential origins both sign as the credential |
+| `origin`, signing principal | Who signs, tagged by role: a credential (its `cred_id`), an operator key (`["operator", key]`), or a specific root key (`["root", key]`, never an unqualified `"root"` alias). Actor and credential origins both sign as the credential |
 | `actor_id`, `binding_gen` | Actor on whose behalf the credential signs (`actor` origin only) |
-| `op_id` | Operation nonce. The operation identity is `(line_id, generation, signing principal, seen_seq, op_id)`: an `op_id` is unique only within its anchor (§5.6). Each operator key and the root have an identity space of their own; the two origins a credential signs under share one |
+| `op_id` | Operation nonce. The operation identity is `(line_id, generation, signing principal, seen_seq, op_id)`: an `op_id` is unique only within its anchor (§5.6). Each operator key and each root key has an identity space of its own; the two origins a credential signs under share one |
 | `op_type`, `target` | What is being done to which object |
 | `expect` | Expected object versions, per record type |
 | `auth_epoch` | Membership epoch the signer acted under. **Checked: must equal the current value** |
@@ -731,7 +756,8 @@ recognize them as one intention.
    request, and when it verifies the revocation in the records. An admission
    error is never taken for that answer.
    - For a credential the stop covers its own records and those of every
-     actor bound to it. For an operator key it covers that key.
+     actor bound to it. For an operator key or a replaced root key it covers
+     that exact key.
    - Every unsettled intent the key signed keeps its slot and is marked
      reconciliation-required, one that was never sent included. Each keeps
      the last answer it actually received; none is given a `revoked` answer
@@ -852,10 +878,10 @@ state machine needs the following transitions.
 ```
 Line {
   generation, root_rev, auth_epoch, audience_rev
-  root key
+  root_keys: two distinct active root keys (equal 1-of-2, threshold fixed at 1)
   operators: operator keys currently authorized
   credentials: cred_id -> { signing key, encryption key, namespace grant, limits, capabilities, revoked }
-  tombstones: cred_ids, actor_ids, join-request ids, revoked operator keys
+  tombstones: cred_ids, actor_ids, join-request ids, revoked operator keys, replaced root keys
   key_epoch, rekey_pending, readers(key_epoch)
   entitled_readers: credentials holding an explicit reader capability
   actors: actor_id -> { namespace_id, cred_id, binding_gen, addr_rev, default_addressed, live }
@@ -863,7 +889,7 @@ Line {
 }
 ```
 
-`auth_epoch` increments on every record that changes operators or
+`auth_epoch` increments on every record that changes root keys, operators or
 credentials, or moves an existing binding. Declaring or removing an actor
 does not increment it: a new worktree binding should not conflict everyone
 else's writes. An intent already in flight that names a not-yet-declared
@@ -877,24 +903,35 @@ derived from the pair, and phase 1 has no record that replaces either key. A
 machine that loses or changes a key enrolls as a new credential with a new
 namespace (Appendix A, E3).
 
+**Equal 1-of-2 roots (O26, decided 2026-11-25).** Every line has exactly two
+distinct active root public keys (`root_keys`), with threshold fixed at 1:
+either active root can sign any root-origin operation, including replacing the
+other root via `root_member_replace`. There is no single unqualified `"root"`
+principal alias — every root operation, session, query and outbox slot names
+`["root", normalized_key]`. Security trade-off: losing one root lets the
+surviving root continue operating and replace the lost root; compromising
+*either* root gives root takeover authority (an honest replacement does not
+guarantee winning a race against a compromised root key).
+
 Every public key that has ever held a role on the line is reserved for life:
-the root key, every operator key ever authorized, and both keys of every
-credential ever enrolled. A reserved key never takes a second role and never
-returns to its first, alone or with a different partner. So a revoked key
-cannot come back under a new `cred_id`, as an operator key, or as the other
-half of someone else's pair. The sequencer checks this on visible fields
-alone, which is why a revoked credential keeps its entry and a revoked
-operator key leaves a tombstone. "A key" here means an algorithm identifier
-together with that algorithm's one accepted public encoding, so that an alias
-or a second encoding of the same key cannot slip past the reservation; the
-encoding is Codex's to specify. The principal that names an operator key or
-the root key is that same value with its role tag, and not a separate
-identifier or a digest; the reservation is over the value without the tag
-(Codex's draft, §2). The reservation is of encodings. It cannot tell that
-two public keys under different algorithms were derived from one secret, and
-no check at the relay can. Enrollment tooling must generate the key of each
-role independently; sharing or converting a secret between roles is not an
-approved way to make keys.
+every active or replaced root key, every operator key ever authorized, and
+both keys of every credential ever enrolled. A reserved key never takes a
+second role and never returns to its first, alone or with a different partner.
+So a revoked or replaced key cannot come back under a new `cred_id`, as an
+operator key, as a root key, or as the other half of someone else's pair. The
+sequencer checks this on visible fields alone, which is why a revoked
+credential keeps its entry and revoked operator keys and replaced root keys
+leave tombstones. "A key" here means an algorithm identifier together with
+that algorithm's one accepted public encoding, so that an alias or a second
+encoding of the same key cannot slip past the reservation; the encoding is
+Codex's to specify. The principal that names an operator key or a root key is
+that same value with its role tag, and not a separate identifier or a digest;
+the reservation is over the value without the tag (Codex's draft, §2). The
+reservation is of encodings. It cannot tell that two public keys under
+different algorithms were derived from one secret, and no check at the relay
+can. Enrollment tooling must generate the key of each role independently;
+sharing or converting a secret between roles is not an approved way to make
+keys.
 
 **Namespace capacity.** In phase 1 a namespace has exactly one declaration
 owner: it is granted to one credential at enrollment and a `namespace_id` is
@@ -921,9 +958,10 @@ encryption key a reader; that key is enrolled as a reader like any other.
 
 | Record | Origin | Sequencer-checked preconditions | Effects |
 | --- | --- | --- | --- |
-| `line_init` | root | Log empty; names the root key, the creation descriptor's digest and the profile (§4.4) | Line state created: `generation = 1`, `root_rev = 1`, `auth_epoch`, `audience_rev` and `key_epoch` at 0, no operators or credentials, `rekey_pending` set until the first activation. The root key is the first reserved key |
-| `operator_key_authorize` | root | `expect.root_rev`; the key has never held any role on the line (§6.1), so in particular it is not authorized now and was never revoked | Key joins the operator set; `root_rev++`; `auth_epoch++` |
-| `operator_key_revoke` | root | `expect.root_rev`; key currently authorized | Key leaves the operator set and is tombstoned for good; `root_rev++`; `auth_epoch++` |
+| `line_init` | root | Log empty; names exactly two distinct root keys (`root_keys`), is signed by one of them (`root_key`), and commits the creation descriptor's digest and the profile (§4.4) | Line state created: `generation = 1`, `root_keys` sorted, `root_rev = 1`, `auth_epoch`, `audience_rev` and `key_epoch` at 0, no operators or credentials, `rekey_pending` set until the first activation. Both root keys enter the key registry |
+| `operator_key_authorize` | root | Signing `root_key` in active `root_keys`; `expect.root_rev`; the key has never held any role on the line (§6.1), so in particular it is not authorized now and was never revoked | Key joins the operator set; `root_rev++`; `auth_epoch++` |
+| `operator_key_revoke` | root | Signing `root_key` in active `root_keys`; `expect.root_rev`; key currently authorized | Key leaves the operator set and is tombstoned for good; `root_rev++`; `auth_epoch++` |
+| `root_member_replace` | root | Syntactic: `old_root_key` and `new_root_key` non-empty, all three of `root_key`, `old_root_key`, `new_root_key` distinct (no self-removal and no collapsing the 2-key set), `expect.root_rev` present. Origin: `root_key` in active `root_keys`. Target: `old_root_key` in active `root_keys`. Conflict: `new_root_key` has never held any role on the line (§6.1) and `expect.root_rev` current. Ciphertext-free | Atomically replaces `old_root_key` with `new_root_key` in sorted `root_keys`, adds `old_root_key` to `tombstones.root_keys`, `root_rev++`, `auth_epoch++`. `rekey_pending` untouched |
 | `recovery_generation` | root | §4.4; carries the tombstone registry, the reserved keys and the reconciled membership and key state | New generation; hot index empty; §5.7 rule 5 applies |
 | `credential_enroll` | operator | Carries the join-request ID, the digest of the join request, both public keys, the `cred_id` and the grant. Syntactic: the two keys differ, `cred_id` is their derivation, the grant is well-formed. Then: join-request ID unused; `cred_id` never enrolled; neither key has ever held any role (§6.1); granted `namespace_id` never granted before | Credential added with its two keys; `auth_epoch++`; `rekey_pending` set |
 | `credential_revoke` | operator | Credential enrolled | Credential tombstoned, its entry and keys kept; its actors disabled for good; `auth_epoch++`; `audience_rev++`; `rekey_pending` set |
@@ -947,10 +985,13 @@ survive a change of keys enrolls the new credential, moves the actors, and
 only then revokes the old one. If the old key has to be revoked at once, its
 actors go with it, and no record brings one back.
 
-A revoked operator key is never authorized again; the root authorizes a new
-key instead. What that key signed before its revocation stays in the log
-with its signer unchanged, and an active principal can still reconcile it
-(§5.5).
+A revoked operator key or a replaced root key is never authorized again in any
+role; an active root authorizes a fresh operator key or installs a fresh peer
+root key via `root_member_replace` instead. A replaced root key that proves
+possession on submission, query or anchor request receives `revoked` (never
+historical receipts), and stops under §5.7 rule 8. What that key signed before
+its replacement stays in the log with its historical signer unchanged, and an
+active root or active operator can still reconcile it (§5.5).
 
 `actor_addressing` replaces `retire` (lifecycle.go:180), which today changes
 default broadcast recipients, delivery and listings and so cannot be an
@@ -1228,7 +1269,8 @@ rejected.
 | Record family | Visible |
 | --- | --- |
 | All | The signed fields of §5.1; `seq`, `seq_time`, `head` |
-| `line_init` | Root key, creation-descriptor digest, the complete profile |
+| `line_init` | Initial two-member `root_keys`, signing `root_key`, creation-descriptor digest, the complete profile |
+| `root_member_replace` | Signing `root_key`, `old_root_key`, `new_root_key`, `expect.root_rev` |
 | Membership and keys | Public keys, credential IDs, join-request IDs and digests, namespace IDs, grants, limits, epochs, manifest credential IDs and wrap commitments |
 | `actor_declare`, `actor_move`, `actor_addressing`, `register_activate` | `actor_id`, `namespace_id`, binding, `default_addressed`, revisions |
 | `call_open` | `call_id`, `from`, `to` |
@@ -1414,9 +1456,9 @@ Not designed here. A later phase must satisfy at least:
 The rows below are of four different kinds, and "agreed" means only the last
 one:
 
-- **Operator choices:** O1, O2, O3 and O3a are decided; O9, O25 and O26 are
-  not. O25 and O26 were put to the operator on 2026-11-23 and are
-  unanswered.
+- **Operator choices:** O1, O2, O3, O3a, O25, O26 and hosting are decided;
+  O9 remains open (low priority). O25, O26 and hosting were decided by the
+  operator on 2026-11-25.
 - **Discussion values:** O4 and O10 hold provisional numbers nobody has
   measured or approved.
 - **Deployment-dependent:** O11.
@@ -1452,8 +1494,8 @@ one:
 | O22 | Operator key lifecycle | Draft v7, following Codex's P8: a revoked operator key leaves a tombstone, is never authorized again, and is told `revoked` once it has shown possession; a key never authorized gets an admission error (§5.4, §6.2) | Agreed in design review; not operator-approved |
 | O23 | Sequence numbering across generations | Whether `seq` restarts in a new generation is undecided; §5.9 depends on the answer. Gemini drafted an unapproved v0 recovery proposal favouring reset to 1 with generation-qualified coordinates ([LDR-RECOVERY.md](LDR-RECOVERY.md)) | Open: Codex + Claude + operator, with recovery |
 | O24 | Questions this document leaves to the enrollment, control-bootstrap and envelope design | Listed in Appendix A.7 as Q1 to Q16. Where each stands after Codex's drafts v1 to v3 is in A.8. The four that were gaps in this document's own text or vectors (Q2, Q10, Q11, Q16) are closed in draft v7 | Partly closed; see A.8 |
-| O25 | Who vouches for a new member's starting state | Codex's draft (P4) proposes that the enrolling operator's device attests the complete control state at the enrollment's commit, and that the joiner verifies every record after it. That trusts the operator's verified store and signing path for everything before the join. If the records the joiner verifies revoke that operator's key before the joiner has accepted its starting state, the joiner stops, and a currently authorized operator must attest afresh for the same credential; that is not a second enrollment (draft v2, §4.2). The alternative is to replay every control record from genesis, which needs no such trust and grows with the line's age. Neither changes a rule in this document. The operator asked on 2026-11-23 for a better way than either. A third route is explored in §14.7: the chain commits to the state, and the operator's signature on the enrollment is the endorsement. It would change the chain frame, and it is not chosen | Open: operator, asked 2026-11-23, unanswered |
-| O26 | Whether the root key can sign inside a validity window | §4.4 gives root records ordinary validity, 10 minutes at most on the provisional numbers. Whether a protected or offline root key can catch up and sign in that time is to be found by a dry run. If it cannot, root records need a validity rule this document does not have | Open: operator, asked 2026-11-23, unanswered |
+| O25 | Who vouches for a new member's starting state | **Decided 2026-11-25: full control-log replay from genesis before ordinary use.** Newly enrolled machines replay all control-only envelopes from genesis (no plaintext, no prior epoch keys); envelope-level control metadata is acceptable. Supersedes P4 (detached operator attestation) for phase 1 and archives §14.7 (`Profile.StateCommit`) as an unchosen exploration | Operator |
+| O26 | Root signing validity window and root key policy | **Decided 2026-11-25: fits within the provisional 10-minute validity window; equal 1-of-2 roots.** Root records keep ordinary validity (§4.4). Lines provision two distinct equal root keys (`root_keys`, threshold 1) with tagged principals `["root", key]`, permanent `tombstones.root_keys`, and `root_member_replace` (§6.1, §6.2) | Operator |
 | O19 | Retirement of operation identity | Anchor-scoped identity; an anchor's identity space retires at its `seq_time` plus a maximum validity that is fixed per generation (§5.6). The alternative is a permanent digest tombstone per rejected operation | Accepted by Codex at design-review level, with two constraints that are folded in |
 
 ## 14. Conformance vectors and the reference checker
@@ -2062,7 +2104,14 @@ The threat model's fault scenarios and the security review's fixtures that
 concern resources, offers, fences and enrollment substitution belong to §12
 and to Codex's documents respectively.
 
-### 14.7 An exploration for O25: a state commitment in the chain
+### 14.7 An exploration for O25: a state commitment in the chain (archived — unchosen for phase 1)
+
+> **Status (2026-11-25):** Archived exploration. On 2026-11-25 the operator
+> decided **O25** in favour of **full control-log replay from genesis before
+> ordinary use**. `Profile.StateCommit`, `ldrcore/commit.go` (state-digest
+> path) and `ldrcore/join.go` remain in `ldrcore/` behind `StateCommit: false`
+> as a kept reference exploration and are not part of the phase-1 wire
+> protocol.
 
 On 2026-11-23 the operator asked whether there is a better way than the two
 routes of O25. This section records a third route and what a reference model
@@ -2368,6 +2417,41 @@ profile, and `signedContext.prune` drops retired anchors and their committed
 operation identities once `head_time > anchor.seq_time + validity_max`
 (trace T50). Vectors: 210 active (2 retired), 50 traces (165 steps).
 
+### 14.9 Draft v8: equal 1-of-2 roots and 2026-11-25 operator decisions
+
+On 2026-11-25 the operator decided hosting (operator-hosted Go relay for LAN
+and closed corporate networks), **O25** (full control-log replay from genesis
+before ordinary use), and **O26** (root signing fits within the provisional
+10-minute validity window; equal 1-of-2 roots). Draft v8 updates `ldrcore/`
+and [LDR-CONFORMANCE-VECTORS.json](LDR-CONFORMANCE-VECTORS.json) to model
+equal 1-of-2 roots:
+
+- `Line.RootKey` is replaced by `Line.RootKeys` (exactly two distinct active
+  root keys in generation > 0) and `Tombstones.RootKeys` (permanent
+  cross-role reservation for replaced root keys).
+- The unqualified `"root"` alias is removed in favour of `RootPrincipal(key)`
+  (`"root:" + key`); every `OriginRoot` record names its signing `RootKey`.
+- `root_member_replace` (Origin: `root`, ciphertext-free) atomically replaces
+  the *other* active root key with a fresh key, requires `expect.root_rev`,
+  forbids self-removal and set collapse (`invalid`), tombstones the replaced
+  key, and increments `root_rev` and `auth_epoch` without setting
+  `rekey_pending`.
+- `Sequencer.standing` returns `standingRevoked` for replaced root keys
+  (`unresolved / revoked` on submit — including `line_init` retries once a
+  line exists — query, and anchor request), while active roots and active
+  operators can reconcile a replaced root's receipts.
+- `Client.RootKey` replaces `Client.Root`, and replaced root keys participate
+  in §5.7 Rule 8 stopped-key enforcement (`deviceKeys`, `revokedInRecords`)
+  without blocking other keys on the same device.
+- Conformance suite expanded to **230 active apply vectors** (2 retired; new
+  `A213`–`A232`) and **52 traces / 176 steps** (new `T51` in sequencer model
+  and `T52` in client model), plus hostile-input generation in `robust_test.go`
+  and invariant checks in `equal_roots_test.go`. Measured on 2026-11-25 under
+  a held `mac` lease (Go 1.25.3, darwin/arm64): `gofmt -l ldrcore/` clean,
+  `go vet ./ldrcore/` clean, `GOMAXPROCS=2 go test -count=1 ./ldrcore/` PASS
+  (54.783s), `GOMAXPROCS=2 go test -race -count=1 ./ldrcore/` PASS (37.306s).
+  Awaiting Codex and Claude cross-review.
+
 ## Appendix A. What this document requires from the enrollment, control-bootstrap and envelope design
 
 Added 2026-11-23 at Codex's request, as input to its draft and to the
@@ -2390,11 +2474,11 @@ line's message history.
 | # | The state machine depends on | From |
 | --- | --- | --- |
 | G1 | A `line_id` that does not depend on any local path. | §2 |
-| G2 | A genesis constant derived from the line identity, the root key and the digest of the root-signed creation descriptor. The relay is provisioned with that descriptor before any record exists, so genesis is fixed in advance. `line_init` names it as its anchor, names generation 1 and the root key, and commits the descriptor's digest and the profile. One that names a different genesis is answered `unknown_anchor`; one that states other contents under the right genesis is refused as invalid bootstrap input. | §4.4 |
+| G2 | A genesis constant derived from the line identity, the canonical initial two-member equal root key set and the digest of the root-signed creation descriptor. The relay is provisioned with that descriptor before any record exists, so genesis is fixed in advance. `line_init` names it as its anchor, names generation 1, the two distinct initial `root_keys` and its signing `root_key`, and commits the descriptor's digest and the profile. One that names a different genesis is answered `unknown_anchor`; one that states other contents under the right genesis is refused as invalid bootstrap input. | §4.4 |
 | G3 | `line_init` is root-signed, exempt from validity but not from its context, and commits only into an empty log. The first record of an empty log can only be `line_init`; a replaying client treats anything else there as a sequencer violation. A malformed or wrongly signed `line_init` is refused with nothing recorded, and is never answered "a line exists". | §4.4, §6.2 |
-| G4 | After `line_init` the line has generation 1, `root_rev` 1, `auth_epoch`, `audience_rev` and `key_epoch` at 0, no operators, no credentials, and `rekey_pending` set. Nothing payload-bearing commits until at least three more records have: a root `operator_key_authorize`, an operator `credential_enroll` that grants reader capability (an activation's manifest is a required list and must equal the entitled readers), and an operator `key_epoch_activate`. | §5.8, §6.2, §6.3 |
-| G5 | Every root record other than `line_init` and `recovery_generation` uses the ordinary envelope and ordinary validity. The root key therefore signs from a verified checkpoint, anchored on the generation's first record or a later anchor, inside a validity window whose provisional maximum is 10 minutes. Root may request an anchor over an authenticated session. | §4.2, §4.4, §5.3, O10 |
-| G6 | `operator_key_authorize` and `operator_key_revoke` sign `expect.root_rev`. Each increments `root_rev` and `auth_epoch`. | §6.2 |
+| G4 | After `line_init` the line has generation 1, two active `root_keys`, `root_rev` 1, `auth_epoch`, `audience_rev` and `key_epoch` at 0, no operators, no credentials, and `rekey_pending` set. Nothing payload-bearing commits until at least three more records have: a root `operator_key_authorize`, an operator `credential_enroll` that grants reader capability (an activation's manifest is a required list and must equal the entitled readers), and an operator `key_epoch_activate`. | §5.8, §6.2, §6.3 |
+| G5 | Every root record other than `line_init` and `recovery_generation` uses the ordinary envelope and ordinary validity. Active root keys therefore sign from a verified checkpoint, anchored on the generation's first record or a later anchor, inside a validity window whose provisional maximum is 10 minutes (confirmed practical by operator decision on O26, 2026-11-25). Active roots may request an anchor over an authenticated session. | §4.2, §4.4, §5.3, O10, O26 |
+| G6 | `operator_key_authorize`, `operator_key_revoke` and `root_member_replace` sign `expect.root_rev` and name their signing `root_key`. Each increments `root_rev` and `auth_epoch`; `root_member_replace` atomically swaps the other active root key for a fresh key and tombstones the replaced key. | §6.2 |
 | G7 | An operator record is a guarantee only if the operator key cannot be used by a process running as the operator's OS user without an authorized, action-scoped approval in which the operator sees the actual action and what the payload means. The signed intent carries an action scope that must match the record type and target. | §3, §7.3 item 9, §10.2 |
 | G8 | The freshness window `F` and the maximum validity are protocol profile data, committed in `line_init` and never chosen by the relay per request. The profile is fixed for a whole generation, and its digest is signed in every intent. A replaying client reads `F` from the chain to check `time_anchor` spacing. | §4.2, §4.4, §5.1, §5.6 |
 
@@ -2428,7 +2512,7 @@ How M3 and M4 are established is not stated in this document: see Q5.
 | --- | --- | --- |
 | V1 | The signature covers at minimum the fields of §5.1: version; the profile digest; `line_id` and `generation`; the origin and the tagged signing principal; `actor_id` and `binding_gen` for actor origin; `op_id`; `op_type` and `target`; `expect`; `auth_epoch`; `key_scope` and `key_epoch`; `seen_seq` and `seen_head`; `validity`; `payload_commit`; and every field on §10's allowlist for the record type. Operator and root intents also sign their action scope. | §3, §5.1, §10 |
 | V2 | The signature is verified over the exact bytes received. A client stores the serialized intent durably before the first send, and every retry sends those bytes. Two submissions are the same operation content when a digest of the intent is equal. | §2, §5.5, §5.7 |
-| V3 | Operation identity is `(line_id, generation, signing principal, seen_seq, op_id)`, where the principal is a credential, an operator key or the root, each kind in its own space. An `op_id` is unique only within its anchor. Different bytes under one identity are `duplicate_mismatch` until the anchor retires; after that an identity that never committed is `expired`, and one that committed still returns its receipt. A later anchor makes a different operation by definition, and a client never chooses one to refresh an unresolved intent. | §5.1, §5.5, §5.6, §5.7 |
+| V3 | Operation identity is `(line_id, generation, signing principal, seen_seq, op_id)`, where the principal is a credential, an operator key (`["operator", key]`) or a specific root key (`["root", key]`), each kind in its own space. An `op_id` is unique only within its anchor. Different bytes under one identity are `duplicate_mismatch` until the anchor retires; after that an identity that never committed is `expired`, and one that committed still returns its receipt. A later anchor makes a different operation by definition, and a client never chooses one to refresh an unresolved intent. | §5.1, §5.5, §5.6, §5.7 |
 | V4 | Anything derived per operation must bind the full context: line, generation, signer, anchor and operation identity, with the relevant scope and epoch. Different plaintext under the same identity is a hazard that arises before sending, and dedup at the relay cannot cure it. | §5.6 |
 | V5 | Binding generations. An actor-origin intent names `(actor_id, binding_gen)` and is authorized only while that is the current binding to the signing credential and the actor is live. `actor_move` increments `binding_gen` and `auth_epoch`, which invalidates intents pending under the old binding. A register value signs `binding_gen` and `writer_rev`, and an activation belongs to the binding generation that made it. | §3, §6.2, §9 |
 | V6 | Expected versions are signed, visible, and defined per record type: `root_rev`; `key_epoch`; `binding_gen`; `addr_rev`; `writer_rev`; `turn_count`; `lifecycle_rev`; a dispute's `rev` and the signer's own `measure_rev`; and `audience_rev` for a default-audience broadcast. A value that is not current is `conflict`. Zero is a real expected value: the first `key_epoch_activate` expects `key_epoch` 0, and a new call's `lifecycle_rev` is 0. See Q10. | §5.1, §5.8, §6.2, §7.2, §8 |
@@ -2459,7 +2543,7 @@ How M3 and M4 are established is not stated in this document: see Q5.
 | S2 | A sequencer-origin record carries no signature and is accepted only over authenticated relay transport. A valid hash chain alone authenticates neither origin nor freshness. | §2 |
 | S3 | `head` covers the previous head, the signed intent bytes and every sequencer-assigned field. `seen_head` in an intent is that value. | §2, §5.1 |
 | S4 | Durable rejections and no-ops are trusted relay decisions. They are authenticated to the client under the relay boundary and cannot be re-derived from the chain. | §5.4 |
-| S5 | A query is signed, carries an operation identity and a digest and not the bytes, and is answered only to a requester authorized to learn that outcome. A query authenticated only by a revoked key, a credential's or an operator's, is refused with `revoked`, and only after that key's possession is shown; a key that never held the role is refused without that distinction. An active, separately authorized principal may reconcile a revoked signer's history by signing a query that names the original operation and digest. | §5.5 |
+| S5 | A query is signed, carries an operation identity and a digest and not the bytes, and is answered only to a requester authorized to learn that outcome. A query authenticated only by a revoked credential, revoked operator key or replaced root key is refused with `revoked`, and only after that key's possession is shown; a key that never held the role is refused without that distinction. An active, separately authorized principal (an active root or active operator) may reconcile a revoked or replaced signer's history by signing a query that names the original operation and digest. | §5.5 |
 | S6 | Request authorization, input bounds and rate limits are required for anchor requests and submissions, and each credential has a bounded quota of durable rejections and no-ops. The quota is per credential, so the principal is authenticated before it is charged. A rate-limit answer never implies non-commit. | §4.2, §5.4 |
 | S7 | A submission arrives on a session authenticated as the principal that signed it. Standing, quota and the `revoked` answer are all judged for that principal, so a signed intent in someone else's hands cannot be submitted by them. | §5.4, §5.5 |
 
@@ -2501,9 +2585,9 @@ approval, and no row rests on a cryptographic test.
 | --- | --- | --- |
 | Q1 | Agreed in direction: the relay is provisioned with the creation descriptor before the first record (P1). Who may provision a line, and how that is authenticated, depends on the deployment and is open. | §4.4 |
 | Q2 | Closed in this document: the profile is committed in `line_init`, and its digest is signed in every intent (P1). | §4.4, §5.1 |
-| Q3 | **Open, the operator's (O26).** Root records keep ordinary validity. Whether a protected or offline root key can sign in time needs a dry run. | §4.4, §13 |
-| Q4 | Agreed: operator-key tombstones, no re-authorization, `revoked` only after possession is shown (P8). | §5.4, §6.2 |
-| Q5 | **Open, the operator's (O25).** Codex proposes a complete-state attestation by the enrolling operator's device, with root- and operator-signed authority evidence, and a verified suffix (P4). The signed envelopes show signed intent; they do not show commit, completeness or currency. The attestation is a trust exception in favour of that operator's verified store, not a re-derivation from the root, and a compromised or rolled-back attesting device remains a limitation. Replay from genesis is the alternative. Codex withdrew an earlier relay-attested variant after this review found that it let a relay invent a line for a joiner. Draft v2 adds the case this review raised: an attestation has no position in the log, so if the records the joiner verifies revoke the attesting operator before the joiner has accepted its state, the joiner stops and keeps the candidate state aside, and a currently authorized, independently pinned operator attests afresh for the same credential. That is not a second `credential_enroll`. The check covers every record up to and including the head the joiner's fresh anchor names; a revocation after that head follows the ordinary rules, and one the relay withholds is still not seen (draft v3). A third route, in which the chain commits to the state and the enrollment itself is the endorsement, is explored in §14.7 and is not chosen. | Codex's draft §4; §13; §14.7 |
+| Q3 | **Decided by the operator (2026-11-25, O26).** Root records keep ordinary validity (10-minute provisional maximum), and lines use equal 1-of-2 roots (`root_keys`, `root_member_replace`, `tombstones.root_keys`). | §4.4, §6.1, §6.2, §13 |
+| Q4 | Agreed: operator-key tombstones, no re-authorization, `revoked` only after possession is shown (P8). Draft v8 extends the same tombstone and `revoked` standing model to replaced root keys. | §5.4, §6.2 |
+| Q5 | **Decided by the operator (2026-11-25, O25): full control-log replay from genesis before ordinary use.** Newly enrolled credentials replay control-only envelopes `(1, 1..head)` without payload sidecars or prior epoch keys before acting. P4 (detached operator attestation) is superseded for phase 1, and §14.7 (`Profile.StateCommit`) is archived as an unchosen exploration. | §0, §13, §14.7 |
 | Q6 | Agreed: `cred_id` is derived from the two keys; neither key is replaced; each key is reserved for life across roles (P2). | §3, §6.1, §6.2 |
 | Q7 | Agreed: the operator's tooling checks possession; the sequencer has no rung for it (P3). | §6.2 |
 | Q8 | Agreed in direction: the join request binds the line, both keys, the grant and a request ID, and its digest is a visible field of the enrollment (P3). The ceremony itself is Codex's and is not reviewed here beyond that. | §6.2, §10 |
