@@ -1,14 +1,15 @@
-# LDR operator-hosted Go relay — architecture, transport, storage, clock and crypto profile (draft v0)
+# LDR operator-hosted Go relay — architecture, transport, storage, clock and crypto profile (draft v1)
 
-2026-11-25 · Gemini · **Unapproved draft proposal.** Not a specification and
-not an authorization to implement production relay, transport or cryptographic
-code. Prepared on `gemini/ldr` for cross-review by Codex (Astra), Claude
-(Fable) and the operator, following the operator's 2026-11-25 decisions:
+2026-11-25 · Gemini · Architecture and design specification on `gemini/ldr`
+reflecting the operator's 2026-11-25 selections (Phase A `ldrcrypto/` and
+`ldrcore/` recovery modelling approved; Phase B/C relay/client production
+implementation remains gated on review):
 
-- **Hosting:** operator-hosted Go relay (selected over Cloudflare Durable
-  Objects so the relay can run on local networks and on closed corporate
-  networks between the operator's and colleagues' agents without depending on
-  external cloud infrastructure).
+- **Hosting:** **Go relay first** — runs identically on local networks, closed
+  corporate networks, and public custom VMs, while keeping **Cloudflare
+  Workers / Durable Objects** explicitly compatible as a future backend via
+  pluggable `session_binding` in `relay_origin` and a swappable `Store`
+  interface.
 - **O25 (new-member control bootstrap):** full control-log replay from genesis
   before ordinary use (envelope-level control metadata without plaintext or
   prior epoch keys is acceptable; supersedes P4 detached attestation and
@@ -17,6 +18,18 @@ code. Prepared on `gemini/ldr` for cross-review by Codex (Astra), Claude
   validity window confirmed practical; **equal 1-of-2 roots** (`root_keys`,
   tagged `["root", key]` principals, `tombstones.root_keys`,
   `root_member_replace`).
+- **O23 & recovery (2026-11-25):** reset `seq` to `1` in generation `g+1`
+  with generation-qualified `(gen, seq)` coordinates everywhere, full replay
+  across generations `(1, 1..base_seq) -> (2, 1..head)`, and tombstone
+  discarded `call_id` / `broadcast_id` values ([LDR-RECOVERY.md](LDR-RECOVERY.md)).
+- **Profile v1 crypto & storage selections (2026-11-25):**
+  - Payload AEAD: **per-message 32-byte CSPRNG salt + `HKDF-SHA256` +
+    `AES-256-GCM`** (100% Go 1.25 stdlib & native Web Crypto).
+  - Signatures: **`ed25519` (default) + strict low-S canonical
+    `ecdsa-p256-sha256`** (for hardware/platform root & operator signers).
+  - Relay storage (Go backend): **zero-dep CRC32C-framed append-only WAL +
+    CAS sidecars + `F_FULLFSYNC`/`fsync`** behind a swappable `Store`
+    interface.
 
 Companions: [LDR-STATE-MACHINE.md](LDR-STATE-MACHINE.md) (draft v8),
 [LDR-CONFORMANCE-VECTORS.json](LDR-CONFORMANCE-VECTORS.json),
@@ -28,7 +41,7 @@ Companions: [LDR-STATE-MACHINE.md](LDR-STATE-MACHINE.md) (draft v8),
 
 ---
 
-## 1. Deployment and network model (LAN and closed networks)
+## 1. Deployment and network model (LAN, closed networks, public VMs, and future Workers)
 
 ### 1.1 Operational shape
 
@@ -39,40 +52,48 @@ eliminates cross-runtime TypeScript/WebAssembly state-machine divergence;
 wire decoding, canonical CBOR checks, signature verification and storage
 integration still require dedicated cross-checks and negative vectors.
 
-Because the relay is intended for **local networks and closed corporate
-networks**, it must operate with **zero dependency on public internet reachability,
-public certificate authorities, ACME/Let's Encrypt, or external cloud APIs**.
+The same Go relay binary serves **local networks**, **closed corporate
+networks**, and **public fully custom VMs** — with zero mandatory dependency
+on public internet reachability, public CAs, ACME, or external cloud APIs when
+run on private networks, and seamless WebPKI/ACME support when run on a public
+VM. Every core protocol rule (`ldrcore/`, CBOR wire format, crypto primitives,
+full-replay bootstrap) stays 100% hosting-agnostic so a **Cloudflare Worker /
+Durable Object** backend can plug in later without altering client state
+machines or wire records.
 
-### 1.2 Endpoint identity and certificate pinning
+### 1.2 Endpoint identity, TLS policy, and session-binding mode
 
-In a closed network, public WebPKI is frequently unavailable or intercepted by
-corporate inspection proxies. The creation descriptor (`ldr.creation-descriptor.v1`,
-signed by one of the two initial root keys) therefore pins the relay endpoint
-explicitly:
+The creation descriptor (`ldr.creation-descriptor.v1`, signed by one of the
+two initial root keys) pins the relay endpoint, server authentication policy,
+and session-binding mode explicitly (no per-request negotiation or silent
+fallback):
 
 ```
 relay_origin = {
-  url:          "https://<host-or-ip>:<port>",   // no credentials or secrets in URL
-  tls_policy:   "pin_spki_sha256" | "pin_ca_root_pem",
-  tls_pin:      <32-byte SHA-256 of SubjectPublicKeyInfo, or private CA root cert>,
-  proxy_mode:   "direct_tls_only"                // see §2.3
+  url:             "https://<host-or-ip>:<port>",   // no credentials or secrets in URL
+  tls_policy:      "pin_spki_sha256" | "pin_ca_root_pem" | "webpki",
+  tls_pin:         <32-byte SPKI SHA-256, private CA root cert, or empty for webpki>,
+  session_binding: "tls13_exporter" | "app_authenticated_session"
 }
 ```
 
 - **Zero-CA default (`pin_spki_sha256`):** `yip relay init` generates a
   self-signed server certificate (ECDSA P-256 or Ed25519) with explicit SANs
   (IP and/or internal DNS name) and outputs its SPKI SHA-256 pin into the
-  creation descriptor. Clients verify the server certificate against that pin
-  during TLS handshake (bypassing public CA lookup while still performing full
-  TLS 1.3 key exchange and signature verification on the leaf key).
+  creation descriptor. Ideal for LANs, closed networks, and direct VMs without
+  ACME. Clients verify the leaf SPKI directly during TLS 1.3 handshake.
 - **Enterprise PKI option (`pin_ca_root_pem`):** for internal corporate CAs,
   the creation descriptor pins the specific internal CA root certificate and
-  expected server DNS SAN so standard internal cert rotation works without
-  trusting the OS global root bundle.
+  expected server DNS SAN so internal cert rotation works without trusting the
+  OS global root bundle.
+- **Public VM / ACME option (`webpki`):** for public custom VMs using
+  auto-renewing Let's Encrypt / ACME certificates (or future Cloudflare Worker
+  endpoints), clients verify standard WebPKI against the pinned HTTPS origin
+  hostname (still requiring TLS 1.3 and never following HTTP redirects).
 - **No redirects or silent migration:** HTTP redirects are refused. Moving a
-  line to a new relay URL or rotating a pinned SPKI requires an explicit
-  root-authenticated migration record (out of scope until specified; clients
-  refuse unauthenticated origin changes).
+  line to a new relay URL, switching hosts (e.g., LAN Go relay -> public VM or
+  Cloudflare Worker), or changing TLS/session policy requires an explicit
+  root-authenticated transition (`recovery_generation`, [LDR-RECOVERY.md](LDR-RECOVERY.md)).
 
 ### 1.3 Line provisioning (Appendix A, Q1)
 
@@ -181,22 +202,27 @@ verifies `session_proof` against the two `root_keys` provisioned in the
 installed creation descriptor (`§1.3`), allowing either provisioned root to
 open a bootstrap session solely to submit `line_init`.
 
-### 2.3 Proxy policy (closed corporate networks)
+### 2.3 Proxy policy and future Cloudflare Worker / Durable Object compatibility
 
-A corporate reverse proxy that terminates TLS breaks `tls-exporter` because
-the client and Go relay see different TLS handshakes. Policy:
+A reverse proxy or cloud edge (such as Cloudflare Workers) that terminates TLS
+before the relay runtime breaks RFC 9266 `tls-exporter` because client and
+backend see different TLS handshakes. Policy:
 
-- **Default (`direct_tls_only`):** the client pins the Go relay's own leaf
-  SPKI or private CA cert directly. Any TLS-terminating MITM proxy causes
-  pin mismatch and fails closed. This works out of the box on LANs and
-  direct internal subnets.
-- **If an internal TCP passthrough / SNI proxy is used:** TLS terminates at
-  the Go relay, so `tls-exporter` and leaf SPKI pinning work unchanged.
-- **TLS-terminating HTTP reverse proxies are unsupported in phase 1.**
-  Supporting one would require an explicit separate profile mode and
-  application-level mutual authentication (such as Noise/HPKE session keys)
-  so the proxy cannot splice sessions or forge `revoked` replies; do not
-  silently weaken `tls-exporter` binding.
+- **Go relay default (`session_binding: "tls13_exporter"`):** used for LANs,
+  closed corporate networks, and direct public custom VMs (including behind a
+  TCP/SNI passthrough proxy). TLS 1.3 terminates directly at the Go relay. Any
+  TLS-terminating MITM proxy causes pin or channel-binding failure and fails
+  closed.
+- **Future Cloudflare Worker / TLS-terminating proxy mode
+  (`session_binding: "app_authenticated_session"`):** reserved explicitly in
+  `relay_origin` so a future Cloudflare Durable Object (via Go/Wasm or
+  vector-verified TypeScript) or reverse-proxied VM can establish an
+  application-level mutually-authenticated session inside the backend (for
+  example, HPKE-established ephemeral session keys or a descriptor-pinned
+  relay transport signing key binding challenges, requests, and replies)
+  without weakening `tls13_exporter` or changing any log record, CBOR
+  envelope, or `ldrcore/` rule. Clients refuse `"app_authenticated_session"`
+  until that transport specification and its negative test suite are approved.
 
 ### 2.4 Request and reply binding (P7)
 
@@ -280,10 +306,12 @@ options exist for the operator-hosted Go relay:
 | **Platform durability traps** | Must explicitly handle **macOS `F_FULLFSYNC`** (`fcntl(fd, F_FULLFSYNC)`), Linux `fsync` + parent-dir `fsync`, and Windows `FlushFileBuffers`; torn tail frame truncation must verify CRC32C and never silently accept corrupt mid-log frames | SQLite handles `F_FULLFSYNC` (`PRAGMA fullfsync = ON` on macOS) and torn-page checksums out of the box, though misconfigured pragmas or network filesystems still break durability |
 | **Auditability** | Small (~600–900 LOC), directly inspectable and fuzzable with fault injection | Large engine, battle-tested against power loss, less transparent internals |
 
-**Draft recommendation (for review):** **Option A (zero-dep CRC32C-framed
+**Operator selection (2026-11-25):** **Option A (zero-dep CRC32C-framed
 append-only WAL + content-addressed sidecar store + periodic canonical
-checkpoints)** fits Yip's zero-dependency architecture and LDR's
-single-writer-per-line sequential workload cleanly — *provided* we treat
+checkpoints behind a swappable `Store` interface)** fits Yip's zero-dependency
+architecture and LDR's single-writer-per-line sequential workload cleanly —
+while keeping the `Store` interface cleanly swappable for SQLite or a
+Cloudflare Durable Object SQLite backend later — *provided* we treat
 durability rigorously:
 
 - **Write ordering for commits with sidecars:**
@@ -425,12 +453,13 @@ state machine:
 
 ---
 
-## 5. Wire encoding and cryptographic suite candidate (P6)
+## 5. Wire encoding and Profile v1 cryptographic suite (P6 — Phase A approved 2026-11-25)
 
-> **Unapproved proposal.** No algorithm or encoding below is authorized for
-> production implementation until reviewed by Codex, Claude and the operator
-> and validated against official RFC test vectors and cross-implementation
-> negative vectors.
+> **Status (2026-11-25):** The operator approved **Phase A (`ldrcrypto/`)**
+> with the selections below (awaiting future cross-review by Codex and Claude
+> when they return). Every primitive is 100% Go 1.25 stdlib AND natively
+> supported by Cloudflare Workers Web Crypto (`Ed25519`, `ECDSA P-256`,
+> `X25519`, `HKDF`, `SHA-256`, `SHA-512`, `AES-256-GCM`).
 
 ### 5.1 Deterministic CBOR restricted subset (RFC 8949 §4.2.1)
 
@@ -482,14 +511,22 @@ LOC):
   - `"ldr.register"`
   - `"ldr.recovery-bundle"` (when recovery is adopted)
 
-### 5.3 Signatures: Ed25519 (RFC 8032) with bounded pre-commitment
+### 5.3 Signatures: Ed25519 (default) + strict low-S ECDSA P-256 (selected 2026-11-25)
 
-- **Candidate:** `Ed25519` (`crypto/ed25519` in Go stdlib) with **strict
-  canonical verification** (reject non-canonical `S >= L`, small-order `R`
-  or `A`, and non-canonical point encodings — note that Go's stdlib
-  `ed25519.Verify` rejects `S >= L` per RFC 8032 §8.4, and we MUST explicitly
-  test ZIP-215 vs RFC 8032 strictness and small-order public-key rejection
-  using published Ed25519 edge-case test vectors!).
+- **Default (`ed25519`):** `crypto/ed25519` (Go stdlib; RFC 8032) with **strict
+  canonical verification**: reject `S >= L` (RFC 8032 §8.4), non-canonical
+  `R` or public-key `A` encodings (`y >= 2^255 - 19`), invalid curve points,
+  and all 8 small-order / torsion points.
+- **Optional hardware/platform signer (`ecdsa-p256-sha256`):** `crypto/ecdsa`
+  + `crypto/elliptic.P256()` (Go stdlib; FIPS 186-5 / RFC 6979) so hardware
+  security keys, platform enclaves, and WebAuthn-backed signers can serve as
+  root or operator keys in Profile v1 without a migration:
+  - Canonical public key encoding: 65-byte uncompressed SEC1 point
+    (`0x04 || X || Y`), validated on-curve via `crypto/ecdh.P256().NewPublicKey`.
+  - Canonical signature encoding: fixed 64-byte raw `r || s` (32-byte big-endian
+    unsigned integers) with **strict low-S normalization** (`1 <= r < N`,
+    `1 <= s <= N/2`) enforced on signing and required on verification, blocking
+    `(r, N-s)` malleability identically to strict Ed25519.
 - **Bounded pre-commitment for hardware-key compatibility:**
   To keep the message passed to external/hardware signing paths small and
   constant-size (avoiding large APDU payloads while still authenticating the
@@ -497,23 +534,15 @@ LOC):
   ```
   M = Enc(["ldr.intent-signature.digest", 1, "sha-512", len(B), SHA-512(B)])
   ```
-  (consistent with the bounded pre-commitment pattern noted in root-signing
-  review). Every normal signer computes `SHA-512(B)` from the exact canonical
-  body `B` it displays/approves; the verifier recomputes `M` from received
-  `B_bytes` and verifies `Ed25519.Verify(pk, M, sig)`.
-- **Public key normalization:** `[alg_id = "ed25519", 32-byte canonical public
-  key]`. Checked against canonical encoding and small-order rejection before
-  entering the permanent key registry.
-- **Root keys (equal 1-of-2):** each of the two root keys carries its own
-  explicit `[alg_id, canonical_pk_bytes]` entry in `root_keys`, allowing
-  heterogeneous algorithms later if a profile adds one (e.g., ECDSA P-256 /
-  WebAuthn COSE key alongside Ed25519) without breaking principal tagging or
-  key reservation — though phase 1's initial profile should start with a
-  single reviewed algorithm (`ed25519`) unless hardware root signing requires
-  P-256 (`ecdsa-p256-sha256` with strict low-S RFC 6979 / SEC1 uncompressed
-  canonical normalization). That single question (whether root keys need
-  `ecdsa-p256` in addition to `ed25519`) should be confirmed before freezing
-  Profile v1!
+  Every signer computes `SHA-512(B)` from the exact canonical body `B` it
+  displays/approves; the verifier recomputes `M` from received `B_bytes` and
+  verifies under `[alg_id, canonical_pk_bytes]` (SHA-256 of `M` for
+  `ecdsa-p256-sha256`, direct `M` for pure `ed25519`).
+- **Public key normalization:** `[alg_id, canonical_pk_bytes]`. Both
+  algorithms are checked for canonical encoding before entering the permanent
+  key registry, and each root key in the equal 1-of-2 `root_keys` set carries
+  its own `[alg_id, canonical_pk_bytes]`, allowing mixed Ed25519 + P-256 root
+  pairs cleanly.
 
 ### 5.4 Per-recipient key wrapping & join-challenge encryption: HPKE Base (RFC 9180)
 
@@ -557,22 +586,20 @@ AES-GCM (explicitly ruled out in `LDR-ENROLLMENT-BOOTSTRAP-ENVELOPE.md` §6):
 | **Candidate 1: AES-256-GCM-SIV** (RFC 8452) with random 96-bit nonce + full `context_bytes` AAD | Needs ~250 LOC pure-Go POLYVAL + AES-CTR + key derivation verified against RFC 8452 Appendix C vectors (or reviewed dep) | **Yes** — repeating `(K, nonce)` on different plaintexts leaks only plaintext equality, never destroys authenticity or leaks XOR of plaintexts | Safe up to key-use limit even across VM snapshots/clones if nonce ever collides; still requires fresh CSPRNG nonce + persist-before-send | Custom POLYVAL implementation needs careful constant-time review, OR brings a small audited library |
 | **Candidate 2: Per-message random-salt HKDF-SHA256 + AES-256-GCM** (`salt = 32 CSPRNG bytes`, `msg_key = HKDF(K_epoch, salt, info=context_bytes)`, `nonce = 12 CSPRNG bytes`, `aad = context_bytes`) | **100% Go stdlib** (`crypto/hkdf`, `crypto/aes`, `crypto/cipher`, `crypto/rand`) | Standard GCM safety per derived key; 256-bit random salt eliminates multi-writer birthday collision across an entire epoch (`2^128` threshold instead of `2^48` / `2^32` for 96-bit random GCM nonces!) | Safe across unlimited concurrent writers without coordination; **HOWEVER**, if a VM snapshot rolls back *before* persist-before-send AND replays identical CSPRNG state, `salt`+`nonce` could repeat | Zero custom crypto primitives; still relies on OS CSPRNG freshness (`crypto/rand` / `getrandom` / `CCRandomGenerateBytes`) and strict persist-before-send |
 
-**Draft assessment (for Codex/Claude review):**
-- **Candidate 2** (32-byte CSPRNG `salt` -> `HKDF-SHA256(K_epoch, salt, info)` ->
-  one-time 32-byte `msg_key` + 12-byte `nonce` -> `AES-256-GCM(msg_key, nonce,
-  plaintext, aad=context_bytes)`) completely eliminates the classic
-  multi-writer 96-bit random-nonce birthday bound of raw AES-GCM while using
-  **zero custom cryptographic code** (100% Go 1.25 stdlib FIPS-reviewed
-  primitives) — unlike `HKDF(op_id)` with fixed nonce, which reuses keys if a
-  client crashes and re-encrypts under the same `op_id`!
-- **Candidate 1 (AES-256-GCM-SIV)** adds an extra layer of defense against
-  cloned-VM CSPRNG-state replay at the cost of implementing or depending on
-  POLYVAL/GCM-SIV.
-- **Explicit key-use limits (mandatory under either candidate):** e.g.,
-  automatic advisory rekey prompt after `2^20` messages or `90` days per epoch
-  (far below cryptographic limits), plus mandatory **persist-before-send**
-  (`§3.3`): a restored local outbox with uncertain encryption state reconciles
-  first and never re-encrypts an existing operation identity.
+**Operator selection (2026-11-25): Candidate 2 (`hkdf-sha256-aes256gcm`)**:
+- Every encryption draws a fresh 32-byte CSPRNG `salt` (`crypto/rand`),
+  derives a one-time 32-byte `msg_key` and 12-byte `nonce` via
+  `HKDF-SHA256(ikm = K_epoch, salt = salt, info = Enc(["ldr.payload-key", 1, context_bytes]))`,
+  and seals with `AES-256-GCM(msg_key, nonce, plaintext, aad = context_bytes)`.
+- This eliminates the classic multi-writer 96-bit random-nonce birthday bound
+  of raw AES-GCM (`2^128` salt collision bound across the epoch), uses **100%
+  Go 1.25 stdlib** with zero custom crypto math, and is **100% native Web
+  Crypto** compatible on Cloudflare Workers — while avoiding the banned
+  `HKDF(op_id)` deterministic-reuse hazard.
+- Honest residual limit: unlike `AES-256-GCM-SIV`, a mid-encryption VM clone
+  that replays identical CSPRNG state before persist-before-send could reuse a
+  `(salt, nonce)` pair. Strict **persist-before-send** (`§3.3`) and explicit
+  key-use limits (`2^20` messages or `90` days per epoch) remain mandatory.
 - **AAD (`context_bytes`)** binds `(purpose, version, profile_digest,
   line_id, generation, principal, actor_id, binding_gen, op_id, op_type,
   seen_seq, seen_head, key_epoch, target, expect, visible_fields)` — never
@@ -668,45 +695,31 @@ Connecting directly to [LDR-RECOVERY.md](LDR-RECOVERY.md) (draft v0):
 
 ---
 
-## 8. Implementation-readiness checklist and phased build plan
+## 8. Implementation status and phased build plan
 
-No production relay, transport, or cryptographic code is authorized yet.
-Before requesting implementation go-ahead from the operator, the following
-design gates remain:
+### Current status (2026-11-25)
 
-### Remaining pre-implementation design gates
-
-1. **Cross-review on `gemini/ldr`:** Codex (Astra) and Claude (Fable) review:
-   - Draft v8 equal 1-of-2 roots (`ldrcore/` + `A213`–`A232` + `T51`–`T52`);
-   - Gemini probe fixes `G1`–`G5` and §11.2 replay checks (`T48`–`T50`);
-   - Recovery draft ([LDR-RECOVERY.md](LDR-RECOVERY.md)) and O23 (`seq` reset
-     to 1 vs monotonic);
-   - This Go-relay architecture draft (`§1`–`§7`), specifically:
-     - Zero-dep WAL (`Option A`) vs SQLite (`Option B`);
-     - Payload AEAD choice (Candidate 1 `AES-256-GCM-SIV` vs Candidate 2
-       random-salt `HKDF-SHA256 + AES-256-GCM`);
-     - Whether Profile v1 needs `ecdsa-p256` alongside `ed25519` for hardware
-       root signing;
-     - Exact wire schema registry (field names, integer bounds, max sizes for
-       O4/Q13) and exact `ClockGuard` sleep/wake policy on LAN laptops.
-
-### Candidate phased build plan (post-approval only)
-
-- **Phase A — Wire encoding & crypto primitives package (`ldrcrypto/`):**
-  deterministic CBOR encoder/decoder with strict negative test suite;
-  canonical Ed25519 + RFC 8032 / edge-case vectors; HPKE Base mode verified
-  against RFC 9180 Appendix A.1 vectors; chosen payload AEAD verified against
-  RFC test vectors; canonical intent/chain/descriptor builders and golden
-  cross-check vectors.
-- **Phase B — Durable store & Go relay server (`ldrstore/`, `ldrrelay/`):**
-  single-transaction WAL + sidecar store with `F_FULLFSYNC` and crash/torn-tail
-  fault-injection tests; `ClockGuard` with discontinuity & restart tests;
-  TLS 1.3 server with `tls-exporter` session challenge binding; `yip relay
-  init / provision / serve / status`; end-to-end integration tests running
-  `T01`–`T52` over real localhost TLS 1.3!
-- **Phase C — Yip client LDR attachment (`ldrclient/` + CLI/MCP wiring):**
-  local durable verified log store + outbox persist-before-send + full-replay
-  joiner (`§6`); P3 key-first enrollment CLI ceremony; equal-roots management
-  CLI (`operator_key_*`, `root_member_replace`); projection materializer and
-  local delivery scan cursor hooked into existing `yip` MCP/CLI tools while
-  keeping host-local resource leases untouched.
+- **Approved by the operator (2026-11-25):**
+  1. `ldrcore/` recovery and generation-transition reference model
+     ([LDR-RECOVERY.md](LDR-RECOVERY.md): O23 `seq` reset to 1 with `(gen, seq)`
+     coordinates, full replay across generations, discarded `call_id` /
+     `broadcast_id` tombstones, traces `T53`–`T58`).
+  2. **Phase A (`ldrcrypto/`):** standalone zero-dep Go package implementing
+     strict deterministic CBOR (RFC 8949 §4.2.1), canonical `ed25519` + strict
+     low-S `ecdsa-p256-sha256`, RFC 9180 HPKE Base mode, random-salt
+     `HKDF-SHA256 + AES-256-GCM` payload AEAD, canonical envelope/chain/
+     descriptor builders, and RFC + negative test vectors.
+- **Awaiting peer cross-review (Codex & Claude) and operator go-ahead:**
+  - **Phase B (`ldrstore/`, `ldrrelay/`):** durable CRC32C WAL + CAS sidecars
+    + `F_FULLFSYNC` behind a swappable `Store` interface; `ClockGuard` with
+    discontinuity & restart tests; TLS 1.3 server with `tls13_exporter`
+    session binding; `yip relay init / provision / serve / status`; end-to-end
+    tests over localhost TLS 1.3.
+  - **Phase C (`ldrclient/` + CLI/MCP wiring):** local durable verified log
+    store + outbox persist-before-send + full-replay joiner (`§6`); P3
+    key-first enrollment CLI ceremony; equal-roots management CLI; projection
+    materializer and delivery scan cursor wired into `yip` while keeping
+    host-local resource leases untouched.
+  - **Optional future backend:** Cloudflare Worker / Durable Object backend
+    implementing the same `Store` / wire protocol with
+    `session_binding: "app_authenticated_session"`.

@@ -1,9 +1,10 @@
-# LDR recovery and generation transitions — draft v0
+# LDR recovery and generation transitions — draft v1
 
-2026-11-25 · Gemini (gemini seat) · Unapproved proposal for cross-review by
-Codex, Claude and the operator. Not a specification, not a security approval,
-and not an implementation plan. Nothing here modifies `ldrcore/` or authorizes
-recovery code.
+2026-11-25 · Gemini (gemini seat) · Operator approved reference modelling in
+`ldrcore/` on 2026-11-25 with O23-B (`seq` reset to 1 with `(gen, seq)`
+coordinates), full cross-generation replay `(1, 1..base_seq) -> (2, 1..head)`,
+and discarded `call_id` / `broadcast_id` tombstoning; awaits Codex and Claude
+cross-review before any relay/client production implementation.
 
 Companions: [LDR-STATE-MACHINE.md](LDR-STATE-MACHINE.md) (§4.4, §5.5, §5.9,
 §6.2, §13 O23, Appendix A Q15), `LDR-THREAT-MODEL.md` (Invariant 14), and
@@ -95,7 +96,7 @@ In addition to standard envelope metadata (protocol version, `line_id`,
 | `reconciled_root_replacements` | Any `root_member_replace` transitions from `(base_seq, tail]` (resulting active 2-member `root_keys` and additional replaced keys in `tombstones.root_keys`) so a root key replaced in the discarded tail can never silently regain authority |
 | `reconciled_revoked_creds` | `cred_id` entries revoked after `base_seq` (including any credentials enrolled in the discarded tail that are also being tombstoned, carrying their normalized public keys and namespaces so key/namespace reservations survive) |
 | `reconciled_removed_actors` | `actor_id` entries removed after `base_seq` |
-| `reconciled_tombstones` | Additional `creds`, `actors`, `join_requests`, `operator_keys`, `root_keys`, `reserved_keys`, `reserved_namespaces`, and per-writer `used_incarnations` learned from external witnesses |
+| `reconciled_tombstones` | Additional `creds`, `actors`, `join_requests`, `operator_keys`, `root_keys`, `calls`, `broadcasts`, `reserved_keys`, `reserved_namespaces`, and per-writer `used_incarnations` learned from external witnesses |
 | `reconciled_epoch_floors` | Minimum post-recovery values for `root_rev`, `auth_epoch`, `audience_rev`, `key_epoch`, per-actor `binding_gen`, and per-writer `writer_rev` so no counter regresses below any value observed in the discarded tail |
 | `reconciled_evidence_digests` | Optional list of digests of retained signed revocation/enrollment/removal envelopes from `(base_seq, tail]` backing the delta |
 | `reconciled_state_digest` | Commitment to the complete reconciled post-recovery state at `(g+1, 1)` (useful even if ordinary frames do not carry per-record commitments) |
@@ -237,29 +238,25 @@ These are proposed traces for review; none is implemented in `ldrcore/` yet
   construct `recovery_generation` and requires explicit migration to a new
   `line_id`.
 
-## 8. Open questions for Codex, Claude and the operator
+## 8. Resolved choices (2026-11-25) and remaining open items
 
-1. **New-member bootstrap into generation `g > 1` (with O25 decided as full
-   control-log replay on 2026-11-25):** must a joiner enrolled in generation 2
-   replay generation 1 up to `base_seq` and then generation 2 from `(2, 1)`, or
-   may `(2, 1)` act as a root-signed base checkpoint? Replaying
-   `(1, 1..base_seq)` + `(2, 1..head)` preserves the exact trust boundary of
-   full replay (root cannot invent honest-member actions before `base_seq`
-   without detection); treating `(2, 1)` as a new genesis shifts trust in the
-   pre-recovery state to the root key.
-2. **Interaction with equal 1-of-2 roots (O26 decided 2026-11-25):** if a root
+1. **New-member bootstrap into generation `g > 1` (decided 2026-11-25):**
+   full cross-generation replay `(1, 1..base_seq)` followed by `(2, 1..head)`
+   (and so on for later generations). Preserves full replay's exact trust
+   boundary all the way from genesis so a root key cannot silently fabricate
+   pre-recovery honest-member history.
+2. **Equal 1-of-2 roots across recovery (O26, decided 2026-11-25):** if a root
    key was replaced in `(base_seq, tail]` via `root_member_replace`, a
-   reconciled `recovery_generation` must carry that replacement forward and be
-   signed by a root key still active after reconciliation; if one of the two
-   roots was compromised, recovery cannot guarantee winning a race against the
+   reconciled `recovery_generation` carries that replacement forward
+   (`active_root_keys` + `tombstones.root_keys`) and must be signed by a root
+   key still active after reconciliation; if one of the two roots was
+   compromised, recovery cannot guarantee winning a race against the
    compromised root (consistent with equal 1-of-2 trade-offs).
-3. **Discarded-tail call/broadcast state:** this draft rolls conversation state
-   back to `(g, base_seq)` while carrying forward *security* tombstones from
-   `(base_seq, tail]`. That means a `call_id` or `broadcast_id` first created
-   in the discarded tail is not automatically tombstoned unless included in
-   `reconciled_tombstones`. Should `reconciled_tombstones` also include
-   discarded `call_id` and `broadcast_id` values so an archived discarded call
-   can never collide with a new call in generation `g+1`?
+3. **Discarded-tail call/broadcast IDs (decided 2026-11-25):**
+   `reconciled_tombstones` includes `calls` and `broadcasts` created in
+   `(base_seq, tail]` (`Line.Tombstones.Calls` and `Line.Tombstones.Broadcasts`),
+   so an archived discarded call or broadcast can never collide with a new ID
+   in generation `g+1`.
 4. **Deferred relay-resource phase (§12):** as Codex noted in call 0001 turn
    16, a future phase with relay-managed leases cannot resume grants on
    `(g+1, 1)` alone; it must additionally execute protected-host recovery

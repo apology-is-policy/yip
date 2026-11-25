@@ -1,17 +1,20 @@
 # LDR hosting options
 
-> **Operator decision (2026-11-25): Operator-hosted Go relay.** The operator
-> selected the operator-hosted Go relay over Cloudflare Durable Objects because
-> the relay will be run on local networks and on closed corporate networks
-> (between the operator's and colleagues' agents) without depending on external
-> cloud hosting. On the same date the operator also resolved the two separate
-> questions noted below: **O25** (full control-log replay from genesis before
-> ordinary use) and **O26** (root signing fits within the provisional 10-minute
-> validity window, with equal 1-of-2 roots). A draft architecture for the
-> operator-hosted Go relay is in [LDR-GO-RELAY-DESIGN.md](LDR-GO-RELAY-DESIGN.md)
-> (unapproved proposal; no relay or crypto implementation is authorized yet).
-> The comparison table below is preserved as the historical record of the
-> 2026-11-23 joint review.
+> **Operator decision (2026-11-25): Go relay first (LAN, closed corporate
+> networks, and public custom VMs), keeping Cloudflare Workers / Durable
+> Objects cleanly open as a future backend.** The operator selected the
+> operator-hosted Go relay as the primary deployment so it can run on local
+> networks, closed corporate networks, and public custom VMs alike, while
+> preserving full wire/crypto/state-machine compatibility for a future
+> Cloudflare Worker / Durable Object backend via pluggable `session_binding`
+> (`tls13_exporter` vs future `app_authenticated_session`), `tls_policy: "webpki"`,
+> native Web Crypto primitives, and a swappable `Store` interface. On the same
+> date the operator also resolved **O25** (full control-log replay from genesis
+> before ordinary use), **O26** (ordinary 10-minute root validity + equal
+> 1-of-2 roots), and **O23** (`seq` reset to 1 with `(gen, seq)` coordinates),
+> and approved `ldrcore/` recovery modelling and Phase A (`ldrcrypto/`). See
+> [LDR-GO-RELAY-DESIGN.md](LDR-GO-RELAY-DESIGN.md). The comparison table
+> below is preserved as the historical record of the 2026-11-23 joint review.
 
 **Joint-review draft 3, 2026-11-23. No recommendation and no deployment
 approval.** The options are a Cloudflare Durable Object per line, or a Go
