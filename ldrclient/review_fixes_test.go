@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/apology-is-policy/yip/ldrcore"
@@ -1843,4 +1846,647 @@ func TestSaveJoinRequestNoClobberAndIdempotentRetry(t *testing.T) {
 	if err := SaveJoinRequest(subDir, req1); !errors.Is(err, ErrOutputExists) {
 		t.Fatalf("SaveJoinRequest over directory: got %v, want ErrOutputExists", err)
 	}
+}
+
+// TestOutboxResolveAllMultiSignerProgressAndMustResolve verifies Codex Turn 16 Finding 1:
+// ResolveAll tracks per-entry resolution across sequential passes for multiple active
+// signers (two credentials), preserves progress across passes, never clears MustResolve
+// while another active signer's unsettled intent has not been answered, and re-arms
+// remaining unsettled entries after a restart (§5.7 rule 3).
+func TestOutboxResolveAllMultiSignerProgressAndMustResolve(t *testing.T) {
+	fx := startOnboardingFixture(t)
+	ctx := context.Background()
+
+	// Enroll two active member credentials: credA and credB.
+	credA, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	grantA := ldrcrypto.JoinGrant{NamespaceID: "ns-multi-a", ActorLimit: 4, Reader: true}
+	reqIDA, reqDigA := fx.enrollP3(t, credA, grantA, 0xa1)
+
+	credB, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	grantB := ldrcrypto.JoinGrant{NamespaceID: "ns-multi-b", ActorLimit: 4, Reader: true}
+	reqIDB, reqDigB := fx.enrollP3(t, credB, grantB, 0xa2)
+	fx.activateNextEpoch(t)
+
+	prinA := ldrcrypto.CredentialPrincipal(credA.CredID)
+	prinB := ldrcrypto.CredentialPrincipal(credB.CredID)
+
+	// Helper: create a member client for credA, compose one genuine pending intent signed
+	// by credA and one genuine pending intent signed by credB (composed on a scratch credB
+	// client), merge both into dirA's outbox.cbor, and reopen dirA so openClientLocked
+	// enforces §5.7 rule 3 (MustResolve=true, NeedsResolve=true on both active signers).
+	setupTwoCredClient := func(t *testing.T, actorA, actorB string, commitOpAOnRelay bool) (*Client, string, *ldrrelay.SessionClient, *ldrrelay.SessionClient, string, string) {
+		t.Helper()
+
+		dirA := t.TempDir()
+		clA, err := InitClientDir(InitDirOptions{
+			Dir: dirA, DirKind: DirKindMember, SignedDescriptor: fx.env.rawDesc, CredKeys: credA,
+			ExpectedGrant: &grantA, ExpectedJoinReq: reqIDA, ExpectedJoinReqDigest: &reqDigA, Activated: false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sessA, err := clA.Dial(ctx, ldrcrypto.PrincipalCredential)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { sessA.Close() })
+		if err := clA.VerifyEnrollmentAndActivate(ctx, sessA); err != nil {
+			t.Fatal(err)
+		}
+
+		dirB := t.TempDir()
+		clB, err := InitClientDir(InitDirOptions{
+			Dir: dirB, DirKind: DirKindMember, SignedDescriptor: fx.env.rawDesc, CredKeys: credB,
+			ExpectedGrant: &grantB, ExpectedJoinReq: reqIDB, ExpectedJoinReqDigest: &reqDigB, Activated: false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sessB, err := clB.Dial(ctx, ldrcrypto.PrincipalCredential)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { sessB.Close() })
+		if err := clB.VerifyEnrollmentAndActivate(ctx, sessB); err != nil {
+			t.Fatal(err)
+		}
+
+		opA, err := clA.ComposeAndPersist(ComposeParams{
+			Action: "decl_" + actorA, Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: actorA}, {Key: "label", Value: false}, {Key: "namespace_id", Value: grantA.NamespaceID}},
+		})
+		if err != nil {
+			t.Fatalf("compose opA: %v", err)
+		}
+		// Advance clB.NextOp so opB gets a distinct OpID ("op-11") when merged into dirA.
+		clB.mu.Lock()
+		clB.outbox.NextOp = 10
+		clB.mu.Unlock()
+		opB, err := clB.ComposeAndPersist(ComposeParams{
+			Action: "decl_" + actorB, Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: actorB}, {Key: "label", Value: false}, {Key: "namespace_id", Value: grantB.NamespaceID}},
+		})
+		if err != nil {
+			t.Fatalf("compose opB: %v", err)
+		}
+
+		obA := clA.OutboxSnapshot()
+		obB := clB.OutboxSnapshot()
+		if commitOpAOnRelay {
+			rep, err := sessA.Submit(ctx, obA[0].IntentBytes, obA[0].PayloadSidecar, obA[0].WrapSidecars)
+			if err != nil || rep.Outcome.Kind != ldrcore.Committed {
+				t.Fatalf("direct commit opA: rep=%+v err=%v", rep, err)
+			}
+		}
+		_ = clB.Close()
+		_ = clA.Close()
+
+		diskOB, err := loadOutbox(filepath.Join(dirA, "outbox.cbor"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		entryB := obB[0]
+		diskOB.Entries = append(diskOB.Entries, &entryB)
+		diskOB.NextOp = 11
+		if err := saveOutbox(filepath.Join(dirA, "outbox.cbor"), diskOB); err != nil {
+			t.Fatal(err)
+		}
+
+		// Reopen dirA: openClientLocked MUST set MustResolve=true and NeedsResolve=true on BOTH!
+		reopened, err := OpenClient(dirA)
+		if err != nil {
+			t.Fatalf("OpenClient(dirA): %v", err)
+		}
+		t.Cleanup(func() { _ = reopened.Close() })
+		if !reopened.Status().MustResolve {
+			t.Fatalf("expected MustResolve=true after restart with two active signers")
+		}
+		return reopened, dirA, sessA, sessB, opA, opB
+	}
+
+	t.Run("sequential_two_credential_passes_preserve_progress_and_require_both", func(t *testing.T) {
+		cl, _, sessA, sessB, opA, opB := setupTwoCredClient(t, "ma-1", "mb-1", false)
+
+		// Before any pass: Compose is blocked.
+		if _, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "blocked_before", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "ma-free-1"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: grantA.NamespaceID}},
+		}); !errors.Is(err, ErrMustResolve) {
+			t.Fatalf("Compose before ResolveAll: got %v, want ErrMustResolve", err)
+		}
+
+		// Pass 1 (credA only): queries opA (ClassUnknown -> stays OutPending, NeedsResolve=false).
+		// opB (credB) has NOT been queried -> MustResolve MUST remain true!
+		if err := cl.ResolveAll(ctx, sessA, prinA); err != nil {
+			t.Fatalf("ResolveAll pass 1 (credA): %v", err)
+		}
+		if !cl.Status().MustResolve {
+			t.Fatalf("MustResolve cleared after querying only credA while credB's intent was never queried!")
+		}
+		for _, e := range cl.OutboxSnapshot() {
+			if e.OpID == opA && (e.Status != ldrcore.OutPending || e.NeedsResolve) {
+				t.Fatalf("expected opA pending with NeedsResolve=false after pass 1, got %+v", e)
+			}
+			if e.OpID == opB && (e.Status != ldrcore.OutPending || !e.NeedsResolve) {
+				t.Fatalf("expected opB pending with NeedsResolve=true after pass 1, got %+v", e)
+			}
+		}
+		if _, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "still_blocked", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "ma-free-1"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: grantA.NamespaceID}},
+		}); !errors.Is(err, ErrMustResolve) {
+			t.Fatalf("Compose after credA-only pass: got %v, want ErrMustResolve", err)
+		}
+
+		// Repeating credA-only pass STILL MUST NOT clear MustResolve!
+		if err := cl.ResolveAll(ctx, sessA, prinA); err != nil {
+			t.Fatalf("repeated ResolveAll (credA): %v", err)
+		}
+		if !cl.Status().MustResolve {
+			t.Fatalf("MustResolve cleared on repeated credA-only pass!")
+		}
+
+		// Pass 2 (credB): queries opB, preserves opA's resolved progress from Pass 1,
+		// and NOW clears MustResolve=false!
+		if err := cl.ResolveAll(ctx, sessB, prinB); err != nil {
+			t.Fatalf("ResolveAll pass 2 (credB): %v", err)
+		}
+		if cl.Status().MustResolve {
+			t.Fatalf("expected MustResolve=false once both credA and credB passes completed")
+		}
+		if _, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "unblocked_after_both", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "ma-free-1"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: grantA.NamespaceID}},
+		}); err != nil {
+			t.Fatalf("Compose after both passes completed failed: %v", err)
+		}
+	})
+
+	t.Run("settled_pass1_progress_persists_while_pass2_still_required", func(t *testing.T) {
+		cl, dirA, sessA, sessB, opA, _ := setupTwoCredClient(t, "ma-2", "mb-2", true)
+
+		// Pass 1 (credA): settles opA -> OutDone and durably saves it, yet MustResolve stays true!
+		if err := cl.ResolveAll(ctx, sessA, prinA); err != nil {
+			t.Fatalf("ResolveAll pass 1 (credA): %v", err)
+		}
+		if !cl.Status().MustResolve {
+			t.Fatalf("MustResolve cleared after credA settled while credB was never queried!")
+		}
+		diskOB, err := loadOutbox(filepath.Join(dirA, "outbox.cbor"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !diskOB.MustResolve || diskOB.Entries[0].OpID != opA || diskOB.Entries[0].Status != ldrcore.OutDone {
+			t.Fatalf("expected durable OutDone for opA with MustResolve=true, got %+v", diskOB)
+		}
+		if _, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "still_blocked_2", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "ma-2"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: grantA.NamespaceID}},
+		}); !errors.Is(err, ErrMustResolve) {
+			t.Fatalf("Compose before credB pass: got %v, want ErrMustResolve", err)
+		}
+
+		// Pass 2 (credB): answers opB, preserves opA==OutDone, clears MustResolve -> slot of opA is reusable!
+		if err := cl.ResolveAll(ctx, sessB, prinB); err != nil {
+			t.Fatalf("ResolveAll pass 2 (credB): %v", err)
+		}
+		if cl.Status().MustResolve {
+			t.Fatalf("expected MustResolve=false after pass 2")
+		}
+		if _, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "reuse_opA_slot", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "ma-2"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: grantA.NamespaceID}},
+		}); err != nil {
+			t.Fatalf("Compose reusing opA's freed slot after both passes: %v", err)
+		}
+	})
+
+	t.Run("restart_between_passes_rearms_remaining_unsettled_entries", func(t *testing.T) {
+		cl, dirA, sessA, sessB, _, _ := setupTwoCredClient(t, "ma-3", "mb-3", false)
+
+		if err := cl.ResolveAll(ctx, sessA, prinA); err != nil {
+			t.Fatalf("pass 1 before restart: %v", err)
+		}
+		if err := cl.Close(); err != nil {
+			t.Fatal(err)
+		}
+		// Restart re-marks ALL unsettled entries NeedsResolve=true (§5.7 rule 3).
+		cl2, err := OpenClient(dirA)
+		if err != nil {
+			t.Fatalf("reopen after partial pass: %v", err)
+		}
+		defer cl2.Close()
+
+		// Running ONLY credB after restart MUST NOT clear MustResolve because opA was not re-queried after restart!
+		if err := cl2.ResolveAll(ctx, sessB, prinB); err != nil {
+			t.Fatalf("credB pass after restart: %v", err)
+		}
+		if !cl2.Status().MustResolve {
+			t.Fatalf("MustResolve cleared after restart without re-querying credA's unsettled opA!")
+		}
+		// Now querying credA clears MustResolve cleanly.
+		if err := cl2.ResolveAll(ctx, sessA, prinA); err != nil {
+			t.Fatalf("credA pass after restart: %v", err)
+		}
+		if cl2.Status().MustResolve {
+			t.Fatalf("expected MustResolve=false once both signers answered after restart")
+		}
+	})
+}
+
+// TestOutboxPreWriteSettlementFailurePreservesPendingAndSlot verifies Codex Turn 16 Finding 2:
+// On a definite pre-write persistence failure during settlement in BOTH Send and ResolveAll,
+// live memory and disk both retain the pending entry and keep its slot occupied (never
+// returning a cached final outcome or allowing a conflicting compose in that slot).
+func TestOutboxPreWriteSettlementFailurePreservesPendingAndSlot(t *testing.T) {
+	fx := startOnboardingFixture(t)
+	ctx := context.Background()
+
+	newMember := func(t *testing.T, ns string, reqByte byte) (*Client, string, *ldrrelay.SessionClient, ldrcrypto.Principal) {
+		t.Helper()
+		keys, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+		grant := ldrcrypto.JoinGrant{NamespaceID: ns, ActorLimit: 4, Reader: true}
+		reqID, reqDig := fx.enrollP3(t, keys, grant, reqByte)
+		fx.activateNextEpoch(t)
+		dir := t.TempDir()
+		cl, err := InitClientDir(InitDirOptions{
+			Dir: dir, DirKind: DirKindMember, SignedDescriptor: fx.env.rawDesc, CredKeys: keys,
+			ExpectedGrant: &grant, ExpectedJoinReq: reqID, ExpectedJoinReqDigest: &reqDig, Activated: false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = cl.Close() })
+		sess, err := cl.Dial(ctx, ldrcrypto.PrincipalCredential)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { sess.Close() })
+		if err := cl.VerifyEnrollmentAndActivate(ctx, sess); err != nil {
+			t.Fatal(err)
+		}
+		return cl, dir, sess, ldrcrypto.CredentialPrincipal(keys.CredID)
+	}
+
+	t.Run("send_settlement_pre_write_failure", func(t *testing.T) {
+		cl, dir, sess, _ := newMember(t, "ns-prewrite-send", 0xb1)
+
+		op1, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "decl_pw1", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "pw-a1"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-prewrite-send"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Let the 1st syncFile (pre-send Sends++) succeed, fail the 2nd syncFile (settlement write)!
+		var syncCalls atomic.Int32
+		cl.SetSyncHooks(func(f *os.File) error {
+			if syncCalls.Add(1) == 2 {
+				return errors.New("injected settlement pre-write fsync failure")
+			}
+			return ldrstore.SyncFile(f)
+		}, nil)
+
+		_, err = cl.Send(ctx, sess, op1)
+		if !errors.Is(err, ldrstore.ErrPreWrite) {
+			t.Fatalf("Send settlement pre-write failure: got %v, want ErrPreWrite", err)
+		}
+		if st := cl.Status(); st.OutboxUncertain {
+			t.Fatalf("clean pre-write failure should not fence outboxUncertain: %+v", st)
+		}
+
+		// Live entry AND disk entry MUST BOTH still be OutPending!
+		obLive := cl.OutboxSnapshot()
+		if len(obLive) != 1 || obLive[0].Status != ldrcore.OutPending {
+			t.Fatalf("live outbox leaked unsettled/final state on ErrPreWrite: %+v", obLive)
+		}
+		obDisk, err := loadOutbox(filepath.Join(dir, "outbox.cbor"))
+		if err != nil || len(obDisk.Entries) != 1 || obDisk.Entries[0].Status != ldrcore.OutPending {
+			t.Fatalf("disk outbox unexpected state: %+v err=%v", obDisk, err)
+		}
+
+		// Slot MUST STILL be occupied in live client!
+		if _, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "conflicting_same_slot", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "pw-a1"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-prewrite-send"}},
+		}); !errors.Is(err, ErrSlotBusy) {
+			t.Fatalf("Compose on same slot after failed Send settlement write: got %v, want ErrSlotBusy", err)
+		}
+
+		// Restore healthy persistence -> retrying Send settles cleanly and frees the slot!
+		cl.SetSyncHooks(nil, nil)
+		rep, err := cl.Send(ctx, sess, op1)
+		if err != nil || rep.Outcome.Kind != ldrcore.Committed {
+			t.Fatalf("retry Send after restoring disk: rep=%+v err=%v", rep, err)
+		}
+		if cl.OutboxSnapshot()[0].Status != ldrcore.OutDone {
+			t.Fatalf("expected OutDone after retry Send")
+		}
+		if _, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "reuse_slot_after_durable_done", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "pw-a1"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-prewrite-send"}},
+		}); err != nil {
+			t.Fatalf("Compose on freed slot after durable settlement failed: %v", err)
+		}
+	})
+
+	t.Run("resolve_all_settlement_pre_write_failure_preserves_pending_slot_and_must_resolve", func(t *testing.T) {
+		// Subcase A: MustResolve=false -> proves slot stays ErrSlotBusy!
+		clA, dirA, sessA, prinA := newMember(t, "ns-prewrite-res-a", 0xb2)
+		opA, err := clA.ComposeAndPersist(ComposeParams{
+			Action: "decl_r1", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "pw-r1"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-prewrite-res-a"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapA := clA.OutboxSnapshot()[0]
+		if rep, err := sessA.Submit(ctx, snapA.IntentBytes, snapA.PayloadSidecar, snapA.WrapSidecars); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+			t.Fatalf("direct submit opA: rep=%+v err=%v", rep, err)
+		}
+		clA.SetSyncHooks(func(*os.File) error {
+			return errors.New("injected ResolveAll pre-write fsync failure")
+		}, nil)
+		if err := clA.ResolveAll(ctx, sessA, prinA); !errors.Is(err, ldrstore.ErrPreWrite) {
+			t.Fatalf("ResolveAll pre-write failure: got %v, want ErrPreWrite", err)
+		}
+		if clA.OutboxSnapshot()[0].Status != ldrcore.OutPending {
+			t.Fatalf("live entry mutated despite ResolveAll ErrPreWrite: %+v", clA.OutboxSnapshot()[0])
+		}
+		if diskOB, err := loadOutbox(filepath.Join(dirA, "outbox.cbor")); err != nil || diskOB.Entries[0].Status != ldrcore.OutPending {
+			t.Fatalf("disk entry unexpected state: %+v err=%v", diskOB, err)
+		}
+		if _, err := clA.ComposeAndPersist(ComposeParams{
+			Action: "conflicting_resolve_slot", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "pw-r1"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-prewrite-res-a"}},
+		}); !errors.Is(err, ErrSlotBusy) {
+			t.Fatalf("Compose on same slot after failed ResolveAll settlement write: got %v, want ErrSlotBusy", err)
+		}
+		// Restore sync -> retry ResolveAll settles opA cleanly and frees slot!
+		clA.SetSyncHooks(nil, nil)
+		if err := clA.ResolveAll(ctx, sessA, prinA); err != nil {
+			t.Fatalf("retry ResolveAll: %v", err)
+		}
+		if clA.OutboxSnapshot()[0].OpID != opA || clA.OutboxSnapshot()[0].Status != ldrcore.OutDone {
+			t.Fatalf("expected opA OutDone after retry ResolveAll: %+v", clA.OutboxSnapshot())
+		}
+		if _, err := clA.ComposeAndPersist(ComposeParams{
+			Action: "reuse_after_resolve", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "pw-r1"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-prewrite-res-a"}},
+		}); err != nil {
+			t.Fatalf("Compose on freed slot after durable ResolveAll failed: %v", err)
+		}
+
+		// Subcase B: MustResolve=true after restart -> failed ResolveAll preserves MustResolve=true & OutPending!
+		clB, dirB, sessB, prinB := newMember(t, "ns-prewrite-res-b", 0xb3)
+		if _, err := clB.ComposeAndPersist(ComposeParams{
+			Action: "decl_r2", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "pw-r2"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-prewrite-res-b"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		snapB := clB.OutboxSnapshot()[0]
+		if rep, err := sessB.Submit(ctx, snapB.IntentBytes, snapB.PayloadSidecar, snapB.WrapSidecars); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+			t.Fatalf("direct submit opB: rep=%+v err=%v", rep, err)
+		}
+		_ = clB.Close()
+		clB2, err := OpenClient(dirB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer clB2.Close()
+		clB2.SetSyncHooks(func(*os.File) error {
+			return errors.New("injected ResolveAll restart pre-write failure")
+		}, nil)
+		if err := clB2.ResolveAll(ctx, sessB, prinB); !errors.Is(err, ldrstore.ErrPreWrite) {
+			t.Fatalf("ResolveAll restart pre-write failure: got %v, want ErrPreWrite", err)
+		}
+		if !clB2.Status().MustResolve || clB2.OutboxSnapshot()[0].Status != ldrcore.OutPending {
+			t.Fatalf("failed ResolveAll mutated MustResolve or entry status: st=%+v ob=%+v", clB2.Status(), clB2.OutboxSnapshot())
+		}
+		clB2.SetSyncHooks(nil, nil)
+		if err := clB2.ResolveAll(ctx, sessB, prinB); err != nil {
+			t.Fatalf("retry ResolveAll after restart: %v", err)
+		}
+		if clB2.Status().MustResolve || clB2.OutboxSnapshot()[0].Status != ldrcore.OutDone {
+			t.Fatalf("expected clean settlement on retry: st=%+v ob=%+v", clB2.Status(), clB2.OutboxSnapshot())
+		}
+	})
+}
+
+// TestOutboxDelayedResponseAfterSlotReuse verifies Codex Turn 16 Finding 3:
+// When a Send or ResolveAll response is delayed in flight while another goroutine
+// settles the original operation and ComposeAndPersist reuses the exact same slot
+// for a newer operation, revalidation ignores the late reply without re-settling
+// the finalized entry or releasing the newer operation's slot.
+func TestOutboxDelayedResponseAfterSlotReuse(t *testing.T) {
+	fx := startOnboardingFixture(t)
+	ctx := context.Background()
+
+	// Helper: pause the next HTTP request whose URL path ends with suffix AFTER the
+	// real RelayServer processes it, returning channels to coordinate deterministically.
+	armDelayedResponse := func(suffix string) (entered chan struct{}, release chan struct{}) {
+		entered = make(chan struct{})
+		release = make(chan struct{})
+		var armed atomic.Bool
+		armed.Store(true)
+		fx.env.setHTTPHook(func(next http.Handler, w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, suffix) && armed.CompareAndSwap(true, false) {
+				rec := httptest.NewRecorder()
+				next.ServeHTTP(rec, r)
+				close(entered)
+				<-release
+				for k, vals := range rec.Header() {
+					for _, v := range vals {
+						w.Header().Add(k, v)
+					}
+				}
+				w.WriteHeader(rec.Code)
+				_, _ = w.Write(rec.Body.Bytes())
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+		t.Cleanup(func() { fx.env.setHTTPHook(nil) })
+		return entered, release
+	}
+
+	newMember := func(t *testing.T, ns string, reqByte byte) (*Client, string, *ldrrelay.SessionClient, *ldrrelay.SessionClient, ldrcrypto.Principal) {
+		t.Helper()
+		keys, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+		grant := ldrcrypto.JoinGrant{NamespaceID: ns, ActorLimit: 4, Reader: true}
+		reqID, reqDig := fx.enrollP3(t, keys, grant, reqByte)
+		fx.activateNextEpoch(t)
+		dir := t.TempDir()
+		cl, err := InitClientDir(InitDirOptions{
+			Dir: dir, DirKind: DirKindMember, SignedDescriptor: fx.env.rawDesc, CredKeys: keys,
+			ExpectedGrant: &grant, ExpectedJoinReq: reqID, ExpectedJoinReqDigest: &reqDig, Activated: false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = cl.Close() })
+		sessSlow, err := cl.Dial(ctx, ldrcrypto.PrincipalCredential)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { sessSlow.Close() })
+		sessFast, err := cl.Dial(ctx, ldrcrypto.PrincipalCredential)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { sessFast.Close() })
+		if err := cl.VerifyEnrollmentAndActivate(ctx, sessFast); err != nil {
+			t.Fatal(err)
+		}
+		return cl, dir, sessSlow, sessFast, ldrcrypto.CredentialPrincipal(keys.CredID)
+	}
+
+	t.Run("delayed_send_reply_after_resolve_and_slot_reuse", func(t *testing.T) {
+		cl, dir, sessSlow, sessFast, prin := newMember(t, "ns-delay-send", 0xc1)
+
+		op1, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "op1_slot_s", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "reuse-a1"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-delay-send"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		entered, release := armDelayedResponse("/submit")
+		sendDone := make(chan error, 1)
+		go func() {
+			_, err := cl.Send(ctx, sessSlow, op1)
+			sendDone <- err
+		}()
+
+		// Wait until RelayServer has committed op1 and paused the HTTP reply to sessSlow.
+		<-entered
+
+		// Settle op1 via ResolveAll on sessFast, then reuse the EXACT SAME slot for op2!
+		if err := cl.ResolveAll(ctx, sessFast, prin); err != nil {
+			close(release)
+			t.Fatalf("ResolveAll while Send delayed: %v", err)
+		}
+		op1Snap := cl.OutboxSnapshot()[0]
+		if op1Snap.OpID != op1 || op1Snap.Status != ldrcore.OutDone || op1Snap.OutcomeSeq == 0 {
+			close(release)
+			t.Fatalf("expected op1 settled via ResolveAll, got %+v", op1Snap)
+		}
+		op2, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "op2_reused_slot_s", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "reuse-a1"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-delay-send"}},
+		})
+		if err != nil {
+			close(release)
+			t.Fatalf("Compose op2 reusing slot: %v", err)
+		}
+
+		// Now release the delayed Send reply for op1!
+		close(release)
+		if err := <-sendDone; err != nil {
+			t.Fatalf("delayed Send returned unexpected error: %v", err)
+		}
+
+		// op1 MUST remain finalized unchanged, and op2 MUST STILL own the slot!
+		ob := cl.OutboxSnapshot()
+		if len(ob) != 2 || ob[0].Status != ldrcore.OutDone || ob[0].OutcomeSeq != op1Snap.OutcomeSeq || ob[1].OpID != op2 || ob[1].Status != ldrcore.OutPending {
+			t.Fatalf("unexpected outbox state after delayed Send reply: %+v", ob)
+		}
+		if _, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "op3_must_hit_busy_slot", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "reuse-a1"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-delay-send"}},
+		}); !errors.Is(err, ErrSlotBusy) {
+			t.Fatalf("delayed Send reply evicted newer slot owner op2! got %v, want ErrSlotBusy", err)
+		}
+		_ = cl.Close()
+		diskOB, err := loadOutbox(filepath.Join(dir, "outbox.cbor"))
+		if err != nil || len(diskOB.Entries) != 2 || diskOB.Entries[0].Status != ldrcore.OutDone || diskOB.Entries[1].Status != ldrcore.OutPending {
+			t.Fatalf("disk outbox corrupted after delayed Send reply: %+v err=%v", diskOB, err)
+		}
+	})
+
+	t.Run("delayed_resolve_unknown_and_outcome_replies_after_send_and_slot_reuse", func(t *testing.T) {
+		for _, tc := range []struct {
+			name        string
+			actor       string
+			ns          string
+			reqByte     byte
+			preCommitOp bool // false -> delayed Query returns ClassUnknown; true -> delayed Query returns ClassOutcome
+		}{
+			{name: "delayed_query_unknown", actor: "reuse-q1", ns: "ns-delay-q1", reqByte: 0xc2, preCommitOp: false},
+			{name: "delayed_query_outcome", actor: "reuse-q2", ns: "ns-delay-q2", reqByte: 0xc3, preCommitOp: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				cl, dir, sessSlow, sessFast, prin := newMember(t, tc.ns, tc.reqByte)
+				op1, err := cl.ComposeAndPersist(ComposeParams{
+					Action: "op1_" + tc.actor, Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+					Fields: ldrcrypto.Map{{Key: "actor_id", Value: tc.actor}, {Key: "label", Value: false}, {Key: "namespace_id", Value: tc.ns}},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tc.preCommitOp {
+					s0 := cl.OutboxSnapshot()[0]
+					if rep, err := sessFast.Submit(ctx, s0.IntentBytes, s0.PayloadSidecar, s0.WrapSidecars); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+						t.Fatalf("pre-commit op1: rep=%+v err=%v", rep, err)
+					}
+				}
+
+				entered, release := armDelayedResponse("/query")
+				resDone := make(chan error, 1)
+				go func() {
+					resDone <- cl.ResolveAll(ctx, sessSlow, prin)
+				}()
+
+				<-entered
+
+				// Settle op1 via Send on sessFast, then reuse the EXACT SAME slot for op2!
+				rep1, err := cl.Send(ctx, sessFast, op1)
+				if err != nil || rep1.Outcome.Kind != ldrcore.Committed {
+					close(release)
+					t.Fatalf("Send op1 while ResolveAll delayed: rep=%+v err=%v", rep1, err)
+				}
+				op2, err := cl.ComposeAndPersist(ComposeParams{
+					Action: "op2_" + tc.actor, Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+					Fields: ldrcrypto.Map{{Key: "actor_id", Value: tc.actor}, {Key: "label", Value: false}, {Key: "namespace_id", Value: tc.ns}},
+				})
+				if err != nil {
+					close(release)
+					t.Fatalf("Compose op2 reusing slot: %v", err)
+				}
+
+				// Release delayed ResolveAll query response for op1!
+				close(release)
+				if err := <-resDone; err != nil {
+					t.Fatalf("delayed ResolveAll returned error: %v", err)
+				}
+
+				// op1 MUST keep its exact finalized Outcome (not overwritten by ClassUnknown!),
+				// and op2 MUST STILL own the slot (not deleted by delayed ClassOutcome)!
+				ob := cl.OutboxSnapshot()
+				if len(ob) != 2 ||
+					ob[0].Status != ldrcore.OutDone ||
+					ob[0].LastClass != ldrcore.ClassOutcome ||
+					ob[0].OutcomeKind != ldrcore.Committed ||
+					ob[0].OutcomeSeq != rep1.Outcome.Seq ||
+					ob[1].OpID != op2 ||
+					ob[1].Status != ldrcore.OutPending {
+					t.Fatalf("delayed ResolveAll corrupted finalized op1 or op2: %+v", ob)
+				}
+				if _, err := cl.ComposeAndPersist(ComposeParams{
+					Action: "op3_must_hit_busy_slot", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+					Fields: ldrcrypto.Map{{Key: "actor_id", Value: tc.actor}, {Key: "label", Value: false}, {Key: "namespace_id", Value: tc.ns}},
+				}); !errors.Is(err, ErrSlotBusy) {
+					t.Fatalf("delayed ResolveAll evicted newer slot owner op2! got %v, want ErrSlotBusy", err)
+				}
+				_ = cl.Close()
+				diskOB, err := loadOutbox(filepath.Join(dir, "outbox.cbor"))
+				if err != nil || len(diskOB.Entries) != 2 || diskOB.Entries[0].Status != ldrcore.OutDone || diskOB.Entries[0].LastClass != ldrcore.ClassOutcome || diskOB.Entries[1].Status != ldrcore.OutPending {
+					t.Fatalf("disk outbox corrupted after delayed ResolveAll: %+v err=%v", diskOB, err)
+				}
+			})
+		}
+	})
 }

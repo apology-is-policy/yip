@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,8 +22,10 @@ import (
 
 type testRelayEnv struct {
 	dir        string
-	wallMS     int64
-	monoMS     int64
+	wallMS     atomic.Int64
+	monoMS     atomic.Int64
+	hookMu     sync.Mutex
+	httpHook   func(next http.Handler, w http.ResponseWriter, r *http.Request)
 	store      *ldrstore.FileStore
 	engine     *ldrrelay.RelayEngine
 	httpServer *http.Server
@@ -33,6 +37,12 @@ type testRelayEnv struct {
 	cd         [32]byte
 	genesis    [32]byte
 	profDigest [32]byte
+}
+
+func (e *testRelayEnv) setHTTPHook(fn func(next http.Handler, w http.ResponseWriter, r *http.Request)) {
+	e.hookMu.Lock()
+	e.httpHook = fn
+	e.hookMu.Unlock()
 }
 
 func startTestRelay(t *testing.T) *testRelayEnv {
@@ -54,9 +64,11 @@ func startTestRelay(t *testing.T) *testRelayEnv {
 	}
 	tlsLn := tls.NewListener(rawLn, tlsCfg)
 
-	env := &testRelayEnv{dir: dir, wallMS: 1_700_000_000_000, monoMS: 0}
+	env := &testRelayEnv{dir: dir}
+	env.wallMS.Store(1_700_000_000_000)
+	env.monoMS.Store(0)
 	clockSrc := func() ldrrelay.ClockSample {
-		return ldrrelay.ClockSample{WallMS: env.wallMS, MonoMS: env.monoMS}
+		return ldrrelay.ClockSample{WallMS: env.wallMS.Load(), MonoMS: env.monoMS.Load()}
 	}
 	st, err := ldrstore.OpenFileStore(dir)
 	if err != nil {
@@ -66,7 +78,17 @@ func startTestRelay(t *testing.T) *testRelayEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hs := &http.Server{Handler: ldrrelay.NewRelayServer(eng)}
+	baseHandler := ldrrelay.NewRelayServer(eng)
+	hs := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		env.hookMu.Lock()
+		h := env.httpHook
+		env.hookMu.Unlock()
+		if h != nil {
+			h(baseHandler, w, r)
+			return
+		}
+		baseHandler.ServeHTTP(w, r)
+	})}
 	go func() { _ = hs.Serve(tlsLn) }()
 
 	r1, err := GenerateSigningKey(ldrcrypto.AlgEd25519)
@@ -128,8 +150,8 @@ func startTestRelay(t *testing.T) *testRelayEnv {
 }
 
 func (e *testRelayEnv) tick(ms int64) {
-	e.wallMS += ms
-	e.monoMS += ms
+	e.wallMS.Add(ms)
+	e.monoMS.Add(ms)
 }
 
 func TestClientEndToEndO25JoinerPersistBeforeSendProjectionDeliveryAndRule8(t *testing.T) {

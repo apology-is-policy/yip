@@ -408,22 +408,32 @@ func openClientLocked(dir string, lf *os.File, syncFile func(*os.File) error, sy
 			return nil, err
 		}
 	}
-	// Rebuild slot index and enforce restart §5.7 rule 3 (MustResolve if unsettled).
+	// Rebuild slot index and enforce restart §5.7 rule 3 (MustResolve if unsettled,
+	// marking every unsettled intent NeedsResolve so all active signers must be queried).
 	hasUnsettled := false
+	needPersist := false
 	for _, e := range c.outbox.Entries {
 		if e.Status == ldrcore.OutPending || e.Status == ldrcore.OutReconcile {
 			c.slots[e.Slot] = e.OpID
 			hasUnsettled = true
+			if !e.NeedsResolve {
+				needPersist = true
+			}
 		}
 	}
-	if hasUnsettled && !c.outbox.MustResolve {
-		candidate := c.outbox
+	if hasUnsettled && (!c.outbox.MustResolve || needPersist) {
+		candidate := clonePersistedOutbox(c.outbox)
 		candidate.MustResolve = true
+		for _, e := range candidate.Entries {
+			if e.Status == ldrcore.OutPending || e.Status == ldrcore.OutReconcile {
+				e.NeedsResolve = true
+			}
+		}
 		if err := c.persistOutboxLocked(candidate); err != nil {
 			cleanupLock()
 			return nil, err
 		}
-		c.outbox.MustResolve = true
+		c.outbox = candidate
 	}
 
 	// Replay verified.wal from seq 1 (with durability barrier) to reconstruct exact verified state.
@@ -850,7 +860,9 @@ func (c *Client) Sync(ctx context.Context, sess *ldrrelay.SessionClient) (int, e
 			c.mu.Lock()
 			if err := c.verifyAndApplyFrameLocked(fr, true); err != nil {
 				c.outbox.Halted = err.Error()
-				_ = saveOutbox(c.outboxPath(), c.outbox)
+				if perr := c.persistOutboxLocked(c.outbox); perr != nil {
+					c.markOutboxUncertainOnErrLocked(perr)
+				}
 				c.mu.Unlock()
 				return applied, fmt.Errorf("%w: %v", ErrViolation, err)
 			}
@@ -1332,7 +1344,9 @@ func (c *Client) verifyAndApplyFrameLocked(fr ldrrelay.ControlFrameWire, persist
 
 	// Rule 8: verifying a revocation stops that key on this device immediately.
 	if c.stopRevokedLocked() && persist {
-		_ = saveOutbox(c.outboxPath(), c.outbox)
+		if perr := c.persistOutboxLocked(c.outbox); perr != nil {
+			c.markOutboxUncertainOnErrLocked(perr)
+		}
 	}
 	return nil
 }
@@ -1706,8 +1720,8 @@ func (c *Client) ComposeAndPersist(p ComposeParams) (string, error) {
 		return "", ErrSlotBusy
 	}
 
-	c.outbox.NextOp++
-	opID := fmt.Sprintf("op-%d", c.outbox.NextOp)
+	nextOp := c.outbox.NextOp + 1
+	opID := fmt.Sprintf("op-%d", nextOp)
 	authEpoch := uint64(c.state.Line.AuthEpoch)
 	keyEpoch := uint64(c.state.Line.KeyEpoch)
 	validity := c.validityMS
@@ -1720,7 +1734,6 @@ func (c *Client) ComposeAndPersist(p ComposeParams) (string, error) {
 	if len(p.Plaintext) > 0 {
 		epKey, ok := c.epochs.Keys[keyEpoch]
 		if !ok || keyEpoch == 0 {
-			c.outbox.NextOp--
 			return "", ErrNoEpochKey
 		}
 		ctxBytes, err := PayloadContextBytes(
@@ -1729,17 +1742,14 @@ func (c *Client) ComposeAndPersist(p ComposeParams) (string, error) {
 			authEpoch, keyEpoch, c.ckSeq, c.ckHead, p.Expect, p.Fields,
 		)
 		if err != nil {
-			c.outbox.NextOp--
 			return "", err
 		}
 		payloadPkg, err = ldrcrypto.SealPayload(epKey, ctxBytes, p.Plaintext)
 		if err != nil {
-			c.outbox.NextOp--
 			return "", err
 		}
 		payloadCommit, err = ldrcrypto.CommitPayload(payloadPkg)
 		if err != nil {
-			c.outbox.NextOp--
 			return "", err
 		}
 	}
@@ -1764,17 +1774,14 @@ func (c *Client) ComposeAndPersist(p ComposeParams) (string, error) {
 		Fields:        p.Fields,
 	})
 	if err != nil {
-		c.outbox.NextOp--
 		return "", err
 	}
 	env, err := ldrcrypto.SignIntent(signer, body)
 	if err != nil {
-		c.outbox.NextOp--
 		return "", err
 	}
 	dig, err := env.Digest()
 	if err != nil {
-		c.outbox.NextOp--
 		return "", err
 	}
 
@@ -1794,16 +1801,17 @@ func (c *Client) ComposeAndPersist(p ComposeParams) (string, error) {
 		WrapSidecars:   make(map[[32]byte][]byte),
 		Status:         ldrcore.OutPending,
 	}
-	c.outbox.Entries = append(c.outbox.Entries, entry)
-	c.slots[slot] = opID
-	if err := c.persistOutboxLocked(c.outbox); err != nil {
-		// Roll back in-memory state on disk failure; fence on uncertain write!
-		c.outbox.Entries = c.outbox.Entries[:len(c.outbox.Entries)-1]
-		delete(c.slots, slot)
-		c.outbox.NextOp--
+	cand := clonePersistedOutbox(c.outbox)
+	cand.NextOp = nextOp
+	cand.Entries = append(cand.Entries, entry)
+	candSlots := cloneSlots(c.slots)
+	candSlots[slot] = opID
+	if err := c.persistOutboxLocked(cand); err != nil {
 		c.markOutboxUncertainOnErrLocked(err)
 		return "", err
 	}
+	c.outbox = cand
+	c.slots = candSlots
 	return opID, nil
 }
 
@@ -1890,8 +1898,8 @@ func (c *Client) ComposeEpochActivate(action string) (string, []byte, error) {
 		return "", nil, err
 	}
 
-	c.outbox.NextOp++
-	opID := fmt.Sprintf("op-%d", c.outbox.NextOp)
+	nextOp := c.outbox.NextOp + 1
+	opID := fmt.Sprintf("op-%d", nextOp)
 	manifest := make([]ldrcrypto.WrapManifestEntry, 0, len(credIDs))
 	wraps := make(map[[32]byte][]byte, len(credIDs))
 	for _, cid := range credIDs {
@@ -1902,17 +1910,14 @@ func (c *Client) ComposeEpochActivate(action string) (string, []byte, error) {
 			cid, encKeys[cid], rsDigest,
 		)
 		if err != nil {
-			c.outbox.NextOp--
 			return "", nil, err
 		}
 		wb, err := ldrcrypto.WrapEpochKey(epochKey, wctx)
 		if err != nil {
-			c.outbox.NextOp--
 			return "", nil, err
 		}
 		wc, err := ldrcrypto.CommitWrap(wb)
 		if err != nil {
-			c.outbox.NextOp--
 			return "", nil, err
 		}
 		manifest = append(manifest, ldrcrypto.WrapManifestEntry{CredID: cid, Commit: wc})
@@ -1937,17 +1942,14 @@ func (c *Client) ComposeEpochActivate(action string) (string, []byte, error) {
 		Manifest:      manifest,
 	})
 	if err != nil {
-		c.outbox.NextOp--
 		return "", nil, err
 	}
 	env, err := ldrcrypto.SignIntent(c.operatorKey.Signer, body)
 	if err != nil {
-		c.outbox.NextOp--
 		return "", nil, err
 	}
 	dig, err := env.Digest()
 	if err != nil {
-		c.outbox.NextOp--
 		return "", nil, err
 	}
 
@@ -1966,20 +1968,75 @@ func (c *Client) ComposeEpochActivate(action string) (string, []byte, error) {
 		WrapSidecars: wraps,
 		Status:       ldrcore.OutPending,
 	}
-	c.outbox.Entries = append(c.outbox.Entries, entry)
-	c.slots[slot] = opID
-	if err := c.persistOutboxLocked(c.outbox); err != nil {
-		c.outbox.Entries = c.outbox.Entries[:len(c.outbox.Entries)-1]
-		delete(c.slots, slot)
-		c.outbox.NextOp--
+	cand := clonePersistedOutbox(c.outbox)
+	cand.NextOp = nextOp
+	cand.Entries = append(cand.Entries, entry)
+	candSlots := cloneSlots(c.slots)
+	candSlots[slot] = opID
+	if err := c.persistOutboxLocked(cand); err != nil {
 		c.markOutboxUncertainOnErrLocked(err)
 		return "", nil, err
 	}
+	c.outbox = cand
+	c.slots = candSlots
 	return opID, epochKey, nil
 }
 
+func cloneOutboxEntry(e *OutboxEntry) *OutboxEntry {
+	if e == nil {
+		return nil
+	}
+	cp := *e
+	cp.IntentBytes = bytes.Clone(e.IntentBytes)
+	cp.PayloadSidecar = bytes.Clone(e.PayloadSidecar)
+	cp.WrapSidecars = make(map[[32]byte][]byte, len(e.WrapSidecars))
+	for k, v := range e.WrapSidecars {
+		cp.WrapSidecars[k] = bytes.Clone(v)
+	}
+	return &cp
+}
+
+func clonePersistedOutbox(ob persistedOutbox) persistedOutbox {
+	cp := ob
+	cp.KeyStops = make(map[string]*KeyStop, len(ob.KeyStops))
+	for k, v := range ob.KeyStops {
+		if v != nil {
+			ks := *v
+			cp.KeyStops[k] = &ks
+		}
+	}
+	cp.Entries = make([]*OutboxEntry, len(ob.Entries))
+	for i, e := range ob.Entries {
+		cp.Entries[i] = cloneOutboxEntry(e)
+	}
+	return cp
+}
+
+func cloneSlots(s map[string]string) map[string]string {
+	cp := make(map[string]string, len(s))
+	for k, v := range s {
+		cp[k] = v
+	}
+	return cp
+}
+
+func isOutboxFinal(status string) bool {
+	return status == ldrcore.OutDone || status == ldrcore.OutClosed
+}
+
+func storedSubmitReply(e *OutboxEntry) ldrrelay.SubmitReply {
+	return ldrrelay.SubmitReply{
+		Class:   e.LastClass,
+		Code:    e.LastCode,
+		Outcome: ldrstore.StoredOutcome{Kind: e.OutcomeKind, Reason: e.OutcomeReason, Seq: e.OutcomeSeq},
+	}
+}
+
 // Send transmits the exact persisted bytes of opID over sess, settles the outbox
-// entry per §5.7, and persists the result durably. Never re-signs or alters bytes!
+// entry per §5.7, and persists the result durably BEFORE publishing entry or
+// slot changes in memory. Revalidates entry status and slot ownership after
+// network I/O so late replies never re-settle finalized entries or release
+// slots owned by newer operations. Never re-signs or alters bytes!
 func (c *Client) Send(ctx context.Context, sess *ldrrelay.SessionClient, opID string) (ldrrelay.SubmitReply, error) {
 	c.mu.Lock()
 	if c.outboxUncertain {
@@ -1990,36 +2047,40 @@ func (c *Client) Send(ctx context.Context, sess *ldrrelay.SessionClient, opID st
 		c.mu.Unlock()
 		return ldrrelay.SubmitReply{}, ErrNotActivated
 	}
-	e := c.findOutboxLocked(opID)
+	idx, e := c.findOutboxIndexLocked(opID)
 	if e == nil {
 		c.mu.Unlock()
 		return ldrrelay.SubmitReply{}, fmt.Errorf("ldrclient: unknown outbox op %q", opID)
 	}
 	if e.Status != ldrcore.OutPending {
-		rep := ldrrelay.SubmitReply{
-			Class: e.LastClass, Code: e.LastCode,
-			Outcome: ldrstore.StoredOutcome{Kind: e.OutcomeKind, Reason: e.OutcomeReason, Seq: e.OutcomeSeq},
-		}
+		rep := storedSubmitReply(e)
 		c.mu.Unlock()
 		return rep, nil
 	}
 	if c.signsNoMoreLocked(e.SignerToken) {
-		e.Status = ldrcore.OutReconcile
-		_ = c.persistOutboxLocked(c.outbox)
+		cand := clonePersistedOutbox(c.outbox)
+		cand.Entries[idx].Status = ldrcore.OutReconcile
+		if perr := c.persistOutboxLocked(cand); perr != nil {
+			c.markOutboxUncertainOnErrLocked(perr)
+		} else {
+			c.outbox = cand
+		}
 		c.mu.Unlock()
 		return ldrrelay.SubmitReply{}, ErrKeyRevoked
 	}
-	e.Sends++
-	if err := c.persistOutboxLocked(c.outbox); err != nil {
-		e.Sends--
+	candSend := clonePersistedOutbox(c.outbox)
+	candSend.Entries[idx].Sends++
+	if err := c.persistOutboxLocked(candSend); err != nil {
 		c.markOutboxUncertainOnErrLocked(err)
 		c.mu.Unlock()
 		return ldrrelay.SubmitReply{}, err
 	}
-	intentBytes := bytes.Clone(e.IntentBytes)
-	payloadSidecar := bytes.Clone(e.PayloadSidecar)
-	wrapSidecars := make(map[[32]byte][]byte, len(e.WrapSidecars))
-	for k, v := range e.WrapSidecars {
+	c.outbox = candSend
+	cur := c.outbox.Entries[idx]
+	intentBytes := bytes.Clone(cur.IntentBytes)
+	payloadSidecar := bytes.Clone(cur.PayloadSidecar)
+	wrapSidecars := make(map[[32]byte][]byte, len(cur.WrapSidecars))
+	for k, v := range cur.WrapSidecars {
 		wrapSidecars[k] = bytes.Clone(v)
 	}
 	c.mu.Unlock()
@@ -2030,25 +2091,60 @@ func (c *Client) Send(ctx context.Context, sess *ldrrelay.SessionClient, opID st
 	}
 
 	c.mu.Lock()
-	c.settleLocked(e, rep)
-	saveErr := c.persistOutboxLocked(c.outbox)
+	if c.outboxUncertain {
+		c.mu.Unlock()
+		return ldrrelay.SubmitReply{}, ErrOutboxUncertain
+	}
+	idx, cur = c.findOutboxIndexLocked(opID)
+	if cur == nil {
+		c.mu.Unlock()
+		return ldrrelay.SubmitReply{}, fmt.Errorf("ldrclient: unknown outbox op %q", opID)
+	}
+	if isOutboxFinal(cur.Status) {
+		// Already finalized while Submit was in flight: ignore late reply and
+		// leave finalized entry and any reused slot untouched.
+		settled := storedSubmitReply(cur)
+		c.mu.Unlock()
+		return settled, nil
+	}
+	if cur.Status == ldrcore.OutReconcile && (rep.Class == ldrcore.ClassAdmission || rep.Class == ldrcore.ClassUnknown) {
+		// Entry transitioned to OutReconcile while Submit was in flight; a
+		// non-definitive reply must not overwrite its stored reason.
+		settled := storedSubmitReply(cur)
+		c.mu.Unlock()
+		return settled, nil
+	}
+	cand := clonePersistedOutbox(c.outbox)
+	candSlots := cloneSlots(c.slots)
+	c.applySettlementToCandidateLocked(&cand, candSlots, idx, rep)
+	saveErr := c.persistOutboxLocked(cand)
 	if saveErr != nil {
 		c.markOutboxUncertainOnErrLocked(saveErr)
-	}
-	c.mu.Unlock()
-	if saveErr != nil {
+		c.mu.Unlock()
 		return rep, saveErr
 	}
+	c.outbox = cand
+	c.slots = candSlots
+	c.mu.Unlock()
 	return rep, nil
 }
 
-// ResolveAll queries every unsettled outbox intent signed by active keys over sess
-// without re-sending bytes (§5.7 rules 3 & 5, G1 fix, Rule 8).
+// ResolveAll queries unsettled outbox intents authorized for sessPrincipal over
+// sess without re-sending bytes (§5.7 rules 3 & 5, G1 fix, Rule 8).
+//
+// Each answered entry is durably persisted before its entry/slot update is
+// published in memory, preserving progress across sequential passes for
+// multiple active signers. MustResolve clears ONLY once every unsettled intent
+// of every active (non-stopped) signer has received a non-admission answer in
+// the current resolution round. Late replies after network I/O revalidate entry
+// status and slot ownership before applying.
 func (c *Client) ResolveAll(ctx context.Context, sess *ldrrelay.SessionClient, sessPrincipal ldrcrypto.Principal) error {
 	sessTok, err := ldrrelay.PrincipalToken(sessPrincipal)
 	if err != nil {
 		return err
 	}
+	isReconciler := sessPrincipal.Kind == ldrcrypto.PrincipalRoot || sessPrincipal.Kind == ldrcrypto.PrincipalOperator
+
 	c.mu.Lock()
 	if c.outboxUncertain {
 		c.mu.Unlock()
@@ -2058,7 +2154,7 @@ func (c *Client) ResolveAll(ctx context.Context, sess *ldrrelay.SessionClient, s
 		c.mu.Unlock()
 		return ErrNotActivated
 	}
-	var todo []*OutboxEntry
+	var todoOpIDs []string
 	for _, e := range c.outbox.Entries {
 		if e.Status != ldrcore.OutPending && e.Status != ldrcore.OutReconcile {
 			continue
@@ -2066,24 +2162,27 @@ func (c *Client) ResolveAll(ctx context.Context, sess *ldrrelay.SessionClient, s
 		if c.signsNoMoreLocked(e.SignerToken) {
 			continue
 		}
-		// Only query operations this session principal is authorized to query.
-		isReconciler := sessPrincipal.Kind == ldrcrypto.PrincipalRoot || sessPrincipal.Kind == ldrcrypto.PrincipalOperator
 		if e.SignerToken != sessTok && !isReconciler {
 			continue
 		}
-		todo = append(todo, e)
+		todoOpIDs = append(todoOpIDs, e.OpID)
 	}
 	c.mu.Unlock()
 
 	incomplete := false
-	for _, e := range todo {
+	for _, opID := range todoOpIDs {
 		c.mu.Lock()
-		if c.signsNoMoreLocked(e.SignerToken) {
+		if c.outboxUncertain {
+			c.mu.Unlock()
+			return ErrOutboxUncertain
+		}
+		_, cur := c.findOutboxIndexLocked(opID)
+		if cur == nil || isOutboxFinal(cur.Status) || c.signsNoMoreLocked(cur.SignerToken) {
 			c.mu.Unlock()
 			continue
 		}
-		key := ldrstore.StoredOpKey{Generation: e.Gen, Signer: e.SignerToken, SeenSeq: e.SeenSeq, OpID: e.OpID}
-		dig := e.IntentDigest
+		key := ldrstore.StoredOpKey{Generation: cur.Gen, Signer: cur.SignerToken, SeenSeq: cur.SeenSeq, OpID: cur.OpID}
+		dig := cur.IntentDigest
 		c.mu.Unlock()
 
 		rep, err := sess.Query(ctx, key, dig)
@@ -2091,37 +2190,74 @@ func (c *Client) ResolveAll(ctx context.Context, sess *ldrrelay.SessionClient, s
 			incomplete = true
 			continue
 		}
+
 		c.mu.Lock()
-		if rep.Class == ldrcore.ClassAdmission {
-			incomplete = true
-			if e.Status == ldrcore.OutReconcile {
-				c.mu.Unlock()
-				continue
-			}
-		} else if e.Status == ldrcore.OutReconcile && rep.Class == ldrcore.ClassUnknown {
+		if c.outboxUncertain {
+			c.mu.Unlock()
+			return ErrOutboxUncertain
+		}
+		idx, cur := c.findOutboxIndexLocked(opID)
+		if cur == nil || isOutboxFinal(cur.Status) || c.signsNoMoreLocked(cur.SignerToken) {
+			// Finalized or stopped while Query was in flight: ignore late reply
+			// without touching finalized entries or reused slot owners.
 			c.mu.Unlock()
 			continue
 		}
-		c.settleLocked(e, rep)
+		cand := clonePersistedOutbox(c.outbox)
+		candSlots := cloneSlots(c.slots)
+		candEntry := cand.Entries[idx]
+		switch {
+		case rep.Class == ldrcore.ClassAdmission:
+			incomplete = true
+			if candEntry.Status == ldrcore.OutReconcile {
+				c.mu.Unlock()
+				continue
+			}
+			c.applySettlementToCandidateLocked(&cand, candSlots, idx, rep)
+		case candEntry.Status == ldrcore.OutReconcile && rep.Class == ldrcore.ClassUnknown:
+			// Relay has no outcome for an OutReconcile intent: preserve its
+			// stored reason while marking this entry answered for this pass.
+			candEntry.NeedsResolve = false
+		default:
+			c.applySettlementToCandidateLocked(&cand, candSlots, idx, rep)
+			if candEntry.Status == ldrcore.OutPending || candEntry.Status == ldrcore.OutReconcile {
+				candEntry.NeedsResolve = false
+			}
+		}
+		if cand.MustResolve && !incomplete && !c.hasActiveNeedsResolveInOutboxLocked(&cand) {
+			cand.MustResolve = false
+		}
+		if saveErr := c.persistOutboxLocked(cand); saveErr != nil {
+			c.markOutboxUncertainOnErrLocked(saveErr)
+			c.mu.Unlock()
+			return saveErr
+		}
+		c.outbox = cand
+		c.slots = candSlots
 		c.mu.Unlock()
 	}
 
 	c.mu.Lock()
-	candidate := c.outbox
-	if !incomplete {
-		candidate.MustResolve = false
+	if c.outboxUncertain {
+		c.mu.Unlock()
+		return ErrOutboxUncertain
 	}
-	err = c.persistOutboxLocked(candidate)
-	if err != nil {
-		c.markOutboxUncertainOnErrLocked(err)
-	} else {
-		c.outbox.MustResolve = candidate.MustResolve
+	if c.outbox.MustResolve && !incomplete && !c.hasActiveNeedsResolveInOutboxLocked(&c.outbox) {
+		cand := clonePersistedOutbox(c.outbox)
+		cand.MustResolve = false
+		if saveErr := c.persistOutboxLocked(cand); saveErr != nil {
+			c.markOutboxUncertainOnErrLocked(saveErr)
+			c.mu.Unlock()
+			return saveErr
+		}
+		c.outbox = cand
 	}
 	c.mu.Unlock()
-	return err
+	return nil
 }
 
-func (c *Client) settleLocked(e *OutboxEntry, rep ldrrelay.SubmitReply) {
+func (c *Client) applySettlementToCandidateLocked(ob *persistedOutbox, slots map[string]string, idx int, rep ldrrelay.SubmitReply) {
+	e := ob.Entries[idx]
 	e.LastClass = rep.Class
 	e.LastCode = rep.Code
 	e.OutcomeKind = rep.Outcome.Kind
@@ -2131,19 +2267,36 @@ func (c *Client) settleLocked(e *OutboxEntry, rep ldrrelay.SubmitReply) {
 	switch rep.Class {
 	case ldrcore.ClassOutcome:
 		e.Status = ldrcore.OutDone
-		delete(c.slots, e.Slot)
+		e.NeedsResolve = false
+		if slots[e.Slot] == e.OpID {
+			delete(slots, e.Slot)
+		}
 	case ldrcore.ClassRefusal:
 		e.Status = ldrcore.OutClosed
-		delete(c.slots, e.Slot)
+		e.NeedsResolve = false
+		if slots[e.Slot] == e.OpID {
+			delete(slots, e.Slot)
+		}
 		if rep.Code == "expired" || rep.Code == "unknown_anchor" {
-			c.outbox.MustResolve = c.unsettledCountLocked() > 0
+			hasActive := false
+			for _, other := range ob.Entries {
+				if other.Status == ldrcore.OutPending || other.Status == ldrcore.OutReconcile {
+					other.NeedsResolve = true
+					if !c.signsNoMoreInOutboxLocked(ob, other.SignerToken) {
+						hasActive = true
+					}
+				}
+			}
+			if hasActive {
+				ob.MustResolve = true
+			}
 		}
 	case ldrcore.ClassUnresolved:
 		e.Status = ldrcore.OutReconcile
 		if rep.Code == "history_unavailable" {
-			c.outbox.Suspect = true
+			ob.Suspect = true
 		} else if rep.Code == "revoked" {
-			c.recordToldRevokedLocked(e.SignerToken, rep.Code)
+			c.recordToldRevokedOnLocked(ob, e.SignerToken, rep.Code)
 		}
 	case ldrcore.ClassMismatch:
 		e.Status = ldrcore.OutReconcile
@@ -2154,23 +2307,23 @@ func (c *Client) settleLocked(e *OutboxEntry, rep ldrrelay.SubmitReply) {
 	}
 }
 
-func (c *Client) findOutboxLocked(opID string) *OutboxEntry {
-	for _, e := range c.outbox.Entries {
+func (c *Client) findOutboxIndexLocked(opID string) (int, *OutboxEntry) {
+	for i, e := range c.outbox.Entries {
 		if e.OpID == opID {
-			return e
+			return i, e
 		}
 	}
-	return nil
+	return -1, nil
 }
 
-func (c *Client) unsettledCountLocked() int {
-	n := 0
-	for _, e := range c.outbox.Entries {
-		if e.Status == ldrcore.OutPending || e.Status == ldrcore.OutReconcile {
-			n++
+func (c *Client) hasActiveNeedsResolveInOutboxLocked(ob *persistedOutbox) bool {
+	for _, e := range ob.Entries {
+		if (e.Status == ldrcore.OutPending || e.Status == ldrcore.OutReconcile) &&
+			e.NeedsResolve && !c.signsNoMoreInOutboxLocked(ob, e.SignerToken) {
+			return true
 		}
 	}
-	return n
+	return false
 }
 
 func (c *Client) devicePrincipalsLocked() []string {
@@ -2205,26 +2358,38 @@ func (c *Client) revokedInRecordsLocked(p string) bool {
 	return false
 }
 
+func (c *Client) signsNoMoreInOutboxLocked(ob *persistedOutbox, p string) bool {
+	return ob.KeyStops[p] != nil || c.revokedInRecordsLocked(p)
+}
+
 func (c *Client) signsNoMoreLocked(p string) bool {
-	return c.outbox.KeyStops[p] != nil || c.revokedInRecordsLocked(p)
+	return c.signsNoMoreInOutboxLocked(&c.outbox, p)
+}
+
+func (c *Client) recordToldRevokedOnLocked(ob *persistedOutbox, p, code string) {
+	if ob.KeyStops[p] == nil {
+		ob.KeyStops[p] = &KeyStop{Key: p, Told: true, Seq: c.ckSeq, Head: c.ckHead, Code: code}
+	}
+	c.suspendSignerOnLocked(ob, p)
 }
 
 func (c *Client) recordToldRevokedLocked(p, code string) {
-	if c.outbox.KeyStops[p] == nil {
-		c.outbox.KeyStops[p] = &KeyStop{Key: p, Told: true, Seq: c.ckSeq, Head: c.ckHead, Code: code}
-	}
-	c.suspendSignerLocked(p)
+	c.recordToldRevokedOnLocked(&c.outbox, p, code)
 }
 
-func (c *Client) suspendSignerLocked(p string) bool {
+func (c *Client) suspendSignerOnLocked(ob *persistedOutbox, p string) bool {
 	changed := false
-	for _, e := range c.outbox.Entries {
+	for _, e := range ob.Entries {
 		if e.Status == ldrcore.OutPending && e.SignerToken == p {
 			e.Status = ldrcore.OutReconcile
 			changed = true
 		}
 	}
 	return changed
+}
+
+func (c *Client) suspendSignerLocked(p string) bool {
+	return c.suspendSignerOnLocked(&c.outbox, p)
 }
 
 func (c *Client) stopRevokedLocked() bool {

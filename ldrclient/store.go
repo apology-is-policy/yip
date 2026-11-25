@@ -62,6 +62,7 @@ type OutboxEntry struct {
 	PayloadSidecar []byte
 	WrapSidecars   map[[32]byte][]byte
 	Status         string // pending | done | closed | reconciliation_required
+	NeedsResolve   bool   // §5.7 rule 3: must be asked about before clearing MustResolve
 	Sends          uint64
 	LastClass      string
 	LastCode       string
@@ -805,6 +806,7 @@ func marshalOutbox(ob persistedOutbox) ([]byte, error) {
 			{Key: "intent_digest", Value: e.IntentDigest[:]},
 			{Key: "last_class", Value: e.LastClass},
 			{Key: "last_code", Value: e.LastCode},
+			{Key: "needs_resolve", Value: e.NeedsResolve},
 			{Key: "op_id", Value: e.OpID},
 			{Key: "op_type", Value: e.OpType},
 			{Key: "outcome_kind", Value: e.OutcomeKind},
@@ -899,6 +901,7 @@ func loadOutbox(path string) (persistedOutbox, error) {
 			e.IntentBytes, _ = ldrcrypto.MapBytes(em, "intent")
 			e.PayloadSidecar, _ = ldrcrypto.MapBytes(em, "payload")
 			e.Status, _ = ldrcrypto.MapString(em, "status")
+			e.NeedsResolve, _ = ldrcrypto.MapBool(em, "needs_resolve")
 			e.Sends, _ = ldrcrypto.MapUint(em, "sends")
 			e.LastClass, _ = ldrcrypto.MapString(em, "last_class")
 			e.LastCode, _ = ldrcrypto.MapString(em, "last_code")
