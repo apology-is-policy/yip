@@ -1670,4 +1670,41 @@ func TestReconcileLineProtectsAcknowledgedPrefixFloorAndOutcomes(t *testing.T) {
 			t.Fatalf("restart with lost WAL: got %v, want ErrCorruptWAL", err)
 		}
 	})
+
+	t.Run("previously_opened_wal_unlinked_or_replaced_quarantines_live_engine", func(t *testing.T) {
+		for _, mode := range []string{"unlinked", "replaced"} {
+			t.Run(mode, func(t *testing.T) {
+				rig := newEngineTestRig(t)
+				// rig already committed seq 1 and seq 2, so FileStore holds an open cached WAL fd!
+				walPath := filepath.Join(rig.dir, "lines", hex.EncodeToString(rig.lineID), "wal.log")
+				if mode == "unlinked" {
+					if err := os.Remove(walPath); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					orig, err := os.ReadFile(walPath)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(walPath+".new", orig, 0o600); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Rename(walPath+".new", walPath); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				rig.clock.wall += 1000
+				rig.clock.mono += 1000
+				root2Prin, env3, _, _ := makeAuthOp(t, rig, "auth-after-"+mode, 1, 2, 2, rig.head2)
+				rep := rig.engine.Submit(rig.lineID, root2Prin, env3.RawBytes, nil, nil)
+				if rep.Class != ldrcore.ClassAdmission || rep.Code != "storage_error" {
+					t.Fatalf("mode %s: expected storage_error, got %+v", mode, rep)
+				}
+				if st := rig.engine.Status()[0]; !st.Quarantined {
+					t.Fatalf("mode %s: live engine MUST quarantine when previously opened WAL path is %s", mode, mode)
+				}
+			})
+		}
+	})
 }

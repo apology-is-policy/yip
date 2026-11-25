@@ -32,7 +32,11 @@ const (
 var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 
 // FileStore implements Store using a zero-dependency CRC32C-framed append-only
-// WAL, content-addressed sidecars, and OS full-sync durability barriers.
+// WAL, content-addressed sidecars, and OS full-sync durability barriers under
+// exclusive single-writer directory ownership (.relay.lock). Cached WAL file
+// descriptors are checked against the recovery path via os.SameFile on every
+// append and sync so an unlinked or replaced wal.log is detected immediately
+// rather than silently acknowledging writes to an orphaned inode.
 type FileStore struct {
 	mu         sync.Mutex
 	rootDir    string
@@ -167,7 +171,18 @@ func (s *FileStore) ProvisionLine(p ProvisionedLine) error {
 		return ErrLineExists
 	}
 	dir := s.lineDir(hexID)
-	if err := os.MkdirAll(filepath.Join(dir, "sidecars"), 0o700); err != nil {
+	linesDir := filepath.Join(s.rootDir, "lines")
+	sidecarsDir := filepath.Join(dir, "sidecars")
+	if err := os.MkdirAll(sidecarsDir, 0o700); err != nil {
+		return err
+	}
+	// Durably sync the parent lines/ directory (persisting the new line
+	// directory entry) and subdirectories BEFORE creating wal.log and
+	// installing provision.cbor.
+	if err := s.syncDir(linesDir); err != nil {
+		return err
+	}
+	if err := s.syncDir(sidecarsDir); err != nil {
 		return err
 	}
 	// Create and durably sync the empty WAL BEFORE installing provision.cbor so
@@ -210,7 +225,10 @@ func (s *FileStore) ProvisionLine(p ProvisionedLine) error {
 	if err := AtomicWriteFile(provPath, enc, 0o600); err != nil {
 		return err
 	}
-	return s.syncDir(dir)
+	if err := s.syncDir(dir); err != nil {
+		return err
+	}
+	return s.syncDir(linesDir)
 }
 
 // ListLines returns the sorted line IDs of all provisioned lines in the store.
@@ -248,8 +266,35 @@ func (s *FileStore) ListLines() ([][]byte, error) {
 	return out, nil
 }
 
+func (s *FileStore) verifyWALHandleMatchesPathLocked(hexID string, f *os.File) error {
+	pathInfo, err := os.Stat(s.walPath(hexID))
+	if err != nil {
+		_ = f.Close()
+		delete(s.walFiles, hexID)
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%w: cached WAL path removed", ErrCorruptWAL)
+		}
+		return fmt.Errorf("%w: stat WAL path: %v", ErrUncertainWrite, err)
+	}
+	fdInfo, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		delete(s.walFiles, hexID)
+		return fmt.Errorf("%w: fstat WAL handle: %v", ErrUncertainWrite, err)
+	}
+	if !os.SameFile(pathInfo, fdInfo) {
+		_ = f.Close()
+		delete(s.walFiles, hexID)
+		return fmt.Errorf("%w: cached WAL descriptor no longer matches recovery path", ErrCorruptWAL)
+	}
+	return nil
+}
+
 func (s *FileStore) openWALForAppendLocked(hexID string) (*os.File, error) {
 	if f, ok := s.walFiles[hexID]; ok {
+		if err := s.verifyWALHandleMatchesPathLocked(hexID, f); err != nil {
+			return nil, err
+		}
 		return f, nil
 	}
 	if _, err := os.Stat(s.provisionPath(hexID)); err != nil {
@@ -355,7 +400,7 @@ func (s *FileStore) appendWALLocked(hexID string, kind byte, body []byte) error 
 	}
 	f, err := s.openWALForAppendLocked(hexID)
 	if err != nil {
-		if errors.Is(err, ErrCorruptWAL) {
+		if errors.Is(err, ErrCorruptWAL) || errors.Is(err, ErrUncertainWrite) {
 			return err
 		}
 		return fmt.Errorf("%w: %v", ErrPreWrite, err)
@@ -369,6 +414,9 @@ func (s *FileStore) appendWALLocked(hexID string, kind byte, body []byte) error 
 		_ = f.Close()
 		delete(s.walFiles, hexID)
 		return fmt.Errorf("%w: wal sync: %v", ErrUncertainWrite, err)
+	}
+	if err := s.verifyWALHandleMatchesPathLocked(hexID, f); err != nil {
+		return err
 	}
 	return nil
 }
@@ -516,10 +564,16 @@ func (s *FileStore) SyncLine(lineID []byte) error {
 		return err
 	}
 	if wf, ok := s.walFiles[hexID]; ok {
+		if err := s.verifyWALHandleMatchesPathLocked(hexID, wf); err != nil {
+			return err
+		}
 		if err := s.syncFile(wf); err != nil {
 			_ = wf.Close()
 			delete(s.walFiles, hexID)
 			return fmt.Errorf("%w: wal barrier sync: %v", ErrUncertainWrite, err)
+		}
+		if err := s.verifyWALHandleMatchesPathLocked(hexID, wf); err != nil {
+			return err
 		}
 	} else {
 		wf, err := os.OpenFile(s.walPath(hexID), os.O_RDWR, 0o600)
@@ -532,6 +586,9 @@ func (s *FileStore) SyncLine(lineID []byte) error {
 		if err := s.syncFile(wf); err != nil {
 			_ = wf.Close()
 			return fmt.Errorf("%w: wal barrier sync: %v", ErrUncertainWrite, err)
+		}
+		if err := s.verifyWALHandleMatchesPathLocked(hexID, wf); err != nil {
+			return err
 		}
 		if err := wf.Close(); err != nil {
 			return fmt.Errorf("%w: wal barrier close: %v", ErrUncertainWrite, err)
