@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"syscall"
 
 	"github.com/apology-is-policy/yip/ldrcrypto"
 	"github.com/apology-is-policy/yip/ldrrelay"
@@ -155,6 +156,105 @@ func createFileExclusive(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	return ldrstore.SyncDir(filepath.Dir(path))
+}
+
+func checkExistingPublishTarget(path string, data []byte, allowIdentical bool) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !allowIdentical || !fi.Mode().IsRegular() || fi.Size() != int64(len(data)) {
+		return fmt.Errorf("%w: %s", ErrOutputExists, path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("%w: %s (%v)", ErrOutputExists, path, err)
+	}
+	defer f.Close()
+	fstat, err := f.Stat()
+	if err != nil || !fstat.Mode().IsRegular() || !os.SameFile(fi, fstat) {
+		return fmt.Errorf("%w: %s", ErrOutputExists, path)
+	}
+	existing, err := io.ReadAll(io.LimitReader(f, int64(len(data))+1))
+	if err != nil || !bytes.Equal(existing, data) {
+		return fmt.Errorf("%w: %s", ErrOutputExists, path)
+	}
+	return nil
+}
+
+// publishFileNoClobber atomically publishes data to path without replacing any
+// existing destination (regular file, symlink, directory, or special file).
+// When allowIdentical is true and path is already a regular file with the exact
+// same bytes, publishFileNoClobber returns nil without modifying path; any other
+// existing destination fails with ErrOutputExists.
+func publishFileNoClobber(path string, data []byte, perm os.FileMode, allowIdentical bool) error {
+	if path == "" {
+		return errors.New("ldrclient: empty output path")
+	}
+	if err := checkExistingPublishTarget(path, data, allowIdentical); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	var rnd [8]byte
+	if _, err := io.ReadFull(rand.Reader, rnd[:]); err != nil {
+		return err
+	}
+	tmpPath := filepath.Join(dir, fmt.Sprintf(".tmp-%s-%s", filepath.Base(path), hex.EncodeToString(rnd[:])))
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
+	if err != nil {
+		return err
+	}
+	cleanup := func() {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+	}
+	if len(data) > 0 {
+		if _, err := f.Write(data); err != nil {
+			cleanup()
+			return err
+		}
+	}
+	if err := ldrstore.SyncFile(f); err != nil {
+		cleanup()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	linkErr := os.Link(tmpPath, path)
+	_ = os.Remove(tmpPath)
+	if linkErr == nil {
+		return ldrstore.SyncDir(dir)
+	}
+	if os.IsExist(linkErr) {
+		if err := checkExistingPublishTarget(path, data, allowIdentical); err == nil {
+			return nil
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		return fmt.Errorf("%w: %s", ErrOutputExists, path)
+	}
+	if errors.Is(linkErr, syscall.ENOTSUP) || errors.Is(linkErr, syscall.EPERM) || errors.Is(linkErr, syscall.ENOSYS) {
+		if err := createFileExclusive(path, data, perm); err != nil {
+			if os.IsExist(err) {
+				if cerr := checkExistingPublishTarget(path, data, allowIdentical); cerr == nil {
+					return nil
+				} else if !os.IsNotExist(cerr) {
+					return cerr
+				}
+				return fmt.Errorf("%w: %s", ErrOutputExists, path)
+			}
+			return err
+		}
+		return nil
+	}
+	return linkErr
 }
 
 func (c *Client) sidecarCachePath(kind string, digest [32]byte) string {

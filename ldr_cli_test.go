@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apology-is-policy/yip/ldrclient"
 	"github.com/apology-is-policy/yip/ldrrelay"
 	"github.com/apology-is-policy/yip/ldrstore"
 )
@@ -129,9 +130,42 @@ func TestLDRCLIEndToEndOverTLS13(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected cred.key persisted on first reader-request before --out failure: %v", err)
 	}
+
+	// Conflicting existing destinations (disposable sentinel AND rootDir/cred.key itself)
+	// MUST be refused without clobbering either the sentinel or cred.key!
+	sentinelPath := filepath.Join(tmp, "disposable-sentinel.txt")
+	sentinelBytes := []byte("cli-disposable-sentinel-do-not-overwrite")
+	if err := os.WriteFile(sentinelPath, sentinelBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := LDRCLI([]string{"root", "reader-request", "--dir", rootDir, "--namespace", "ns-admin", "--out", sentinelPath}, &errOutBuf); err == nil {
+		t.Fatalf("expected `yip ldr root reader-request` to refuse existing sentinel destination")
+	}
+	if got, err := os.ReadFile(sentinelPath); err != nil || !bytes.Equal(sentinelBytes, got) {
+		t.Fatalf("`yip ldr root reader-request` clobbered disposable sentinel!")
+	}
+	if err := LDRCLI([]string{"root", "reader-request", "--dir", rootDir, "--namespace", "ns-admin", "--out", filepath.Join(rootDir, "cred.key")}, &errOutBuf); err == nil {
+		t.Fatalf("expected `yip ldr root reader-request` to refuse overwriting rootDir/cred.key")
+	}
+	if got, err := os.ReadFile(filepath.Join(rootDir, "cred.key")); err != nil || !bytes.Equal(rootCredBefore, got) {
+		t.Fatalf("`yip ldr root reader-request` clobbered rootDir/cred.key!")
+	}
+
 	resumedReq := runLDR("root", "reader-request", "--dir", rootDir, "--namespace", "ns-admin", "--out", opReqF)
 	if !resumedReq["resumed"].(bool) {
-		t.Fatalf("expected second `yip ldr root reader-request` after --out error to resume cleanly, got %+v", resumedReq)
+		t.Fatalf("expected resumed `yip ldr root reader-request` after --out errors, got %+v", resumedReq)
+	}
+	opReqBytes, err := os.ReadFile(opReqF)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exact retry to the SAME --out before enrollment succeeds idempotently!
+	exactRetry := runLDR("root", "reader-request", "--dir", rootDir, "--namespace", "ns-admin", "--out", opReqF)
+	if !exactRetry["resumed"].(bool) || exactRetry["cred_id"] != resumedReq["cred_id"] || exactRetry["request_id"] != resumedReq["request_id"] {
+		t.Fatalf("exact retry mismatch: got %+v, want %+v", exactRetry, resumedReq)
+	}
+	if got, err := os.ReadFile(opReqF); err != nil || !bytes.Equal(opReqBytes, got) {
+		t.Fatalf("exact retry altered opReqF!")
 	}
 	rootCredResumed, err := os.ReadFile(filepath.Join(rootDir, "cred.key"))
 	if err != nil {
@@ -176,6 +210,28 @@ func TestLDRCLIEndToEndOverTLS13(t *testing.T) {
 		runLDR("join", "prove", "--dir", clientDir, "--operator-pub", opPub, "--request", reqF, "--challenge", chF, "--out", prF)
 		runLDR("join", "enroll", "--dir", rootDir, "--operator-key", opKey, "--request", reqF, "--challenge", chF, "--secret", secF, "--proof", prF)
 	}
+	// `yip ldr join request` MUST refuse an existing disposable sentinel without
+	// clobbering it or initializing the target dir, and MUST refuse overwriting
+	// cred.key even if --out points inside a newly initialized dir!
+	unusedJoinDir := filepath.Join(tmp, "unused-join-dir")
+	var joinSentinelBuf bytes.Buffer
+	if err := LDRCLI([]string{"join", "request", "--dir", unusedJoinDir, "--descriptor", descFile, "--namespace", "ns-unused", "--actor-limit", "2", "--reader", "--out", sentinelPath}, &joinSentinelBuf); err == nil {
+		t.Fatalf("expected `yip ldr join request` to refuse existing sentinel destination")
+	}
+	if got, err := os.ReadFile(sentinelPath); err != nil || !bytes.Equal(sentinelBytes, got) {
+		t.Fatalf("`yip ldr join request` clobbered disposable sentinel!")
+	}
+	if _, err := os.Stat(unusedJoinDir); !os.IsNotExist(err) {
+		t.Fatalf("failed `yip ldr join request` created target dir %s", unusedJoinDir)
+	}
+	selfCollisionDir := filepath.Join(tmp, "self-collision-join-dir")
+	if err := LDRCLI([]string{"join", "request", "--dir", selfCollisionDir, "--descriptor", descFile, "--namespace", "ns-self", "--actor-limit", "2", "--reader", "--out", filepath.Join(selfCollisionDir, "cred.key")}, &joinSentinelBuf); err == nil {
+		t.Fatalf("expected `yip ldr join request` with --out <dir>/cred.key to refuse clobbering cred.key")
+	}
+	if _, err := ldrclient.LoadCredentialKeys(filepath.Join(selfCollisionDir, "cred.key")); err != nil {
+		t.Fatalf("`yip ldr join request` corrupted newly created cred.key: %v", err)
+	}
+
 	p3Enroll("alice", aliceDir, "ns-alice")
 	p3Enroll("bob", bobDir, "ns-bob")
 

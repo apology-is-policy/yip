@@ -1752,3 +1752,95 @@ func TestInitClientDirPreservesExistingPartialAndOpenDirectories(t *testing.T) {
 		_ = fresh.Close()
 	})
 }
+
+// TestSaveJoinRequestNoClobberAndIdempotentRetry verifies Codex Turn 14:
+// SaveJoinRequest publishes without clobbering existing destinations (sentinel
+// files, conflicting requests, symlinks, directories) and treats an existing
+// byte-identical regular request file as idempotent success.
+func TestSaveJoinRequestNoClobberAndIdempotentRetry(t *testing.T) {
+	fx := startOnboardingFixture(t)
+
+	makeReq := func(t *testing.T, ns string, reqByte byte) ldrcrypto.JoinRequest {
+		t.Helper()
+		keys, err := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, err := ldrcrypto.SignJoinRequest(keys.Signing.Signer, ldrcrypto.JoinRequest{
+			RequestID:        bytes.Repeat([]byte{reqByte}, 16),
+			LineID:           fx.env.lineID,
+			Generation:       1,
+			DescriptorDigest: fx.env.cd,
+			EncryptionKey:    keys.Encryption.PublicKey(),
+			Grant:            ldrcrypto.JoinGrant{NamespaceID: ns, ActorLimit: 0, Reader: true},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return req
+	}
+
+	req1 := makeReq(t, "ns-exp-1", 0x91)
+	req2 := makeReq(t, "ns-exp-2", 0x92)
+
+	// 1. Existing disposable sentinel regular file MUST fail with ErrOutputExists and stay intact.
+	dir := t.TempDir()
+	sentinelPath := filepath.Join(dir, "sentinel.key")
+	sentinelBytes := []byte("disposable-sentinel-must-never-be-overwritten")
+	if err := os.WriteFile(sentinelPath, sentinelBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveJoinRequest(sentinelPath, req1); !errors.Is(err, ErrOutputExists) {
+		t.Fatalf("SaveJoinRequest over sentinel: got %v, want ErrOutputExists", err)
+	}
+	gotSentinel, err := os.ReadFile(sentinelPath)
+	if err != nil || !bytes.Equal(sentinelBytes, gotSentinel) {
+		t.Fatalf("sentinel file was modified! err=%v", err)
+	}
+
+	// 2. Fresh regular destination publishes cleanly; exact retry succeeds idempotently;
+	//    conflicting second request fails with ErrOutputExists leaving req1 untouched!
+	reqPath := filepath.Join(dir, "req1.cbor")
+	if err := SaveJoinRequest(reqPath, req1); err != nil {
+		t.Fatalf("initial SaveJoinRequest: %v", err)
+	}
+	req1Bytes, err := os.ReadFile(reqPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveJoinRequest(reqPath, req1); err != nil {
+		t.Fatalf("exact idempotent retry SaveJoinRequest: %v", err)
+	}
+	afterRetryBytes, err := os.ReadFile(reqPath)
+	if err != nil || !bytes.Equal(req1Bytes, afterRetryBytes) {
+		t.Fatalf("exact retry altered req1.cbor!")
+	}
+	if err := SaveJoinRequest(reqPath, req2); !errors.Is(err, ErrOutputExists) {
+		t.Fatalf("conflicting SaveJoinRequest over req1.cbor: got %v, want ErrOutputExists", err)
+	}
+	afterConflictBytes, err := os.ReadFile(reqPath)
+	if err != nil || !bytes.Equal(req1Bytes, afterConflictBytes) {
+		t.Fatalf("conflicting SaveJoinRequest altered req1.cbor!")
+	}
+
+	// 3. Symlink destination (even pointing to byte-identical req1.cbor!) MUST fail with ErrOutputExists.
+	symPath := filepath.Join(dir, "link-to-req1.cbor")
+	if err := os.Symlink(reqPath, symPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveJoinRequest(symPath, req1); !errors.Is(err, ErrOutputExists) {
+		t.Fatalf("SaveJoinRequest over symlink to identical file: got %v, want ErrOutputExists", err)
+	}
+	if fi, err := os.Lstat(symPath); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("symlink destination was altered! err=%v", err)
+	}
+
+	// 4. Directory destination MUST fail with ErrOutputExists.
+	subDir := filepath.Join(dir, "subdir")
+	if err := os.Mkdir(subDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveJoinRequest(subDir, req1); !errors.Is(err, ErrOutputExists) {
+		t.Fatalf("SaveJoinRequest over directory: got %v, want ErrOutputExists", err)
+	}
+}

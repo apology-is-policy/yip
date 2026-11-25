@@ -443,6 +443,11 @@ func ldrJoinCLI(args []string, out io.Writer) error {
 		if dir == "" || descPath == "" || ns == "" || outPath == "" {
 			return errors.New("join request requires --dir, --descriptor, --namespace, --out")
 		}
+		if _, err := os.Lstat(outPath); err == nil {
+			return fmt.Errorf("%w: %s", ldrclient.ErrOutputExists, outPath)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
 		limit, err := strconv.ParseUint(limitStr, 10, 64)
 		if err != nil {
 			return err

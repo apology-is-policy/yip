@@ -31,6 +31,7 @@ var (
 	ErrKeyFile          = errors.New("ldrclient: invalid key file")
 	ErrCredentialExists = errors.New("ldrclient: credential key already exists in client directory")
 	ErrDirInitialized   = errors.New("ldrclient: client directory already initialized or non-empty; choose a fresh directory")
+	ErrOutputExists     = errors.New("ldrclient: output destination already exists")
 )
 
 // SigningKeyMaterial holds a Profile v1 signing private key (Ed25519 or ECDSA P-256).

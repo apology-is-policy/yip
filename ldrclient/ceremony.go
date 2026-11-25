@@ -48,13 +48,17 @@ func marshalJoinRequest(req ldrcrypto.JoinRequest) ([]byte, error) {
 	})
 }
 
-// SaveJoinRequest writes a signed P3 JoinRequest to path as canonical CBOR.
+// SaveJoinRequest publishes a signed P3 JoinRequest to path as canonical CBOR
+// without clobbering any existing destination. If path already exists as a
+// byte-identical regular file, SaveJoinRequest succeeds idempotently without
+// modifying it; conflicting regular files, symlinks, and directories fail with
+// ErrOutputExists.
 func SaveJoinRequest(path string, req ldrcrypto.JoinRequest) error {
 	raw, err := marshalJoinRequest(req)
 	if err != nil {
 		return err
 	}
-	return ldrstore.AtomicWriteFile(path, raw, 0o644)
+	return publishFileNoClobber(path, raw, 0o644, true)
 }
 
 func saveJoinRequestCreateOnly(path string, req ldrcrypto.JoinRequest) error {
