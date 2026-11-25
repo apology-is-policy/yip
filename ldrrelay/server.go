@@ -640,7 +640,7 @@ func (s *RelayServer) handleLog(w http.ResponseWriter, lineID []byte, cb [32]byt
 		if ib == nil {
 			ib = []byte{}
 		}
-		arr[i] = ldrcrypto.Map{
+		fm := ldrcrypto.Map{
 			{Key: "gen", Value: fr.Gen},
 			{Key: "head", Value: fr.Head[:]},
 			{Key: "intent", Value: ib},
@@ -650,6 +650,20 @@ func (s *RelayServer) handleLog(w http.ResponseWriter, lineID []byte, cb [32]byt
 			{Key: "seq", Value: fr.Seq},
 			{Key: "seq_time", Value: fr.SeqTime},
 		}
+		if fr.PayloadCommit != nil {
+			fm = append(fm, ldrcrypto.MapEntry{Key: "payload_commit", Value: fr.PayloadCommit.ToCBORMap()})
+		}
+		if len(fr.WrapCommits) > 0 {
+			wArr := make([]any, len(fr.WrapCommits))
+			for j, wm := range fr.WrapCommits {
+				wArr[j] = ldrcrypto.Map{
+					{Key: "commit", Value: wm.Commit.ToCBORMap()},
+					{Key: "cred_id", Value: bytes.Clone(wm.CredID[:])},
+				}
+			}
+			fm = append(fm, ldrcrypto.MapEntry{Key: "wraps", Value: wArr})
+		}
+		arr[i] = fm
 	}
 	writeCBOR(w, http.StatusOK, ldrcrypto.Map{
 		{Key: "class", Value: "ok"},
@@ -1168,18 +1182,74 @@ func (c *SessionClient) ControlLog(ctx context.Context, fromSeq, maxCount uint64
 		if !ok {
 			return nil, errors.New("ldrrelay: invalid control frame element")
 		}
-		var fr ControlFrameWire
-		fr.Gen, _ = ldrcrypto.MapUint(fm, "gen")
-		fr.Seq, _ = ldrcrypto.MapUint(fm, "seq")
-		fr.SeqTime, _ = ldrcrypto.MapUint(fm, "seq_time")
-		fr.Origin, _ = ldrcrypto.MapString(fm, "origin")
-		fr.OpType, _ = ldrcrypto.MapString(fm, "op_type")
-		fr.IntentBytes, _ = ldrcrypto.MapBytes(fm, "intent")
-		if ph, err := ldrcrypto.MapBytesLen(fm, "prev_head", 32); err == nil {
-			copy(fr.PrevHead[:], ph)
+		if err := ldrcrypto.RequireExactKeys(fm,
+			[]string{"gen", "head", "intent", "op_type", "origin", "prev_head", "seq", "seq_time"},
+			"payload_commit", "wraps"); err != nil {
+			return nil, fmt.Errorf("ldrrelay: invalid control frame keys: %w", err)
 		}
-		if hd, err := ldrcrypto.MapBytesLen(fm, "head", 32); err == nil {
-			copy(fr.Head[:], hd)
+		var fr ControlFrameWire
+		var err error
+		if fr.Gen, err = ldrcrypto.MapUint(fm, "gen"); err != nil {
+			return nil, err
+		}
+		if fr.Seq, err = ldrcrypto.MapUint(fm, "seq"); err != nil {
+			return nil, err
+		}
+		if fr.SeqTime, err = ldrcrypto.MapUint(fm, "seq_time"); err != nil {
+			return nil, err
+		}
+		if fr.Origin, err = ldrcrypto.MapString(fm, "origin"); err != nil {
+			return nil, err
+		}
+		if fr.OpType, err = ldrcrypto.MapString(fm, "op_type"); err != nil {
+			return nil, err
+		}
+		if fr.IntentBytes, err = ldrcrypto.MapBytes(fm, "intent"); err != nil {
+			return nil, err
+		}
+		ph, err := ldrcrypto.MapBytesLen(fm, "prev_head", 32)
+		if err != nil {
+			return nil, err
+		}
+		copy(fr.PrevHead[:], ph)
+		hd, err := ldrcrypto.MapBytesLen(fm, "head", 32)
+		if err != nil {
+			return nil, err
+		}
+		copy(fr.Head[:], hd)
+		if pcRaw, has := fm["payload_commit"]; has {
+			c, err := ldrcrypto.ParseCommitment(pcRaw)
+			if err != nil {
+				return nil, err
+			}
+			fr.PayloadCommit = &c
+		}
+		if _, has := fm["wraps"]; has {
+			wArr, err := ldrcrypto.MapArray(fm, "wraps")
+			if err != nil {
+				return nil, err
+			}
+			fr.WrapCommits = make([]ldrcrypto.WrapManifestEntry, 0, len(wArr))
+			for _, we := range wArr {
+				wm, ok := we.(map[string]any)
+				if !ok {
+					return nil, errors.New("ldrrelay: invalid wrap entry in control frame")
+				}
+				if err := ldrcrypto.RequireExactKeys(wm, []string{"commit", "cred_id"}); err != nil {
+					return nil, err
+				}
+				cidB, err := ldrcrypto.MapBytesLen(wm, "cred_id", 32)
+				if err != nil {
+					return nil, err
+				}
+				cm, err := ldrcrypto.ParseCommitment(wm["commit"])
+				if err != nil {
+					return nil, err
+				}
+				var cid [32]byte
+				copy(cid[:], cidB)
+				fr.WrapCommits = append(fr.WrapCommits, ldrcrypto.WrapManifestEntry{CredID: cid, Commit: cm})
+			}
 		}
 		out = append(out, fr)
 	}

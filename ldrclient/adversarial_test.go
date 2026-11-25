@@ -106,9 +106,12 @@ func TestClientAdversarialSecurityBoundaries(t *testing.T) {
 	// 2. O25 grant-mismatch refusal: Bob expects actor_limit=4, relay has 99 -> ErrEnrollmentCheck!
 	bobDir := t.TempDir()
 	wantGrant := ldrcrypto.JoinGrant{NamespaceID: "ns-bob", ActorLimit: 4, Reader: true}
+	bobReqID := bytes.Repeat([]byte{0x11}, 16)
+	var bobReqDig [32]byte
+	copy(bobReqDig[:], bytes.Repeat([]byte{0x11}, 32))
 	bob, err := InitClientDir(InitDirOptions{
 		Dir: bobDir, SignedDescriptor: env.rawDesc, CredKeys: bobKeys,
-		ExpectedGrant: &wantGrant, Activated: false,
+		ExpectedGrant: &wantGrant, ExpectedJoinReq: bobReqID, ExpectedJoinReqDigest: &bobReqDig, Activated: false,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -179,7 +182,7 @@ func TestClientAdversarialSecurityBoundaries(t *testing.T) {
 	actualGrant := ldrcrypto.JoinGrant{NamespaceID: "ns-bob", ActorLimit: 99, Reader: true}
 	bobOK, err := InitClientDir(InitDirOptions{
 		Dir: bobOKDir, SignedDescriptor: env.rawDesc, CredKeys: bobKeys,
-		ExpectedGrant: &actualGrant, Activated: false,
+		ExpectedGrant: &actualGrant, ExpectedJoinReq: bobReqID, ExpectedJoinReqDigest: &bobReqDig, Activated: false,
 	})
 	if err != nil {
 		t.Fatal(err)

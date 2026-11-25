@@ -231,13 +231,22 @@ func (c *Client) writeProjFileLocked(pf projFile) (bool, error) {
 }
 
 // Project advances the rebuildable projection directory to ckSeq (separate
-// durable cursor ProjectedSeq, §11.2 rules 2–3). If any file on disk disagrees
-// with the verified store (e.g., local edit/taint), automatically wipes and
-// rebuilds from verified.wal once.
+// durable cursor ProjectedSeq, §11.2 rules 2–3). Enforces the O25 activation
+// and durability gate before publishing any file or advancing ProjectedSeq.
+// If any file on disk disagrees with the verified store (e.g., local edit/taint),
+// automatically wipes and rebuilds from verified.wal once.
 func (c *Client) Project(ctx context.Context, sess *ldrrelay.SessionClient) error {
 	rebuilt := false
 	for {
 		c.mu.Lock()
+		if c.outboxUncertain {
+			c.mu.Unlock()
+			return ErrOutboxUncertain
+		}
+		if !c.outbox.Activated {
+			c.mu.Unlock()
+			return ErrNotActivated
+		}
 		if c.cursors.ProjectedSeq >= c.ckSeq {
 			c.mu.Unlock()
 			return nil
@@ -311,6 +320,14 @@ func sha256Sum(b []byte) []byte {
 // Rebuild wipes the projection directory and re-materializes it cleanly from verified.wal.
 func (c *Client) Rebuild(ctx context.Context, sess *ldrrelay.SessionClient) error {
 	c.mu.Lock()
+	if c.outboxUncertain {
+		c.mu.Unlock()
+		return ErrOutboxUncertain
+	}
+	if !c.outbox.Activated {
+		c.mu.Unlock()
+		return ErrNotActivated
+	}
 	if err := c.wipeProjectionLocked(); err != nil {
 		c.mu.Unlock()
 		return err
@@ -333,6 +350,14 @@ func (c *Client) wipeProjectionLocked() error {
 // authoritative verified store (§11.1). Local edits never acquire authority.
 func (c *Client) VerifiedRead(ctx context.Context, sess *ldrrelay.SessionClient, relPath string) (string, error) {
 	c.mu.Lock()
+	if c.outboxUncertain {
+		c.mu.Unlock()
+		return "", ErrOutboxUncertain
+	}
+	if !c.outbox.Activated {
+		c.mu.Unlock()
+		return "", ErrNotActivated
+	}
 	obj, isView := c.viewOf[relPath]
 	coord, isRec := c.source[relPath]
 	if !isView && !isRec {
@@ -449,10 +474,17 @@ func (c *Client) deriveOwedNoticesLocked(after *ldrcore.State, fr ldrrelay.Contr
 }
 
 // ScanDelivery advances the durable ScannedSeq cursor over verified.wal and
-// queues newly owed local notices (§11.3).
+// queues newly owed local notices (§11.3). Refuses before O25 activation or
+// while outbox durability is uncertain.
 func (c *Client) ScanDelivery() (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.outboxUncertain {
+		return 0, ErrOutboxUncertain
+	}
+	if !c.outbox.Activated {
+		return 0, ErrNotActivated
+	}
 	added := 0
 	for c.cursors.ScannedSeq < c.ckSeq {
 		seq := c.cursors.ScannedSeq + 1
@@ -474,11 +506,12 @@ func (c *Client) ScanDelivery() (int, error) {
 
 // DeliverableNotices returns only unacknowledged notices whose actor is STILL
 // live, bound to this credential, at the exact binding generation, and in the
-// current generation (§11.3 / C2). Notices for moved/removed actors are withheld.
+// current generation (§11.3 / C2). Never exposes notices before O25 activation
+// or while outbox durability is uncertain.
 func (c *Client) DeliverableNotices() []LocalNotice {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.credKeys == nil {
+	if c.outboxUncertain || !c.outbox.Activated || c.credKeys == nil {
 		return nil
 	}
 	myTok := ldrrelay.CredToken(c.credKeys.CredID)
@@ -506,6 +539,12 @@ func (c *Client) DeliverableNotices() []LocalNotice {
 func (c *Client) AckNotice(id string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.outboxUncertain {
+		return ErrOutboxUncertain
+	}
+	if !c.outbox.Activated {
+		return ErrNotActivated
+	}
 	n, ok := c.cursors.Notices[id]
 	if !ok {
 		return fmt.Errorf("ldrclient: unknown notice %q", id)

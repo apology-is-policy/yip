@@ -123,6 +123,21 @@ func TestLDRCLIEndToEndOverTLS13(t *testing.T) {
 	// 6. P9 epoch activation runs on enrolled reader Alice's dir with operator key!
 	runLDR("epoch", "activate", "--dir", aliceDir, "--operator-key", opKey)
 
+	// 6b. Before O25 activation, `yip ldr sync --project` and `--scan` MUST fail
+	//     with ErrNotActivated, while plain provisional `sync` succeeds and exposes
+	//     zero deliverable notices!
+	var unactBuf bytes.Buffer
+	if err := LDRCLI([]string{"sync", "--dir", bobDir, "--project"}, &unactBuf); err == nil {
+		t.Fatalf("expected `yip ldr sync --project` to fail before activation")
+	}
+	if err := LDRCLI([]string{"sync", "--dir", bobDir, "--scan"}, &unactBuf); err == nil {
+		t.Fatalf("expected `yip ldr sync --scan` to fail before activation")
+	}
+	provSync := runLDR("sync", "--dir", bobDir)
+	if provSync["deliverable"] != nil {
+		t.Fatalf("expected nil deliverable notices before activation, got %+v", provSync["deliverable"])
+	}
+
 	// 7. Alice and Bob complete O25 full-replay activation, declare actors, and exchange an encrypted call!
 	runLDR("join", "activate", "--dir", aliceDir)
 	runLDR("join", "activate", "--dir", bobDir)

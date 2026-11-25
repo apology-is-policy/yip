@@ -224,7 +224,7 @@ func ldrRootCLI(args []string, out io.Writer) error {
 			return err
 		}
 		cl, err := ldrclient.InitClientDir(ldrclient.InitDirOptions{
-			Dir: dir, SignedDescriptor: rawDesc, Activated: true,
+			Dir: dir, DirKind: ldrclient.DirKindAdmin, SignedDescriptor: rawDesc, Activated: true,
 		})
 		if err != nil {
 			return err
@@ -444,13 +444,19 @@ func ldrJoinCLI(args []string, out io.Writer) error {
 		if err != nil {
 			return err
 		}
+		reqDig, err := ldrcrypto.VerifyJoinRequest(req)
+		if err != nil {
+			return err
+		}
 		cl, err := ldrclient.InitClientDir(ldrclient.InitDirOptions{
-			Dir:              dir,
-			SignedDescriptor: rawDesc,
-			CredKeys:         credKeys,
-			ExpectedGrant:    &grant,
-			ExpectedJoinReq:  reqID,
-			Activated:        false,
+			Dir:                   dir,
+			DirKind:               ldrclient.DirKindMember,
+			SignedDescriptor:      rawDesc,
+			CredKeys:              credKeys,
+			ExpectedGrant:         &grant,
+			ExpectedJoinReq:       reqID,
+			ExpectedJoinReqDigest: &reqDig,
+			Activated:             false,
 		})
 		if err != nil {
 			return err

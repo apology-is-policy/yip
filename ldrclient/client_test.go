@@ -215,7 +215,7 @@ func TestClientEndToEndO25JoinerPersistBeforeSendProjectionDeliveryAndRule8(t *t
 	}
 	defer sOp.Close()
 
-	enrollMember := func(name string, credKeys *CredentialKeyBundle, grant ldrcrypto.JoinGrant, reqByte byte) {
+	enrollMember := func(name string, credKeys *CredentialKeyBundle, grant ldrcrypto.JoinGrant, reqByte byte) ([]byte, [32]byte) {
 		t.Helper()
 		req, err := ldrcrypto.SignJoinRequest(credKeys.Signing.Signer, ldrcrypto.JoinRequest{
 			RequestID:        bytes.Repeat([]byte{reqByte}, 16),
@@ -239,7 +239,10 @@ func TestClientEndToEndO25JoinerPersistBeforeSendProjectionDeliveryAndRule8(t *t
 		if err := ldrcrypto.VerifyJoinProof(opKey.Signer.PublicKey(), req, ch, sec, pr); err != nil {
 			t.Fatalf("VerifyJoinProof(%s): %v", name, err)
 		}
-		reqDig, _ := ldrcrypto.VerifyJoinRequest(req)
+		reqDig, err := ldrcrypto.VerifyJoinRequest(req)
+		if err != nil {
+			t.Fatalf("VerifyJoinRequest(%s): %v", name, err)
+		}
 		skC, _ := req.SigningKey.ToCBOR()
 		ekC, _ := req.EncryptionKey.ToCBOR()
 		opID, err := admin.ComposeAndPersist(ComposeParams{
@@ -266,6 +269,7 @@ func TestClientEndToEndO25JoinerPersistBeforeSendProjectionDeliveryAndRule8(t *t
 		if _, err := admin.Sync(ctx, sOp); err != nil {
 			t.Fatal(err)
 		}
+		return req.RequestID, reqDig
 	}
 
 	aliceKeys, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
@@ -275,8 +279,8 @@ func TestClientEndToEndO25JoinerPersistBeforeSendProjectionDeliveryAndRule8(t *t
 
 	// Operator device enrolls itself with actor_limit=0, reader=true (P9 reader generator).
 	enrollMember("op-device", opCredKeys, ldrcrypto.JoinGrant{NamespaceID: "ns-op", ActorLimit: 0, Reader: true}, 0x01)
-	enrollMember("alice", aliceKeys, aliceGrant, 0x02)
-	enrollMember("bob", bobKeys, bobGrant, 0x03)
+	aliceReqID, aliceReqDig := enrollMember("alice", aliceKeys, aliceGrant, 0x02)
+	bobReqID, bobReqDig := enrollMember("bob", bobKeys, bobGrant, 0x03)
 
 	// Activate epoch 1 on the enrolled operator reader (P9).
 	actOp, _, err := admin.ComposeEpochActivate("activate_epoch_1")
@@ -295,7 +299,7 @@ func TestClientEndToEndO25JoinerPersistBeforeSendProjectionDeliveryAndRule8(t *t
 	aliceDir := t.TempDir()
 	alice, err := InitClientDir(InitDirOptions{
 		Dir: aliceDir, SignedDescriptor: env.rawDesc, CredKeys: aliceKeys,
-		ExpectedGrant: &aliceGrant, Activated: false,
+		ExpectedGrant: &aliceGrant, ExpectedJoinReq: aliceReqID, ExpectedJoinReqDigest: &aliceReqDig, Activated: false,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -322,7 +326,7 @@ func TestClientEndToEndO25JoinerPersistBeforeSendProjectionDeliveryAndRule8(t *t
 	bobDir := t.TempDir()
 	bob, err := InitClientDir(InitDirOptions{
 		Dir: bobDir, SignedDescriptor: env.rawDesc, CredKeys: bobKeys,
-		ExpectedGrant: &bobGrant, Activated: false,
+		ExpectedGrant: &bobGrant, ExpectedJoinReq: bobReqID, ExpectedJoinReqDigest: &bobReqDig, Activated: false,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -458,7 +462,7 @@ func TestClientEndToEndO25JoinerPersistBeforeSendProjectionDeliveryAndRule8(t *t
 	_, _ = admin.Sync(ctx, sOp)
 	charlieKeys, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
 	charlieGrant := ldrcrypto.JoinGrant{NamespaceID: "ns-charlie", ActorLimit: 2, Reader: true}
-	enrollMember("charlie", charlieKeys, charlieGrant, 0x04)
+	charlieReqID, charlieReqDig := enrollMember("charlie", charlieKeys, charlieGrant, 0x04)
 
 	// Operator moves actor "bob" to Charlie (binding_gen 1 -> 2) to test C2 notice withholding!
 	mvOp, err := admin.ComposeAndPersist(ComposeParams{
@@ -496,7 +500,7 @@ func TestClientEndToEndO25JoinerPersistBeforeSendProjectionDeliveryAndRule8(t *t
 	charlieDir := t.TempDir()
 	charlie, err := InitClientDir(InitDirOptions{
 		Dir: charlieDir, SignedDescriptor: env.rawDesc, CredKeys: charlieKeys,
-		ExpectedGrant: &charlieGrant, Activated: false,
+		ExpectedGrant: &charlieGrant, ExpectedJoinReq: charlieReqID, ExpectedJoinReqDigest: &charlieReqDig, Activated: false,
 	})
 	if err != nil {
 		t.Fatal(err)

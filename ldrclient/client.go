@@ -26,6 +26,7 @@ var (
 	ErrFailClosed      = errors.New("ldrclient: client failed closed due to violation or suspected rollback")
 	ErrKeyRevoked      = errors.New("ldrclient: key is revoked and signs nothing more")
 	ErrNotActivated    = errors.New("ldrclient: member has not completed O25 enrollment verification")
+	ErrOutboxUncertain = errors.New("ldrclient: durable outbox state uncertain after persistence failure; reconcile required")
 	ErrNoEpochKey      = errors.New("ldrclient: no epoch key available for payload encryption")
 	ErrEnrollmentCheck = errors.New("ldrclient: committed enrollment disagrees with saved P3 request")
 	ErrViolation       = errors.New("ldrclient: sequencer violation detected on replay")
@@ -114,27 +115,85 @@ type Client struct {
 	viewOf  map[string]string
 
 	// Durable outbox, epoch keys, and projection/delivery cursors.
-	outbox  persistedOutbox
-	slots   map[string]string // slot -> unsettled op_id
-	epochs  persistedEpochs
-	cursors persistedCursors
+	outbox                persistedOutbox
+	outboxUncertain       bool
+	outboxUncertainReason string
+	slots                 map[string]string // slot -> unsettled op_id
+	epochs                persistedEpochs
+	cursors               persistedCursors
+
+	// Optional durability hooks (nil defaults to OS SyncFile/SyncDir).
+	syncFileFn func(*os.File) error
+	syncDirFn  func(string) error
+}
+
+// SetSyncHooks overrides file/directory durability barriers used by Client
+// outbox persistence and reconciliation (nil restores OS SyncFile/SyncDir).
+// Intended for fault-injection tests controlling write visibility vs sync success.
+func (c *Client) SetSyncHooks(syncFile func(*os.File) error, syncDir func(string) error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.syncFileFn = syncFile
+	c.syncDirFn = syncDir
+}
+
+func (c *Client) persistOutboxLocked(ob persistedOutbox) error {
+	return saveOutboxWithHooks(c.outboxPath(), ob, c.syncFileFn, c.syncDirFn)
+}
+
+func (c *Client) markOutboxUncertainOnErrLocked(err error) {
+	if err == nil || errors.Is(err, ldrstore.ErrPreWrite) {
+		return
+	}
+	c.outboxUncertain = true
+	c.outboxUncertainReason = err.Error()
 }
 
 // InitDirOptions configures initializing a fresh client directory for a pinned descriptor.
 type InitDirOptions struct {
-	Dir              string
-	SignedDescriptor []byte
-	CredKeys         *CredentialKeyBundle // optional (for member credential)
-	ExpectedGrant    *ldrcrypto.JoinGrant // optional (for P3 onboarding verification)
-	ExpectedJoinReq  []byte               // optional
-	Activated        bool                 // true for root/operator admin dirs; false for joining members until O25 gate passes
+	Dir                   string
+	DirKind               string // DirKindAdmin or DirKindMember (inferred from Activated if empty)
+	SignedDescriptor      []byte
+	CredKeys              *CredentialKeyBundle // required for DirKindMember; optional for DirKindAdmin
+	ExpectedGrant         *ldrcrypto.JoinGrant // required for DirKindMember (P3 ceremony evidence)
+	ExpectedJoinReq       []byte               // required for DirKindMember (P3 join_request_id)
+	ExpectedJoinReqDigest *[32]byte            // required for DirKindMember (P3 join_request_digest)
+	Activated             bool                 // true for admin dirs; false for joining member dirs until O25 gate passes
 }
 
 // InitClientDir initializes a fresh durable client directory pinned to SignedDescriptor.
+// Joining member directories MUST provide complete P3 ceremony evidence
+// (CredKeys, ExpectedGrant, ExpectedJoinReq, ExpectedJoinReqDigest) and start
+// with Activated=false; administrative directories are explicitly marked DirKindAdmin.
 func InitClientDir(opts InitDirOptions) (*Client, error) {
 	if opts.Dir == "" {
 		return nil, errors.New("ldrclient: empty client directory")
 	}
+	kind := opts.DirKind
+	if kind == "" {
+		if opts.Activated {
+			kind = DirKindAdmin
+		} else {
+			kind = DirKindMember
+		}
+	}
+	switch kind {
+	case DirKindMember:
+		if opts.Activated {
+			return nil, fmt.Errorf("%w: joining member directory cannot start activated", ErrEnrollmentCheck)
+		}
+		if opts.CredKeys == nil || opts.ExpectedGrant == nil || opts.ExpectedGrant.NamespaceID == "" ||
+			len(opts.ExpectedJoinReq) == 0 || opts.ExpectedJoinReqDigest == nil {
+			return nil, fmt.Errorf("%w: joining member directory requires complete P3 ceremony evidence (cred keys, grant, request_id, request_digest)", ErrEnrollmentCheck)
+		}
+	case DirKindAdmin:
+		if !opts.Activated {
+			return nil, errors.New("ldrclient: administrative directory must specify Activated=true")
+		}
+	default:
+		return nil, fmt.Errorf("ldrclient: invalid dir_kind %q", kind)
+	}
+
 	desc, cd, genesis, _, err := ldrcrypto.VerifyCreationDescriptor(opts.SignedDescriptor)
 	if err != nil {
 		return nil, err
@@ -142,13 +201,20 @@ func InitClientDir(opts InitDirOptions) (*Client, error) {
 	if err := os.MkdirAll(filepath.Join(opts.Dir, "sidecars"), 0o700); err != nil {
 		return nil, err
 	}
+	var reqDigCopy *[32]byte
+	if opts.ExpectedJoinReqDigest != nil {
+		d := *opts.ExpectedJoinReqDigest
+		reqDigCopy = &d
+	}
 	cfg := persistedConfig{
-		SignedDescriptor:  bytes.Clone(opts.SignedDescriptor),
-		LineID:            bytes.Clone(desc.LineID),
-		DescriptorDigest:  cd,
-		GenesisAnchor:     genesis,
-		ExpectedGrant:     opts.ExpectedGrant,
-		ExpectedJoinReqID: bytes.Clone(opts.ExpectedJoinReq),
+		DirKind:               kind,
+		SignedDescriptor:      bytes.Clone(opts.SignedDescriptor),
+		LineID:                bytes.Clone(desc.LineID),
+		DescriptorDigest:      cd,
+		GenesisAnchor:         genesis,
+		ExpectedGrant:         opts.ExpectedGrant,
+		ExpectedJoinReqID:     bytes.Clone(opts.ExpectedJoinReq),
+		ExpectedJoinReqDigest: reqDigCopy,
 	}
 	if opts.CredKeys != nil {
 		cid := opts.CredKeys.CredID
@@ -170,9 +236,17 @@ func InitClientDir(opts InitDirOptions) (*Client, error) {
 }
 
 // OpenClient opens an existing client directory, acquires its exclusive OS lock,
-// verifies its pinned creation descriptor, and replays verified.wal from genesis.
-// On restart, any unsettled outbox entry automatically sets MustResolve = true (§5.7 rule 3).
+// enforces durability barriers on outbox.cbor and verified.wal, verifies its
+// pinned creation descriptor and ceremony configuration, and replays verified.wal
+// from genesis. On restart, any unsettled outbox entry automatically sets
+// MustResolve = true (§5.7 rule 3).
 func OpenClient(dir string) (*Client, error) {
+	return OpenClientWithSyncHooks(dir, nil, nil)
+}
+
+// OpenClientWithSyncHooks opens an existing client directory using the provided
+// file/directory durability hooks (nil defaults to OS SyncFile/SyncDir).
+func OpenClientWithSyncHooks(dir string, syncFile func(*os.File) error, syncDir func(string) error) (*Client, error) {
 	if dir == "" {
 		return nil, errors.New("ldrclient: empty client directory")
 	}
@@ -188,6 +262,13 @@ func OpenClient(dir string) (*Client, error) {
 	cleanupLock := func() {
 		_ = funlock(lf)
 		_ = lf.Close()
+	}
+
+	// Enforce a durability barrier on outbox.cbor before trusting any persisted
+	// activation or outbox state on reopen.
+	if err := syncOutboxBarrier(filepath.Join(dir, "outbox.cbor"), syncFile, syncDir); err != nil {
+		cleanupLock()
+		return nil, err
 	}
 
 	cfg, err := loadConfig(filepath.Join(dir, "config.cbor"))
@@ -238,9 +319,17 @@ func OpenClient(dir string) (*Client, error) {
 		slots:      make(map[string]string),
 		epochs:     ep,
 		cursors:    cur,
+		syncFileFn: syncFile,
+		syncDirFn:  syncDir,
 	}
 	if ck, err := LoadCredentialKeys(c.credKeyPath()); err == nil {
 		c.credKeys = ck
+	}
+	if c.cfg.DirKind == DirKindMember {
+		if err := c.validateMemberCeremonyConfigLocked(); err != nil {
+			cleanupLock()
+			return nil, err
+		}
 	}
 	// Rebuild slot index and enforce restart §5.7 rule 3 (MustResolve if unsettled).
 	hasUnsettled := false
@@ -251,15 +340,17 @@ func OpenClient(dir string) (*Client, error) {
 		}
 	}
 	if hasUnsettled && !c.outbox.MustResolve {
-		c.outbox.MustResolve = true
-		if err := saveOutbox(c.outboxPath(), c.outbox); err != nil {
+		candidate := c.outbox
+		candidate.MustResolve = true
+		if err := c.persistOutboxLocked(candidate); err != nil {
 			cleanupLock()
 			return nil, err
 		}
+		c.outbox.MustResolve = true
 	}
 
-	// Replay verified.wal from seq 1 to reconstruct exact verified state.
-	frames, err := loadVerifiedWAL(c.walPath())
+	// Replay verified.wal from seq 1 (with durability barrier) to reconstruct exact verified state.
+	frames, err := loadVerifiedWAL(c.walPath(), syncFile, syncDir)
 	if err != nil {
 		cleanupLock()
 		return nil, err
@@ -268,6 +359,15 @@ func OpenClient(dir string) (*Client, error) {
 		if err := c.verifyAndApplyFrameLocked(fr, false); err != nil {
 			cleanupLock()
 			return nil, fmt.Errorf("ldrclient: verified.wal replay failed: %w", err)
+		}
+	}
+	// Defense-in-depth: a reopened member directory claiming Activated=true
+	// MUST be backed by a verified credential_enroll record in verified.wal
+	// matching its complete saved P3 ceremony evidence.
+	if c.cfg.DirKind == DirKindMember && c.outbox.Activated {
+		if err := c.verifyEnrolledMemberLocked(false, true); err != nil {
+			cleanupLock()
+			return nil, fmt.Errorf("ldrclient: persisted activated flag lacks verified enrollment: %w", err)
 		}
 	}
 	return c, nil
@@ -366,22 +466,25 @@ func (c *Client) Stops() []KeyStop {
 
 // Status returns a concise JSON-friendly status summary (no private keys).
 type ClientStatus struct {
-	LineID        string   `json:"line_id"`
-	CredID        string   `json:"cred_id,omitempty"`
-	Activated     bool     `json:"activated"`
-	Generation    uint64   `json:"generation"`
-	CheckpointSeq uint64   `json:"checkpoint_seq"`
-	CheckpointHd  string   `json:"checkpoint_head"`
-	KeyEpoch      int64    `json:"key_epoch"`
-	AuthEpoch     int64    `json:"auth_epoch"`
-	HasEpochKeys  []uint64 `json:"has_epoch_keys"`
-	ProjectedSeq  uint64   `json:"projected_seq"`
-	ScannedSeq    uint64   `json:"scanned_seq"`
-	MustResolve   bool     `json:"must_resolve"`
-	Suspect       bool     `json:"suspect"`
-	Halted        string   `json:"halted,omitempty"`
-	OutboxCount   int      `json:"outbox_count"`
-	StoppedKeys   []string `json:"stopped_keys,omitempty"`
+	DirKind               string   `json:"dir_kind"`
+	LineID                string   `json:"line_id"`
+	CredID                string   `json:"cred_id,omitempty"`
+	Activated             bool     `json:"activated"`
+	OutboxUncertain       bool     `json:"outbox_uncertain,omitempty"`
+	OutboxUncertainReason string   `json:"outbox_uncertain_reason,omitempty"`
+	Generation            uint64   `json:"generation"`
+	CheckpointSeq         uint64   `json:"checkpoint_seq"`
+	CheckpointHd          string   `json:"checkpoint_head"`
+	KeyEpoch              int64    `json:"key_epoch"`
+	AuthEpoch             int64    `json:"auth_epoch"`
+	HasEpochKeys          []uint64 `json:"has_epoch_keys"`
+	ProjectedSeq          uint64   `json:"projected_seq"`
+	ScannedSeq            uint64   `json:"scanned_seq"`
+	MustResolve           bool     `json:"must_resolve"`
+	Suspect               bool     `json:"suspect"`
+	Halted                string   `json:"halted,omitempty"`
+	OutboxCount           int      `json:"outbox_count"`
+	StoppedKeys           []string `json:"stopped_keys,omitempty"`
 }
 
 func (c *Client) Status() ClientStatus {
@@ -403,22 +506,25 @@ func (c *Client) Status() ClientStatus {
 		}
 	}
 	return ClientStatus{
-		LineID:        hex.EncodeToString(c.cfg.LineID),
-		CredID:        cid,
-		Activated:     c.outbox.Activated,
-		Generation:    c.ckGen,
-		CheckpointSeq: c.ckSeq,
-		CheckpointHd:  hex.EncodeToString(c.ckHead[:]),
-		KeyEpoch:      c.state.Line.KeyEpoch,
-		AuthEpoch:     c.state.Line.AuthEpoch,
-		HasEpochKeys:  epKeys,
-		ProjectedSeq:  c.cursors.ProjectedSeq,
-		ScannedSeq:    c.cursors.ScannedSeq,
-		MustResolve:   c.outbox.MustResolve,
-		Suspect:       c.outbox.Suspect,
-		Halted:        c.outbox.Halted,
-		OutboxCount:   len(c.outbox.Entries),
-		StoppedKeys:   stopped,
+		DirKind:               c.cfg.DirKind,
+		LineID:                hex.EncodeToString(c.cfg.LineID),
+		CredID:                cid,
+		Activated:             c.outbox.Activated,
+		OutboxUncertain:       c.outboxUncertain,
+		OutboxUncertainReason: c.outboxUncertainReason,
+		Generation:            c.ckGen,
+		CheckpointSeq:         c.ckSeq,
+		CheckpointHd:          hex.EncodeToString(c.ckHead[:]),
+		KeyEpoch:              c.state.Line.KeyEpoch,
+		AuthEpoch:             c.state.Line.AuthEpoch,
+		HasEpochKeys:          epKeys,
+		ProjectedSeq:          c.cursors.ProjectedSeq,
+		ScannedSeq:            c.cursors.ScannedSeq,
+		MustResolve:           c.outbox.MustResolve,
+		Suspect:               c.outbox.Suspect,
+		Halted:                c.outbox.Halted,
+		OutboxCount:           len(c.outbox.Entries),
+		StoppedKeys:           stopped,
 	}
 }
 
@@ -426,6 +532,10 @@ func (c *Client) Status() ClientStatus {
 // ("credential", "operator", or "root"). Refuses stopped/revoked keys before dialing!
 func (c *Client) Dial(ctx context.Context, role string) (*ldrrelay.SessionClient, error) {
 	c.mu.Lock()
+	if c.outboxUncertain {
+		c.mu.Unlock()
+		return nil, ErrOutboxUncertain
+	}
 	if c.outbox.Halted != "" || c.outbox.Suspect {
 		c.mu.Unlock()
 		return nil, ErrFailClosed
@@ -482,7 +592,9 @@ func (c *Client) Dial(ctx context.Context, role string) (*ldrrelay.SessionClient
 		if errors.As(err, &ae) && ae.Class == ldrcore.ClassUnresolved && ae.Code == "revoked" {
 			c.mu.Lock()
 			c.recordToldRevokedLocked(tok, "revoked")
-			_ = saveOutbox(c.outboxPath(), c.outbox)
+			if perr := c.persistOutboxLocked(c.outbox); perr != nil {
+				c.markOutboxUncertainOnErrLocked(perr)
+			}
 			c.mu.Unlock()
 			return nil, ErrKeyRevoked
 		}
@@ -497,6 +609,10 @@ func (c *Client) Dial(ctx context.Context, role string) (*ldrrelay.SessionClient
 // any newly committed epoch wraps for this credential.
 func (c *Client) Sync(ctx context.Context, sess *ldrrelay.SessionClient) (int, error) {
 	c.mu.Lock()
+	if c.outboxUncertain {
+		c.mu.Unlock()
+		return 0, ErrOutboxUncertain
+	}
 	if c.outbox.Halted != "" {
 		reason := c.outbox.Halted
 		c.mu.Unlock()
@@ -543,32 +659,37 @@ func (c *Client) Sync(ctx context.Context, sess *ldrrelay.SessionClient) (int, e
 	return applied, nil
 }
 
-// VerifyEnrollmentAndActivate implements the O25 full-replay onboarding activation
-// gate (§6 of LDR-GO-RELAY-DESIGN.md): obtains a fresh anchor, replays control
-// frames 1..fseq from genesis, verifies the credential's committed keys and grant
-// match the saved P3 request, unwraps the current epoch key if reader==true, and
-// atomically flips Activated = true.
-func (c *Client) VerifyEnrollmentAndActivate(ctx context.Context, sess *ldrrelay.SessionClient) error {
-	ar, err := c.Anchor(ctx, sess)
-	if err != nil {
+func (c *Client) validateMemberCeremonyConfigLocked() error {
+	if c.credKeys == nil {
+		return fmt.Errorf("%w: member directory missing credential keys", ErrEnrollmentCheck)
+	}
+	if c.cfg.ExpectedCredID == nil || *c.cfg.ExpectedCredID != c.credKeys.CredID {
+		return fmt.Errorf("%w: member directory expected_cred_id missing or disagrees with local cred.key", ErrEnrollmentCheck)
+	}
+	if c.cfg.ExpectedGrant == nil || c.cfg.ExpectedGrant.NamespaceID == "" {
+		return fmt.Errorf("%w: member directory missing expected_grant", ErrEnrollmentCheck)
+	}
+	if len(c.cfg.ExpectedJoinReqID) == 0 {
+		return fmt.Errorf("%w: member directory missing expected_join_req_id", ErrEnrollmentCheck)
+	}
+	if c.cfg.ExpectedJoinReqDigest == nil {
+		return fmt.Errorf("%w: member directory missing expected_join_req_digest", ErrEnrollmentCheck)
+	}
+	return nil
+}
+
+// verifyEnrolledMemberLocked verifies that this joining member directory has
+// complete P3 ceremony evidence AND that verified replay history contains the
+// exact matching credential_enroll record (cred_id, signing_key, encryption_key,
+// grant, join_request_id, and join_request_digest).
+func (c *Client) verifyEnrolledMemberLocked(requireActiveReaderEpoch, allowRevoked bool) error {
+	if c.cfg.DirKind != DirKindMember {
+		return fmt.Errorf("%w: administrative directory is not a joining member directory", ErrEnrollmentCheck)
+	}
+	if err := c.validateMemberCeremonyConfigLocked(); err != nil {
 		return err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.credKeys == nil {
-		return errors.New("ldrclient: member activation requires credential keys")
-	}
-	if ar.Seq == 0 || c.ckSeq < ar.Seq || c.entries[ar.Seq-1].frame.Head != ar.Head {
-		return fmt.Errorf("%w: synced checkpoint (%d) did not verify fresh anchor (%d)", ErrViolation, c.ckSeq, ar.Seq)
-	}
 	myTok := ldrrelay.CredToken(c.credKeys.CredID)
-	cr := c.state.Line.Credentials[myTok]
-	if cr == nil {
-		return fmt.Errorf("%w: credential not enrolled in verified state", ErrEnrollmentCheck)
-	}
-	if cr.Revoked {
-		return fmt.Errorf("%w: credential already revoked", ErrKeyRevoked)
-	}
 	wantSig, err := ldrrelay.KeyToken(c.credKeys.Signing.Signer.PublicKey())
 	if err != nil {
 		return err
@@ -577,17 +698,60 @@ func (c *Client) VerifyEnrollmentAndActivate(ctx context.Context, sess *ldrrelay
 	if err != nil {
 		return err
 	}
-	if cr.SigningKey != wantSig || cr.EncryptionKey != wantEnc {
-		return fmt.Errorf("%w: enrolled keys do not match local credential keys", ErrEnrollmentCheck)
-	}
-	if c.cfg.ExpectedGrant != nil {
-		if cr.Namespace != c.cfg.ExpectedGrant.NamespaceID ||
-			cr.ActorLimit != int64(c.cfg.ExpectedGrant.ActorLimit) ||
-			cr.Reader != c.cfg.ExpectedGrant.Reader {
-			return fmt.Errorf("%w: enrolled grant differs from saved P3 join request", ErrEnrollmentCheck)
+	wantReqID := hex.EncodeToString(c.cfg.ExpectedJoinReqID)
+	wantReqDig := hex.EncodeToString(c.cfg.ExpectedJoinReqDigest[:])
+
+	// Locate the actual verified credential_enroll record in verified history.
+	var enrollRec *ldrcore.Record
+	enrollCount := 0
+	for _, ve := range c.entries {
+		if ve.decoded == nil || ve.decoded.OpType != "credential_enroll" {
+			continue
+		}
+		if ve.decoded.Record.Cred == myTok {
+			r := ve.decoded.Record
+			enrollRec = &r
+			enrollCount++
 		}
 	}
-	if cr.Reader {
+	if enrollCount == 0 {
+		return fmt.Errorf("%w: no verified credential_enroll record found for local credential", ErrEnrollmentCheck)
+	}
+	if enrollCount > 1 {
+		return fmt.Errorf("%w: duplicate credential_enroll records (%d) for local credential", ErrViolation, enrollCount)
+	}
+	if enrollRec.SigningKey != wantSig || enrollRec.EncryptionKey != wantEnc {
+		return fmt.Errorf("%w: verified credential_enroll keys do not match local credential keys", ErrEnrollmentCheck)
+	}
+	if enrollRec.Grant == nil ||
+		enrollRec.Grant.Namespace != c.cfg.ExpectedGrant.NamespaceID ||
+		enrollRec.Grant.ActorLimit != int64(c.cfg.ExpectedGrant.ActorLimit) ||
+		enrollRec.Grant.Reader != c.cfg.ExpectedGrant.Reader {
+		return fmt.Errorf("%w: verified credential_enroll grant differs from saved P3 join request", ErrEnrollmentCheck)
+	}
+	if enrollRec.JoinRequest != wantReqID {
+		return fmt.Errorf("%w: verified credential_enroll join_request_id does not match saved P3 request", ErrEnrollmentCheck)
+	}
+	if enrollRec.JoinRequestDigest != wantReqDig {
+		return fmt.Errorf("%w: verified credential_enroll join_request_digest does not match saved P3 request", ErrEnrollmentCheck)
+	}
+
+	cr := c.state.Line.Credentials[myTok]
+	if cr == nil {
+		return fmt.Errorf("%w: credential not enrolled in verified state", ErrEnrollmentCheck)
+	}
+	if !allowRevoked && cr.Revoked {
+		return fmt.Errorf("%w: credential already revoked", ErrKeyRevoked)
+	}
+	if cr.SigningKey != wantSig || cr.EncryptionKey != wantEnc {
+		return fmt.Errorf("%w: enrolled state keys do not match local credential keys", ErrEnrollmentCheck)
+	}
+	if cr.Namespace != c.cfg.ExpectedGrant.NamespaceID ||
+		cr.ActorLimit != int64(c.cfg.ExpectedGrant.ActorLimit) ||
+		cr.Reader != c.cfg.ExpectedGrant.Reader {
+		return fmt.Errorf("%w: enrolled state grant differs from saved P3 join request", ErrEnrollmentCheck)
+	}
+	if requireActiveReaderEpoch && cr.Reader {
 		hasAny := false
 		for ep := range c.epochs.Keys {
 			if slices.Contains(c.state.Line.Readers[int64(ep)], myTok) {
@@ -599,14 +763,109 @@ func (c *Client) VerifyEnrollmentAndActivate(ctx context.Context, sess *ldrrelay
 			return fmt.Errorf("%w: reader credential awaiting first epoch activation", ErrNoEpochKey)
 		}
 	}
+	return nil
+}
+
+// VerifyEnrollmentAndActivate implements the O25 full-replay onboarding activation
+// gate (§6 of LDR-GO-RELAY-DESIGN.md): obtains a fresh anchor, replays control
+// frames 1..fseq from genesis, verifies the actual committed credential_enroll
+// record matches the complete saved P3 request (keys, grant, join_request_id,
+// join_request_digest), verifies epoch wrap availability for readers, durably
+// persists Activated=true, and publishes the in-memory flag ONLY after persistence
+// succeeds. On an ambiguous persistence failure, ordinary operations stay fenced
+// pending ReconcileDurability.
+func (c *Client) VerifyEnrollmentAndActivate(ctx context.Context, sess *ldrrelay.SessionClient) error {
+	c.mu.Lock()
+	if c.outboxUncertain {
+		c.mu.Unlock()
+		return ErrOutboxUncertain
+	}
+	if c.outbox.Halted != "" || c.outbox.Suspect {
+		c.mu.Unlock()
+		return ErrFailClosed
+	}
+	c.mu.Unlock()
+
+	ar, err := c.Anchor(ctx, sess)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.outboxUncertain {
+		return ErrOutboxUncertain
+	}
+	if c.outbox.Halted != "" || c.outbox.Suspect {
+		return ErrFailClosed
+	}
+	if ar.Seq == 0 || c.ckSeq < ar.Seq || c.entries[ar.Seq-1].frame.Head != ar.Head {
+		return fmt.Errorf("%w: synced checkpoint (%d) did not verify fresh anchor (%d)", ErrViolation, c.ckSeq, ar.Seq)
+	}
+	if err := c.verifyEnrolledMemberLocked(true, false); err != nil {
+		return err
+	}
+	// Stage and persist candidate outbox BEFORE publishing Activated in memory!
+	candidate := c.outbox
+	candidate.Activated = true
+	if err := c.persistOutboxLocked(candidate); err != nil {
+		c.markOutboxUncertainOnErrLocked(err)
+		return err
+	}
 	c.outbox.Activated = true
-	return saveOutbox(c.outboxPath(), c.outbox)
+	return nil
+}
+
+// ReconcileDurability enforces explicit file+directory durability barriers on
+// outbox.cbor and verified.wal, reloads durable outbox state from disk, verifies
+// enrollment backing if Activated=true on a member directory, and lifts
+// outboxUncertain only when all barriers and checks succeed.
+func (c *Client) ReconcileDurability() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err := syncOutboxBarrier(c.outboxPath(), c.syncFileFn, c.syncDirFn); err != nil {
+		return err
+	}
+	if _, err := os.Stat(c.walPath()); err == nil {
+		if _, err := loadVerifiedWAL(c.walPath(), c.syncFileFn, c.syncDirFn); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	ob, err := loadOutbox(c.outboxPath())
+	if err != nil {
+		return err
+	}
+	if ob.NextOp < c.outbox.NextOp {
+		return fmt.Errorf("%w: reconciled outbox next_op %d regressed below %d", ldrstore.ErrCorruptWAL, ob.NextOp, c.outbox.NextOp)
+	}
+	if c.cfg.DirKind == DirKindMember && ob.Activated {
+		if err := c.verifyEnrolledMemberLocked(false, true); err != nil {
+			return err
+		}
+	}
+	slots := make(map[string]string)
+	for _, e := range ob.Entries {
+		if e.Status == ldrcore.OutPending || e.Status == ldrcore.OutReconcile {
+			slots[e.Slot] = e.OpID
+		}
+	}
+	c.outbox = ob
+	c.slots = slots
+	c.outboxUncertain = false
+	c.outboxUncertainReason = ""
+	return nil
 }
 
 // Anchor requests a fresh anchor over sess and syncs verified local state up to it.
 // Fails closed if Halted, Suspect, or stopped (G2 / Rule 8).
 func (c *Client) Anchor(ctx context.Context, sess *ldrrelay.SessionClient) (ldrrelay.AnchorReply, error) {
 	c.mu.Lock()
+	if c.outboxUncertain {
+		c.mu.Unlock()
+		return ldrrelay.AnchorReply{}, ErrOutboxUncertain
+	}
 	if c.outbox.Halted != "" || c.outbox.Suspect {
 		c.mu.Unlock()
 		return ldrrelay.AnchorReply{}, ErrFailClosed
@@ -650,13 +909,17 @@ func (c *Client) verifyAndApplyFrameLocked(fr ldrrelay.ControlFrameWire, persist
 	if fr.PrevHead != c.ckHead {
 		return fmt.Errorf("seq %d prev_head does not link to checkpoint", fr.Seq)
 	}
+	if fr.SeqTime > uint64(ldrcore.MaxCounter) {
+		return fmt.Errorf("seq %d seq_time %d out of domain", fr.Seq, fr.SeqTime)
+	}
 
 	var next ldrcore.State
 	var dec *ldrrelay.DecodedIntent
 	var opKey *ldrstore.StoredOpKey
 
 	if fr.Origin == ldrcore.OriginSequencer {
-		if fr.OpType != "time_anchor" || len(fr.IntentBytes) != 0 {
+		if fr.Seq == 1 || fr.OpType != "time_anchor" || len(fr.IntentBytes) != 0 ||
+			fr.PayloadCommit != nil || len(fr.WrapCommits) != 0 {
 			return fmt.Errorf("seq %d invalid sequencer frame", fr.Seq)
 		}
 		wantHead, err := ldrcrypto.AnchorChainHead(c.ckHead, c.profDigest, c.cfg.LineID, fr.Gen, fr.Seq, fr.SeqTime)
@@ -684,6 +947,11 @@ func (c *Client) verifyAndApplyFrameLocked(fr ldrrelay.ControlFrameWire, persist
 		if dec.Generation != fr.Gen {
 			return fmt.Errorf("seq %d signed generation %d != frame gen %d", fr.Seq, dec.Generation, fr.Gen)
 		}
+		// Compare outer origin, op_type, and sidecar commitment metadata against
+		// the signed body BEFORE applying or persisting.
+		if err := ldrrelay.VerifyControlFrameMetadata(fr, dec); err != nil {
+			return err
+		}
 		pubKey, err := c.resolveReplaySignerKeyLocked(dec.Principal, fr.Seq == 1 && dec.OpType == "line_init")
 		if err != nil {
 			return fmt.Errorf("seq %d unauthorized signer: %v", fr.Seq, err)
@@ -703,13 +971,19 @@ func (c *Client) verifyAndApplyFrameLocked(fr ldrrelay.ControlFrameWire, persist
 			return fmt.Errorf("seq %d duplicates committed op identity from seq %d", fr.Seq, prevSeq)
 		}
 		if dec.OpType == "line_init" {
-			if fr.Seq != 1 || dec.SeenSeq != 0 || dec.SeenHead != c.cfg.GenesisAnchor {
-				return fmt.Errorf("seq %d line_init not anchored on pinned genesis", fr.Seq)
+			if fr.Seq != 1 {
+				return fmt.Errorf("seq %d line_init only permitted at seq 1", fr.Seq)
 			}
-			if dec.DescriptorDigest == nil || *dec.DescriptorDigest != c.cfg.DescriptorDigest {
-				return fmt.Errorf("seq %d line_init descriptor digest mismatch", fr.Seq)
+			// Shared pinned bootstrap check matching relay Submit & startup replay:
+			// validates genesis anchor, descriptor digest, embedded profile digest,
+			// and canonical 1-of-2 root key pair.
+			if cls, code := ldrrelay.ValidateLineInitBootstrap(c.desc, c.cfg.DescriptorDigest, c.cfg.GenesisAnchor, c.profDigest, dec); cls != "" {
+				return fmt.Errorf("seq %d line_init bootstrap failed (%s/%s)", fr.Seq, cls, code)
 			}
 		} else {
+			if fr.Seq == 1 {
+				return fmt.Errorf("seq %d non-line_init op %q at genesis", fr.Seq, dec.OpType)
+			}
 			anc, held := c.rctx.anchors[dec.SeenSeq]
 			if !held {
 				return fmt.Errorf("seq %d anchored at unknown/retired seq %d", fr.Seq, dec.SeenSeq)
@@ -1022,6 +1296,14 @@ func (c *Client) fetchVerifiedSidecar(ctx context.Context, sess *ldrrelay.Sessio
 //   - ldrcore.ReadOK (authenticated, valid plaintext)
 func (c *Client) ReadPayload(ctx context.Context, sess *ldrrelay.SessionClient, seq uint64) ([]byte, string, error) {
 	c.mu.Lock()
+	if c.outboxUncertain {
+		c.mu.Unlock()
+		return nil, "", ErrOutboxUncertain
+	}
+	if !c.outbox.Activated {
+		c.mu.Unlock()
+		return nil, "", ErrNotActivated
+	}
 	if seq < 1 || seq > uint64(len(c.entries)) {
 		c.mu.Unlock()
 		return nil, "", fmt.Errorf("ldrclient: seq %d not in verified store", seq)
@@ -1093,6 +1375,9 @@ func (c *Client) ComposeAndPersist(p ComposeParams) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.outboxUncertain {
+		return "", ErrOutboxUncertain
+	}
 	if c.outbox.Halted != "" || c.outbox.Suspect {
 		return "", ErrFailClosed
 	}
@@ -1217,11 +1502,12 @@ func (c *Client) ComposeAndPersist(p ComposeParams) (string, error) {
 	}
 	c.outbox.Entries = append(c.outbox.Entries, entry)
 	c.slots[slot] = opID
-	if err := saveOutbox(c.outboxPath(), c.outbox); err != nil {
-		// Roll back in-memory state on disk failure!
+	if err := c.persistOutboxLocked(c.outbox); err != nil {
+		// Roll back in-memory state on disk failure; fence on uncertain write!
 		c.outbox.Entries = c.outbox.Entries[:len(c.outbox.Entries)-1]
 		delete(c.slots, slot)
 		c.outbox.NextOp--
+		c.markOutboxUncertainOnErrLocked(err)
 		return "", err
 	}
 	return opID, nil
@@ -1235,6 +1521,9 @@ func (c *Client) ComposeEpochActivate(action string) (string, []byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.outboxUncertain {
+		return "", nil, ErrOutboxUncertain
+	}
 	if c.outbox.Halted != "" || c.outbox.Suspect {
 		return "", nil, ErrFailClosed
 	}
@@ -1382,10 +1671,11 @@ func (c *Client) ComposeEpochActivate(action string) (string, []byte, error) {
 	}
 	c.outbox.Entries = append(c.outbox.Entries, entry)
 	c.slots[slot] = opID
-	if err := saveOutbox(c.outboxPath(), c.outbox); err != nil {
+	if err := c.persistOutboxLocked(c.outbox); err != nil {
 		c.outbox.Entries = c.outbox.Entries[:len(c.outbox.Entries)-1]
 		delete(c.slots, slot)
 		c.outbox.NextOp--
+		c.markOutboxUncertainOnErrLocked(err)
 		return "", nil, err
 	}
 	return opID, epochKey, nil
@@ -1395,6 +1685,10 @@ func (c *Client) ComposeEpochActivate(action string) (string, []byte, error) {
 // entry per §5.7, and persists the result durably. Never re-signs or alters bytes!
 func (c *Client) Send(ctx context.Context, sess *ldrrelay.SessionClient, opID string) (ldrrelay.SubmitReply, error) {
 	c.mu.Lock()
+	if c.outboxUncertain {
+		c.mu.Unlock()
+		return ldrrelay.SubmitReply{}, ErrOutboxUncertain
+	}
 	e := c.findOutboxLocked(opID)
 	if e == nil {
 		c.mu.Unlock()
@@ -1410,12 +1704,14 @@ func (c *Client) Send(ctx context.Context, sess *ldrrelay.SessionClient, opID st
 	}
 	if c.signsNoMoreLocked(e.SignerToken) {
 		e.Status = ldrcore.OutReconcile
-		_ = saveOutbox(c.outboxPath(), c.outbox)
+		_ = c.persistOutboxLocked(c.outbox)
 		c.mu.Unlock()
 		return ldrrelay.SubmitReply{}, ErrKeyRevoked
 	}
 	e.Sends++
-	if err := saveOutbox(c.outboxPath(), c.outbox); err != nil {
+	if err := c.persistOutboxLocked(c.outbox); err != nil {
+		e.Sends--
+		c.markOutboxUncertainOnErrLocked(err)
 		c.mu.Unlock()
 		return ldrrelay.SubmitReply{}, err
 	}
@@ -1434,7 +1730,10 @@ func (c *Client) Send(ctx context.Context, sess *ldrrelay.SessionClient, opID st
 
 	c.mu.Lock()
 	c.settleLocked(e, rep)
-	saveErr := saveOutbox(c.outboxPath(), c.outbox)
+	saveErr := c.persistOutboxLocked(c.outbox)
+	if saveErr != nil {
+		c.markOutboxUncertainOnErrLocked(saveErr)
+	}
 	c.mu.Unlock()
 	if saveErr != nil {
 		return rep, saveErr
@@ -1450,6 +1749,10 @@ func (c *Client) ResolveAll(ctx context.Context, sess *ldrrelay.SessionClient, s
 		return err
 	}
 	c.mu.Lock()
+	if c.outboxUncertain {
+		c.mu.Unlock()
+		return ErrOutboxUncertain
+	}
 	var todo []*OutboxEntry
 	for _, e := range c.outbox.Entries {
 		if e.Status != ldrcore.OutPending && e.Status != ldrcore.OutReconcile {
@@ -1499,10 +1802,16 @@ func (c *Client) ResolveAll(ctx context.Context, sess *ldrrelay.SessionClient, s
 	}
 
 	c.mu.Lock()
+	candidate := c.outbox
 	if !incomplete {
-		c.outbox.MustResolve = false
+		candidate.MustResolve = false
 	}
-	err = saveOutbox(c.outboxPath(), c.outbox)
+	err = c.persistOutboxLocked(candidate)
+	if err != nil {
+		c.markOutboxUncertainOnErrLocked(err)
+	} else {
+		c.outbox.MustResolve = candidate.MustResolve
+	}
 	c.mu.Unlock()
 	return err
 }

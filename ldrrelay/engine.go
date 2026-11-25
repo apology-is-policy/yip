@@ -168,32 +168,69 @@ func (e *RelayEngine) SetQuotaMax(n int) {
 // Shared historical and live admission validators (used identically by both
 // live Submit and startup loadAndVerifyLine replay).
 
-// validateLineInitBootstrap verifies that a line_init intent binds the exact
+// ValidateLineInitBootstrap verifies that a line_init intent binds the exact
 // provisioned generation-1 context, genesis anchor, descriptor digest, profile,
-// and canonical equal 1-of-2 root key set. Returns (class, code) or ("", "") if valid.
-func (rt *lineRuntime) validateLineInitBootstrap(dec *DecodedIntent) (string, string) {
+// and canonical equal 1-of-2 root key set. Shared identically by live relay
+// Submit, relay startup replay, and client O25 genesis replay.
+// Returns (class, code) or ("", "") if valid.
+func ValidateLineInitBootstrap(desc ldrcrypto.CreationDescriptor, cd, genesis, profDigest [32]byte, dec *DecodedIntent) (string, string) {
 	if dec.Generation < 1 {
 		return ldrcore.ClassAdmission, "malformed"
 	}
 	if dec.Generation != 1 || dec.SeenSeq > 0 {
 		return ldrcore.ClassUnresolved, "history_unavailable"
 	}
-	if dec.SeenHead != rt.genesis {
+	if dec.SeenHead != genesis {
 		return ldrcore.ClassRefusal, "unknown_anchor"
 	}
-	if dec.DescriptorDigest == nil || *dec.DescriptorDigest != rt.cd || dec.InitProfile == nil {
+	if dec.DescriptorDigest == nil || *dec.DescriptorDigest != cd || dec.InitProfile == nil {
 		return ldrcore.ClassAdmission, "invalid_bootstrap"
 	}
 	initProfDig, err := dec.InitProfile.Digest()
-	if err != nil || initProfDig != rt.profDigest {
+	if err != nil || initProfDig != profDigest {
 		return ldrcore.ClassAdmission, "invalid_bootstrap"
 	}
-	wantR0, _ := KeyToken(rt.desc.RootKeys[0])
-	wantR1, _ := KeyToken(rt.desc.RootKeys[1])
-	if len(dec.Record.RootKeys) != 2 || dec.Record.RootKeys[0] != wantR0 || dec.Record.RootKeys[1] != wantR1 {
+	sortedRoots, err := ldrcrypto.CanonicalRootKeys(desc.RootKeys)
+	if err != nil || len(sortedRoots) != 2 {
+		return ldrcore.ClassAdmission, "invalid_bootstrap"
+	}
+	wantR0, err0 := KeyToken(sortedRoots[0])
+	wantR1, err1 := KeyToken(sortedRoots[1])
+	if err0 != nil || err1 != nil || len(dec.Record.RootKeys) != 2 || dec.Record.RootKeys[0] != wantR0 || dec.Record.RootKeys[1] != wantR1 {
 		return ldrcore.ClassAdmission, "invalid_bootstrap"
 	}
 	return "", ""
+}
+
+// VerifyControlFrameMetadata checks that a ControlFrameWire's outer origin,
+// op_type, and sidecar commitment metadata agree verbatim with the decoded
+// signed intent body.
+func VerifyControlFrameMetadata(fr ControlFrameWire, dec *DecodedIntent) error {
+	if fr.Origin != dec.Origin || fr.OpType != dec.OpType {
+		return fmt.Errorf("seq %d outer origin/op_type (%s/%s) disagrees with signed intent (%s/%s)",
+			fr.Seq, fr.Origin, fr.OpType, dec.Origin, dec.OpType)
+	}
+	if dec.PayloadCommit.Length > 0 {
+		if fr.PayloadCommit == nil || !fr.PayloadCommit.Equal(dec.PayloadCommit) {
+			return fmt.Errorf("seq %d outer payload_commit disagrees with signed intent", fr.Seq)
+		}
+	} else if fr.PayloadCommit != nil && (fr.PayloadCommit.Length > 0 || !fr.PayloadCommit.Equal(dec.PayloadCommit)) {
+		return fmt.Errorf("seq %d outer carries unexpected payload_commit", fr.Seq)
+	}
+	if len(fr.WrapCommits) != len(dec.Manifest) {
+		return fmt.Errorf("seq %d outer wrap commit count %d disagrees with signed manifest %d",
+			fr.Seq, len(fr.WrapCommits), len(dec.Manifest))
+	}
+	for i := range dec.Manifest {
+		if fr.WrapCommits[i].CredID != dec.Manifest[i].CredID || !fr.WrapCommits[i].Commit.Equal(dec.Manifest[i].Commit) {
+			return fmt.Errorf("seq %d outer wrap commit[%d] disagrees with signed manifest", fr.Seq, i)
+		}
+	}
+	return nil
+}
+
+func (rt *lineRuntime) validateLineInitBootstrap(dec *DecodedIntent) (string, string) {
+	return ValidateLineInitBootstrap(rt.desc, rt.cd, rt.genesis, rt.profDigest, dec)
 }
 
 // validateAnchorAndDeadline checks an ordinary intent's signed anchor reference

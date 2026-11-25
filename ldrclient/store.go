@@ -1,12 +1,15 @@
 package ldrclient
 
 import (
+	"bytes"
 	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,6 +17,14 @@ import (
 	"github.com/apology-is-policy/yip/ldrcrypto"
 	"github.com/apology-is-policy/yip/ldrrelay"
 	"github.com/apology-is-policy/yip/ldrstore"
+)
+
+// Client directory roles distinguish pre-existing administrative directories
+// from joining/enrolled member credential directories requiring complete P3
+// ceremony evidence and O25 activation.
+const (
+	DirKindAdmin  = "admin"
+	DirKindMember = "member"
 )
 
 func p256Curve() elliptic.Curve { return elliptic.P256() }
@@ -92,13 +103,15 @@ type persistedCursors struct {
 }
 
 type persistedConfig struct {
-	SignedDescriptor  []byte
-	LineID            []byte
-	DescriptorDigest  [32]byte
-	GenesisAnchor     [32]byte
-	ExpectedCredID    *[32]byte
-	ExpectedGrant     *ldrcrypto.JoinGrant
-	ExpectedJoinReqID []byte
+	DirKind               string // DirKindAdmin or DirKindMember
+	SignedDescriptor      []byte
+	LineID                []byte
+	DescriptorDigest      [32]byte
+	GenesisAnchor         [32]byte
+	ExpectedCredID        *[32]byte
+	ExpectedGrant         *ldrcrypto.JoinGrant
+	ExpectedJoinReqID     []byte
+	ExpectedJoinReqDigest *[32]byte
 }
 
 type persistedEpochs struct {
@@ -123,6 +136,7 @@ func saveConfig(path string, cfg persistedConfig) error {
 	m := ldrcrypto.Map{
 		{Key: "cd", Value: cfg.DescriptorDigest[:]},
 		{Key: "descriptor", Value: cfg.SignedDescriptor},
+		{Key: "dir_kind", Value: cfg.DirKind},
 		{Key: "genesis", Value: cfg.GenesisAnchor[:]},
 		{Key: "line_id", Value: cfg.LineID},
 		{Key: "v", Value: uint64(1)},
@@ -148,6 +162,9 @@ func saveConfig(path string, cfg persistedConfig) error {
 	if len(cfg.ExpectedJoinReqID) > 0 {
 		m = append(m, ldrcrypto.MapEntry{Key: "expected_join_req_id", Value: cfg.ExpectedJoinReqID})
 	}
+	if cfg.ExpectedJoinReqDigest != nil {
+		m = append(m, ldrcrypto.MapEntry{Key: "expected_join_req_digest", Value: cfg.ExpectedJoinReqDigest[:]})
+	}
 	raw, err := ldrcrypto.MarshalCBOR(m)
 	if err != nil {
 		return err
@@ -168,12 +185,18 @@ func loadConfig(path string) (persistedConfig, error) {
 	if !ok {
 		return persistedConfig{}, errors.New("ldrclient: invalid config.cbor")
 	}
-	if err := ldrcrypto.RequireExactKeys(m, []string{"cd", "descriptor", "genesis", "line_id", "v"},
-		"expected_cred_id", "expected_grant", "expected_join_req_id"); err != nil {
+	if err := ldrcrypto.RequireExactKeys(m, []string{"cd", "descriptor", "dir_kind", "genesis", "line_id", "v"},
+		"expected_cred_id", "expected_grant", "expected_join_req_digest", "expected_join_req_id"); err != nil {
 		return persistedConfig{}, err
 	}
 	var cfg persistedConfig
 	var err2 error
+	if cfg.DirKind, err2 = ldrcrypto.MapString(m, "dir_kind"); err2 != nil {
+		return persistedConfig{}, err2
+	}
+	if cfg.DirKind != DirKindAdmin && cfg.DirKind != DirKindMember {
+		return persistedConfig{}, fmt.Errorf("ldrclient: invalid dir_kind %q", cfg.DirKind)
+	}
 	if cfg.SignedDescriptor, err2 = ldrcrypto.MapBytes(m, "descriptor"); err2 != nil {
 		return persistedConfig{}, err2
 	}
@@ -226,6 +249,15 @@ func loadConfig(path string) (persistedConfig, error) {
 			return persistedConfig{}, err
 		}
 	}
+	if _, has := m["expected_join_req_digest"]; has {
+		db, err := ldrcrypto.MapBytesLen(m, "expected_join_req_digest", 32)
+		if err != nil {
+			return persistedConfig{}, err
+		}
+		var d [32]byte
+		copy(d[:], db)
+		cfg.ExpectedJoinReqDigest = &d
+	}
 	return cfg, nil
 }
 
@@ -234,7 +266,7 @@ func appendVerifiedFrameWAL(path string, fr ldrrelay.ControlFrameWire) error {
 	if ib == nil {
 		ib = []byte{}
 	}
-	body, err := ldrcrypto.MarshalCBORWithLimits(ldrcrypto.Map{
+	fm := ldrcrypto.Map{
 		{Key: "gen", Value: fr.Gen},
 		{Key: "head", Value: fr.Head[:]},
 		{Key: "intent", Value: ib},
@@ -244,7 +276,21 @@ func appendVerifiedFrameWAL(path string, fr ldrrelay.ControlFrameWire) error {
 		{Key: "seq", Value: fr.Seq},
 		{Key: "seq_time", Value: fr.SeqTime},
 		{Key: "v", Value: uint64(1)},
-	}, ldrcrypto.Limits{MaxBytes: clientWALMaxBody, MaxDepth: 16, MaxItems: 8192})
+	}
+	if fr.PayloadCommit != nil {
+		fm = append(fm, ldrcrypto.MapEntry{Key: "payload_commit", Value: fr.PayloadCommit.ToCBORMap()})
+	}
+	if len(fr.WrapCommits) > 0 {
+		wArr := make([]any, len(fr.WrapCommits))
+		for i, wm := range fr.WrapCommits {
+			wArr[i] = ldrcrypto.Map{
+				{Key: "commit", Value: wm.Commit.ToCBORMap()},
+				{Key: "cred_id", Value: bytes.Clone(wm.CredID[:])},
+			}
+		}
+		fm = append(fm, ldrcrypto.MapEntry{Key: "wraps", Value: wArr})
+	}
+	body, err := ldrcrypto.MarshalCBORWithLimits(fm, ldrcrypto.Limits{MaxBytes: clientWALMaxBody, MaxDepth: 16, MaxItems: 8192})
 	if err != nil {
 		return err
 	}
@@ -272,12 +318,23 @@ func appendVerifiedFrameWAL(path string, fr ldrrelay.ControlFrameWire) error {
 	return f.Close()
 }
 
-func loadVerifiedWAL(path string) ([]ldrrelay.ControlFrameWire, error) {
-	data, err := os.ReadFile(path)
+func loadVerifiedWAL(path string, syncFile func(*os.File) error, syncDir func(string) error) ([]ldrrelay.ControlFrameWire, error) {
+	if syncFile == nil {
+		syncFile = ldrstore.SyncFile
+	}
+	if syncDir == nil {
+		syncDir = ldrstore.SyncDir
+	}
+	wf, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
+		return nil, err
+	}
+	data, err := io.ReadAll(wf)
+	if err != nil {
+		_ = wf.Close()
 		return nil, err
 	}
 	var out []ldrrelay.ControlFrameWire
@@ -286,22 +343,26 @@ func loadVerifiedWAL(path string) ([]ldrrelay.ControlFrameWire, error) {
 		rem := len(data) - off
 		if rem < clientWALHdrSize {
 			// Truncated tail at EOF: safely truncate.
-			if err := truncateClientWAL(path, int64(off)); err != nil {
+			if err := wf.Truncate(int64(off)); err != nil {
+				_ = wf.Close()
 				return nil, err
 			}
 			break
 		}
 		hdr := data[off : off+clientWALHdrSize]
 		if string(hdr[0:4]) != clientWALMagic || hdr[4] != clientWALVersion || hdr[5] != 0 {
+			_ = wf.Close()
 			return nil, fmt.Errorf("ldrclient: corrupt verified.wal header at offset %d", off)
 		}
 		bodyLen := int(binary.BigEndian.Uint32(hdr[6:10]))
 		if bodyLen == 0 || bodyLen > clientWALMaxBody {
+			_ = wf.Close()
 			return nil, fmt.Errorf("ldrclient: invalid verified.wal body length %d", bodyLen)
 		}
 		frameLen := clientWALHdrSize + bodyLen + clientWALCRCSize
 		if off+frameLen > len(data) {
-			if err := truncateClientWAL(path, int64(off)); err != nil {
+			if err := wf.Truncate(int64(off)); err != nil {
+				_ = wf.Close()
 				return nil, err
 			}
 			break
@@ -309,53 +370,194 @@ func loadVerifiedWAL(path string) ([]ldrrelay.ControlFrameWire, error) {
 		fb := data[off : off+frameLen]
 		wantCRC := binary.BigEndian.Uint32(fb[clientWALHdrSize+bodyLen:])
 		if crc32.Checksum(fb[:clientWALHdrSize+bodyLen], clientCRCTable) != wantCRC {
+			_ = wf.Close()
 			return nil, fmt.Errorf("ldrclient: verified.wal CRC32C mismatch at offset %d", off)
 		}
 		dec, err := ldrcrypto.UnmarshalCBOR(fb[clientWALHdrSize:clientWALHdrSize+bodyLen], ldrcrypto.Limits{MaxBytes: clientWALMaxBody, MaxDepth: 16, MaxItems: 8192})
 		if err != nil {
+			_ = wf.Close()
 			return nil, err
 		}
 		m, ok := dec.(map[string]any)
 		if !ok {
+			_ = wf.Close()
 			return nil, errors.New("ldrclient: invalid verified.wal frame body")
 		}
+		if err := ldrcrypto.RequireExactKeys(m,
+			[]string{"gen", "head", "intent", "op_type", "origin", "prev_head", "seq", "seq_time", "v"},
+			"payload_commit", "wraps"); err != nil {
+			_ = wf.Close()
+			return nil, fmt.Errorf("ldrclient: invalid verified.wal frame keys: %w", err)
+		}
 		var fr ldrrelay.ControlFrameWire
-		fr.Gen, _ = ldrcrypto.MapUint(m, "gen")
-		fr.Seq, _ = ldrcrypto.MapUint(m, "seq")
-		fr.SeqTime, _ = ldrcrypto.MapUint(m, "seq_time")
-		fr.Origin, _ = ldrcrypto.MapString(m, "origin")
-		fr.OpType, _ = ldrcrypto.MapString(m, "op_type")
-		fr.IntentBytes, _ = ldrcrypto.MapBytes(m, "intent")
+		if fr.Gen, err = ldrcrypto.MapUint(m, "gen"); err != nil {
+			_ = wf.Close()
+			return nil, err
+		}
+		if fr.Seq, err = ldrcrypto.MapUint(m, "seq"); err != nil {
+			_ = wf.Close()
+			return nil, err
+		}
+		if fr.SeqTime, err = ldrcrypto.MapUint(m, "seq_time"); err != nil {
+			_ = wf.Close()
+			return nil, err
+		}
+		if fr.Origin, err = ldrcrypto.MapString(m, "origin"); err != nil {
+			_ = wf.Close()
+			return nil, err
+		}
+		if fr.OpType, err = ldrcrypto.MapString(m, "op_type"); err != nil {
+			_ = wf.Close()
+			return nil, err
+		}
+		if fr.IntentBytes, err = ldrcrypto.MapBytes(m, "intent"); err != nil {
+			_ = wf.Close()
+			return nil, err
+		}
 		ph, err1 := ldrcrypto.MapBytesLen(m, "prev_head", 32)
 		hd, err2 := ldrcrypto.MapBytesLen(m, "head", 32)
 		if err1 != nil || err2 != nil {
+			_ = wf.Close()
 			return nil, errors.New("ldrclient: invalid verified.wal head bytes")
 		}
 		copy(fr.PrevHead[:], ph)
 		copy(fr.Head[:], hd)
+		if pcRaw, has := m["payload_commit"]; has {
+			c, err := ldrcrypto.ParseCommitment(pcRaw)
+			if err != nil {
+				_ = wf.Close()
+				return nil, err
+			}
+			fr.PayloadCommit = &c
+		}
+		if _, has := m["wraps"]; has {
+			wArr, err := ldrcrypto.MapArray(m, "wraps")
+			if err != nil {
+				_ = wf.Close()
+				return nil, err
+			}
+			fr.WrapCommits = make([]ldrcrypto.WrapManifestEntry, 0, len(wArr))
+			for _, we := range wArr {
+				wm, ok := we.(map[string]any)
+				if !ok {
+					_ = wf.Close()
+					return nil, errors.New("ldrclient: invalid verified.wal wrap entry")
+				}
+				if err := ldrcrypto.RequireExactKeys(wm, []string{"commit", "cred_id"}); err != nil {
+					_ = wf.Close()
+					return nil, err
+				}
+				cidB, err := ldrcrypto.MapBytesLen(wm, "cred_id", 32)
+				if err != nil {
+					_ = wf.Close()
+					return nil, err
+				}
+				cm, err := ldrcrypto.ParseCommitment(wm["commit"])
+				if err != nil {
+					_ = wf.Close()
+					return nil, err
+				}
+				var cid [32]byte
+				copy(cid[:], cidB)
+				fr.WrapCommits = append(fr.WrapCommits, ldrcrypto.WrapManifestEntry{CredID: cid, Commit: cm})
+			}
+		}
 		out = append(out, fr)
 		off += frameLen
+	}
+	if err := syncFile(wf); err != nil {
+		_ = wf.Close()
+		return nil, fmt.Errorf("%w: verified.wal barrier sync: %v", ldrstore.ErrUncertainWrite, err)
+	}
+	if err := wf.Close(); err != nil {
+		return nil, fmt.Errorf("%w: verified.wal close: %v", ldrstore.ErrUncertainWrite, err)
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return nil, fmt.Errorf("%w: verified.wal dir barrier sync: %v", ldrstore.ErrUncertainWrite, err)
 	}
 	return out, nil
 }
 
-func truncateClientWAL(path string, sz int64) error {
+// atomicWriteFileWithHooks distinguishes clean pre-rename failures (ErrPreWrite)
+// from ambiguous post-rename directory sync failures (ErrUncertainWrite).
+func atomicWriteFileWithHooks(path string, data []byte, perm os.FileMode, syncFile func(*os.File) error, syncDir func(string) error) error {
+	if syncFile == nil {
+		syncFile = ldrstore.SyncFile
+	}
+	if syncDir == nil {
+		syncDir = ldrstore.SyncDir
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("%w: %v", ldrstore.ErrPreWrite, err)
+	}
+	var rnd [8]byte
+	if _, err := io.ReadFull(rand.Reader, rnd[:]); err != nil {
+		return fmt.Errorf("%w: %v", ldrstore.ErrPreWrite, err)
+	}
+	tmpPath := filepath.Join(dir, fmt.Sprintf(".tmp-%s-%s", filepath.Base(path), hex.EncodeToString(rnd[:])))
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ldrstore.ErrPreWrite, err)
+	}
+	cleanup := func() {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+	}
+	if _, err := f.Write(data); err != nil {
+		cleanup()
+		return fmt.Errorf("%w: %v", ldrstore.ErrPreWrite, err)
+	}
+	if err := syncFile(f); err != nil {
+		cleanup()
+		return fmt.Errorf("%w: %v", ldrstore.ErrPreWrite, err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("%w: %v", ldrstore.ErrPreWrite, err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("%w: %v", ldrstore.ErrPreWrite, err)
+	}
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("%w: post-rename dir sync: %v", ldrstore.ErrUncertainWrite, err)
+	}
+	return nil
+}
+
+func syncOutboxBarrier(path string, syncFile func(*os.File) error, syncDir func(string) error) error {
+	if syncFile == nil {
+		syncFile = ldrstore.SyncFile
+	}
+	if syncDir == nil {
+		syncDir = ldrstore.SyncDir
+	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
-		return err
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("%w: open outbox for barrier: %v", ldrstore.ErrUncertainWrite, err)
 	}
-	if err := f.Truncate(sz); err != nil {
+	if err := syncFile(f); err != nil {
 		_ = f.Close()
-		return err
+		return fmt.Errorf("%w: outbox file barrier sync: %v", ldrstore.ErrUncertainWrite, err)
 	}
-	if err := ldrstore.SyncFile(f); err != nil {
-		_ = f.Close()
-		return err
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("%w: outbox file close: %v", ldrstore.ErrUncertainWrite, err)
 	}
-	return f.Close()
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("%w: outbox dir barrier sync: %v", ldrstore.ErrUncertainWrite, err)
+	}
+	return nil
 }
 
 func saveOutbox(path string, ob persistedOutbox) error {
+	return saveOutboxWithHooks(path, ob, nil, nil)
+}
+
+func saveOutboxWithHooks(path string, ob persistedOutbox, syncFile func(*os.File) error, syncDir func(string) error) error {
 	stops := make([]any, 0, len(ob.KeyStops))
 	stopKeys := make([]string, 0, len(ob.KeyStops))
 	for k := range ob.KeyStops {
@@ -377,7 +579,7 @@ func saveOutbox(path string, ob persistedOutbox) error {
 	for _, e := range ob.Entries {
 		pCBOR, err := e.Principal.ToCBOR()
 		if err != nil {
-			return err
+			return fmt.Errorf("%w: %v", ldrstore.ErrPreWrite, err)
 		}
 		ps := e.PayloadSidecar
 		if ps == nil {
@@ -429,9 +631,9 @@ func saveOutbox(path string, ob persistedOutbox) error {
 		{Key: "v", Value: uint64(1)},
 	}, ldrcrypto.Limits{MaxBytes: 4 * 1024 * 1024, MaxDepth: 16, MaxItems: 32768})
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ldrstore.ErrPreWrite, err)
 	}
-	return ldrstore.AtomicWriteFile(path, raw, 0o600)
+	return atomicWriteFileWithHooks(path, raw, 0o600, syncFile, syncDir)
 }
 
 func loadOutbox(path string) (persistedOutbox, error) {
