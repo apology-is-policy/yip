@@ -31,10 +31,10 @@ implementation remains gated on review):
     CAS sidecars + `F_FULLFSYNC`/`fsync`** behind a swappable `Store`
     interface.
 
-Companions: [LDR-STATE-MACHINE.md](LDR-STATE-MACHINE.md) (draft v8),
+Companions: [LDR-STATE-MACHINE.md](LDR-STATE-MACHINE.md) (draft v9),
 [LDR-CONFORMANCE-VECTORS.json](LDR-CONFORMANCE-VECTORS.json),
 [LDR-HOSTING-COMPARISON.md](LDR-HOSTING-COMPARISON.md),
-[LDR-RECOVERY.md](LDR-RECOVERY.md) (draft v0),
+[LDR-RECOVERY.md](LDR-RECOVERY.md) (draft v1),
 [LDR-THREAT-MODEL.md](LDR-THREAT-MODEL.md), and
 [LDR-ENROLLMENT-BOOTSTRAP-ENVELOPE.md](LDR-ENROLLMENT-BOOTSTRAP-ENVELOPE.md)
 (draft v3).
@@ -699,16 +699,27 @@ Connecting directly to [LDR-RECOVERY.md](LDR-RECOVERY.md) (draft v0):
 
 ### Current status (2026-11-25)
 
-- **Approved by the operator (2026-11-25):**
-  1. `ldrcore/` recovery and generation-transition reference model
-     ([LDR-RECOVERY.md](LDR-RECOVERY.md): O23 `seq` reset to 1 with `(gen, seq)`
-     coordinates, full replay across generations, discarded `call_id` /
-     `broadcast_id` tombstones, traces `T53`–`T58`).
-  2. **Phase A (`ldrcrypto/`):** standalone zero-dep Go package implementing
-     strict deterministic CBOR (RFC 8949 §4.2.1), canonical `ed25519` + strict
-     low-S `ecdsa-p256-sha256`, RFC 9180 HPKE Base mode, random-salt
-     `HKDF-SHA256 + AES-256-GCM` payload AEAD, canonical envelope/chain/
-     descriptor builders, and RFC + negative test vectors.
+- **Completed on `gemini/ldr` (approved by the operator 2026-11-25; awaiting Codex/Claude cross-review):**
+  1. **Draft v9 `ldrcore/` recovery and generation-transition reference model**
+     ([LDR-RECOVERY.md](LDR-RECOVERY.md), `ldrcore/recovery.go`,
+     `ldrcore/recovery_test.go`): O23-B `seq` reset to 1 with `(gen, seq)`
+     coordinates everywhere, full cross-generation replay from genesis,
+     discarded `call_id` / `broadcast_id` tombstones, 232 active vectors
+     (`A233`–`A234`) and 58 traces / 196 steps (`T53`–`T58`). Verified under
+     held `mac` lease: `gofmt` clean, `go vet ./ldrcore/` clean,
+     `GOMAXPROCS=2 go test -count=1 ./ldrcore/` PASS (`63.976s`),
+     `-race` PASS (`34.947s`).
+  2. **Phase A (`ldrcrypto/`):** standalone zero-dep Go 1.25 stdlib package
+     (`cbor.go`, `sign.go`, `digest.go`, `hpke.go`, `aead.go`, `envelope.go`,
+     plus RFC/negative/property test suites) implementing strict deterministic
+     CBOR (RFC 8949 §4.2.1), canonical `ed25519` (RFC 8032 §8.4 + all 8
+     small-order point rejections) + strict low-S `ecdsa-p256-sha256`,
+     RFC 9180 HPKE Base mode (byte-verified against Appendix A.1.1 + AES-256-GCM
+     suite), random-salt `HKDF-SHA256 + AES-256-GCM` payload AEAD, and
+     canonical descriptor / P3 ceremony / envelope / P7 session-auth builders.
+     Verified under held `mac` lease: `gofmt` clean, `go vet ./ldrcore/ ./ldrcrypto/`
+     clean, `GOMAXPROCS=2 go test -count=1 ./ldrcrypto/` PASS (`0.557s`),
+     `-race` PASS (`2.118s`).
 - **Awaiting peer cross-review (Codex & Claude) and operator go-ahead:**
   - **Phase B (`ldrstore/`, `ldrrelay/`):** durable CRC32C WAL + CAS sidecars
     + `F_FULLFSYNC` behind a swappable `Store` interface; `ClockGuard` with
