@@ -2489,4 +2489,89 @@ func TestOutboxDelayedResponseAfterSlotReuse(t *testing.T) {
 			})
 		}
 	})
+
+	// Codex Turn 18: a delayed ClassUnknown query from an earlier resolution epoch
+	// MUST NOT clear NeedsResolve or MustResolve after a stale-checkpoint refusal
+	// (expired) starts a fresh resolution epoch on remaining pending entries (§5.7 rule 3).
+	t.Run("delayed_unknown_query_across_stale_checkpoint_refusal_does_not_clear_must_resolve", func(t *testing.T) {
+		cl, dir, sessSlow, sessFast, prin := newMember(t, "ns-delay-stale-epoch", 0xc4)
+
+		// Compose two pending intents on distinct slots anchored at current checkpoint.
+		op1, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "op1_pending_across_expired", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "stale-a1"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-delay-stale-epoch"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		op2, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "op2_will_expire", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "stale-a2"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-delay-stale-epoch"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Start ResolveAll on sessSlow (issued in ResolveEpoch 0) and pause the real
+		// ClassUnknown reply for op1 in flight!
+		entered, release := armDelayedResponse("/query")
+		resDone := make(chan error, 1)
+		go func() {
+			resDone <- cl.ResolveAll(ctx, sessSlow, prin)
+		}()
+		<-entered
+
+		// Advance relay clock past op2's validity window so Send(op2) receives a real
+		// stale-checkpoint refusal (ClassRefusal / "expired"), bumping ResolveEpoch -> 1,
+		// marking op1.NeedsResolve=true, and setting MustResolve=true!
+		fx.env.tick(int64(cl.validityMS) + 10_000)
+		rep2, err := cl.Send(ctx, sessFast, op2)
+		if err != nil || rep2.Class != ldrcore.ClassRefusal || rep2.Code != "expired" {
+			close(release)
+			t.Fatalf("expected expired refusal for op2, got rep=%+v err=%v", rep2, err)
+		}
+		if !cl.Status().MustResolve {
+			close(release)
+			t.Fatalf("expected MustResolve=true after expired refusal with pending op1")
+		}
+
+		// Release the delayed ClassUnknown query reply from epoch 0!
+		close(release)
+		if err := <-resDone; err != nil {
+			t.Fatalf("delayed ResolveAll returned unexpected error: %v", err)
+		}
+
+		// Stale epoch-0 ClassUnknown MUST NOT clear op1.NeedsResolve or MustResolve!
+		if !cl.Status().MustResolve {
+			t.Fatalf("delayed epoch-0 ClassUnknown cleared MustResolve after epoch-1 expired refusal!")
+		}
+		ob := cl.OutboxSnapshot()
+		if len(ob) != 2 || ob[0].OpID != op1 || ob[0].Status != ldrcore.OutPending || !ob[0].NeedsResolve || ob[1].OpID != op2 || ob[1].Status != ldrcore.OutClosed {
+			t.Fatalf("unexpected outbox state after stale-epoch delayed query: %+v", ob)
+		}
+		if _, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "must_still_be_blocked", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "stale-free"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-delay-stale-epoch"}},
+		}); !errors.Is(err, ErrMustResolve) {
+			t.Fatalf("Compose after stale-epoch delayed query: got %v, want ErrMustResolve", err)
+		}
+		diskOB, err := loadOutbox(filepath.Join(dir, "outbox.cbor"))
+		if err != nil || !diskOB.MustResolve || diskOB.ResolveEpoch == 0 || !diskOB.Entries[0].NeedsResolve {
+			t.Fatalf("disk outbox lost MustResolve/ResolveEpoch/NeedsResolve: %+v err=%v", diskOB, err)
+		}
+
+		// Now a fresh ResolveAll pass issued in epoch 1 queries op1 and clears MustResolve!
+		if err := cl.ResolveAll(ctx, sessFast, prin); err != nil {
+			t.Fatalf("fresh epoch-1 ResolveAll failed: %v", err)
+		}
+		if cl.Status().MustResolve {
+			t.Fatalf("expected MustResolve=false after fresh epoch-1 ResolveAll answered op1")
+		}
+		if _, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "unblocked_in_epoch_1", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "stale-free"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-delay-stale-epoch"}},
+		}); err != nil {
+			t.Fatalf("Compose after fresh epoch-1 ResolveAll failed: %v", err)
+		}
+	})
 }

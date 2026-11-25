@@ -408,21 +408,19 @@ func openClientLocked(dir string, lf *os.File, syncFile func(*os.File) error, sy
 			return nil, err
 		}
 	}
-	// Rebuild slot index and enforce restart §5.7 rule 3 (MustResolve if unsettled,
-	// marking every unsettled intent NeedsResolve so all active signers must be queried).
+	// Rebuild slot index and enforce restart §5.7 rule 3: start a fresh
+	// resolution epoch whenever unsettled intents exist, marking every
+	// unsettled intent NeedsResolve so all active signers must be queried.
 	hasUnsettled := false
-	needPersist := false
 	for _, e := range c.outbox.Entries {
 		if e.Status == ldrcore.OutPending || e.Status == ldrcore.OutReconcile {
 			c.slots[e.Slot] = e.OpID
 			hasUnsettled = true
-			if !e.NeedsResolve {
-				needPersist = true
-			}
 		}
 	}
-	if hasUnsettled && (!c.outbox.MustResolve || needPersist) {
+	if hasUnsettled {
 		candidate := clonePersistedOutbox(c.outbox)
+		candidate.ResolveEpoch++
 		candidate.MustResolve = true
 		for _, e := range candidate.Entries {
 			if e.Status == ldrcore.OutPending || e.Status == ldrcore.OutReconcile {
@@ -1086,6 +1084,9 @@ func (c *Client) ReconcileDurability() error {
 	}
 	if ob.NextOp < c.outbox.NextOp {
 		return fmt.Errorf("%w: reconciled outbox next_op %d regressed below %d", ldrstore.ErrCorruptWAL, ob.NextOp, c.outbox.NextOp)
+	}
+	if ob.ResolveEpoch < c.outbox.ResolveEpoch {
+		return fmt.Errorf("%w: reconciled outbox resolve_epoch %d regressed below %d", ldrstore.ErrCorruptWAL, ob.ResolveEpoch, c.outbox.ResolveEpoch)
 	}
 	ep, err := loadEpochs(c.epochsPath())
 	if err != nil {
@@ -2181,6 +2182,7 @@ func (c *Client) ResolveAll(ctx context.Context, sess *ldrrelay.SessionClient, s
 			c.mu.Unlock()
 			continue
 		}
+		queryEpoch := c.outbox.ResolveEpoch
 		key := ldrstore.StoredOpKey{Generation: cur.Gen, Signer: cur.SignerToken, SeenSeq: cur.SeenSeq, OpID: cur.OpID}
 		dig := cur.IntentDigest
 		c.mu.Unlock()
@@ -2203,6 +2205,15 @@ func (c *Client) ResolveAll(ctx context.Context, sess *ldrrelay.SessionClient, s
 			c.mu.Unlock()
 			continue
 		}
+		stalePass := c.outbox.ResolveEpoch != queryEpoch
+		if stalePass && (rep.Class == ldrcore.ClassUnknown || rep.Class == ldrcore.ClassAdmission) {
+			// A newer resolution pass began (e.g. stale-checkpoint refusal) while
+			// this query was in flight; a non-definitive reply from the earlier pass
+			// MUST NOT clear NeedsResolve or overwrite the entry's state (§5.7 rule 3).
+			incomplete = true
+			c.mu.Unlock()
+			continue
+		}
 		cand := clonePersistedOutbox(c.outbox)
 		candSlots := cloneSlots(c.slots)
 		candEntry := cand.Entries[idx]
@@ -2221,7 +2232,11 @@ func (c *Client) ResolveAll(ctx context.Context, sess *ldrrelay.SessionClient, s
 		default:
 			c.applySettlementToCandidateLocked(&cand, candSlots, idx, rep)
 			if candEntry.Status == ldrcore.OutPending || candEntry.Status == ldrcore.OutReconcile {
-				candEntry.NeedsResolve = false
+				if !stalePass {
+					candEntry.NeedsResolve = false
+				} else {
+					incomplete = true
+				}
 			}
 		}
 		if cand.MustResolve && !incomplete && !c.hasActiveNeedsResolveInOutboxLocked(&cand) {
@@ -2278,14 +2293,22 @@ func (c *Client) applySettlementToCandidateLocked(ob *persistedOutbox, slots map
 			delete(slots, e.Slot)
 		}
 		if rep.Code == "expired" || rep.Code == "unknown_anchor" {
+			hasUnsettled := false
 			hasActive := false
 			for _, other := range ob.Entries {
 				if other.Status == ldrcore.OutPending || other.Status == ldrcore.OutReconcile {
+					hasUnsettled = true
 					other.NeedsResolve = true
 					if !c.signsNoMoreInOutboxLocked(ob, other.SignerToken) {
 						hasActive = true
 					}
 				}
+			}
+			if hasUnsettled {
+				// Start a fresh resolution epoch so any in-flight non-definitive
+				// queries issued before this stale-checkpoint refusal cannot clear
+				// NeedsResolve on remaining entries (§5.7 rule 3).
+				ob.ResolveEpoch++
 			}
 			if hasActive {
 				ob.MustResolve = true

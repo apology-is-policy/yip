@@ -82,13 +82,14 @@ type KeyStop struct {
 }
 
 type persistedOutbox struct {
-	NextOp      uint64
-	MustResolve bool
-	Suspect     bool
-	Halted      string
-	Activated   bool
-	KeyStops    map[string]*KeyStop
-	Entries     []*OutboxEntry
+	NextOp       uint64
+	ResolveEpoch uint64
+	MustResolve  bool
+	Suspect      bool
+	Halted       string
+	Activated    bool
+	KeyStops     map[string]*KeyStop
+	Entries      []*OutboxEntry
 }
 
 // LocalNotice is a delivery notice derived from verified log records (§11.3).
@@ -830,6 +831,7 @@ func marshalOutbox(ob persistedOutbox) ([]byte, error) {
 		{Key: "key_stops", Value: stops},
 		{Key: "must_resolve", Value: ob.MustResolve},
 		{Key: "next_op", Value: ob.NextOp},
+		{Key: "resolve_epoch", Value: ob.ResolveEpoch},
 		{Key: "suspect", Value: ob.Suspect},
 		{Key: "v", Value: uint64(1)},
 	}, ldrcrypto.Limits{MaxBytes: 4 * 1024 * 1024, MaxDepth: 16, MaxItems: 32768})
@@ -860,6 +862,7 @@ func loadOutbox(path string) (persistedOutbox, error) {
 	ob.Halted, _ = ldrcrypto.MapString(m, "halted")
 	ob.MustResolve, _ = ldrcrypto.MapBool(m, "must_resolve")
 	ob.NextOp, _ = ldrcrypto.MapUint(m, "next_op")
+	ob.ResolveEpoch, _ = ldrcrypto.MapUint(m, "resolve_epoch")
 	ob.Suspect, _ = ldrcrypto.MapBool(m, "suspect")
 
 	if ksArr, err := ldrcrypto.MapArray(m, "key_stops"); err == nil {
