@@ -1,9 +1,10 @@
 # LDR operator-hosted Go relay — architecture, transport, storage, clock and crypto profile (draft v1)
 
 2026-11-25 · Gemini · Architecture and design specification on `gemini/ldr`
-reflecting the operator's 2026-11-25 selections (Phase A `ldrcrypto/` and
-`ldrcore/` recovery modelling approved; Phase B/C relay/client production
-implementation remains gated on review):
+reflecting the operator's 2026-11-25 selections (Draft v9 `ldrcore/` recovery,
+Phase A `ldrcrypto/`, and Phase B `ldrstore/` + `ldrrelay/` + `yip relay` CLI
+approved and implemented; Phase C `ldrclient/` + MCP wiring remains gated on
+review):
 
 - **Hosting:** **Go relay first** — runs identically on local networks, closed
   corporate networks, and public custom VMs, while keeping **Cloudflare
@@ -720,12 +721,31 @@ Connecting directly to [LDR-RECOVERY.md](LDR-RECOVERY.md) (draft v0):
      Verified under held `mac` lease: `gofmt` clean, `go vet ./ldrcore/ ./ldrcrypto/`
      clean, `GOMAXPROCS=2 go test -count=1 ./ldrcrypto/` PASS (`0.557s`),
      `-race` PASS (`2.118s`).
+  3. **Phase B (`ldrstore/`, `ldrrelay/`, `relay_cli.go`):**
+     - `ldrstore/`: swappable `Store` interface + zero-dep CRC32C-framed
+       append-only WAL (`FileStore`), content-addressed commitment-verified
+       sidecars (`payload-*`, `wrap-*`), macOS `F_FULLFSYNC` / Unix `fsync` /
+       Windows `FlushFileBuffers` + parent-dir sync + exclusive `flock`, clean
+       torn-EOF tail recovery, and hard fail-closed rejection on mid-log/CRC/
+       sidecar corruption.
+     - `ldrrelay/`: `ClockGuard` discontinuity/freeze/sleep/restart detector;
+       canonical wire-intent codec covering all 26 phase-1 record types bridged
+       into `ldrcore.Apply` with real `ldrcrypto` signatures, cryptographic
+       `cred_id` derivation, and real SHA-256 chain heads; serialized per-line
+       `RelayEngine` with full startup WAL/signature/chain replay, P5
+       lookup-before-sidecars, demand-driven `time_anchor`, and `Compact`;
+       TLS 1.3 server/client transport with `InitSelfSignedCert`, strict
+       `pin_spki_sha256` / `pin_ca_root_pem` / `webpki` verification, RFC 9266
+       `tls-exporter` channel-bound single-use challenge sessions (`P7`),
+       and mid-session revocation enforcement.
+     - `yip relay <init|provision|serve|status>` CLI subcommands.
+     - Verified under held `mac` lease (Go 1.25.3, `darwin/arm64`): `gofmt`
+       clean, `go vet ./ldrstore/ ./ldrrelay/ ./ldrcrypto/ ./` clean;
+       `ldrstore/` PASS (`0.537s`, `-race` `1.792s`), `ldrrelay/` PASS
+       (`0.520s`, `-race` `2.140s`), `ldrcrypto/` `-race` PASS (`2.113s`),
+       `TestRelayCLI` PASS (`0.358s`, `-race` `1.464s`), full root `yip`
+       regression suite PASS (`23.912s`).
 - **Awaiting peer cross-review (Codex & Claude) and operator go-ahead:**
-  - **Phase B (`ldrstore/`, `ldrrelay/`):** durable CRC32C WAL + CAS sidecars
-    + `F_FULLFSYNC` behind a swappable `Store` interface; `ClockGuard` with
-    discontinuity & restart tests; TLS 1.3 server with `tls13_exporter`
-    session binding; `yip relay init / provision / serve / status`; end-to-end
-    tests over localhost TLS 1.3.
   - **Phase C (`ldrclient/` + CLI/MCP wiring):** local durable verified log
     store + outbox persist-before-send + full-replay joiner (`§6`); P3
     key-first enrollment CLI ceremony; equal-roots management CLI; projection

@@ -50,6 +50,7 @@ DELIVERY AND BROADCASTS
   yip broadcast briefing --to a,b    body on stdin; CLI/operator attribution
   yip broadcast announcement|regroup --to a,b    same recipient snapshot
   yip api broadcasts             addressed broadcasts, including reply requests
+  yip relay init|provision|serve|status   operator-hosted LDR TLS 1.3 relay
 
 COMMANDS
 
@@ -197,8 +198,11 @@ func main() {
 		}
 	}
 
-	// Every command but install needs to know which line it is on before it
-	// can find anything; install resolves its own.
+	// Every command but install and relay needs to know which local line it is on.
+	if cmd == "relay" {
+		check(RelayCLI(args, os.Stdout))
+		return
+	}
 	if cmd != "install" {
 		switch {
 		case line != "":
