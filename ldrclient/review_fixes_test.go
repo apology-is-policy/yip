@@ -2872,14 +2872,16 @@ func TestClientCursorDurabilityPreWriteAndAmbiguousReconcile(t *testing.T) {
 		}
 
 		// 1. Let Project advance cleanly through ckSeq-1, then inject definite ErrPreWrite
-		//    specifically on the tip cursor save (call #ckSeq)!
+		//    specifically on the tip cursors.cbor save (call #ckSeq to cursors.cbor)!
 		var tipFail atomic.Bool
 		tipFail.Store(true)
-		var writes atomic.Uint64
+		var cursorWrites atomic.Uint64
 		bob.SetSyncHooks(func(f *os.File) error {
-			n := writes.Add(1)
-			if tipFail.Load() && n >= ckSeq {
-				return errors.New("injected tip Project cursors pre-write failure")
+			if strings.Contains(filepath.Base(f.Name()), "cursors.cbor") {
+				n := cursorWrites.Add(1)
+				if tipFail.Load() && n >= ckSeq {
+					return errors.New("injected tip Project cursors pre-write failure")
+				}
 			}
 			return ldrstore.SyncFile(f)
 		}, nil)
@@ -2934,11 +2936,12 @@ func TestClientCursorDurabilityPreWriteAndAmbiguousReconcile(t *testing.T) {
 		}
 		var syncMu sync.Mutex
 		dirSyncFails := true
+		cleanClientDir := filepath.Clean(dir)
 		bob.SetSyncHooks(nil, func(d string) error {
 			syncMu.Lock()
 			fail := dirSyncFails
 			syncMu.Unlock()
-			if fail {
+			if fail && filepath.Clean(d) == cleanClientDir {
 				return errors.New("injected Project post-rename dir sync failure")
 			}
 			return ldrstore.SyncDir(d)
@@ -2981,6 +2984,260 @@ func TestClientCursorDurabilityPreWriteAndAmbiguousReconcile(t *testing.T) {
 		}
 		if _, err := bobFinal.VerifiedRead(ctx, sBob, "calls/call-proj-2/turn-1"); err != nil {
 			t.Fatalf("reopened VerifiedRead after reconciled Project: %v", err)
+		}
+	})
+}
+
+// TestProjectionDirSyncBarrierAndCompleteWipeRetry verifies Codex Turn 22:
+//  1. When projection-directory sync fails while cursor-directory sync is healthy,
+//     Project fails without advancing ProjectedSeq even when the renamed projection
+//     file is already visible on disk with identical bytes — both on in-process
+//     retry AND after reopen — and progresses cleanly once projection-dir sync
+//     is restored.
+//  2. When wipeProjectionLocked fails during os.RemoveAll (e.g. unwritable stray
+//     subdirectory containing an extra file outside the verified projection set),
+//     Rebuild propagates the error, Project refuses to skip the pending wipe (even
+//     after reopen), and retrying once cleanup is unblocked removes the extra file
+//     completely and rebuilds cleanly.
+func TestProjectionDirSyncBarrierAndCompleteWipeRetry(t *testing.T) {
+	fx := startOnboardingFixture(t)
+	ctx := context.Background()
+
+	_, _ = fx.alice.Sync(ctx, fx.sAlice)
+	opDeclAlice, err := fx.alice.ComposeAndPersist(ComposeParams{
+		Action: "decl_alice_p22", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+		Fields: ldrcrypto.Map{{Key: "actor_id", Value: "alice-p22"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: fx.aliceGrant.NamespaceID}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := fx.alice.Send(ctx, fx.sAlice, opDeclAlice); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+		t.Fatalf("decl alice-p22: %+v err=%v", rep, err)
+	}
+	_, _ = fx.alice.Sync(ctx, fx.sAlice)
+
+	setupMember := func(t *testing.T, ns, actor string, reqByte byte) (*Client, string, *ldrrelay.SessionClient) {
+		t.Helper()
+		keys, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+		grant := ldrcrypto.JoinGrant{NamespaceID: ns, ActorLimit: 4, Reader: true}
+		reqID, reqDig := fx.enrollP3(t, keys, grant, reqByte)
+		fx.activateNextEpoch(t)
+		dir := t.TempDir()
+		cl, err := InitClientDir(InitDirOptions{
+			Dir: dir, DirKind: DirKindMember, SignedDescriptor: fx.env.rawDesc, CredKeys: keys,
+			ExpectedGrant: &grant, ExpectedJoinReq: reqID, ExpectedJoinReqDigest: &reqDig, Activated: false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = cl.Close() })
+		sess, err := cl.Dial(ctx, ldrcrypto.PrincipalCredential)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { sess.Close() })
+		if err := cl.VerifyEnrollmentAndActivate(ctx, sess); err != nil {
+			t.Fatal(err)
+		}
+		opD, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "decl_" + actor, Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: actor}, {Key: "label", Value: false}, {Key: "namespace_id", Value: ns}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rep, err := cl.Send(ctx, sess, opD); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+			t.Fatalf("decl %s: %+v err=%v", actor, rep, err)
+		}
+		_, _ = cl.Sync(ctx, sess)
+
+		_, _ = fx.alice.Sync(ctx, fx.sAlice)
+		opC, err := fx.alice.ComposeAndPersist(ComposeParams{
+			Action: "call_" + actor, Origin: ldrcore.OriginActor, OpType: "call_open", ActorID: "alice-p22",
+			Fields:    ldrcrypto.Map{{Key: "call_id", Value: "call-" + actor}, {Key: "to", Value: actor}},
+			Plaintext: []byte(`{"subject":"p22","body":"projection durability test"}`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rep, err := fx.alice.Send(ctx, fx.sAlice, opC); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+			t.Fatalf("call_open %s: %+v err=%v", actor, rep, err)
+		}
+		if _, err := cl.Sync(ctx, sess); err != nil {
+			t.Fatal(err)
+		}
+		return cl, dir, sess
+	}
+
+	t.Run("projection_dir_sync_failure_blocks_cursor_advance_on_retry_and_reopen", func(t *testing.T) {
+		cl, dir, sess := setupMember(t, "ns-p22-sync", "bob-p22-sync", 0xe1)
+		_, ckSeq, _ := cl.Checkpoint()
+
+		// Fail syncDir ONLY for paths at or beneath projection/, keeping client root
+		// dir (cursors.cbor directory) 100% healthy!
+		projRoot := filepath.Clean(cl.ProjectionDir())
+		var projSyncFails atomic.Bool
+		projSyncFails.Store(true)
+		dirHook := func(d string) error {
+			clean := filepath.Clean(d)
+			if projSyncFails.Load() && (clean == projRoot || strings.HasPrefix(clean, projRoot+string(filepath.Separator))) {
+				return errors.New("injected projection-directory sync failure")
+			}
+			return ldrstore.SyncDir(d)
+		}
+		cl.SetSyncHooks(nil, dirHook)
+
+		// 1. First Project writes the first projection file (renamed into place!) and
+		//    fails on projection-dir sync BEFORE advancing cursors.cbor!
+		if err := cl.Project(ctx, sess); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("first Project with failing projection-dir sync: got %v, want ErrUncertainWrite", err)
+		}
+		stuckSeq := cl.Status().ProjectedSeq
+		if stuckSeq >= ckSeq {
+			t.Fatalf("Project advanced cursor to tip %d despite failing projection-dir sync!", stuckSeq)
+		}
+		// Confirm the renamed projection file IS already visible on disk for seq stuckSeq+1!
+		var visibleProjFile string
+		_ = filepath.Walk(projRoot, func(p string, info os.FileInfo, err error) error {
+			if err == nil && !info.IsDir() && visibleProjFile == "" {
+				visibleProjFile = p
+			}
+			return nil
+		})
+		if visibleProjFile == "" {
+			t.Fatalf("expected renamed projection file to already be visible on disk after post-rename dir sync failure")
+		}
+
+		// 2. In-process retry while projection-dir sync STILL fails MUST NOT accept
+		//    the identical visible file and advance cursors.cbor!
+		if err := cl.Project(ctx, sess); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("in-process retry Project with failing projection-dir sync: got %v, want ErrUncertainWrite", err)
+		}
+		if got := cl.Status().ProjectedSeq; got != stuckSeq {
+			t.Fatalf("in-process retry advanced ProjectedSeq from %d to %d despite projection-dir sync failure!", stuckSeq, got)
+		}
+
+		// 3. Reopen while projection-dir sync STILL fails (client dir is healthy so reopen succeeds),
+		//    then retry Project -> MUST STILL fail without advancing cursors.cbor!
+		_ = cl.Close()
+		cl2, err := OpenClientWithSyncHooks(dir, nil, dirHook)
+		if err != nil {
+			t.Fatalf("OpenClientWithSyncHooks (cursor dir healthy): %v", err)
+		}
+		defer cl2.Close()
+		if got := cl2.Status().ProjectedSeq; got != stuckSeq {
+			t.Fatalf("reopened ProjectedSeq=%d, want %d", got, stuckSeq)
+		}
+		if err := cl2.Project(ctx, sess); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("post-reopen retry Project with failing projection-dir sync: got %v, want ErrUncertainWrite", err)
+		}
+		if got := cl2.Status().ProjectedSeq; got != stuckSeq {
+			t.Fatalf("post-reopen retry advanced ProjectedSeq from %d to %d despite projection-dir sync failure!", stuckSeq, got)
+		}
+		if _, err := cl2.VerifiedRead(ctx, sess, "calls/call-bob-p22-sync/turn-1"); !errors.Is(err, ErrNotProjected) {
+			t.Fatalf("VerifiedRead before projection-dir sync restored: got %v, want ErrNotProjected", err)
+		}
+
+		// 4. Restore projection-dir sync -> Project completes cleanly and VerifiedRead succeeds
+		//    both in-process and after reopen!
+		projSyncFails.Store(false)
+		if err := cl2.Project(ctx, sess); err != nil {
+			t.Fatalf("Project after restoring projection-dir sync: %v", err)
+		}
+		if got := cl2.Status().ProjectedSeq; got != ckSeq {
+			t.Fatalf("ProjectedSeq after restore=%d, want %d", got, ckSeq)
+		}
+		if _, err := cl2.VerifiedRead(ctx, sess, "calls/call-bob-p22-sync/turn-1"); err != nil {
+			t.Fatalf("VerifiedRead after restore: %v", err)
+		}
+		_ = cl2.Close()
+		cl3, err := OpenClient(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cl3.Close()
+		if got := cl3.Status().ProjectedSeq; got != ckSeq {
+			t.Fatalf("final reopened ProjectedSeq=%d, want %d", got, ckSeq)
+		}
+		if _, err := cl3.VerifiedRead(ctx, sess, "calls/call-bob-p22-sync/turn-1"); err != nil {
+			t.Fatalf("final reopened VerifiedRead: %v", err)
+		}
+	})
+
+	t.Run("wipe_failure_propagates_and_retry_removes_stale_extra_file", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("chmod 0500 does not prevent root from unlinking files")
+		}
+		cl, dir, sess := setupMember(t, "ns-p22-wipe", "bob-p22-wipe", 0xe2)
+		if err := cl.Project(ctx, sess); err != nil {
+			t.Fatalf("initial Project: %v", err)
+		}
+		_, ckSeq, _ := cl.Checkpoint()
+
+		// Plant an extra file outside the verified projection set inside a read-only
+		// subdirectory so os.RemoveAll(projection/) fails with EACCES!
+		strayDir := filepath.Join(cl.ProjectionDir(), "stray-extra")
+		extraFile := filepath.Join(strayDir, "stale-extra.txt")
+		if err := os.MkdirAll(strayDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(extraFile, []byte("stale-outside-verified-set"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(strayDir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(strayDir, 0o700) })
+
+		// 1. Rebuild MUST propagate the os.RemoveAll error (never succeed with extraFile still on disk!).
+		if err := cl.Rebuild(ctx, sess); err == nil {
+			t.Fatalf("Rebuild succeeded despite os.RemoveAll failing on unwritable stray directory!")
+		}
+		if _, err := os.Stat(extraFile); err != nil {
+			t.Fatalf("expected extraFile to remain observable after failed wipe: %v", err)
+		}
+		if got := cl.Status().ProjectedSeq; got != 0 {
+			t.Fatalf("expected ProjectedSeq=0 while wipe is incomplete, got %d", got)
+		}
+
+		// 2. Retrying Project (in-process AND after reopen) while strayDir is STILL
+		//    unwritable MUST keep failing to complete the pending wipe rather than
+		//    projecting over the uncleared directory!
+		if err := cl.Project(ctx, sess); err == nil {
+			t.Fatalf("Project succeeded without finishing pending wipe!")
+		}
+		_ = cl.Close()
+		cl2, err := OpenClient(dir)
+		if err != nil {
+			t.Fatalf("reopen while wipe pending: %v", err)
+		}
+		defer cl2.Close()
+		if err := cl2.Project(ctx, sess); err == nil {
+			t.Fatalf("reopened Project succeeded without finishing pending wipe!")
+		}
+		if _, err := cl2.VerifiedRead(ctx, sess, "calls/call-bob-p22-wipe/turn-1"); !errors.Is(err, ErrNotProjected) {
+			t.Fatalf("VerifiedRead while wipe pending: got %v, want ErrNotProjected", err)
+		}
+
+		// 3. Restore directory permissions -> retry completes the wipe (removing extraFile!)
+		//    and re-materializes the verified projection cleanly!
+		if err := os.Chmod(strayDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := cl2.Project(ctx, sess); err != nil {
+			t.Fatalf("Project retry after unblocking wipe failed: %v", err)
+		}
+		if _, err := os.Stat(extraFile); !os.IsNotExist(err) {
+			t.Fatalf("extra stale file survived completed wipe retry! err=%v", err)
+		}
+		if _, err := os.Stat(strayDir); !os.IsNotExist(err) {
+			t.Fatalf("stray directory survived completed wipe retry! err=%v", err)
+		}
+		if got := cl2.Status().ProjectedSeq; got != ckSeq {
+			t.Fatalf("ProjectedSeq after completed wipe retry=%d, want %d", got, ckSeq)
+		}
+		if _, err := cl2.VerifiedRead(ctx, sess, "calls/call-bob-p22-wipe/turn-1"); err != nil {
+			t.Fatalf("VerifiedRead after completed wipe retry: %v", err)
 		}
 	})
 }

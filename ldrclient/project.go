@@ -198,6 +198,61 @@ func parseProjViewTag(content string) (projCoord, bool) {
 	return projCoord{gen: g, seq: s}, true
 }
 
+func (c *Client) syncProjDirChainLocked(startDir string) error {
+	syncDir := c.syncDirFn
+	if syncDir == nil {
+		syncDir = ldrstore.SyncDir
+	}
+	projRoot := filepath.Clean(c.projDir())
+	cur := filepath.Clean(startDir)
+	for {
+		if err := syncDir(cur); err != nil {
+			return fmt.Errorf("%w: projection dir barrier sync %s: %v", ldrstore.ErrUncertainWrite, cur, err)
+		}
+		if cur == projRoot {
+			break
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return nil
+}
+
+func (c *Client) syncProjAncestorDirsLocked(full string) error {
+	projRoot := filepath.Clean(c.projDir())
+	dir := filepath.Clean(filepath.Dir(full))
+	if dir == projRoot {
+		return nil
+	}
+	parent := filepath.Dir(dir)
+	if parent == dir {
+		return nil
+	}
+	return c.syncProjDirChainLocked(parent)
+}
+
+func (c *Client) syncProjPathBarrierLocked(full string) error {
+	syncFile := c.syncFileFn
+	if syncFile == nil {
+		syncFile = ldrstore.SyncFile
+	}
+	f, err := os.OpenFile(full, os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("%w: open projection file for barrier: %v", ldrstore.ErrUncertainWrite, err)
+	}
+	if err := syncFile(f); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("%w: projection file barrier sync: %v", ldrstore.ErrUncertainWrite, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("%w: projection file close: %v", ldrstore.ErrUncertainWrite, err)
+	}
+	return c.syncProjDirChainLocked(filepath.Dir(full))
+}
+
 func (c *Client) writeProjFileLocked(pf projFile) (bool, error) {
 	full := filepath.Join(c.projDir(), filepath.FromSlash(pf.path))
 	oldBytes, err := os.ReadFile(full)
@@ -205,14 +260,26 @@ func (c *Client) writeProjFileLocked(pf projFile) (bool, error) {
 		if !os.IsNotExist(err) {
 			return false, err
 		}
-		if err := ldrstore.AtomicWriteFile(full, []byte(pf.content), 0o600); err != nil {
+		if err := atomicWriteFileWithHooks(full, []byte(pf.content), 0o600, c.syncFileFn, c.syncDirFn); err != nil {
+			return false, err
+		}
+		if err := c.syncProjAncestorDirsLocked(full); err != nil {
 			return false, err
 		}
 		return true, nil
 	}
 	old := string(oldBytes)
 	if !pf.view {
-		return old == pf.content, nil
+		if old != pf.content {
+			return false, nil
+		}
+		// Ensure an already-visible matching projection file and its parent
+		// directory chain are durably synced before advancing ProjectedSeq
+		// (handles retry and reopen after a prior post-rename dir-sync failure).
+		if err := c.syncProjPathBarrierLocked(full); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
 	tag, ok := parseProjViewTag(old)
 	head := projCoord{gen: c.ckGen, seq: c.ckSeq}
@@ -220,11 +287,23 @@ func (c *Client) writeProjFileLocked(pf projFile) (bool, error) {
 	case !ok || tag.greater(head):
 		return false, nil
 	case tag.greater(pf.tag):
+		if err := c.syncProjPathBarrierLocked(full); err != nil {
+			return false, err
+		}
 		return true, nil
 	case tag == pf.tag:
-		return old == pf.content, nil
+		if old != pf.content {
+			return false, nil
+		}
+		if err := c.syncProjPathBarrierLocked(full); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
-	if err := ldrstore.AtomicWriteFile(full, []byte(pf.content), 0o600); err != nil {
+	if err := atomicWriteFileWithHooks(full, []byte(pf.content), 0o600, c.syncFileFn, c.syncDirFn); err != nil {
+		return false, err
+	}
+	if err := c.syncProjAncestorDirsLocked(full); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -253,6 +332,12 @@ func (c *Client) Project(ctx context.Context, sess *ldrrelay.SessionClient) erro
 		if !c.outbox.Activated {
 			c.mu.Unlock()
 			return ErrNotActivated
+		}
+		if c.cursors.WipePending {
+			if err := c.completeWipeLocked(); err != nil {
+				c.mu.Unlock()
+				return err
+			}
 		}
 		if c.cursors.ProjectedSeq >= c.ckSeq {
 			c.mu.Unlock()
@@ -288,7 +373,7 @@ func (c *Client) Project(ctx context.Context, sess *ldrrelay.SessionClient) erro
 			c.mu.Unlock()
 			return ErrNotActivated
 		}
-		if c.cursors.ProjectedSeq != seq-1 {
+		if c.cursors.WipePending || c.cursors.ProjectedSeq != seq-1 {
 			c.mu.Unlock()
 			continue
 		}
@@ -367,16 +452,56 @@ func (c *Client) Rebuild(ctx context.Context, sess *ldrrelay.SessionClient) erro
 }
 
 func (c *Client) wipeProjectionLocked() error {
+	if !c.cursors.WipePending || c.cursors.ProjectedSeq != 0 {
+		cand := clonePersistedCursors(c.cursors)
+		cand.ProjectedSeq = 0
+		if !c.cursors.WipePending {
+			cand.Rebuilds++
+		}
+		cand.WipePending = true
+		if err := c.persistCursorsLocked(cand); err != nil {
+			c.markCursorsUncertainOnErrLocked(err)
+			return err
+		}
+		c.cursors = cand
+	}
+	return c.completeWipeLocked()
+}
+
+func (c *Client) completeWipeLocked() error {
+	projDir := c.projDir()
+	if err := os.RemoveAll(projDir); err != nil {
+		return fmt.Errorf("ldrclient: wipe projection directory failed: %w", err)
+	}
+	if _, err := os.Stat(projDir); err == nil {
+		return fmt.Errorf("ldrclient: projection directory still exists after wipe: %s", projDir)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	syncDir := c.syncDirFn
+	if syncDir == nil {
+		syncDir = ldrstore.SyncDir
+	}
+	if err := syncDir(c.dir); err != nil {
+		return fmt.Errorf("%w: sync client dir after projection wipe: %v", ldrstore.ErrUncertainWrite, err)
+	}
+	if err := os.Mkdir(projDir, 0o700); err != nil {
+		return err
+	}
+	if err := syncDir(projDir); err != nil {
+		return fmt.Errorf("%w: sync recreated projection dir: %v", ldrstore.ErrUncertainWrite, err)
+	}
+	if err := syncDir(c.dir); err != nil {
+		return fmt.Errorf("%w: sync client dir after recreating projection dir: %v", ldrstore.ErrUncertainWrite, err)
+	}
 	cand := clonePersistedCursors(c.cursors)
-	cand.ProjectedSeq = 0
-	cand.Rebuilds++
+	cand.WipePending = false
 	if err := c.persistCursorsLocked(cand); err != nil {
 		c.markCursorsUncertainOnErrLocked(err)
 		return err
 	}
 	c.cursors = cand
-	_ = os.RemoveAll(c.projDir())
-	return os.MkdirAll(c.projDir(), 0o700)
+	return nil
 }
 
 // VerifiedRead reads a projected file ONLY after checking it against the
@@ -394,6 +519,10 @@ func (c *Client) VerifiedRead(ctx context.Context, sess *ldrrelay.SessionClient,
 	if !c.outbox.Activated {
 		c.mu.Unlock()
 		return "", ErrNotActivated
+	}
+	if c.cursors.WipePending {
+		c.mu.Unlock()
+		return "", ErrNotProjected
 	}
 	obj, isView := c.viewOf[relPath]
 	coord, isRec := c.source[relPath]

@@ -108,6 +108,7 @@ type persistedCursors struct {
 	ProjectedSeq uint64
 	ScannedSeq   uint64
 	Rebuilds     uint64
+	WipePending  bool
 	Notices      map[string]*LocalNotice
 }
 
@@ -1039,6 +1040,7 @@ func marshalCursors(cur persistedCursors) ([]byte, error) {
 		{Key: "rebuilds", Value: cur.Rebuilds},
 		{Key: "scanned_seq", Value: cur.ScannedSeq},
 		{Key: "v", Value: uint64(1)},
+		{Key: "wipe_pending", Value: cur.WipePending},
 	}, ldrcrypto.Limits{MaxBytes: 2 * 1024 * 1024, MaxDepth: 16, MaxItems: 32768})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ldrstore.ErrPreWrite, err)
@@ -1078,6 +1080,7 @@ func loadCursors(path string) (persistedCursors, error) {
 	cur.ProjectedSeq, _ = ldrcrypto.MapUint(m, "projected_seq")
 	cur.ScannedSeq, _ = ldrcrypto.MapUint(m, "scanned_seq")
 	cur.Rebuilds, _ = ldrcrypto.MapUint(m, "rebuilds")
+	cur.WipePending, _ = ldrcrypto.MapBool(m, "wipe_pending")
 	if arr, err := ldrcrypto.MapArray(m, "notices"); err == nil {
 		for _, elem := range arr {
 			nm, ok := elem.(map[string]any)
