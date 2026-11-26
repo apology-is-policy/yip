@@ -48,6 +48,8 @@ const ldrUsage = `yip ldr -- Long Distance Relay client, equal-roots admin, and 
     yip ldr call open|say|bye|note|read|status|attach|ratify|dispute|measure|resolve|list --dir <client-dir> ...
     yip ldr broadcast create|list|read|reply --dir <client-dir> ...
     yip ldr register put|list --dir <client-dir> ...
+    yip ldr attach --dir <client-dir> [--line <line>] [--as <local-agent>] [--actor <ldr-actor>]
+    yip ldr detach [--line <line>]
     yip ldr status --dir <client-dir>
 `
 
@@ -75,6 +77,10 @@ func LDRCLI(args []string, out io.Writer) error {
 		return ldrBroadcastCLI(rest, out)
 	case "register":
 		return ldrRegisterCLI(rest, out)
+	case "attach":
+		return ldrAttachCLI(rest, out)
+	case "detach":
+		return ldrDetachCLI(rest, out)
 	case "status":
 		return ldrStatusCLI(rest, out)
 	default:

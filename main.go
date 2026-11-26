@@ -187,9 +187,12 @@ func main() {
 	args, runtime = takeFlag(args, "--runtime", "claude")
 	var seat bool
 	var wakeWindow time.Duration
+	var ldrDir, ldrActor string
 	if cmd == "install" || cmd == "uninstall" || cmd == "doctor" {
 		args, profile = takeFlag(args, "--profile", "")
 		seat = hasFlag(args, "--seat")
+		args, ldrDir = takeFlag(args, "--ldr-dir", "")
+		args, ldrActor = takeFlag(args, "--ldr-actor", "")
 		var ww string
 		args, ww = takeFlag(args, "--wake-window", "")
 		if ww != "" {
@@ -199,12 +202,12 @@ func main() {
 		}
 	}
 
-	// Every command but install, relay, and ldr needs to know which local line it is on.
+	// Every command but install, relay, and standalone ldr needs to know which local line it is on.
 	if cmd == "relay" {
 		check(RelayCLI(args, os.Stdout))
 		return
 	}
-	if cmd == "ldr" {
+	if cmd == "ldr" && first(args) != "attach" && first(args) != "detach" {
 		check(LDRCLI(args, os.Stdout))
 		return
 	}
@@ -220,6 +223,13 @@ func main() {
 				activeLine = id
 			}
 		}
+	}
+	if cmd == "ldr" {
+		if as != "" && first(args) == "attach" {
+			args = append(args, "--as", as)
+		}
+		check(LDRCLI(args, os.Stdout))
+		return
 	}
 
 	// A human observer does not beat as the agent registered at this checkout.
@@ -291,16 +301,33 @@ func main() {
 		fmt.Println(out)
 	case "inbox":
 		me := must(WhoAmI(as, ""))
+		if _, ok := loadLDRAttachment(); ok {
+			out, err := (&server{me: me}).call("inbox", map[string]any{"all": first(args) == "--all"})
+			check(err)
+			fmt.Println(out)
+			return
+		}
 		out, err := Inbox(me, first(args) == "--all")
 		check(err)
 		fmt.Println(out)
 	case "retire":
 		me := must(WhoAmI(as, ""))
+		if _, ok := loadLDRAttachment(); ok {
+			out, err := (&server{me: me}).call("retire", map[string]any{"undo": first(args) == "--undo"})
+			check(err)
+			fmt.Println(out)
+			return
+		}
 		check(Retire(me, first(args) != "--undo"))
 		fmt.Println("retirement updated")
 	case "install":
 		res, err := InstallWith("", line, as, local, runtime, InstallOptions{Seat: seat, Profile: profile, WakeWindow: wakeWindow})
 		check(err)
+		if ldrDir != "" {
+			activeLine = res.Line
+			_, err = AttachLDRLine(ldrDir, res.Agent, ldrActor)
+			check(err)
+		}
 		verb := "joined"
 		if res.Reinstall {
 			verb = "rejoined"
@@ -439,6 +466,12 @@ func main() {
 		RunHookRuntime(args[0], as, runtime)
 	case "ring":
 		me := must(WhoAmI(as, ""))
+		if _, ok := loadLDRAttachment(); ok {
+			out, err := (&server{me: me}).call("ring", nil)
+			check(err)
+			fmt.Println(out)
+			return
+		}
 		out, err := RingText(me)
 		check(err)
 		fmt.Println(out)
@@ -469,6 +502,12 @@ func main() {
 		fmt.Println(out)
 	case "bye":
 		me := must(WhoAmI(as, ""))
+		if _, ok := loadLDRAttachment(); ok {
+			out, err := (&server{me: me}).call("bye", map[string]any{"call": first(args)})
+			check(err)
+			fmt.Println(out)
+			return
+		}
 		c, err := ResolveCall(first(args), me)
 		check(err)
 		check(SetBye(c, me))
@@ -479,6 +518,12 @@ func main() {
 		}
 	case "presence":
 		me, _ := WhoAmI(as, "")
+		if _, ok := loadLDRAttachment(); ok {
+			out, err := (&server{me: me}).call("presence", map[string]any{"peer": first(args)})
+			check(err)
+			fmt.Println(out)
+			return
+		}
 		out, err := presenceText(first(args), me)
 		check(err)
 		fmt.Println(out)
@@ -495,6 +540,16 @@ func main() {
 			if n, err := strconv.Atoi(a); err == nil {
 				pids = append(pids, n)
 			}
+		}
+		if _, ok := loadLDRAttachment(); ok {
+			rawPids := make([]any, len(pids))
+			for i, p := range pids {
+				rawPids[i] = float64(p)
+			}
+			out, err := (&server{me: me}).call("busy", map[string]any{"text": args[0], "pids": rawPids})
+			check(err)
+			fmt.Println(out)
+			return
 		}
 		check(SetBusy(me, args[0], pids))
 		fmt.Println("ok")

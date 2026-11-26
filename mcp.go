@@ -290,8 +290,8 @@ type server struct {
 	agyConv  string // per tools/call: root conversation UUID from _meta
 	subagent bool
 
-	started      time.Time
-	cwd          string
+	started time.Time
+	cwd     string
 }
 
 const (
@@ -582,6 +582,9 @@ func (s *server) call(name string, a map[string]any) (string, error) {
 			return "", fmt.Errorf("channel_ack requires the receiving Channels MCP connection")
 		}
 		return "channel probe acknowledged for this session", acknowledgeChannel(s.me, s.channel, argStr(a, "id"))
+	}
+	if out, handled, err := ldrToolCall(s.me, name, a); handled {
+		return out, err
 	}
 	if out, handled, err := coordinationCall(s.me, name, a); handled {
 		return out, err
