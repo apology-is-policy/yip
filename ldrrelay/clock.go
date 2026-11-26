@@ -97,7 +97,8 @@ type ClockGuard struct {
 	mu               sync.Mutex
 	cfg              ClockConfig
 	nowFn            ClockSource
-	floorMS          int64
+	floorMS          uint64
+	floorInvalid     bool
 	trusted          bool
 	uncertainReason  string
 	prevWallMS       int64
@@ -107,6 +108,8 @@ type ClockGuard struct {
 }
 
 // NewClockGuard initializes a ClockGuard against a persisted time_floor.
+// Out-of-domain persisted floors (> ldrcore.MaxCounter) are rejected BEFORE
+// any signed conversion and leave the guard permanently fail-closed.
 func NewClockGuard(persistedFloor uint64, cfg ClockConfig, nowFn ClockSource) *ClockGuard {
 	cfg = cfg.normalized()
 	if nowFn == nil {
@@ -116,24 +119,32 @@ func NewClockGuard(persistedFloor uint64, cfg ClockConfig, nowFn ClockSource) *C
 	g := &ClockGuard{
 		cfg:              cfg,
 		nowFn:            nowFn,
-		floorMS:          int64(persistedFloor),
+		floorMS:          persistedFloor,
 		trusted:          true,
 		prevWallMS:       sample.WallMS,
 		prevMonoMS:       sample.MonoMS,
 		lastWallChangeMo: sample.MonoMS,
 	}
-	if sample.WallMS < 0 || sample.WallMS > ldrcore.MaxCounter {
+	if persistedFloor > uint64(ldrcore.MaxCounter) {
+		g.floorInvalid = true
+		g.tripLocked("persisted_floor_out_of_domain")
+		return g
+	}
+	if sample.WallMS < 0 || uint64(sample.WallMS) > uint64(ldrcore.MaxCounter) {
 		g.tripLocked("wall_clock_out_of_domain")
 		return g
 	}
-	if g.floorMS > 0 {
-		if sample.WallMS < g.floorMS {
-			skew := g.floorMS - sample.WallMS
+	// Both persistedFloor and sample.WallMS are in [0, ldrcore.MaxCounter],
+	// so signed int64 arithmetic below cannot wrap or overflow.
+	floorSigned := int64(g.floorMS)
+	if floorSigned > 0 {
+		if sample.WallMS < floorSigned {
+			skew := floorSigned - sample.WallMS
 			if skew > cfg.MaxBackwardSkewMS {
 				g.tripLocked(fmt.Sprintf("restart_backward_jump_%dms", skew))
 			}
-		} else if sample.WallMS-g.floorMS > cfg.MaxRestartForwardJumpMS {
-			g.tripLocked(fmt.Sprintf("restart_forward_jump_%dms", sample.WallMS-g.floorMS))
+		} else if sample.WallMS-floorSigned > cfg.MaxRestartForwardJumpMS {
+			g.tripLocked(fmt.Sprintf("restart_forward_jump_%dms", sample.WallMS-floorSigned))
 		}
 	}
 	return g
@@ -159,7 +170,12 @@ func (g *ClockGuard) sampleLocked() ClockSample {
 	if !g.trusted {
 		return cur
 	}
-	if cur.WallMS < 0 || cur.WallMS > ldrcore.MaxCounter {
+	if g.floorInvalid || g.floorMS > uint64(ldrcore.MaxCounter) {
+		g.floorInvalid = true
+		g.tripLocked("persisted_floor_out_of_domain")
+		return cur
+	}
+	if cur.WallMS < 0 || uint64(cur.WallMS) > uint64(ldrcore.MaxCounter) {
 		g.tripLocked("wall_clock_out_of_domain")
 		return cur
 	}
@@ -167,6 +183,10 @@ func (g *ClockGuard) sampleLocked() ClockSample {
 	deltaMono := cur.MonoMS - g.prevMonoMS
 	if deltaMono < 0 {
 		g.tripLocked("monotonic_clock_regressed")
+		return cur
+	}
+	if deltaMono > ldrcore.MaxCounter {
+		g.tripLocked("monotonic_clock_out_of_domain")
 		return cur
 	}
 	drift := deltaWall - deltaMono
@@ -179,8 +199,9 @@ func (g *ClockGuard) sampleLocked() ClockSample {
 		g.tripLocked(fmt.Sprintf("clock_step_drift_%dms", drift))
 		return cur
 	}
-	if cur.WallMS < g.floorMS && g.floorMS-cur.WallMS > g.cfg.MaxBackwardSkewMS {
-		g.tripLocked(fmt.Sprintf("backward_below_floor_%dms", g.floorMS-cur.WallMS))
+	floorSigned := int64(g.floorMS)
+	if cur.WallMS < floorSigned && floorSigned-cur.WallMS > g.cfg.MaxBackwardSkewMS {
+		g.tripLocked(fmt.Sprintf("backward_below_floor_%dms", floorSigned-cur.WallMS))
 		return cur
 	}
 	if cur.WallMS != g.prevWallMS {
@@ -200,27 +221,41 @@ func (g *ClockGuard) sampleLocked() ClockSample {
 func (g *ClockGuard) Reading() (uint64, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.floorInvalid || g.floorMS > uint64(ldrcore.MaxCounter) {
+		g.floorInvalid = true
+		g.tripLocked("persisted_floor_out_of_domain")
+		return 0, false
+	}
 	cur := g.sampleLocked()
 	if !g.trusted {
 		return 0, false
 	}
-	t := cur.WallMS
+	t := uint64(cur.WallMS)
 	if t < g.floorMS {
 		t = g.floorMS
 	}
-	if t < 0 || t > ldrcore.MaxCounter {
+	if t > uint64(ldrcore.MaxCounter) {
 		g.tripLocked("evaluation_time_out_of_domain")
 		return 0, false
 	}
-	return uint64(t), true
+	return t, true
 }
 
 // AdvanceFloor monotonically advances the in-memory floor after durable persistence.
+// An out-of-domain floor trips the guard fail-closed rather than converting negatively.
 func (g *ClockGuard) AdvanceFloor(floor uint64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if int64(floor) > g.floorMS {
-		g.floorMS = int64(floor)
+	if floor > uint64(ldrcore.MaxCounter) {
+		g.floorInvalid = true
+		if floor > g.floorMS {
+			g.floorMS = floor
+		}
+		g.tripLocked("floor_out_of_domain")
+		return
+	}
+	if floor > g.floorMS {
+		g.floorMS = floor
 	}
 }
 
@@ -228,7 +263,7 @@ func (g *ClockGuard) AdvanceFloor(floor uint64) {
 func (g *ClockGuard) Floor() uint64 {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return uint64(g.floorMS)
+	return g.floorMS
 }
 
 // Status returns a snapshot of the ClockGuard state.
@@ -242,7 +277,7 @@ func (g *ClockGuard) statusLocked() ClockStatus {
 	return ClockStatus{
 		Trusted:         g.trusted,
 		UncertainReason: g.uncertainReason,
-		FloorMS:         uint64(g.floorMS),
+		FloorMS:         g.floorMS,
 		LastWallMS:      g.prevWallMS,
 		LastDriftMS:     g.lastDriftMS,
 	}
@@ -250,14 +285,20 @@ func (g *ClockGuard) statusLocked() ClockStatus {
 
 // ConfirmResume re-baselines ClockGuard after an operator or trusted health
 // check confirms the host wall clock is synchronized and >= floor.
+// Out-of-domain persisted floors can NEVER be resumed.
 func (g *ClockGuard) ConfirmResume() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.floorInvalid || g.floorMS > uint64(ldrcore.MaxCounter) {
+		g.floorInvalid = true
+		g.tripLocked("persisted_floor_out_of_domain")
+		return fmt.Errorf("ldrrelay: cannot resume clock with out-of-domain floor %d", g.floorMS)
+	}
 	cur := g.nowFn()
-	if cur.WallMS < 0 || cur.WallMS > ldrcore.MaxCounter {
+	if cur.WallMS < 0 || uint64(cur.WallMS) > uint64(ldrcore.MaxCounter) {
 		return errors.New("ldrrelay: cannot resume clock outside safe domain")
 	}
-	if cur.WallMS < g.floorMS {
+	if uint64(cur.WallMS) < g.floorMS {
 		return fmt.Errorf("ldrrelay: cannot resume clock while wall %d < floor %d", cur.WallMS, g.floorMS)
 	}
 	g.prevWallMS = cur.WallMS

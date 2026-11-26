@@ -41,7 +41,11 @@ var (
 // atomically without clobbering unrelated files, and returns the 32-byte
 // SHA-256(SPKI) pin for pin_spki_sha256. Interrupted initializations (such as
 // post-link directory sync failures or second-output write failures) are
-// recoverable on retry while preserving the matching key/cert identity.
+// recoverable on retry while preserving the matching key/cert identity. When
+// keyPath already exists without certPath, any existing regular standalone
+// ECDSA P-256 "EC PRIVATE KEY" PEM file is accepted by format (preserving its
+// bytes unchanged, without asserting provenance that a prior relay init
+// created it) to mint the matching certificate at certPath.
 func InitSelfSignedCert(certPath, keyPath string, hosts []string) ([32]byte, error) {
 	return initSelfSignedCertWithHooks(certPath, keyPath, hosts, nil, nil)
 }
@@ -110,8 +114,10 @@ func initSelfSignedCertWithHooks(
 		return spkiPin, nil
 
 	case keyExists && !certExists:
-		// Recover from an interrupted initialization where keyPath was linked
-		// (e.g., key-dir SyncDir failed or certPath write failed pre-link).
+		// Recover when keyPath exists without certPath (e.g., key-dir SyncDir
+		// failed or certPath write failed pre-link). Accepts an existing regular
+		// standalone ECDSA P-256 PEM key by format (preserving its bytes without
+		// establishing prior relay-init provenance) and mints a matching cert.
 		priv, _, err := loadExistingRelayKey(keyPath)
 		if err != nil {
 			return zero, fmt.Errorf("%w: %s: %v", ErrTLSOutputExists, keyPath, err)

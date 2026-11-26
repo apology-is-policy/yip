@@ -289,6 +289,16 @@ func (e *RelayEngine) loadAndVerifyLine(lineID []byte) (*lineRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Validate persisted time_floor against the protocol safe-integer domain
+	// BEFORE constructing ClockGuard or doing any signed arithmetic.
+	if snap.TimeFloor > uint64(ldrcore.MaxCounter) {
+		return nil, fmt.Errorf("%w: persisted time_floor %d exceeds protocol max %d",
+			ldrstore.ErrCorruptWAL, snap.TimeFloor, uint64(ldrcore.MaxCounter))
+	}
+	if snap.LastCleanShutdownWallMS > uint64(ldrcore.MaxCounter) {
+		return nil, fmt.Errorf("%w: persisted last_clean_shutdown_wall_ms %d exceeds protocol max %d",
+			ldrstore.ErrCorruptWAL, snap.LastCleanShutdownWallMS, uint64(ldrcore.MaxCounter))
+	}
 	desc, cd, genesis, _, err := ldrcrypto.VerifyCreationDescriptor(snap.Provisioned.SignedDescriptor)
 	if err != nil {
 		return nil, err
@@ -554,6 +564,14 @@ func verifyReconcilePreservesAcknowledgedLocked(prev, fresh *lineRuntime) error 
 	}
 	oldFloor := prev.clock.Floor()
 	freshFloor := fresh.clock.Floor()
+	if oldFloor > uint64(ldrcore.MaxCounter) {
+		return fmt.Errorf("%w: acknowledged time_floor %d exceeds protocol max %d",
+			ldrstore.ErrCorruptWAL, oldFloor, uint64(ldrcore.MaxCounter))
+	}
+	if freshFloor > uint64(ldrcore.MaxCounter) {
+		return fmt.Errorf("%w: reconciled time_floor %d exceeds protocol max %d",
+			ldrstore.ErrCorruptWAL, freshFloor, uint64(ldrcore.MaxCounter))
+	}
 	if freshFloor < oldFloor {
 		return fmt.Errorf("%w: reconciled time_floor %d regressed below acknowledged %d",
 			ldrstore.ErrCorruptWAL, freshFloor, oldFloor)
@@ -1336,19 +1354,70 @@ func (e *RelayEngine) Shutdown() error {
 	e.mu.RUnlock()
 	sample := e.nowFn()
 	var wall uint64
-	if sample.WallMS > 0 {
+	if sample.WallMS > 0 && sample.WallMS <= ldrcore.MaxCounter {
 		wall = uint64(sample.WallMS)
 	}
 	for _, rt := range rts {
 		rt.mu.Lock()
 		// Never append a clean-shutdown marker with stale in-memory floor onto a
-		// quarantined WAL whose durable tail/floor may be ahead or torn.
-		if !rt.quarantined {
-			_ = e.store.RecordCleanShutdown(rt.lineID, rt.clock.Floor(), wall)
+		// quarantined WAL whose durable tail/floor may be ahead or torn, or with
+		// an out-of-domain floor.
+		if fl := rt.clock.Floor(); !rt.quarantined && fl <= uint64(ldrcore.MaxCounter) {
+			_ = e.store.RecordCleanShutdown(rt.lineID, fl, wall)
 		}
 		rt.mu.Unlock()
 	}
 	return e.store.Close()
+}
+
+// ClockResumeResult reports the outcome of an explicit operator clock-resume
+// confirmation for one provisioned line.
+type ClockResumeResult struct {
+	LineID string      `json:"line_id"`
+	Clock  ClockStatus `json:"clock"`
+	Error  string      `json:"error,omitempty"`
+}
+
+// ConfirmClockResume applies an explicit local operator clock confirmation to
+// lineID's running ClockGuard (LDR-GO-RELAY-DESIGN §4.1). It never clears
+// storage quarantine.
+func (e *RelayEngine) ConfirmClockResume(lineID []byte) (ClockStatus, error) {
+	rt, ok := e.getLine(lineID)
+	if !ok {
+		return ClockStatus{}, ldrstore.ErrLineNotFound
+	}
+	err := rt.clock.ConfirmResume()
+	return rt.clock.Status(), err
+}
+
+// ConfirmAllClockResumes applies an explicit local operator clock confirmation
+// to every provisioned line's running ClockGuard. If any line refuses resume,
+// all per-line statuses are returned alongside the first error.
+func (e *RelayEngine) ConfirmAllClockResumes() ([]ClockResumeResult, error) {
+	e.mu.RLock()
+	rts := make([]*lineRuntime, 0, len(e.lines))
+	for _, rt := range e.lines {
+		rts = append(rts, rt)
+	}
+	e.mu.RUnlock()
+	sort.Slice(rts, func(i, j int) bool { return rts[i].hexID < rts[j].hexID })
+	results := make([]ClockResumeResult, 0, len(rts))
+	var firstErr error
+	for _, rt := range rts {
+		err := rt.clock.ConfirmResume()
+		res := ClockResumeResult{
+			LineID: rt.hexID,
+			Clock:  rt.clock.Status(),
+		}
+		if err != nil {
+			res.Error = err.Error()
+			if firstErr == nil {
+				firstErr = fmt.Errorf("line %s: %w", rt.hexID, err)
+			}
+		}
+		results = append(results, res)
+	}
+	return results, firstErr
 }
 
 // Status returns non-secret operational diagnostics for every provisioned line.

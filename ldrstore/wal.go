@@ -439,6 +439,12 @@ func (s *FileStore) AppendCommit(lineID []byte, frame CommittedFrame, sidecars m
 		}
 		return fmt.Errorf("%w: %v", ErrPreWrite, err)
 	}
+	if newFloor > ldrcrypto.MaxCounter {
+		return fmt.Errorf("%w: %w: time_floor %d exceeds protocol max %d", ErrPreWrite, ErrInvalidRecord, newFloor, ldrcrypto.MaxCounter)
+	}
+	if frame.SeqTime > ldrcrypto.MaxCounter {
+		return fmt.Errorf("%w: %w: seq_time %d exceeds protocol max %d", ErrPreWrite, ErrInvalidRecord, frame.SeqTime, ldrcrypto.MaxCounter)
+	}
 	// Verify and persist every referenced sidecar BEFORE writing the WAL commit.
 	if frame.PayloadCommit != nil && frame.PayloadCommit.Length > 0 {
 		blob, ok := sidecars[frame.PayloadCommit.Digest]
@@ -485,6 +491,9 @@ func (s *FileStore) AppendNonCommit(lineID []byte, entry HotEntry, newFloor uint
 	if entry.Outcome.Kind != "rejected" && entry.Outcome.Kind != "noop" {
 		return fmt.Errorf("%w: %v: non-commit outcome kind %q", ErrPreWrite, ErrInvalidRecord, entry.Outcome.Kind)
 	}
+	if newFloor > ldrcrypto.MaxCounter {
+		return fmt.Errorf("%w: %w: time_floor %d exceeds protocol max %d", ErrPreWrite, ErrInvalidRecord, newFloor, ldrcrypto.MaxCounter)
+	}
 	body, err := ldrcrypto.MarshalCBOR(ldrcrypto.Map{
 		{Key: "entry", Value: encodeHotEntryMap(entry)},
 		{Key: "floor", Value: newFloor},
@@ -506,6 +515,9 @@ func (s *FileStore) AppendCompact(lineID []byte, retired []StoredOpKey, newFloor
 	hexID, err := lineHex(lineID)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrPreWrite, err)
+	}
+	if newFloor > ldrcrypto.MaxCounter {
+		return fmt.Errorf("%w: %w: time_floor %d exceeds protocol max %d", ErrPreWrite, ErrInvalidRecord, newFloor, ldrcrypto.MaxCounter)
 	}
 	keys := make([]any, len(retired))
 	for i, k := range retired {
@@ -532,6 +544,9 @@ func (s *FileStore) RecordCleanShutdown(lineID []byte, floor, wallMS uint64) err
 	hexID, err := lineHex(lineID)
 	if err != nil {
 		return err
+	}
+	if floor > ldrcrypto.MaxCounter || wallMS > ldrcrypto.MaxCounter {
+		return fmt.Errorf("%w: clean shutdown floor/wall out of domain", ErrInvalidRecord)
 	}
 	body, err := ldrcrypto.MarshalCBOR(ldrcrypto.Map{
 		{Key: "floor", Value: floor},
@@ -796,6 +811,9 @@ func applyWALRecord(snap *LineSnapshot, kind byte, body []byte) error {
 	floor, err := ldrcrypto.MapUint(m, "floor")
 	if err != nil {
 		return err
+	}
+	if floor > ldrcrypto.MaxCounter {
+		return fmt.Errorf("time_floor %d exceeds protocol max %d", floor, ldrcrypto.MaxCounter)
 	}
 	if floor < snap.TimeFloor {
 		return fmt.Errorf("time_floor regression %d < %d", floor, snap.TimeFloor)

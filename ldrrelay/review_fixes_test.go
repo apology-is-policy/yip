@@ -2,6 +2,7 @@ package ldrrelay
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -10,6 +11,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2047,4 +2049,223 @@ func TestInitSelfSignedCertSyncFailureRecoveryAndPreservation(t *testing.T) {
 			t.Fatalf("different-hosts refusal altered key A!")
 		}
 	})
+}
+
+func makeRoot2AuthOp(t *testing.T, rig *engineTestRig, opID string, authEpoch, rootRev, seenSeq uint64, seenHead [32]byte) (ldrcrypto.Principal, ldrcrypto.SignedIntent, ldrstore.StoredOpKey, [32]byte) {
+	t.Helper()
+	root2Prin := ldrcrypto.RootPrincipal(rig.root2.PublicKey())
+	extraOp, _ := ldrcrypto.GenerateEd25519Key()
+	extraCBOR, _ := extraOp.PublicKey().ToCBOR()
+	env, k, dig := rig.signOp(t, rig.root2, WireIntentInput{
+		ProfileDigest: rig.profDigest, LineID: rig.lineID, Generation: 1,
+		Origin: ldrcore.OriginRoot, Principal: root2Prin,
+		OpID: opID, OpType: "operator_key_authorize",
+		AuthEpoch: authEpoch, SeenSeq: seenSeq, SeenHead: seenHead, ValidityMS: 60_000,
+		PayloadCommit: ldrcrypto.EmptyPayloadCommit(),
+		Expect:        ldrcrypto.ExpectMap{"root_rev": rootRev},
+		Fields:        ldrcrypto.Map{{Key: "operator_key", Value: extraCBOR}},
+	})
+	return root2Prin, env, k, dig
+}
+
+// TestRelayEngineOutOfDomainFloorLoadAndReconcileRejected verifies Codex Turn 30 Finding 1:
+// Both startup load (NewRelayEngine) and runtime reconciliation (ReconcileLine)
+// reject persisted TimeFloor values exceeding ldrcore.MaxCounter (including
+// MaxCounter+1, MaxInt64+1 signed-wrap boundary, and MaxUint64) with ErrCorruptWAL
+// BEFORE ClockGuard conversion, and FileStore rejects writing out-of-domain floors.
+func TestRelayEngineOutOfDomainFloorLoadAndReconcileRejected(t *testing.T) {
+	badFloors := []struct {
+		name  string
+		floor uint64
+	}{
+		{name: "max_counter_plus_1", floor: uint64(ldrcore.MaxCounter) + 1},
+		{name: "signed_wrap_max_int64_plus_1", floor: uint64(math.MaxInt64) + 1},
+		{name: "max_uint64", floor: math.MaxUint64},
+	}
+
+	for _, tc := range badFloors {
+		tc := tc
+		t.Run("startup_and_reconcile_"+tc.name, func(t *testing.T) {
+			rig := newEngineTestRig(t)
+
+			// 1. FileStore write boundary refuses out-of-domain floors cleanly (ErrPreWrite/ErrInvalidRecord).
+			if err := rig.baseStore.AppendCompact(rig.lineID, nil, tc.floor); !errors.Is(err, ldrstore.ErrPreWrite) || !errors.Is(err, ldrstore.ErrInvalidRecord) {
+				t.Fatalf("%s: AppendCompact out-of-domain floor got %v, want ErrPreWrite+ErrInvalidRecord", tc.name, err)
+			}
+			if err := rig.baseStore.RecordCleanShutdown(rig.lineID, tc.floor, 1_700_000_000_000); !errors.Is(err, ldrstore.ErrInvalidRecord) {
+				t.Fatalf("%s: RecordCleanShutdown out-of-domain floor got %v, want ErrInvalidRecord", tc.name, err)
+			}
+
+			// 2. Startup load (NewRelayEngine) MUST reject out-of-domain TimeFloor with ErrCorruptWAL.
+			badStartupStore := &faultStore{
+				base: rig.baseStore,
+				loadMutator: func(s *ldrstore.LineSnapshot) error {
+					s.TimeFloor = tc.floor
+					return nil
+				},
+			}
+			if _, err := NewRelayEngine(badStartupStore, DefaultClockConfig(), rig.clock.source()); !errors.Is(err, ldrstore.ErrCorruptWAL) {
+				t.Fatalf("%s: NewRelayEngine accepted/misclassified out-of-domain floor: got %v, want ErrCorruptWAL", tc.name, err)
+			}
+
+			// 3. Quarantine the live line and inject out-of-domain TimeFloor during ReconcileLine ->
+			//    MUST reject with ErrCorruptWAL and keep the line quarantined!
+			rig.fs.mu.Lock()
+			rig.fs.commitFault = func([]byte, ldrstore.CommittedFrame, map[[32]byte]ldrstore.SidecarBlob, uint64) error {
+				return fmt.Errorf("%w: injected quarantine fault", ldrstore.ErrUncertainWrite)
+			}
+			rig.fs.mu.Unlock()
+			rig.clock.wall += 1000
+			rig.clock.mono += 1000
+			root2Prin, env3, _, _ := makeRoot2AuthOp(t, rig, "quar-op-"+tc.name, 1, 2, 2, rig.head2)
+			rep := rig.engine.Submit(rig.lineID, root2Prin, env3.RawBytes, nil, nil)
+			if rep.Class != ldrcore.ClassAdmission || rep.Code != "storage_error" {
+				t.Fatalf("expected quarantine trigger storage_error, got %+v", rep)
+			}
+			rig.fs.mu.Lock()
+			rig.fs.commitFault = nil
+			rig.fs.mu.Unlock()
+			if st := rig.engine.Status()[0]; !st.Quarantined {
+				t.Fatalf("expected line quarantined before ReconcileLine")
+			}
+
+			rig.fs.mu.Lock()
+			rig.fs.loadMutator = func(s *ldrstore.LineSnapshot) error {
+				s.TimeFloor = tc.floor
+				return nil
+			}
+			rig.fs.mu.Unlock()
+
+			if err := rig.engine.ReconcileLine(rig.lineID); !errors.Is(err, ldrstore.ErrCorruptWAL) {
+				t.Fatalf("%s: ReconcileLine with out-of-domain floor got %v, want ErrCorruptWAL", tc.name, err)
+			}
+			if st := rig.engine.Status()[0]; !st.Quarantined {
+				t.Fatalf("%s: failed ReconcileLine cleared quarantine!", tc.name)
+			}
+
+			// Clear mutator -> genuine valid reconcile still succeeds.
+			rig.fs.mu.Lock()
+			rig.fs.loadMutator = nil
+			rig.fs.mu.Unlock()
+			if err := rig.engine.ReconcileLine(rig.lineID); err != nil {
+				t.Fatalf("%s: clean ReconcileLine after mutator clear: %v", tc.name, err)
+			}
+		})
+	}
+}
+
+// TestAdminSocketSecurityAndClockResume verifies Codex Turn 30 Finding 2 at the
+// ldrrelay boundary: owner-only 0600 local Unix admin socket, refusal to clobber
+// non-socket files or active sockets, explicit ConfirmClockResume wiring (refusing
+// wall < floor, succeeding when wall >= floor, and never clearing storage quarantine).
+func TestAdminSocketSecurityAndClockResume(t *testing.T) {
+	rig := newEngineTestRig(t)
+	ctx := context.Background()
+
+	// Use a short temp dir under /tmp so macOS 104-byte Unix sun_path limit is respected.
+	sockDir, err := os.MkdirTemp("/tmp", "yip-adm-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+
+	// 1. Sentinel non-socket file MUST NOT be clobbered by StartAdminServer.
+	sentinelSock := filepath.Join(sockDir, "sentinel.sock")
+	sentinelBytes := []byte("KEEP-ADMIN-SENTINEL\n")
+	if err := os.WriteFile(sentinelSock, sentinelBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StartAdminServer(sentinelSock, rig.engine); !errors.Is(err, ErrAdminSocketConflict) {
+		t.Fatalf("StartAdminServer over regular sentinel: got %v, want ErrAdminSocketConflict", err)
+	}
+	if got, _ := os.ReadFile(sentinelSock); !bytes.Equal(got, sentinelBytes) {
+		t.Fatalf("StartAdminServer altered regular sentinel file!")
+	}
+
+	// 2. Bind real admin socket and verify owner-only 0600 permissions + active conflict check.
+	sockPath := filepath.Join(sockDir, "admin.sock")
+	adm, err := StartAdminServer(sockPath, rig.engine)
+	if err != nil {
+		t.Fatalf("StartAdminServer: %v", err)
+	}
+	defer adm.Close(ctx)
+
+	fi, err := os.Lstat(sockPath)
+	if err != nil {
+		t.Fatalf("Lstat admin socket: %v", err)
+	}
+	if fi.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("expected Unix socket mode, got %v", fi.Mode())
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("admin socket perm = %#o, want 0600", perm)
+	}
+	if _, err := StartAdminServer(sockPath, rig.engine); !errors.Is(err, ErrAdminSocketConflict) {
+		t.Fatalf("second StartAdminServer on active socket: got %v, want ErrAdminSocketConflict", err)
+	}
+
+	// 3. Trip clock via backward jump -> AdminStatus reports untrusted, AdminClockResume refuses while wall < floor.
+	rig.clock.wall -= 10_000
+	rig.clock.mono += 100
+	cg, ok := rig.engine.ClockGuardFor(rig.lineID)
+	if !ok {
+		t.Fatalf("ClockGuardFor missing")
+	}
+	if st := cg.Sample(); st.Trusted {
+		t.Fatalf("expected backward jump to trip ClockGuard")
+	}
+
+	lines, err := AdminStatus(ctx, sockPath)
+	if err != nil || len(lines) != 1 || lines[0].Clock.Trusted {
+		t.Fatalf("AdminStatus while tripped: lines=%+v err=%v", lines, err)
+	}
+	if _, err := AdminClockResume(ctx, sockPath, rig.lineID); err == nil {
+		t.Fatalf("AdminClockResume MUST refuse while wall < floor")
+	}
+
+	// 4. Also quarantine the line; once wall >= floor, AdminClockResume clears clock_uncertain
+	//    but MUST NOT clear storage quarantine!
+	rig.fs.mu.Lock()
+	rig.fs.commitFault = func([]byte, ldrstore.CommittedFrame, map[[32]byte]ldrstore.SidecarBlob, uint64) error {
+		return fmt.Errorf("%w: injected quar", ldrstore.ErrUncertainWrite)
+	}
+	rig.fs.mu.Unlock()
+	rig.clock.wall += 15_000
+	rig.clock.mono += 1000
+	res, err := AdminClockResume(ctx, sockPath, rig.lineID)
+	if err != nil || len(res) != 1 || !res[0].Clock.Trusted {
+		t.Fatalf("AdminClockResume after wall >= floor: res=%+v err=%v", res, err)
+	}
+	// Trigger quarantine on next write, trip clock again, resume clock, verify quarantine remains!
+	rig.clock.wall += 1000
+	rig.clock.mono += 1000
+	root2Prin, env3, _, _ := makeRoot2AuthOp(t, rig, "quar-clk-op", 1, 2, 2, rig.head2)
+	rep := rig.engine.Submit(rig.lineID, root2Prin, env3.RawBytes, nil, nil)
+	if rep.Code != "storage_error" {
+		t.Fatalf("expected storage_error quarantine, got %+v", rep)
+	}
+	rig.fs.mu.Lock()
+	rig.fs.commitFault = nil
+	rig.fs.mu.Unlock()
+	rig.clock.wall += 120_000 // huge forward jump with 0 mono -> trips clock
+	cg.Sample()
+	if cg.Status().Trusted {
+		t.Fatalf("expected forward jump to trip ClockGuard")
+	}
+	res2, err := AdminClockResume(ctx, sockPath, nil)
+	if err != nil || len(res2) != 1 || !res2[0].Clock.Trusted {
+		t.Fatalf("AdminClockResume all lines: res=%+v err=%v", res2, err)
+	}
+	linesAfter, err := AdminStatus(ctx, sockPath)
+	if err != nil || len(linesAfter) != 1 || !linesAfter[0].Quarantined || !linesAfter[0].Clock.Trusted {
+		t.Fatalf("AdminClockResume MUST preserve storage quarantine while resuming clock: %+v err=%v", linesAfter, err)
+	}
+
+	// 5. Close removes the socket cleanly.
+	if err := adm.Close(ctx); err != nil {
+		t.Fatalf("adm.Close: %v", err)
+	}
+	if _, err := os.Lstat(sockPath); !os.IsNotExist(err) {
+		t.Fatalf("expected admin socket removed on Close, stat err=%v", err)
+	}
 }

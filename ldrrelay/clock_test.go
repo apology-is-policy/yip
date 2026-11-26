@@ -1,8 +1,11 @@
 package ldrrelay
 
 import (
+	"math"
 	"strings"
 	"testing"
+
+	"github.com/apology-is-policy/yip/ldrcore"
 )
 
 type fakeClock struct {
@@ -125,4 +128,79 @@ func TestClockGuardDetectsDiscontinuitiesAndResumes(t *testing.T) {
 			t.Fatalf("expected uncertain on 60-day forward restart jump")
 		}
 	})
+}
+
+// TestClockGuardOutOfDomainFloorFailClosed verifies Codex Turn 30 Finding 1:
+// persisted floors above ldrcore.MaxCounter (including MaxCounter+1, MaxInt64,
+// MaxInt64+1 signed-wrap boundary, and MaxUint64) are rejected BEFORE signed
+// conversion and keep ClockGuard fail-closed across Sample, Reading, AdvanceFloor,
+// and ConfirmResume.
+func TestClockGuardOutOfDomainFloorFailClosed(t *testing.T) {
+	// Exact protocol upper boundary MaxCounter MUST remain valid.
+	fcMax := &fakeClock{wall: ldrcore.MaxCounter, mono: 0}
+	cgMax := NewClockGuard(uint64(ldrcore.MaxCounter), DefaultClockConfig(), fcMax.source())
+	if st := cgMax.Status(); !st.Trusted || st.FloorMS != uint64(ldrcore.MaxCounter) {
+		t.Fatalf("exact MaxCounter floor should be trusted, got %+v", st)
+	}
+	if tm, ok := cgMax.Reading(); !ok || tm != uint64(ldrcore.MaxCounter) {
+		t.Fatalf("exact MaxCounter Reading: got (%d, %v), want (%d, true)", tm, ok, ldrcore.MaxCounter)
+	}
+
+	outOfDomain := []struct {
+		name  string
+		floor uint64
+	}{
+		{name: "max_counter_plus_1", floor: uint64(ldrcore.MaxCounter) + 1},
+		{name: "max_int64", floor: uint64(math.MaxInt64)},
+		{name: "signed_wrap_max_int64_plus_1", floor: uint64(math.MaxInt64) + 1},
+		{name: "max_uint64", floor: math.MaxUint64},
+	}
+
+	for _, tc := range outOfDomain {
+		tc := tc
+		t.Run("startup_"+tc.name, func(t *testing.T) {
+			fc := &fakeClock{wall: 1_700_000_000_000, mono: 0}
+			cg := NewClockGuard(tc.floor, DefaultClockConfig(), fc.source())
+			st := cg.Status()
+			if st.Trusted {
+				t.Fatalf("%s: expected fail-closed untrusted ClockGuard, got %+v", tc.name, st)
+			}
+			if !strings.Contains(st.UncertainReason, "floor_out_of_domain") {
+				t.Fatalf("%s: unexpected reason %q", tc.name, st.UncertainReason)
+			}
+			if st.FloorMS != tc.floor || cg.Floor() != tc.floor {
+				t.Fatalf("%s: floor corrupted/wrapped: got %d, want %d", tc.name, cg.Floor(), tc.floor)
+			}
+			if tm, ok := cg.Reading(); ok || tm != 0 {
+				t.Fatalf("%s: Reading MUST fail closed, got (%d, %v)", tc.name, tm, ok)
+			}
+			if s2 := cg.Sample(); s2.Trusted {
+				t.Fatalf("%s: Sample MUST stay untrusted, got %+v", tc.name, s2)
+			}
+			if err := cg.ConfirmResume(); err == nil {
+				t.Fatalf("%s: ConfirmResume MUST refuse out-of-domain persisted floor", tc.name)
+			}
+			if tm, ok := cg.Reading(); ok || tm != 0 {
+				t.Fatalf("%s: Reading after failed ConfirmResume MUST stay fail-closed, got (%d, %v)", tc.name, tm, ok)
+			}
+		})
+
+		t.Run("advance_floor_"+tc.name, func(t *testing.T) {
+			fc := &fakeClock{wall: 1_700_000_000_000, mono: 0}
+			cg := NewClockGuard(1_700_000_000_000, DefaultClockConfig(), fc.source())
+			if !cg.Status().Trusted {
+				t.Fatalf("expected trusted before AdvanceFloor")
+			}
+			cg.AdvanceFloor(tc.floor)
+			if st := cg.Status(); st.Trusted || !strings.Contains(st.UncertainReason, "floor_out_of_domain") {
+				t.Fatalf("%s: AdvanceFloor out of domain MUST trip fail-closed, got %+v", tc.name, st)
+			}
+			if tm, ok := cg.Reading(); ok || tm != 0 {
+				t.Fatalf("%s: Reading after out-of-domain AdvanceFloor got (%d, %v)", tc.name, tm, ok)
+			}
+			if err := cg.ConfirmResume(); err == nil {
+				t.Fatalf("%s: ConfirmResume MUST refuse after out-of-domain AdvanceFloor", tc.name)
+			}
+		})
+	}
 }

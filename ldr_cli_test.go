@@ -4,16 +4,19 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/apology-is-policy/yip/ldrclient"
+	"github.com/apology-is-policy/yip/ldrcore"
 	"github.com/apology-is-policy/yip/ldrcrypto"
 	"github.com/apology-is-policy/yip/ldrrelay"
 	"github.com/apology-is-policy/yip/ldrstore"
@@ -623,5 +626,273 @@ func TestLDRCLIOutputPreservationAliasingAndRetry(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(filepath.Join(relayDir, "tls", "server.key")); !bytes.Equal(keyBytes, got) {
 		t.Fatalf("conflicting relay init clobbered server.key!")
+	}
+}
+
+// TestRelayCLILiveClockResumeEndToEnd verifies Codex Turn 30 Finding 2 end-to-end:
+// `yip relay serve` exposes an owner-only local Unix admin socket wired to the
+// running RelayEngine's ClockGuard, and `yip relay clock <status|resume>`
+// inspects and recovers a tripped ClockGuard on the live running process
+// (without restarting the relay), rejecting unsafe resume while wall < floor
+// and restoring live authoritative AnchorRequest evaluation once wall >= floor.
+func TestRelayCLILiveClockResumeEndToEnd(t *testing.T) {
+	// Short temp dir under /tmp so default <dir>/admin.sock fits within macOS 104-byte sun_path.
+	tmp, err := os.MkdirTemp("/tmp", "yip-rclk-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmp) })
+
+	relayDir := filepath.Join(tmp, "relay")
+	keysDir := filepath.Join(tmp, "keys")
+	r1Key := filepath.Join(keysDir, "r1.key")
+	r1Pub := filepath.Join(keysDir, "r1.pub")
+	r2Key := filepath.Join(keysDir, "r2.key")
+	r2Pub := filepath.Join(keysDir, "r2.pub")
+	descFile := filepath.Join(tmp, "desc.cbor")
+
+	var buf bytes.Buffer
+	mustRelay := func(args ...string) map[string]any {
+		t.Helper()
+		buf.Reset()
+		if err := RelayCLI(args, &buf); err != nil {
+			t.Fatalf("RelayCLI %v: %v", args, err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &m); err != nil {
+			t.Fatalf("decode RelayCLI %v: %v (raw=%q)", args, err, buf.String())
+		}
+		return m
+	}
+	mustLDR := func(args ...string) map[string]any {
+		t.Helper()
+		buf.Reset()
+		if err := LDRCLI(args, &buf); err != nil {
+			t.Fatalf("LDRCLI %v: %v", args, err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &m); err != nil {
+			t.Fatalf("decode LDRCLI %v: %v (raw=%q)", args, err, buf.String())
+		}
+		return m
+	}
+
+	initRes := mustRelay("init", "--dir", relayDir, "--hosts", "127.0.0.1,localhost")
+	pinHex := initRes["pin_spki_sha256"].(string)
+
+	mustLDR("root", "keygen", "--out", r1Key, "--pub", r1Pub)
+	mustLDR("root", "keygen", "--out", r2Key, "--pub", r2Pub)
+
+	// Start live relay serve first? Provision line before starting serve (single-writer lock).
+	// Create descriptor using placeholder URL, wait — ClientTLSConfig needs the actual port!
+	// Reserve a loopback listener port? Better: bind listener inside runRelayServe on 127.0.0.1:0,
+	// wait — creation descriptor pins URL! Let's probe an ephemeral loopback port quickly or
+	// provision after binding? No, OpenFileStore holds flock, so pick a free port right before serve.
+	probeLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listenAddr := probeLn.Addr().String()
+	_ = probeLn.Close()
+
+	relayURL := "https://" + listenAddr
+	descRes := mustLDR("root", "descriptor",
+		"--root1", r1Pub, "--root2", r2Pub,
+		"--url", relayURL, "--tls-policy", "pin_spki_sha256", "--tls-pin", pinHex,
+		"--signer", r1Key, "--out", descFile, "--freshness-ms", "10000", "--max-validity-ms", "600000")
+	lineHex := descRes["line_id"].(string)
+	lineID, err := hex.DecodeString(lineHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRelay("provision", "--dir", relayDir, "--descriptor", descFile)
+
+	// Thread-safe controllable clock shared by the running relay & background 1s sampler.
+	var clkMu sync.Mutex
+	wallMS := int64(1_700_000_000_000)
+	monoMS := int64(0)
+	clockSrc := func() ldrrelay.ClockSample {
+		clkMu.Lock()
+		defer clkMu.Unlock()
+		return ldrrelay.ClockSample{WallMS: wallMS, MonoMS: monoMS}
+	}
+	shiftClock := func(dWall, dMono int64) {
+		clkMu.Lock()
+		wallMS += dWall
+		monoMS += dMono
+		clkMu.Unlock()
+	}
+
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	readyCh := make(chan relayServeReady, 1)
+	serveErrCh := make(chan error, 1)
+	var serveOut bytes.Buffer
+	go func() {
+		serveErrCh <- runRelayServe(serveCtx, relayServeOpts{
+			Dir:      relayDir,
+			Listen:   listenAddr,
+			ClockCfg: ldrrelay.DefaultClockConfig(),
+			NowFn:    clockSrc,
+			ReadyCh:  readyCh,
+		}, &serveOut)
+	}()
+	defer func() {
+		cancelServe()
+		if err := <-serveErrCh; err != nil {
+			t.Errorf("runRelayServe shutdown err: %v", err)
+		}
+	}()
+
+	ready := <-readyCh
+	if ready.AdminSock != ldrrelay.DefaultAdminSocketPath(relayDir) {
+		t.Fatalf("unexpected admin socket path: %s", ready.AdminSock)
+	}
+
+	// Connect an authenticated TLS 1.3 SessionClient as root1 and commit line_init.
+	rawDesc, err := os.ReadFile(descFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desc, cd, genesis, _, err := ldrcrypto.VerifyCreationDescriptor(rawDesc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1KM, err := ldrclient.LoadSigningKey(r1Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profDig, err := desc.Profile.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1Prin := ldrcrypto.RootPrincipal(r1KM.Signer.PublicKey())
+	ctx := context.Background()
+	sess, err := ldrrelay.DialSession(ctx, desc.RelayOrigin, lineID, profDig, 1, r1Prin, r1KM.Signer)
+	if err != nil {
+		t.Fatalf("root1 DialSession: %v", err)
+	}
+	defer sess.Close()
+	sortedRoots, err := ldrcrypto.CanonicalRootKeys(desc.RootKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootsCBOR := make([]any, len(sortedRoots))
+	for i, rk := range sortedRoots {
+		rootsCBOR[i], err = rk.ToCBOR()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	profMap, err := desc.Profile.ToCBORMap()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyBytes, err := ldrrelay.BuildWireIntentBody(ldrrelay.WireIntentInput{
+		ProfileDigest: profDig,
+		LineID:        lineID,
+		Generation:    1,
+		Origin:        ldrcore.OriginRoot,
+		Principal:     r1Prin,
+		OpID:          "cli-clk-init",
+		OpType:        "line_init",
+		SeenSeq:       0,
+		SeenHead:      genesis,
+		ValidityMS:    600_000,
+		PayloadCommit: ldrcrypto.EmptyPayloadCommit(),
+		Fields: ldrcrypto.Map{
+			{Key: "descriptor_digest", Value: cd[:]},
+			{Key: "profile", Value: profMap},
+			{Key: "root_keys", Value: rootsCBOR},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := ldrcrypto.SignIntent(r1KM.Signer, bodyBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := sess.Submit(ctx, env.RawBytes, nil, nil)
+	if err != nil || rep.Outcome.Kind != ldrcore.Committed {
+		t.Fatalf("line_init commit: rep=%+v err=%v", rep, err)
+	}
+
+	checkHealthClockTrusted := func(want bool) {
+		t.Helper()
+		tlsCfg, err := ldrrelay.ClientTLSConfig(desc.RelayOrigin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hc := &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}}
+		defer hc.CloseIdleConnections()
+		resp, err := hc.Get(relayURL + "/v1/health")
+		if err != nil {
+			t.Fatalf("GET /v1/health: %v", err)
+		}
+		defer resp.Body.Close()
+		var h map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := h["clock_trusted"].(bool); got != want {
+			t.Fatalf("/v1/health clock_trusted=%v, want %v (body=%+v)", got, want, h)
+		}
+	}
+
+	checkHealthClockTrusted(true)
+
+	// 1. Backward jump trips the RUNNING relay's ClockGuard -> live AnchorRequest returns clock_uncertain.
+	shiftClock(-10_000, 100)
+	ancRep, err := sess.AnchorRequest(ctx)
+	if err != nil || ancRep.Class != ldrcore.ClassAdmission || ancRep.Code != "clock_uncertain" {
+		t.Fatalf("expected clock_uncertain after backward jump, got rep=%+v err=%v", ancRep, err)
+	}
+	checkHealthClockTrusted(false)
+
+	// `yip relay clock status --dir <relayDir>` reports trusted=false via the local admin socket!
+	clkStatus := mustRelay("clock", "status", "--dir", relayDir)
+	linesRaw := clkStatus["lines"].([]any)
+	if len(linesRaw) != 1 || linesRaw[0].(map[string]any)["clock"].(map[string]any)["trusted"].(bool) {
+		t.Fatalf("expected relay clock status trusted=false, got %+v", clkStatus)
+	}
+
+	// `yip relay clock resume` MUST FAIL while wall < floor, leaving live relay untrusted!
+	var failBuf bytes.Buffer
+	if err := RelayCLI([]string{"clock", "resume", "--dir", relayDir}, &failBuf); err == nil {
+		t.Fatalf("expected relay clock resume to fail while wall < floor (out=%s)", failBuf.String())
+	}
+	checkHealthClockTrusted(false)
+
+	// 2. Host wall clock catches back up past floor + FreshnessMS (10s) -> explicit CLI resume
+	//    clears the trip on the RUNNING process (no restart!), and live AnchorRequest commits!
+	shiftClock(25_000, 1_000)
+	resRes := mustRelay("clock", "resume", "--dir", relayDir)
+	if !resRes["ok"].(bool) {
+		t.Fatalf("expected relay clock resume ok=true, got %+v", resRes)
+	}
+	checkHealthClockTrusted(true)
+
+	ancOK, err := sess.AnchorRequest(ctx)
+	if err != nil || ancOK.Class != ldrcore.ClassOutcome || ancOK.Seq != 2 || !ancOK.Wrote {
+		t.Fatalf("expected live AnchorRequest to commit seq 2 after CLI clock resume, got %+v err=%v", ancOK, err)
+	}
+
+	// 3. Forward jump / sleep trip -> explicit `yip relay clock resume --line <hex>` recovers live evaluation!
+	shiftClock(120_000, 5)
+	ancFwdFail, err := sess.AnchorRequest(ctx)
+	if err != nil || ancFwdFail.Class != ldrcore.ClassAdmission || ancFwdFail.Code != "clock_uncertain" {
+		t.Fatalf("expected clock_uncertain after forward jump, got %+v err=%v", ancFwdFail, err)
+	}
+	checkHealthClockTrusted(false)
+
+	resLine := mustRelay("clock", "resume", "--dir", relayDir, "--line", lineHex)
+	if !resLine["ok"].(bool) {
+		t.Fatalf("expected per-line relay clock resume ok=true, got %+v", resLine)
+	}
+	checkHealthClockTrusted(true)
+
+	ancOK2, err := sess.AnchorRequest(ctx)
+	if err != nil || ancOK2.Class != ldrcore.ClassOutcome || ancOK2.Seq != 3 || !ancOK2.Wrote {
+		t.Fatalf("expected live AnchorRequest to commit seq 3 after per-line CLI clock resume, got %+v err=%v", ancOK2, err)
 	}
 }
