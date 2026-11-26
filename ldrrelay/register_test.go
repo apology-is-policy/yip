@@ -3,6 +3,7 @@ package ldrrelay
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/apology-is-policy/yip/ldrcore"
@@ -298,5 +299,246 @@ func TestAdvisoryRegistersPublishListAndSection9Rules(t *testing.T) {
 	listAfter, err := opSess.ListRegisters(ctx, "")
 	if err != nil || len(listAfter) != 1 || !listAfter[0].Historical {
 		t.Fatalf("expected cached register to become Historical=true after revoke, got %+v err=%v", listAfter, err)
+	}
+}
+
+func TestAdvisoryRegistersPaginationByCountAndBytes(t *testing.T) {
+	fx := startRelayFixture(t)
+	ctx := context.Background()
+
+	rootPrin := ldrcrypto.RootPrincipal(fx.root1.PublicKey())
+	rootSess, err := DialSession(ctx, fx.origin, fx.lineID, fx.profDigest, 1, rootPrin, fx.root1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rootSess.Close()
+
+	rk0, _ := fx.desc.RootKeys[0].ToCBOR()
+	rk1, _ := fx.desc.RootKeys[1].ToCBOR()
+	profMap, _ := fx.desc.Profile.ToCBORMap()
+	initRaw := mustMarshalSignedIntent(t, fx.root1, WireIntentInput{
+		ProfileDigest: fx.profDigest, LineID: fx.lineID, Generation: 1,
+		Origin: ldrcore.OriginRoot, Principal: rootPrin,
+		OpID: "op-init", OpType: "line_init", SeenSeq: 0, SeenHead: fx.genesis, PayloadCommit: ldrcrypto.EmptyPayloadCommit(),
+		Fields: ldrcrypto.Map{{Key: "descriptor_digest", Value: fx.cd[:]}, {Key: "profile", Value: profMap}, {Key: "root_keys", Value: []any{rk0, rk1}}},
+	})
+	rep, err := rootSess.Submit(ctx, initRaw, nil, nil)
+	if err != nil || rep.Outcome.Kind != ldrcore.Committed {
+		t.Fatalf("line_init: %+v %v", rep, err)
+	}
+	head := rep.Head
+	seq := rep.Outcome.Seq
+
+	opKey, _ := ldrcrypto.GenerateEd25519Key()
+	opPub, _ := opKey.PublicKey().ToCBOR()
+	fx.clock.wall += 1000
+	fx.clock.mono += 1000
+	authRaw := mustMarshalSignedIntent(t, fx.root1, WireIntentInput{
+		ProfileDigest: fx.profDigest, LineID: fx.lineID, Generation: 1,
+		Origin: ldrcore.OriginRoot, Principal: rootPrin,
+		OpID: "op-auth", OpType: "operator_key_authorize", SeenSeq: seq, SeenHead: head, ValidityMS: 60_000,
+		PayloadCommit: ldrcrypto.EmptyPayloadCommit(), Expect: ldrcrypto.ExpectMap{"root_rev": 1},
+		Fields: ldrcrypto.Map{{Key: "operator_key", Value: opPub}},
+	})
+	rep, err = rootSess.Submit(ctx, authRaw, nil, nil)
+	if err != nil || rep.Outcome.Kind != ldrcore.Committed {
+		t.Fatalf("auth op: %+v %v", rep, err)
+	}
+	head, seq = rep.Head, rep.Outcome.Seq
+
+	opPrin := ldrcrypto.OperatorPrincipal(opKey.PublicKey())
+	opSess, err := DialSession(ctx, fx.origin, fx.lineID, fx.profDigest, 1, opPrin, opKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opSess.Close()
+
+	// Enroll one credential with actor_limit=8 so 8 actors x 3 registers = 24 entries,
+	// each carrying ~56 KiB ciphertext -> ~1.35 MiB total (> 1 MiB maxHTTPBodyBytes!).
+	credSig, _ := ldrcrypto.GenerateEd25519Key()
+	credEnc, _ := ldrcrypto.GenerateX25519Key()
+	credID, _ := ldrcrypto.DeriveCredID(credSig.PublicKey(), credEnc.PublicKey())
+	grant := ldrcrypto.JoinGrant{NamespaceID: "ns-bulk", ActorLimit: 8, Reader: true}
+	req, err := ldrcrypto.SignJoinRequest(credSig, ldrcrypto.JoinRequest{
+		RequestID: bytes.Repeat([]byte{0x61}, 16), LineID: fx.lineID, Generation: 1,
+		DescriptorDigest: fx.cd, EncryptionKey: credEnc.PublicKey(), Grant: grant,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, sec, err := ldrcrypto.CreateJoinChallenge(opKey.PublicKey(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr, err := ldrcrypto.RespondJoinChallenge(credSig, credEnc, opKey.PublicKey(), req, ch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ldrcrypto.VerifyJoinProof(opKey.PublicKey(), req, ch, sec, pr); err != nil {
+		t.Fatal(err)
+	}
+	reqDig, _ := ldrcrypto.VerifyJoinRequest(req)
+	skC, _ := req.SigningKey.ToCBOR()
+	ekC, _ := req.EncryptionKey.ToCBOR()
+	fx.clock.wall += 1000
+	fx.clock.mono += 1000
+	enrollRaw := mustMarshalSignedIntent(t, opKey, WireIntentInput{
+		ProfileDigest: fx.profDigest, LineID: fx.lineID, Generation: 1,
+		Origin: ldrcore.OriginOperator, Principal: opPrin,
+		OpID: "op-enroll", OpType: "credential_enroll", AuthEpoch: 1, SeenSeq: seq, SeenHead: head, ValidityMS: 60_000,
+		PayloadCommit: ldrcrypto.EmptyPayloadCommit(),
+		Fields: ldrcrypto.Map{
+			{Key: "cred_id", Value: credID[:]},
+			{Key: "encryption_key", Value: ekC},
+			{Key: "grant", Value: ldrcrypto.Map{
+				{Key: "actor_limit", Value: grant.ActorLimit},
+				{Key: "namespace_id", Value: grant.NamespaceID},
+				{Key: "reader", Value: grant.Reader},
+			}},
+			{Key: "join_request_digest", Value: reqDig[:]},
+			{Key: "join_request_id", Value: req.RequestID},
+			{Key: "signing_key", Value: skC},
+		},
+	})
+	rep, err = opSess.Submit(ctx, enrollRaw, nil, nil)
+	if err != nil || rep.Outcome.Kind != ldrcore.Committed {
+		t.Fatalf("enroll: %+v %v", rep, err)
+	}
+	head, seq = rep.Head, rep.Outcome.Seq
+
+	epochKey, _ := ldrcrypto.GenerateEpochKey()
+	rsDig, _ := ldrcrypto.ReaderSetDigest([][32]byte{credID})
+	wb, err := ldrcrypto.WrapEpochKey(epochKey, ldrcrypto.EpochWrapContext{
+		LineID: fx.lineID, Generation: 1, ProfileDigest: fx.profDigest,
+		NewEpoch: 1, ExpectEpoch: 0, AuthEpoch: 2, OpIdentityBytes: []byte("op-ep1"),
+		RecipientCredID: credID, RecipientEncKey: credEnc.PublicKey(), ReaderSetDigest: rsDig,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wc, _ := ldrcrypto.CommitWrap(wb)
+	fx.clock.wall += 1000
+	fx.clock.mono += 1000
+	epRaw := mustMarshalSignedIntent(t, opKey, WireIntentInput{
+		ProfileDigest: fx.profDigest, LineID: fx.lineID, Generation: 1,
+		Origin: ldrcore.OriginOperator, Principal: opPrin,
+		OpID: "op-ep1", OpType: "key_epoch_activate", AuthEpoch: 2, SeenSeq: seq, SeenHead: head, ValidityMS: 60_000,
+		PayloadCommit: ldrcrypto.EmptyPayloadCommit(), Expect: ldrcrypto.ExpectMap{"key_epoch": 0},
+		Manifest: []ldrcrypto.WrapManifestEntry{{CredID: credID, Commit: wc}},
+	})
+	rep, err = opSess.Submit(ctx, epRaw, nil, map[[32]byte][]byte{credID: wb})
+	if err != nil || rep.Outcome.Kind != ldrcore.Committed {
+		t.Fatalf("epoch activate: %+v %v", rep, err)
+	}
+	head, seq = rep.Head, rep.Outcome.Seq
+
+	credPrin := ldrcrypto.CredentialPrincipal(credID)
+	credSess, err := DialSession(ctx, fx.origin, fx.lineID, fx.profDigest, 1, credPrin, credSig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer credSess.Close()
+
+	largeBody := bytes.Repeat([]byte("A"), 56*1024) // ~56 KiB plaintext -> ~56.1 KiB package (< 64 KiB cap)
+	regTypes := []string{"presence", "roadmap", "resource"}
+	opIdx := 0
+	for a := 1; a <= 8; a++ {
+		actor := fmt.Sprintf("actor-%02d", a)
+		opIdx++
+		fx.clock.wall += 100
+		fx.clock.mono += 100
+		declRaw := mustMarshalSignedIntent(t, credSig, WireIntentInput{
+			ProfileDigest: fx.profDigest, LineID: fx.lineID, Generation: 1,
+			Origin: ldrcore.OriginCredential, Principal: credPrin,
+			OpID: fmt.Sprintf("op-d-%d", opIdx), OpType: "actor_declare", AuthEpoch: 2, KeyEpoch: 1,
+			SeenSeq: seq, SeenHead: head, ValidityMS: 60_000,
+			PayloadCommit: ldrcrypto.EmptyPayloadCommit(),
+			Fields:        ldrcrypto.Map{{Key: "actor_id", Value: actor}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-bulk"}},
+		})
+		rep, err = credSess.Submit(ctx, declRaw, nil, nil)
+		if err != nil || rep.Outcome.Kind != ldrcore.Committed {
+			t.Fatalf("declare %s: %+v %v", actor, rep, err)
+		}
+		head, seq = rep.Head, rep.Outcome.Seq
+
+		for _, reg := range regTypes {
+			opIdx++
+			inc := fmt.Sprintf("inc-%s-%s", actor, reg)
+			fx.clock.wall += 100
+			fx.clock.mono += 100
+			actRaw := mustMarshalSignedIntent(t, credSig, WireIntentInput{
+				ProfileDigest: fx.profDigest, LineID: fx.lineID, Generation: 1,
+				Origin: ldrcore.OriginCredential, Principal: credPrin,
+				OpID: fmt.Sprintf("op-a-%d", opIdx), OpType: "register_activate", AuthEpoch: 2, KeyEpoch: 1,
+				SeenSeq: seq, SeenHead: head, ValidityMS: 60_000,
+				PayloadCommit: ldrcrypto.EmptyPayloadCommit(), Expect: ldrcrypto.ExpectMap{"writer_rev": 0},
+				Fields: ldrcrypto.Map{{Key: "actor_id", Value: actor}, {Key: "incarnation", Value: inc}, {Key: "register", Value: reg}},
+			})
+			rep, err = credSess.Submit(ctx, actRaw, nil, nil)
+			if err != nil || rep.Outcome.Kind != ldrcore.Committed {
+				t.Fatalf("activate %s/%s: %+v %v", actor, reg, rep, err)
+			}
+			head, seq = rep.Head, rep.Outcome.Seq
+
+			cBytes, _ := ldrcrypto.RegisterPayloadContextBytes(fx.profDigest, fx.lineID, 1, reg, actor, credID, 1, 1, inc, 1, 1)
+			pkg, err := ldrcrypto.SealPayload(epochKey, cBytes, largeBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cm, _ := ldrcrypto.CommitPayload(pkg)
+			envRaw, err := ldrcrypto.SignRegisterEnvelope(credSig, ldrcrypto.RegisterEnvelope{
+				Version: 1, LineID: fx.lineID, Generation: 1, ProfileDigest: fx.profDigest,
+				Register: reg, ActorID: actor, CredID: credID,
+				BindingGen: 1, WriterRev: 1, Incarnation: inc, KeyEpoch: 1, Counter: 1,
+				PayloadCommit: cm,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			putRep, err := credSess.PutRegister(ctx, envRaw, pkg)
+			if err != nil || putRep.Class != "ok" {
+				t.Fatalf("PutRegister %s/%s: rep=%+v err=%v", actor, reg, putRep, err)
+			}
+		}
+	}
+
+	// 1. Verify default byte-budget pagination splits the ~1.35 MiB dataset (> 1 MiB transport cap!)
+	//    across multiple <=512 KiB pages, and SessionClient.ListRegisters consumes all 24 entries cleanly.
+	p1, cur1, more1, err := opSess.ListRegistersPage(ctx, "", "", MaxRegisterPageCount)
+	if err != nil {
+		t.Fatalf("ListRegistersPage(1): %v", err)
+	}
+	if !more1 || len(p1) == 0 || len(p1) >= 24 || cur1 == "" {
+		t.Fatalf("expected byte-bounded first page (<24 entries, has_more=true), got len=%d more=%v cur=%q", len(p1), more1, cur1)
+	}
+	all, err := opSess.ListRegisters(ctx, "")
+	if err != nil {
+		t.Fatalf("ListRegisters across >1MiB dataset failed: %v", err)
+	}
+	if len(all) != 24 {
+		t.Fatalf("expected all 24 entries across pages, got %d", len(all))
+	}
+
+	// 2. Verify explicit max_count pagination walks filtered entries cleanly in sorted order.
+	var byCount []RegisterEntryWire
+	after := ""
+	pages := 0
+	for {
+		pg, next, more, err := opSess.ListRegistersPage(ctx, "presence", after, 3)
+		if err != nil {
+			t.Fatalf("ListRegistersPage(presence, page %d): %v", pages, err)
+		}
+		pages++
+		if len(pg) > 3 {
+			t.Fatalf("page exceeded max_count=3: got %d", len(pg))
+		}
+		byCount = append(byCount, pg...)
+		if !more {
+			break
+		}
+		after = next
+	}
+	if len(byCount) != 8 || pages < 3 {
+		t.Fatalf("expected 8 presence entries across >=3 pages, got len=%d pages=%d", len(byCount), pages)
 	}
 }

@@ -402,6 +402,10 @@ func openClientLocked(dir string, lf *os.File, syncFile func(*os.File) error, sy
 		cleanupLock()
 		return nil, err
 	}
+	if err := syncOutboxBarrier(filepath.Join(dir, "registers.cbor"), syncFile, syncDir); err != nil {
+		cleanupLock()
+		return nil, err
+	}
 
 	cfg, err := loadConfig(filepath.Join(dir, "config.cbor"))
 	if err != nil {
@@ -1177,6 +1181,9 @@ func (c *Client) ReconcileDurability() error {
 	if err := syncOutboxBarrier(c.cursorsPath(), c.syncFileFn, c.syncDirFn); err != nil {
 		return err
 	}
+	if err := syncOutboxBarrier(c.registersPath(), c.syncFileFn, c.syncDirFn); err != nil {
+		return err
+	}
 	ob, err := loadOutbox(c.outboxPath())
 	if err != nil {
 		return err
@@ -1222,6 +1229,21 @@ func (c *Client) ReconcileDurability() error {
 		}
 		if prevNotice.Acked && !gotNotice.Acked {
 			return fmt.Errorf("%w: reconciled cursors.cbor regressed acknowledged notice %q", ldrstore.ErrCorruptWAL, id)
+		}
+	}
+	regs, err := loadRegisters(c.registersPath())
+	if err != nil {
+		return err
+	}
+	if c.registersUncertain {
+		for k, w := range c.registers.Writers {
+			if _, exists := regs.Writers[k]; !exists {
+				cp := *w
+				regs.Writers[k] = &cp
+			}
+		}
+		for _, w := range regs.Writers {
+			w.TrustedCounter = false
 		}
 	}
 	frames, err := loadVerifiedWAL(c.walPath(), c.syncFileFn, c.syncDirFn)
@@ -1281,6 +1303,15 @@ func (c *Client) ReconcileDurability() error {
 			slots[e.Slot] = e.OpID
 		}
 	}
+	// If register counter durability was uncertain, durably persist the
+	// untrusted-counter requirement BEFORE clearing registersUncertain or
+	// installing candidate state so an immediate close+reopen still forces
+	// fresh register_activate re-incarnation (§9).
+	if c.registersUncertain {
+		if err := c.persistRegistersLocked(regs); err != nil {
+			return err
+		}
+	}
 	c.state = cand.state
 	c.entries = cand.entries
 	c.ckGen = cand.ckGen
@@ -1293,16 +1324,9 @@ func (c *Client) ReconcileDurability() error {
 	c.epochs = ep
 	c.outbox = ob
 	c.cursors = cur
-	if regs, rerr := loadRegisters(c.registersPath()); rerr == nil {
-		if c.registersUncertain {
-			for _, w := range regs.Writers {
-				w.TrustedCounter = false
-			}
-		}
-		c.registers = regs
-		c.registersUncertain = false
-		c.registersUncertainMsg = ""
-	}
+	c.registers = regs
+	c.registersUncertain = false
+	c.registersUncertainMsg = ""
 	c.slots = slots
 	c.outboxUncertain = false
 	c.outboxUncertainReason = ""

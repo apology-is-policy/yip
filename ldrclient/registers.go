@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 
 	"github.com/apology-is-policy/yip/ldrcore"
 	"github.com/apology-is-policy/yip/ldrcrypto"
@@ -51,7 +50,7 @@ type VerifiedRegister struct {
 	Counter      uint64
 	AcceptedAtMS uint64
 	Historical   bool
-	ReadStatus   string // ReadOK, ReadNoKey, ReadUndecryptable
+	ReadStatus   string // ldrcore.ReadOK, ReadNoKey, ReadUndecryptable
 	Plaintext    []byte
 }
 
@@ -183,6 +182,17 @@ func (c *Client) markRegistersUncertainOnErrLocked(err error) {
 	}
 }
 
+func (c *Client) recordValidatedRevokedStopLocked(prinTok, code string) error {
+	cand := clonePersistedOutbox(c.outbox)
+	c.recordToldRevokedOnLocked(&cand, prinTok, code)
+	if err := c.persistOutboxLocked(cand); err != nil {
+		c.markOutboxUncertainOnErrLocked(err)
+		return err
+	}
+	c.outbox = cand
+	return nil
+}
+
 func randomIncarnationID() (string, error) {
 	b := make([]byte, 16)
 	if _, err := io.ReadFull(rand.Reader, b); err != nil {
@@ -192,11 +202,14 @@ func randomIncarnationID() (string, error) {
 }
 
 // EnsureRegisterActivated ensures that this credential owns an active, trusted
-// §9 writer incarnation for (actorID, register). Does not issue a redundant
-// register_activate when the committed activation matches the local trusted counter.
+// §9 writer incarnation for (actorID, register). Enforces Rule 8 credential stop
+// checks before taking any fast path or issuing requests.
 func (c *Client) EnsureRegisterActivated(ctx context.Context, sess *ldrrelay.SessionClient, actorID, register string) error {
 	if !ldrcrypto.ValidRegisterType(register) || actorID == "" {
 		return fmt.Errorf("ldrclient: invalid actor %q or register %q", actorID, register)
+	}
+	if sess == nil {
+		return errors.New("ldrclient: nil session")
 	}
 	key := actorID + "/" + register
 
@@ -230,6 +243,16 @@ func (c *Client) EnsureRegisterActivated(ctx context.Context, sess *ldrrelay.Ses
 		return errors.New("ldrclient: credential keys required for register activation")
 	}
 	credTok := ldrrelay.CredToken(c.credKeys.CredID)
+	credPrinTok := ldrcore.CredentialPrincipal(credTok)
+	if c.signsNoMoreLocked(credPrinTok) {
+		c.mu.Unlock()
+		return ErrKeyRevoked
+	}
+	sessPrin := sess.Principal()
+	if sessPrin.Kind != ldrcrypto.PrincipalCredential || sessPrin.CredID != c.credKeys.CredID {
+		c.mu.Unlock()
+		return errors.New("ldrclient: register activation session principal does not match loaded credential")
+	}
 	actor := c.state.Line.Actors[actorID]
 	if actor == nil || !actor.Live || actor.Cred != credTok {
 		c.mu.Unlock()
@@ -309,11 +332,14 @@ func (c *Client) EnsureRegisterActivated(ctx context.Context, sess *ldrrelay.Ses
 
 // PublishRegister encrypts plaintext under the active key epoch, signs a §9
 // advisory register envelope with a durably advanced monotonic counter, and
-// publishes it to the relay. Re-activates once if the relay reports a stale
-// activation or counter.
+// publishes it to the relay. Enforces local Rule 8 stops before signing/sending
+// and durably persists Rule 8 terminal evidence on a validated unresolved/revoked reply.
 func (c *Client) PublishRegister(ctx context.Context, sess *ldrrelay.SessionClient, actorID, register string, plaintext []byte) (ldrrelay.RegisterPutReply, error) {
 	if !ldrcrypto.ValidRegisterType(register) || actorID == "" {
 		return ldrrelay.RegisterPutReply{}, fmt.Errorf("ldrclient: invalid actor %q or register %q", actorID, register)
+	}
+	if sess == nil {
+		return ldrrelay.RegisterPutReply{}, errors.New("ldrclient: nil session")
 	}
 	key := actorID + "/" + register
 
@@ -346,6 +372,16 @@ func (c *Client) PublishRegister(ctx context.Context, sess *ldrrelay.SessionClie
 		if c.credKeys == nil {
 			c.mu.Unlock()
 			return ldrrelay.RegisterPutReply{}, errors.New("ldrclient: credential keys required for register publish")
+		}
+		credPrinTok := ldrcore.CredentialPrincipal(ldrrelay.CredToken(c.credKeys.CredID))
+		if c.signsNoMoreLocked(credPrinTok) {
+			c.mu.Unlock()
+			return ldrrelay.RegisterPutReply{}, ErrKeyRevoked
+		}
+		sessPrin := sess.Principal()
+		if sessPrin.Kind != ldrcrypto.PrincipalCredential || sessPrin.CredID != c.credKeys.CredID {
+			c.mu.Unlock()
+			return ldrrelay.RegisterPutReply{}, errors.New("ldrclient: register publish session principal does not match loaded credential")
 		}
 		if c.state.Line.RekeyPending {
 			c.mu.Unlock()
@@ -429,7 +465,15 @@ func (c *Client) PublishRegister(ctx context.Context, sess *ldrrelay.SessionClie
 		if rep.Class == "ok" {
 			return rep, nil
 		}
-		if rep.Code == "revoked" {
+		if rep.Class == ldrcore.ClassUnresolved && rep.Code == "revoked" {
+			// Reply binding was verified on the pinned TLS 1.3 session for
+			// credPrinTok; persist Rule 8 terminal stop before returning.
+			c.mu.Lock()
+			perr := c.recordValidatedRevokedStopLocked(credPrinTok, rep.Code)
+			c.mu.Unlock()
+			if perr != nil {
+				return rep, perr
+			}
 			return rep, ErrKeyRevoked
 		}
 		if attempt == 0 && (rep.Code == ldrcore.RegStaleWriter || rep.Code == ldrcore.RegNoActivation ||
@@ -438,8 +482,15 @@ func (c *Client) PublishRegister(ctx context.Context, sess *ldrrelay.SessionClie
 				return rep, serr
 			}
 			c.mu.Lock()
-			if w := c.registers.Writers[key]; w != nil {
-				w.TrustedCounter = false
+			if c.registers.Writers[key] != nil {
+				cand := clonePersistedRegisters(c.registers)
+				cand.Writers[key].TrustedCounter = false
+				if perr := c.persistRegistersLocked(cand); perr != nil {
+					c.markRegistersUncertainOnErrLocked(perr)
+					c.mu.Unlock()
+					return rep, perr
+				}
+				c.registers = cand
 			}
 			c.mu.Unlock()
 			continue
@@ -449,17 +500,53 @@ func (c *Client) PublishRegister(ctx context.Context, sess *ldrrelay.SessionClie
 	return ldrrelay.RegisterPutReply{}, ErrRegisterRejected
 }
 
-// ReadRegisters fetches advisory registers from the relay, cryptographically
-// verifies every envelope signature and payload commitment against local
-// verified.wal state, computes Historical locally per §9, and decrypts bodies
-// using locally unwrapped epoch keys.
+// ReadRegisters fetches advisory registers from the relay across bounded pages,
+// enforces local Rule 8 stop checks on the session principal, cryptographically
+// verifies every envelope signature, payload commitment, and committed writer
+// incarnation/binding against local verified.wal state, computes Historical
+// locally per §9, and decrypts bodies using locally unwrapped epoch keys.
 func (c *Client) ReadRegisters(ctx context.Context, sess *ldrrelay.SessionClient, registerFilter string) ([]VerifiedRegister, error) {
 	if registerFilter != "" && !ldrcrypto.ValidRegisterType(registerFilter) {
 		return nil, fmt.Errorf("ldrclient: unknown register %q", registerFilter)
 	}
+	if sess == nil {
+		return nil, errors.New("ldrclient: nil session")
+	}
+	sessPrinTok, err := ldrrelay.PrincipalToken(sess.Principal())
+	if err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	if c.outboxUncertain {
+		c.mu.Unlock()
+		return nil, ErrOutboxUncertain
+	}
+	if c.epochsUncertain {
+		c.mu.Unlock()
+		return nil, ErrEpochsUncertain
+	}
+	if c.outbox.Halted != "" {
+		reason := c.outbox.Halted
+		c.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrViolation, reason)
+	}
+	if c.signsNoMoreLocked(sessPrinTok) {
+		c.mu.Unlock()
+		return nil, ErrKeyRevoked
+	}
+	c.mu.Unlock()
+
 	entries, err := sess.ListRegisters(ctx, registerFilter)
 	if err != nil {
-		if strings.Contains(err.Error(), "revoked") {
+		var authErr *ldrrelay.AuthError
+		if errors.As(err, &authErr) && authErr.Class == ldrcore.ClassUnresolved && authErr.Code == "revoked" {
+			c.mu.Lock()
+			perr := c.recordValidatedRevokedStopLocked(sessPrinTok, authErr.Code)
+			c.mu.Unlock()
+			if perr != nil {
+				return nil, perr
+			}
 			return nil, ErrKeyRevoked
 		}
 		return nil, err
@@ -508,14 +595,32 @@ func (c *Client) ReadRegisters(ctx context.Context, sess *ldrrelay.SessionClient
 			return nil, fmt.Errorf("%w: register envelope signature invalid: %v", ErrViolation, err)
 		}
 
-		// Compute Historical locally against verified.wal state (§9); never trust relay boolean.
+		// Validate signed writer_rev, incarnation, and binding_gen against the
+		// committed writer activation in verified.wal (§9).
 		actor := c.state.Line.Actors[env.ActorID]
 		w := c.state.Line.RegisterWriters[env.ActorID+"/"+env.Register]
+		if w == nil || env.WriterRev > uint64(w.WriterRev) {
+			return nil, fmt.Errorf("%w: register writer_rev %d exceeds committed activation for %s/%s", ErrViolation, env.WriterRev, env.ActorID, env.Register)
+		}
+		if env.WriterRev == uint64(w.WriterRev) {
+			if env.Incarnation != w.Incarnation || env.BindingGen != uint64(w.BindingGen) {
+				return nil, fmt.Errorf("%w: register writer_rev %d contradicts committed activation (incarnation/binding_gen) for %s/%s", ErrViolation, env.WriterRev, env.ActorID, env.Register)
+			}
+			if actor != nil && w.BindingGen == actor.BindingGen && credTok != actor.Cred {
+				return nil, fmt.Errorf("%w: register writer_rev %d signed by non-owning credential for %s/%s", ErrViolation, env.WriterRev, env.ActorID, env.Register)
+			}
+		} else if env.BindingGen > uint64(w.BindingGen) || (actor != nil && env.BindingGen > uint64(actor.BindingGen)) {
+			return nil, fmt.Errorf("%w: register superseded writer_rev %d has impossible binding_gen %d for %s/%s", ErrViolation, env.WriterRev, env.BindingGen, env.ActorID, env.Register)
+		}
+
+		// Compute Historical locally against verified.wal state (§9); never trust relay boolean.
 		historical := cred.Revoked ||
 			actor == nil || !actor.Live ||
 			actor.Cred != credTok ||
 			uint64(actor.BindingGen) != env.BindingGen ||
-			w == nil || uint64(w.WriterRev) != env.WriterRev
+			w.BindingGen != actor.BindingGen ||
+			uint64(w.WriterRev) != env.WriterRev ||
+			w.Incarnation != env.Incarnation
 
 		vr := VerifiedRegister{
 			Actor:        env.ActorID,

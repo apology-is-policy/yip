@@ -13,6 +13,16 @@ import (
 	"github.com/apology-is-policy/yip/ldrcrypto"
 )
 
+const (
+	// MaxRegisterPageCount bounds entries returned by a single /register/list page.
+	MaxRegisterPageCount = 64
+	// MaxRegisterPageBytes bounds cumulative encoded entry bytes per /register/list
+	// page so responses stay safely below maxHTTPBodyBytes (1 MiB) even when many
+	// actors hold large 64 KiB encrypted registers.
+	MaxRegisterPageBytes = 512 * 1024
+	maxRegisterListPages = 1024
+)
+
 type storedRegister struct {
 	actor        string
 	register     string
@@ -30,7 +40,8 @@ type RegisterPutReply struct {
 
 // RegisterEntryWire is one cached signed/encrypted advisory register entry served
 // by the relay. Clients MUST independently verify the envelope signature, payload
-// commitment, and Historical status against their own verified log state.
+// commitment, writer incarnation/binding, and Historical status against their own
+// verified log state.
 type RegisterEntryWire struct {
 	Actor        string
 	Register     string
@@ -38,6 +49,17 @@ type RegisterEntryWire struct {
 	Payload      []byte
 	AcceptedAtMS uint64
 	Historical   bool
+}
+
+func registerEntryCBOR(ent RegisterEntryWire) ldrcrypto.Map {
+	return ldrcrypto.Map{
+		{Key: "accepted_at_ms", Value: ent.AcceptedAtMS},
+		{Key: "actor", Value: ent.Actor},
+		{Key: "envelope", Value: ent.EnvBytes},
+		{Key: "historical", Value: ent.Historical},
+		{Key: "payload", Value: ent.Payload},
+		{Key: "register", Value: ent.Register},
+	}
 }
 
 // PublishRegister verifies and publishes one signed/encrypted advisory register
@@ -117,28 +139,35 @@ func (e *RelayEngine) PublishRegister(lineID []byte, sessPrincipal ldrcrypto.Pri
 	return RegisterPutReply{Class: "ok", AcceptedAtMS: uint64(nowMS)}
 }
 
-// ListRegisters returns cached advisory register entries for an authenticated
-// standing principal, optionally filtered by register type ("presence", "roadmap", "resource").
-func (e *RelayEngine) ListRegisters(lineID []byte, sessPrincipal ldrcrypto.Principal, registerFilter string) ([]RegisterEntryWire, string) {
+// ListRegistersPage returns one deterministic, sorted page of cached advisory
+// registers strictly after afterKey, bounded by both maxCount and maxBytes
+// (exact canonical CBOR encoded entry byte budget).
+func (e *RelayEngine) ListRegistersPage(lineID []byte, sessPrincipal ldrcrypto.Principal, registerFilter, afterKey string, maxCount, maxBytes uint64) ([]RegisterEntryWire, string, bool, string) {
 	rt, ok := e.getLine(lineID)
 	if !ok {
-		return nil, "wrong_line"
+		return nil, "", false, "wrong_line"
 	}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
 	if rt.quarantined {
-		return nil, "storage_quarantined"
+		return nil, "", false, "storage_quarantined"
 	}
 	_, stg := rt.resolveSignerKeyLocked(sessPrincipal)
 	switch stg {
 	case standingRevoked:
-		return nil, "revoked"
+		return nil, "", false, "revoked"
 	case standingNever:
-		return nil, "unknown_signer"
+		return nil, "", false, "unknown_signer"
 	}
 	if registerFilter != "" && !ldrcrypto.ValidRegisterType(registerFilter) {
-		return nil, ldrcore.RegUnknownType
+		return nil, "", false, ldrcore.RegUnknownType
+	}
+	if maxCount == 0 || maxCount > MaxRegisterPageCount {
+		maxCount = MaxRegisterPageCount
+	}
+	if maxBytes == 0 || maxBytes > MaxRegisterPageBytes {
+		maxBytes = MaxRegisterPageBytes
 	}
 
 	keys := make([]string, 0, len(rt.regData))
@@ -146,23 +175,63 @@ func (e *RelayEngine) ListRegisters(lineID []byte, sessPrincipal ldrcrypto.Princ
 		if registerFilter != "" && sr.register != registerFilter {
 			continue
 		}
+		if afterKey != "" && k <= afterKey {
+			continue
+		}
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
-	out := make([]RegisterEntryWire, 0, len(keys))
+	out := make([]RegisterEntryWire, 0, min(len(keys), int(maxCount)))
+	var usedBytes uint64
+	hasMore := false
+	nextCursor := ""
 	for _, k := range keys {
 		sr := rt.regData[k]
-		out = append(out, RegisterEntryWire{
+		ent := RegisterEntryWire{
 			Actor:        sr.actor,
 			Register:     sr.register,
 			EnvBytes:     bytes.Clone(sr.envBytes),
 			Payload:      bytes.Clone(sr.payload),
 			AcceptedAtMS: sr.acceptedAtMS,
 			Historical:   rt.registers.Historical(rt.state, sr.actor, sr.register),
+		}
+		enc, err := ldrcrypto.MarshalCBORWithLimits(registerEntryCBOR(ent), ldrcrypto.Limits{
+			MaxBytes: maxHTTPBodyBytes, MaxDepth: 16, MaxItems: 1024,
 		})
+		if err != nil {
+			return nil, "", false, "internal_encoding_error"
+		}
+		entBytes := uint64(len(enc))
+		if uint64(len(out)) >= maxCount || (len(out) > 0 && usedBytes+entBytes > maxBytes) {
+			hasMore = true
+			last := out[len(out)-1]
+			nextCursor = last.Actor + "/" + last.Register
+			break
+		}
+		out = append(out, ent)
+		usedBytes += entBytes
 	}
-	return out, ""
+	return out, nextCursor, hasMore, ""
+}
+
+// ListRegisters returns all cached advisory register entries for an authenticated
+// standing principal, optionally filtered by register type.
+func (e *RelayEngine) ListRegisters(lineID []byte, sessPrincipal ldrcrypto.Principal, registerFilter string) ([]RegisterEntryWire, string) {
+	var all []RegisterEntryWire
+	after := ""
+	for page := 0; page < maxRegisterListPages; page++ {
+		entries, next, more, errCode := e.ListRegistersPage(lineID, sessPrincipal, registerFilter, after, MaxRegisterPageCount, MaxRegisterPageBytes)
+		if errCode != "" {
+			return nil, errCode
+		}
+		all = append(all, entries...)
+		if !more {
+			return all, ""
+		}
+		after = next
+	}
+	return all, ""
 }
 
 func (s *RelayServer) handleRegisterPut(w http.ResponseWriter, lineID []byte, cb [32]byte, body []byte, reqDigest [32]byte) {
@@ -232,7 +301,7 @@ func (s *RelayServer) handleRegisterList(w http.ResponseWriter, lineID []byte, c
 		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
 		return
 	}
-	if err := ldrcrypto.RequireExactKeys(m, []string{"register", "req_id", "session_id", "v"}); err != nil {
+	if err := ldrcrypto.RequireExactKeys(m, []string{"register", "req_id", "session_id", "v"}, "after_key", "max_count"); err != nil {
 		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
 		return
 	}
@@ -247,12 +316,28 @@ func (s *RelayServer) handleRegisterList(w http.ResponseWriter, lineID []byte, c
 		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
 		return
 	}
+	var afterKey string
+	if _, has := m["after_key"]; has {
+		afterKey, err = ldrcrypto.MapString(m, "after_key")
+		if err != nil {
+			writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
+			return
+		}
+	}
+	var maxCount uint64
+	if _, has := m["max_count"]; has {
+		maxCount, err = ldrcrypto.MapUint(m, "max_count")
+		if err != nil {
+			writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
+			return
+		}
+	}
 	prin, gen, ok := s.validateSession(sid, lineID, cb, reqID, true)
 	if !ok {
 		writeCBOR(w, http.StatusUnauthorized, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "invalid_session"}, {Key: "v", Value: uint64(1)}})
 		return
 	}
-	entries, errCode := s.engine.ListRegisters(lineID, prin, regFilter)
+	entries, nextCursor, hasMore, errCode := s.engine.ListRegistersPage(lineID, prin, regFilter, afterKey, maxCount, s.registerPageByteCap())
 	if errCode != "" {
 		cls := ldrcore.ClassAdmission
 		status := http.StatusForbidden
@@ -277,19 +362,14 @@ func (s *RelayServer) handleRegisterList(w http.ResponseWriter, lineID []byte, c
 	}
 	arr := make([]any, len(entries))
 	for i, ent := range entries {
-		arr[i] = ldrcrypto.Map{
-			{Key: "accepted_at_ms", Value: ent.AcceptedAtMS},
-			{Key: "actor", Value: ent.Actor},
-			{Key: "envelope", Value: ent.EnvBytes},
-			{Key: "historical", Value: ent.Historical},
-			{Key: "payload", Value: ent.Payload},
-			{Key: "register", Value: ent.Register},
-		}
+		arr[i] = registerEntryCBOR(ent)
 	}
 	writeCBOR(w, http.StatusOK, ldrcrypto.Map{
 		{Key: "class", Value: "ok"},
 		{Key: "entries", Value: arr},
+		{Key: "has_more", Value: hasMore},
 		{Key: "line_id", Value: lineID},
+		{Key: "next_cursor", Value: nextCursor},
 		{Key: "req_digest", Value: reqDigest[:]},
 		{Key: "req_id", Value: reqID},
 		{Key: "session_gen", Value: gen},
@@ -332,68 +412,136 @@ func (c *SessionClient) PutRegister(ctx context.Context, envBytes, payload []byt
 	return out, nil
 }
 
-// ListRegisters fetches cached advisory registers over the bound session.
-func (c *SessionClient) ListRegisters(ctx context.Context, registerFilter string) ([]RegisterEntryWire, error) {
+// ListRegistersPage fetches one bounded page of cached advisory registers over
+// the bound session. Returns *AuthError when the relay returns a reply-bound
+// unresolved/revoked refusal.
+func (c *SessionClient) ListRegistersPage(ctx context.Context, registerFilter, afterKey string, maxCount uint64) ([]RegisterEntryWire, string, bool, error) {
 	c.mu.Lock()
 	c.nextReqID++
 	reqID := c.nextReqID
 	c.mu.Unlock()
 
-	rawReq, err := ldrcrypto.MarshalCBOR(ldrcrypto.Map{
+	reqMap := ldrcrypto.Map{
 		{Key: "register", Value: registerFilter},
 		{Key: "req_id", Value: reqID},
 		{Key: "session_id", Value: c.sessionID},
 		{Key: "v", Value: uint64(1)},
-	})
+	}
+	if afterKey != "" {
+		reqMap = append(reqMap, ldrcrypto.MapEntry{Key: "after_key", Value: afterKey})
+	}
+	if maxCount > 0 {
+		reqMap = append(reqMap, ldrcrypto.MapEntry{Key: "max_count", Value: maxCount})
+	}
+	rawReq, err := ldrcrypto.MarshalCBOR(reqMap)
 	if err != nil {
-		return nil, err
+		return nil, "", false, err
 	}
 	reqDigest := sha256.Sum256(rawReq)
 	resp, err := c.postRawCBOR(ctx, "register/list", rawReq)
 	if err != nil {
-		return nil, err
+		return nil, "", false, err
 	}
 	if err := c.verifyReplyBinding(resp, reqID, reqDigest); err != nil {
-		return nil, err
+		return nil, "", false, err
 	}
-	cls, _ := ldrcrypto.MapString(resp, "class")
+	cls, err := ldrcrypto.MapString(resp, "class")
+	if err != nil || cls == "" {
+		return nil, "", false, errors.New("ldrrelay: malformed register list reply class")
+	}
 	if cls != "ok" {
-		code, _ := ldrcrypto.MapString(resp, "code")
-		return nil, fmt.Errorf("ldrrelay: register list refused (%s / %s)", cls, code)
+		code, err := ldrcrypto.MapString(resp, "code")
+		if err != nil || code == "" {
+			return nil, "", false, errors.New("ldrrelay: malformed register list refusal code")
+		}
+		if cls == ldrcore.ClassUnresolved && code == "revoked" {
+			return nil, "", false, &AuthError{Class: cls, Code: code}
+		}
+		return nil, "", false, fmt.Errorf("ldrrelay: register list refused (%s / %s)", cls, code)
+	}
+	if err := ldrcrypto.RequireExactKeys(resp, []string{
+		"class", "entries", "has_more", "line_id", "next_cursor",
+		"req_digest", "req_id", "session_gen", "session_id", "v",
+	}); err != nil {
+		return nil, "", false, fmt.Errorf("ldrrelay: malformed register list reply: %w", err)
+	}
+	hasMore, err := ldrcrypto.MapBool(resp, "has_more")
+	if err != nil {
+		return nil, "", false, err
+	}
+	nextCursor, err := ldrcrypto.MapString(resp, "next_cursor")
+	if err != nil {
+		return nil, "", false, err
 	}
 	arr, err := ldrcrypto.MapArray(resp, "entries")
 	if err != nil {
-		return nil, err
+		return nil, "", false, err
 	}
 	out := make([]RegisterEntryWire, 0, len(arr))
 	for _, elem := range arr {
 		em, ok := elem.(map[string]any)
 		if !ok {
-			return nil, errors.New("ldrrelay: invalid register entry element")
+			return nil, "", false, errors.New("ldrrelay: invalid register entry element")
 		}
 		if err := ldrcrypto.RequireExactKeys(em, []string{"accepted_at_ms", "actor", "envelope", "historical", "payload", "register"}); err != nil {
-			return nil, fmt.Errorf("ldrrelay: invalid register entry keys: %w", err)
+			return nil, "", false, fmt.Errorf("ldrrelay: invalid register entry keys: %w", err)
 		}
 		var ent RegisterEntryWire
 		if ent.Actor, err = ldrcrypto.MapString(em, "actor"); err != nil {
-			return nil, err
+			return nil, "", false, err
 		}
 		if ent.Register, err = ldrcrypto.MapString(em, "register"); err != nil {
-			return nil, err
+			return nil, "", false, err
 		}
 		if ent.EnvBytes, err = ldrcrypto.MapBytes(em, "envelope"); err != nil {
-			return nil, err
+			return nil, "", false, err
 		}
 		if ent.Payload, err = ldrcrypto.MapBytes(em, "payload"); err != nil {
-			return nil, err
+			return nil, "", false, err
 		}
 		if ent.AcceptedAtMS, err = ldrcrypto.MapUint(em, "accepted_at_ms"); err != nil {
-			return nil, err
+			return nil, "", false, err
 		}
 		if ent.Historical, err = ldrcrypto.MapBool(em, "historical"); err != nil {
-			return nil, err
+			return nil, "", false, err
 		}
 		out = append(out, ent)
 	}
-	return out, nil
+	if hasMore && (len(out) == 0 || nextCursor == "") {
+		return nil, "", false, errors.New("ldrrelay: register list page indicates has_more without progress")
+	}
+	if !hasMore && nextCursor != "" {
+		return nil, "", false, errors.New("ldrrelay: register list final page must have empty next_cursor")
+	}
+	return out, nextCursor, hasMore, nil
+}
+
+// ListRegisters fetches all cached advisory registers across bounded pages,
+// enforcing strictly advancing cursors and sorted unique keys.
+func (c *SessionClient) ListRegisters(ctx context.Context, registerFilter string) ([]RegisterEntryWire, error) {
+	var all []RegisterEntryWire
+	afterKey := ""
+	prevKey := ""
+	for page := 0; page < maxRegisterListPages; page++ {
+		entries, nextCursor, hasMore, err := c.ListRegistersPage(ctx, registerFilter, afterKey, MaxRegisterPageCount)
+		if err != nil {
+			return nil, err
+		}
+		for _, ent := range entries {
+			k := ent.Actor + "/" + ent.Register
+			if prevKey != "" && k <= prevKey {
+				return nil, fmt.Errorf("ldrrelay: non-monotonic register list key %q after %q", k, prevKey)
+			}
+			prevKey = k
+			all = append(all, ent)
+		}
+		if !hasMore {
+			return all, nil
+		}
+		if nextCursor <= afterKey || nextCursor != prevKey {
+			return nil, fmt.Errorf("ldrrelay: invalid register list cursor %q (after=%q last=%q)", nextCursor, afterKey, prevKey)
+		}
+		afterKey = nextCursor
+	}
+	return nil, errors.New("ldrrelay: register list exceeded maximum page count")
 }

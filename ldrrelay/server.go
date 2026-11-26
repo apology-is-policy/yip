@@ -54,12 +54,13 @@ type activeSession struct {
 type RelayServer struct {
 	engine *RelayEngine
 
-	mu          sync.Mutex
-	pending     map[string]pendingChallenge // hex(session_id)
-	sessions    map[string]*activeSession   // hex(session_id)
-	nowFn       func() time.Time            // nil defaults to time.Now (test hook)
-	idleTimeout time.Duration               // <=0 defaults to sessionIdleTimeout
-	mux         *http.ServeMux
+	mu              sync.Mutex
+	pending         map[string]pendingChallenge // hex(session_id)
+	sessions        map[string]*activeSession   // hex(session_id)
+	nowFn           func() time.Time            // nil defaults to time.Now (test hook)
+	idleTimeout     time.Duration               // <=0 defaults to sessionIdleTimeout
+	maxRegPageBytes uint64                      // 0 defaults to MaxRegisterPageBytes
+	mux             *http.ServeMux
 }
 
 // NewRelayServer creates an HTTP handler serving the LDR v1 relay API.
@@ -108,6 +109,27 @@ func (s *RelayServer) setTestSessionClock(nowFn func() time.Time, idle time.Dura
 	} else {
 		s.idleTimeout = sessionIdleTimeout
 	}
+}
+
+// SetMaxRegisterPageBytes overrides the encoded CBOR byte budget per
+// /register/list page (0 restores MaxRegisterPageBytes; capped at MaxRegisterPageBytes).
+func (s *RelayServer) SetMaxRegisterPageBytes(n uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n > MaxRegisterPageBytes {
+		n = MaxRegisterPageBytes
+	}
+	s.maxRegPageBytes = n
+}
+
+func (s *RelayServer) registerPageByteCap() uint64 {
+	s.mu.Lock()
+	n := s.maxRegPageBytes
+	s.mu.Unlock()
+	if n == 0 || n > MaxRegisterPageBytes {
+		return MaxRegisterPageBytes
+	}
+	return n
 }
 
 // ServeHTTP satisfies http.Handler. Every line endpoint requires TLS 1.3.
@@ -1115,6 +1137,9 @@ func (c *SessionClient) Close() {
 
 // SessionID returns the authenticated session ID.
 func (c *SessionClient) SessionID() []byte { return bytes.Clone(c.sessionID) }
+
+// Principal returns the authenticated principal bound to this session.
+func (c *SessionClient) Principal() ldrcrypto.Principal { return c.principal }
 
 // ChannelBinding returns the 32-byte RFC 9266 tls-exporter channel binding value.
 func (c *SessionClient) ChannelBinding() [32]byte { return c.cb }
