@@ -376,7 +376,7 @@ func TestLDRBridgeTwoWorkstationsMCPHooksLiveDeliveryAndHostLocalResources(t *te
 		if got := strings.Join(v.styledTranscript(90, colors()), " "); !strings.Contains(got, "Hello from Alice workstation over TLS 1.3!") {
 			t.Fatalf("transcript: %q", got)
 		}
-		if got := strings.Join(v.relayTopology(), " "); !strings.Contains(got, "bob-codex") || !strings.Contains(got, "alice-gemini") {
+		if got := strings.Join(v.relayTopology(colors()), " "); !strings.Contains(got, "bob-codex") || !strings.Contains(got, "alice-gemini") {
 			t.Fatalf("topology: %q", got)
 		}
 		for _, key := range "arbP4" {

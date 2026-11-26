@@ -103,39 +103,47 @@ func relayBoardEntries(tr *ldrclient.CallTranscript) []sbEntry {
 func (v *view) relayDashboard(w int, p palette) []string {
 	r := v.st.relay
 	out := []string{p.text(p.cyan, "RELAY STATUS")}
-	add := func(s string) { out = append(out, wrap(terminalText(s), w)...) }
+	add := func(style, s string) {
+		for _, line := range wrap(s, w) {
+			out = append(out, p.text(style, line))
+		}
+	}
 	if r.Origin.URL != "" {
-		add(r.Origin.URL)
-		add(r.Origin.SessionBinding)
+		add(p.ink, r.Origin.URL)
+		add(p.muted, r.Origin.SessionBinding)
 	}
 	if v.st.err != "" {
-		add("Refresh failed")
-		add(v.st.err)
+		add(p.red, "! Refresh failed")
+		add(p.muted, v.st.err)
 	}
 	if r.VerifiedAt.IsZero() {
 		if v.st.err == "" {
-			add("Connecting…")
+			add(p.amber, "○ Connecting…")
 		}
 		return out
 	}
-	add("Last verified " + r.VerifiedAt.Local().Format("15:04:05 MST"))
-	add(fmt.Sprintf("Checkpoint %d · epoch %d", r.Status.CheckpointSeq, r.Status.KeyEpoch))
-	add("Line " + r.Status.LineID)
+	stampStyle := p.green
+	if v.st.err != "" {
+		stampStyle = p.muted
+	}
+	add(stampStyle, "✓ Last verified "+r.VerifiedAt.Local().Format("15:04:05 MST"))
+	add(p.ink, fmt.Sprintf("Checkpoint %d · epoch %d", r.Status.CheckpointSeq, r.Status.KeyEpoch))
+	add(p.muted, "Line "+r.Status.LineID)
 	if len(r.endpoints) > 0 {
-		out = append(out, "", p.text(p.cyan, "LOCAL DELIVERY"))
+		out = append(out, "", p.text(p.violet, "LOCAL DELIVERY"))
 		for _, e := range r.endpoints {
-			add(e)
+			add(p.ink, e)
 		}
 	}
 	return out
 }
 
-func (v *view) relayTopology() []string {
+func (v *view) relayTopology(p palette) []string {
 	r := v.st.relay
 	if r.VerifiedAt.IsZero() {
 		return []string{"Awaiting verified line state"}
 	}
-	out := []string{terminalText(r.Origin.URL), "└─ Line " + r.Status.LineID}
+	out := []string{p.text(p.cyan, "⇄ "+r.Origin.URL), p.text(p.line, "└─ ") + p.text(p.ink, "Line "+r.Status.LineID)}
 	sc := v.selectedCall()
 	for i, cred := range r.Credentials {
 		branch, indent := "├─ ", "│  "
@@ -143,33 +151,37 @@ func (v *view) relayTopology() []string {
 			branch, indent = "└─ ", "   "
 		}
 		label := fmt.Sprintf("%s · %s", cred.Namespace, cred.ID[:min(12, len(cred.ID))])
+		color := p.violet
 		if cred.ID == r.Status.CredID {
 			label += " · this client"
 		}
 		if cred.Revoked {
 			label += " · revoked"
+			color = p.red
 		}
-		out = append(out, terminalText("   "+branch+label))
+		out = append(out, p.text(p.line, "   "+branch)+p.text(color, "◇ "+label))
 		var actors []string
 		for _, a := range r.Actors {
 			if a.Cred != cred.ID {
 				continue
 			}
-			name := a.ID
-			if !a.Live {
-				name += " · retired"
-			}
+			name, style, glyph := a.ID, p.ink, "○"
 			if sc != nil && (a.ID == sc.call.From || a.ID == sc.call.To) {
 				name += " · selected call"
+				style, glyph = p.cyan, "●"
 			}
-			actors = append(actors, name)
+			if !a.Live {
+				name += " · retired"
+				style = p.muted
+			}
+			actors = append(actors, p.text(style, glyph+" "+name))
 		}
 		for j, name := range actors {
 			twig := "├─ "
 			if j == len(actors)-1 {
 				twig = "└─ "
 			}
-			out = append(out, terminalText("   "+indent+twig+name))
+			out = append(out, p.text(p.line, "   "+indent+twig)+name)
 		}
 	}
 	return out
