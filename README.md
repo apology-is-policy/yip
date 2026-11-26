@@ -332,6 +332,8 @@ Use a distinct identity when changing transports or replacing a registered targe
 
 ## Switchboard and broadcasts
 
+To put colleagues on a project line across machines, follow the [team relay deployment guide](docs/LDR-TEAM-DEPLOYMENT.md).
+
 ```sh
 yip switchboard --line myproject
 yip switchboard --line myproject --by your-name
