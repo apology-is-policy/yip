@@ -51,7 +51,10 @@ var ldrAckTimeout = 5 * time.Second
 //
 // Callers MUST NOT fall back to YIP_LDR_DIR or local-only writes when err != nil.
 func loadLDRAttachment() (LDRAttachment, bool, error) {
-	p := ldrAttachmentPath()
+	return readLDRAttachment(ldrAttachmentPath(), strings.TrimSpace(os.Getenv("YIP_LDR_DIR")))
+}
+
+func readLDRAttachment(p, envDir string) (LDRAttachment, bool, error) {
 	b, err := os.ReadFile(p)
 	if err == nil {
 		var att LDRAttachment
@@ -77,7 +80,7 @@ func loadLDRAttachment() (LDRAttachment, bool, error) {
 	if !os.IsNotExist(err) {
 		return LDRAttachment{}, true, fmt.Errorf("cannot read LDR attachment %s: %w", p, err)
 	}
-	if envDir := strings.TrimSpace(os.Getenv("YIP_LDR_DIR")); envDir != "" {
+	if envDir != "" {
 		return LDRAttachment{Version: 1, ClientDir: envDir, Actors: map[string]string{}}, true, nil
 	}
 	return LDRAttachment{}, false, nil

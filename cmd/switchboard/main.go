@@ -179,7 +179,17 @@ func run(screen tcell.Screen, yip, dir string) (foregroundArgs []string) {
 						finished <- completion{"Selected line " + values[0], err}
 						return
 					}
-					msg, err := runAction(ctx, yip, dir, args, body)
+					var msg string
+					var err error
+					if a.command == "@agent" {
+						msg, err = installBoardAgent(ctx, yip, dir, args, values)
+					} else {
+						msg, err = runAction(ctx, yip, dir, args, body)
+					}
+					if err == nil && a.command == "switchboard --create-line" {
+						err = os.Setenv("YIP_LINE", strings.TrimSpace(values[0]))
+						msg = "Created line " + values[0] + ". Add its first agent."
+					}
 					if msg == "" && err == nil {
 						msg = a.label + " completed"
 					}
@@ -197,7 +207,7 @@ func run(screen tcell.Screen, yip, dir string) (foregroundArgs []string) {
 				r.message = strings.TrimSpace(r.message + "\n" + r.err.Error())
 			}
 			actionStatus(r.message, false, r.err != nil)
-			current = boardSnapshot{Error: "Refreshing line…"}
+			current = boardSnapshot{Line: os.Getenv("YIP_LINE"), Error: "Refreshing line…"}
 			selected.Store(applySnapshot(current, ""))
 			startObserver()
 		case <-ticker.C:
@@ -225,8 +235,19 @@ func run(screen tcell.Screen, yip, dir string) (foregroundArgs []string) {
 				if e.Key() == tcell.KeyCtrlC || (e.Rune() == 'q' && C.board_editing() == 0) {
 					return
 				}
-				if C.board_editing() != 0 {
-					code := map[tcell.Key]int{tcell.KeyBackspace: 8, tcell.KeyBackspace2: 8, tcell.KeyEnter: 13, tcell.KeyEscape: 27, tcell.KeyLeft: 256, tcell.KeyRight: 257, tcell.KeyHome: 258, tcell.KeyEnd: 259, tcell.KeyDelete: 260, tcell.KeyTab: 9}[e.Key()]
+				if e.Key() == tcell.KeyF1 {
+					C.board_help()
+					continue
+				}
+				editing := C.board_editing() != 0
+				if !editing && e.Key() == tcell.KeyEscape && C.board_dismiss() != 0 {
+					continue
+				}
+				code := map[tcell.Key]int{tcell.KeyBackspace: 8, tcell.KeyBackspace2: 8, tcell.KeyEnter: 13, tcell.KeyEscape: 27, tcell.KeyLeft: 256, tcell.KeyRight: 257, tcell.KeyHome: 258, tcell.KeyEnd: 259, tcell.KeyDelete: 260, tcell.KeyTab: 9, tcell.KeyUp: 261, tcell.KeyDown: 262, tcell.KeyPgUp: 263, tcell.KeyPgDn: 264}[e.Key()]
+				if e.Rune() == ' ' {
+					code = 32
+				}
+				if editing || code != 0 {
 					C.board_key(C.int(code), C.uint(e.Rune()))
 				} else {
 					if n := len(current.Calls); n > 0 {

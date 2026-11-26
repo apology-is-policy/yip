@@ -338,14 +338,145 @@ func check() error {
 	live.Broadcasts = []string{"Operator briefing"}
 	live.Roadmaps = []string{"Station one"}
 	applySnapshot(live, "second")
-	for i, want := range []string{"Workstation topology", "Verified relay checkpoint", "Operator briefing", "Station one", "Inspect signed descriptor"} {
+	for i, want := range []string{"Workstation topology", "Verified relay checkpoint", "Operator briefing", "Station one", "Run Doctor"} {
 		C.board_toggle_view(C.int(i))
 		draw(idle)
+		if i == 1 && !strings.Contains(draw(idle), "onto the relay.") {
+			return fmt.Errorf("relay introduction clipped at column boundary")
+		}
 		if !strings.Contains(draw(idle), want) {
 			return fmt.Errorf("window %d did not show %q", i, want)
 		}
 		C.board_toggle_view(C.int(i))
 		draw(idle)
+	}
+	// Exercise real title controls and the usable body width after a terminal resize.
+	for _, size := range [][2]int{{160, 44}, {80, 24}, {40, 10}} {
+		screen.SetSize(size[0], size[1])
+		C.board_toggle_view(3)
+		draw(idle)
+		rendered := strings.Split(draw(idle), "\n")
+		located := false
+		for y, row := range rendered {
+			pos := strings.Index(row, "Roadmaps")
+			if pos < 0 {
+				continue
+			}
+			left := strings.LastIndex(row[:pos], "╔")
+			right := strings.Index(row[pos:], "╗")
+			if left < 0 || right < 0 {
+				return fmt.Errorf("missing roadmap corner at %v: %s", size, row)
+			}
+			x := len([]rune(row[:left]))
+			end := len([]rune(row[:pos+right]))
+			if diff := x - (size[0] - 1 - end); diff < -2 || diff > 2 || end-x < min(130, size[0]-7) {
+				return fmt.Errorf("unbalanced roadmap at %v: %s", size, row)
+			}
+			dot := strings.Index(row[pos:pos+right], "●")
+			if dot < 0 {
+				return fmt.Errorf("missing close lamp")
+			}
+			closeX := len([]rune(row[:pos+dot]))
+			if err := checkInk(closeX, y, 0xea3323); err != nil {
+				return err
+			}
+			click(closeX, y)
+			if C.board_views()&2 != 0 {
+				return fmt.Errorf("red lamp left roadmap open at %v", size)
+			}
+			located = true
+			break
+		}
+		if !located {
+			return fmt.Errorf("missing Roadmaps window at %v", size)
+		}
+	}
+	titles := []string{"Line topology", "Relays", "Broadcasts", "Roadmaps", "Configuration", "Create a Line", "Add Agent", "Manage Lines", "Manage Agents", "Connect to a Relay", "Relay client", "Relay operator", "Compose broadcast"}
+	for _, size := range [][2]int{{124, 36}, {80, 24}, {40, 10}} {
+		screen.SetSize(size[0], size[1])
+		for i, title := range titles {
+			C.board_toggle_view(C.int(i))
+			draw(idle)
+			rendered := strings.Split(draw(idle), "\n")
+			header := false
+			for y, row := range rendered {
+				index := strings.Index(row, "╡"+title+" ╞")
+				if index < 0 {
+					continue
+				}
+				header = true
+				left := strings.LastIndex(row[:index], "╔")
+				right := strings.Index(row[index:], "╗")
+				if left < 0 || right < 0 {
+					return fmt.Errorf("clipped title %q at %v", title, size)
+				}
+				x := len([]rune(row[:left]))
+				end := len([]rune(row[:index+right]))
+				bottom := false
+				for _, body := range rendered[y+1:] {
+					cells := []rune(body)
+					if len(cells) <= end {
+						break
+					}
+					if cells[x] == '╚' && cells[end] == '╝' {
+						bottom = true
+						break
+					}
+					if cells[x] != '║' || cells[end] != '║' {
+						return fmt.Errorf("broken side of %q at %v\n%s", title, size, body)
+					}
+				}
+				if !bottom {
+					return fmt.Errorf("missing bottom of %q at %v", title, size)
+				}
+				break
+			}
+			if !header {
+				return fmt.Errorf("missing framed %q at %v\n%s", title, size, strings.Join(rendered, "\n"))
+			}
+			C.board_toggle_view(C.int(i))
+			draw(idle)
+		}
+	}
+	screen.SetSize(100, 32)
+	C.board_toggle_view(12) // Compose
+	draw(idle)
+	compose := draw(idle)
+	fieldFound := false
+	for y, row := range strings.Split(compose, "\n") {
+		if at := strings.Index(row, "Recipients ("); at >= 0 {
+			click(len([]rune(row[:at]))+2, y+1)
+			for _, r := range "review-team" {
+				C.board_key(0, C.uint(r))
+				draw(idle)
+			}
+			fieldFound = true
+			break
+		}
+	}
+	if !fieldFound || !strings.Contains(draw(idle), "review-team") {
+		return fmt.Errorf("could not edit the broadcast draft\n%s", compose)
+	}
+	C.board_toggle_view(4)
+	draw(idle)
+	if !strings.Contains(draw(idle), "Run Doctor") {
+		return fmt.Errorf("configuration inherited the broadcast form")
+	}
+	C.board_toggle_view(4)
+	C.board_toggle_view(12)
+	C.board_toggle_view(12)
+	draw(idle)
+	if !strings.Contains(draw(idle), "review-team") {
+		return fmt.Errorf("opening Configuration lost the broadcast draft")
+	}
+	C.board_toggle_view(12)
+	live.TranscriptID = "first"
+	live.Transcript = "Alice · TURN #1\nFirst line\n\nBob · NOTE #1\nSecond line"
+	live.TranscriptInks = "b dgy"
+	applySnapshot(live, "first")
+	draw(idle)
+	if !strings.Contains(draw(idle), strings.Repeat("┄", 12)) {
+		return fmt.Errorf("missing inter-message divider")
 	}
 	fmt.Println("Switchboard views, ImTUI palette, minimizer states, one-row menu, frame spacing, drag, resize, selection and Unicode verified")
 	return nil

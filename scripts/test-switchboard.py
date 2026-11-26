@@ -151,7 +151,7 @@ with tempfile.TemporaryDirectory(prefix='yip-pty-') as tmp:
                 drain(.3)
                 os.write(master,b'2jj1q')
             elif mode == 'native':
-                for key,label in [(b'\x1bOR',b'Line topology'),(b'\x1bOS',b'Relay health'),(b'\x1b[15~',b'Broadcasts'),(b'\x1b[17~',b'Roadmaps'),(b'\x1b[18~',b'Configuration')]:
+                for key,label in [(b'\x1bOR',b'Line topology'),(b'\x1bOS',b'Relays'),(b'\x1b[15~',b'Broadcasts'),(b'\x1b[17~',b'Roadmaps'),(b'\x1b[18~',b'Configuration')]:
                     os.write(master,key)
                     drain(.3)
                     rows = terminal_rows(output, 160, 44)

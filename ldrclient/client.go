@@ -423,16 +423,12 @@ func openClientLocked(dir string, lf *os.File, syncFile func(*os.File) error, sy
 		return nil, err
 	}
 
-	cfg, err := loadConfig(filepath.Join(dir, "config.cbor"))
+	cfg, desc, err := configuredDescriptor(dir)
 	if err != nil {
 		cleanupLock()
 		return nil, err
 	}
-	desc, cd, genesis, _, err := ldrcrypto.VerifyCreationDescriptor(cfg.SignedDescriptor)
-	if err != nil || !bytes.Equal(desc.LineID, cfg.LineID) || cd != cfg.DescriptorDigest || genesis != cfg.GenesisAnchor {
-		cleanupLock()
-		return nil, fmt.Errorf("ldrclient: pinned config descriptor verification failed: %v", err)
-	}
+	genesis := cfg.GenesisAnchor
 	profDigest, err := desc.Profile.Digest()
 	if err != nil {
 		cleanupLock()
@@ -718,6 +714,24 @@ func (c *Client) AttachRootKey(km *SigningKeyMaterial) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.rootKey = km
+}
+
+// ConfiguredOrigin reads the pinned public descriptor without opening the outbox
+// or taking the enrolled workstation's client lock.
+func ConfiguredOrigin(dir string) (ldrcrypto.RelayOrigin, error) {
+	_, desc, err := configuredDescriptor(dir)
+	return desc.RelayOrigin, err
+}
+func configuredDescriptor(dir string) (persistedConfig, ldrcrypto.CreationDescriptor, error) {
+	cfg, err := loadConfig(filepath.Join(dir, "config.cbor"))
+	if err != nil {
+		return cfg, ldrcrypto.CreationDescriptor{}, err
+	}
+	desc, cd, genesis, _, err := ldrcrypto.VerifyCreationDescriptor(cfg.SignedDescriptor)
+	if err != nil || !bytes.Equal(desc.LineID, cfg.LineID) || cd != cfg.DescriptorDigest || genesis != cfg.GenesisAnchor {
+		return cfg, ldrcrypto.CreationDescriptor{}, fmt.Errorf("ldrclient: pinned config descriptor verification failed: %v", err)
+	}
+	return cfg, desc, nil
 }
 
 // Descriptor returns the pinned creation descriptor, CD, genesis, and profile digest.

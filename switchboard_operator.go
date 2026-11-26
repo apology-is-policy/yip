@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -45,4 +46,25 @@ func switchboardOperator(action string, args []string) (string, error) {
 	}
 	err = SetResolution(call, d, Resolution{By: by, Kind: "human", Detail: stdinBody(), At: now()})
 	return fmt.Sprintf("Resolved %s as %s (human)", d.ID, by), err
+}
+
+// Match the ID the normal --line resolver will use on subsequent launches.
+func createSwitchboardLine(args []string) error {
+	if len(args) != 1 || !validComponent(args[0]) || slugify(args[0]) != args[0] {
+		return errors.New("use a line name of 1–48 lowercase letters, digits or internal hyphens")
+	}
+	if os.Getenv("YIP_ROOT") != "" {
+		return errors.New("YIP_ROOT fixes this session to one directory")
+	}
+	activeLine = args[0]
+	if err := os.MkdirAll(filepath.Dir(Root()), 0755); err != nil {
+		return err
+	}
+	if err := os.Mkdir(Root(), 0755); err != nil {
+		if os.IsExist(err) {
+			return fmt.Errorf("line %q already exists; select it in Manage Lines", activeLine)
+		}
+		return err
+	}
+	return EnsureRoot()
 }

@@ -339,9 +339,11 @@ yip switchboard --line myproject --by your-name
 
 The branch Switchboard opens Calls, Transcript and Line status. Drag a title bar to move a pane, use its corner to resize it, and click the title lamp to collapse it. The Follow lamp turns red when you scroll up and green when you reach the bottom. Click the switch to toggle it directly.
 
-Open **View → Configuration** (F7) for a workstation or operator action. Enter paths on the machine running the board. Review shows the exact field values. Apply runs the corresponding Yip operation and displays its output. Use **Connect to relay** on the new workstation and **Enroll workstation** on the operator's machine. Transfer the public request, challenge and proof through your usual trusted channel. Keep the challenge secret and private keys on their originating machine.
+From a new checkout choose **Actions → Create a Line**, name it, then choose **Add Agent**. Pick the provider and a worktree, shared seat or Codex profile. The install result includes the launch command. **Manage Lines** selects the line to observe. **Manage Agents** shows its registrations and delivery state. The framed **?** button or **F1** opens help for the active window.
 
-**View → Line topology** (F3) shows enrolled credentials and their actors. **Relay health** (F4) shows session and synchronization results, the last verified checkpoint and local delivery. On the relay host choose **Host a line → Monitor local admin socket** to include live admission counters. Set `YIP_RELAY_ADMIN_SOCKET` to preselect the socket. **Broadcasts** (F5) and **Roadmaps** (F6) open independent windows. Use **Compose broadcast** for an operator announcement, briefing or regroup.
+**Line topology** (F3) shows local attachments, enrolled workstations and relay actors. **Relays** (F4) lists attached local lines and their configured origins. Select one to observe its verified checkpoint, open client operations or detach. Choose **Connect** on a joining workstation and **Operator → Enroll workstation** on the operator's machine. Verify the descriptor and workstation fingerprints through a trusted channel. Keep private keys and the challenge secret on their originating machine. On the relay host, **Operator → Host a line → Monitor local admin socket** adds live admission counters.
+
+**Broadcasts** (F5) has its own composer. **Roadmaps** (F6) opens a wide station map. **Configuration** (F7) provides Doctor and resource settings. Forms show their inputs for review before applying them.
 
 | Kind | Purpose |
 | --- | --- |

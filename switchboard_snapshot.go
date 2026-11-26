@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/apology-is-policy/yip/ldrclient"
+	"github.com/apology-is-policy/yip/ldrcore"
 	"github.com/apology-is-policy/yip/ldrrelay"
 	"io"
 	"os"
@@ -16,7 +17,8 @@ import (
 )
 
 type switchboardSnapshot struct {
-	Lines                                      []string
+	ClientDir                                  string
+	Lines, RelayLines, RelayLabels             []string
 	Line                                       string
 	Error                                      string
 	TranscriptID                               string
@@ -46,7 +48,8 @@ func serveSwitchboardSnapshots(ctx context.Context, in io.Reader, out io.Writer)
 		var req struct {
 			Selected string
 			ldrclient.ObservationViews
-			Health bool
+			Health       bool
+			RoadmapWidth int
 		}
 		if err := requests.Decode(&raw); err != nil {
 			if errors.Is(err, io.EOF) {
@@ -63,20 +66,14 @@ func serveSwitchboardSnapshots(ctx context.Context, in io.Reader, out io.Writer)
 		}
 		selected := req.Selected
 		att, remote, err := loadLDRAttachment()
-		if err != nil {
-			state = sbState{}
-			lastDir = ""
-			if err := responses.Encode(switchboardSnapshot{Line: activeLine, Error: err.Error()}); err != nil {
-				return err
-			}
-			continue
-		}
 		if att.ClientDir != lastDir {
 			state = sbState{}
 			loader = &sbLoader{}
 			lastDir = att.ClientDir
 		}
-		if remote {
+		if err != nil {
+			state = sbState{err: err.Error(), relay: &sbRelay{}}
+		} else if remote {
 			if state.relay == nil {
 				state.relay = &sbRelay{}
 			}
@@ -84,7 +81,13 @@ func serveSwitchboardSnapshots(ctx context.Context, in io.Reader, out io.Writer)
 		} else {
 			state = loader.load()
 		}
-		snap := makeSwitchboardSnapshot(state, selected, req.ObservationViews)
+		snap := makeSwitchboardSnapshot(state, selected, req.ObservationViews, req.RoadmapWidth)
+		if remote && err == nil {
+			local, inks := localBoardTopology(state, &att)
+			snap.Topology = append(snap.Topology, local...)
+			snap.TopologyInks += inks
+		}
+		snap.ClientDir = att.ClientDir
 		snap.Lines = []string{activeLine}
 		if os.Getenv("YIP_ROOT") == "" {
 			entries, _ := os.ReadDir(filepath.Join(yipHome(), "lines"))
@@ -96,6 +99,27 @@ func serveSwitchboardSnapshots(ctx context.Context, in io.Reader, out io.Writer)
 			slices.Sort(snap.Lines)
 		}
 
+		if req.Health {
+			for _, id := range snap.Lines {
+				entry, exists, entryErr := att, remote, err
+				if id != activeLine {
+					entry, exists, entryErr = readLDRAttachment(filepath.Join(lineDirFor(id), "ldr.json"), "")
+				}
+				if !exists {
+					continue
+				}
+				label := "Attachment needs attention"
+				if entryErr == nil {
+					if origin, e := ldrclient.ConfiguredOrigin(entry.ClientDir); e == nil {
+						label = origin.URL
+					} else {
+						label = "Client directory unavailable · " + entry.ClientDir
+					}
+				}
+				snap.RelayLines = append(snap.RelayLines, id)
+				snap.RelayLabels = append(snap.RelayLabels, strings.ReplaceAll(terminalText(label), "\n", " "))
+			}
+		}
 		if socket := os.Getenv("YIP_RELAY_ADMIN_SOCKET"); req.Health && socket != "" {
 			probe, stop := context.WithTimeout(ctx, 2*time.Second)
 			admin, e := ldrrelay.ReadAdminStatus(probe, socket)
@@ -128,7 +152,7 @@ func serveSwitchboardSnapshots(ctx context.Context, in io.Reader, out io.Writer)
 	}
 }
 
-func makeSwitchboardSnapshot(state sbState, selected string, views ldrclient.ObservationViews) switchboardSnapshot {
+func makeSwitchboardSnapshot(state sbState, selected string, views ldrclient.ObservationViews, roadmapWidth int) switchboardSnapshot {
 	snapshot := switchboardSnapshot{Line: activeLine, Error: state.err}
 	view := &view{st: state}
 	route := "Local call"
@@ -161,7 +185,11 @@ func makeSwitchboardSnapshot(state sbState, selected string, views ldrclient.Obs
 			transcript.WriteString(strings.Join(rows, "\n"))
 			inks.WriteString(tones)
 		} else {
-			for _, entry := range call.entries {
+			for i, entry := range call.entries {
+				if i > 0 {
+					transcript.WriteString("\n\n")
+					inks.WriteByte('d')
+				}
 				header := terminalText(entry.from + " · " + entry.kind)
 				if entry.n > 0 {
 					header += fmt.Sprintf(" #%d", entry.n)
@@ -181,8 +209,7 @@ func makeSwitchboardSnapshot(state sbState, selected string, views ldrclient.Obs
 				body := terminalText(entry.body)
 				transcript.WriteString(header + "\n" + body)
 				inks.WriteByte(ink)
-				inks.WriteString(strings.Repeat(" ", strings.Count(body, "\n")+2))
-				transcript.WriteString("\n\n")
+				inks.WriteString(strings.Repeat(" ", strings.Count(body, "\n")+1))
 			}
 		}
 		snapshot.TranscriptInks = inks.String()
@@ -191,14 +218,7 @@ func makeSwitchboardSnapshot(state sbState, selected string, views ldrclient.Obs
 	}
 	snapshot.Overview, snapshot.OverviewInks = snapshotLines(view.dashboard(33, p), p)
 	if state.relay == nil {
-		snapshot.Topology = []string{"Local line · " + activeLine}
-		for i, member := range state.members {
-			branch := "├─ "
-			if i == len(state.members)-1 {
-				branch = "└─ "
-			}
-			snapshot.Topology = append(snapshot.Topology, branch+member)
-		}
+		snapshot.Topology, snapshot.TopologyInks = localBoardTopology(state, nil)
 		snapshot.Health = []string{"Local line · " + activeLine, "No relay attachment"}
 		if views.Broadcasts {
 			for _, call := range state.calls {
@@ -209,11 +229,10 @@ func makeSwitchboardSnapshot(state sbState, selected string, views ldrclient.Obs
 				}
 			}
 		}
-		if views.Roadmaps {
-			snapshot.Roadmaps, snapshot.RoadmapInks = snapshotLines(view.mapLines(65, p), p)
-		}
+
 	} else {
 		snapshot.Topology, snapshot.TopologyInks = snapshotLines(view.relayTopology(p), p)
+
 		r := state.relay
 		snapshot.Health, snapshot.HealthInks = snapshotLines(view.relayDashboard(65, p), p)
 		stage := r.Stage
@@ -225,20 +244,59 @@ func makeSwitchboardSnapshot(state sbState, selected string, views ldrclient.Obs
 			}
 			snapshot.HealthInks = shade + snapshot.HealthInks
 		}
+		if r.Status.LineID != "" {
+			snapshot.Health = append(snapshot.Health, "", "Workstation · "+r.Status.DirKind,
+				fmt.Sprintf("Generation %d · auth epoch %d", r.Status.Generation, r.Status.AuthEpoch),
+				fmt.Sprintf("Projection %d · delivery scan %d", r.Status.ProjectedSeq, r.Status.ScannedSeq),
+				fmt.Sprintf("Outbox entries %d", r.Status.OutboxCount))
+		}
 		for _, b := range r.Broadcasts {
 			snapshot.Broadcasts = append(snapshot.Broadcasts, b.Kind+" · "+b.By+" · "+b.ID, b.Body, "Recipients: "+strings.Join(b.Recipients, ", "))
 			for _, rep := range b.Replies {
 				snapshot.Broadcasts = append(snapshot.Broadcasts, rep.From+" · "+rep.Body)
 			}
 		}
-		if views.Roadmaps {
-			snapshot.Roadmaps = strings.Split(formatLDRRoadmaps(r.Roadmaps, ""), "\n")
-		}
+
 		if r.BroadcastError != "" {
 			snapshot.Broadcasts = append(snapshot.Broadcasts, r.BroadcastError)
 		}
-		if r.RoadmapError != "" {
-			snapshot.Roadmaps = append(snapshot.Roadmaps, r.RoadmapError)
+	}
+
+	if views.Roadmaps {
+		if roadmapWidth <= 0 {
+			roadmapWidth = 65
+		}
+		width := min(256, max(20, roadmapWidth))
+		var notices []string
+		if r := state.relay; r != nil {
+			for _, reg := range r.Roadmaps {
+				var payload ldrRoadmapPayload
+				switch {
+				case reg.ReadStatus != ldrcore.ReadOK:
+					notices = append(notices, fmt.Sprintf("%s · %s · epoch %d", reg.Actor, reg.ReadStatus, reg.KeyEpoch))
+				case json.Unmarshal(reg.Plaintext, &payload) != nil:
+					notices = append(notices, reg.Actor+" · unreadable roadmap")
+				case payload.Cleared:
+					continue
+				case payload.Roadmap == nil || normalizeRoadmap(payload.Roadmap) != nil:
+					notices = append(notices, reg.Actor+" · invalid roadmap")
+				default:
+					rm := *payload.Roadmap
+					rm.Agent = reg.Actor
+					if reg.Historical {
+						rm.Arc += " [historical]"
+					}
+					view.st.roadmaps = append(view.st.roadmaps, rm)
+				}
+			}
+			if r.RoadmapError != "" {
+				notices = append(notices, r.RoadmapError)
+			}
+		}
+		snapshot.Roadmaps, snapshot.RoadmapInks = snapshotLines(view.mapLines(width, p), p)
+		for _, notice := range notices {
+			snapshot.Roadmaps = append(snapshot.Roadmaps, terminalText(notice))
+			snapshot.RoadmapInks += "y"
 		}
 	}
 
@@ -265,4 +323,44 @@ func snapshotLines(rows []string, p palette) ([]string, string) {
 		rows[i] = terminalText(row)
 	}
 	return rows, inks.String()
+}
+
+func localBoardTopology(st sbState, att *LDRAttachment) ([]string, string) {
+	rows := []string{"Local line · " + activeLine}
+	inks := "y"
+	members, seats := LoadMembers(), LoadSeats()
+	names := st.members
+	if att != nil {
+		names = LineNames()
+	}
+	if len(names) == 0 {
+		return append(rows, "No local agents registered."), inks + "b"
+	}
+	for i, name := range names {
+		branch, indent := "├─ ", "│  "
+		if i+1 == len(names) {
+			branch, indent = "└─ ", "   "
+		}
+		label := name
+		if att != nil {
+			label += " → relay actor " + att.actorFor(name)
+		}
+		rows = append(rows, branch+terminalText(label))
+		inks += "g"
+		detail := "Worktree · " + members.PathOf(name)
+		if seat, ok := seats.Seats[name]; ok {
+			detail = seatDescription(seat)
+		}
+		rows = append(rows, indent+terminalText(detail))
+		inks += " "
+		status := st.endpoints[name]
+		if att != nil {
+			status = EndpointStatus(name)
+		}
+		if status != "" {
+			rows = append(rows, indent+terminalText(status))
+			inks += "b"
+		}
+	}
+	return rows, inks
 }

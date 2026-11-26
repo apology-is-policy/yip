@@ -51,7 +51,9 @@ void status_lines(const std::string &text, const std::string &inks, bool wrap = 
     for (size_t line = 0; start < text.size(); ++line) {
         const size_t end = text.find('\n', start);
         ImGui::PushStyleColor(ImGuiCol_Text, foreground(line < inks.size() ? inks[line] : ' '));
-        if (wrap) ImGui::PushTextWrapPos(std::max(ImGui::GetCursorPosX()+1,ImGui::GetWindowWidth()-4));
+        if (wrap)
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
+                                   std::max(1.f, ImGui::GetContentRegionAvail().x - 2));
         ImGui::TextUnformatted(text.data() + start, text.data() + std::min(end, text.size()));
         if (wrap) ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
@@ -100,7 +102,7 @@ void place_pane(PaneLayout &previous, ImVec2 position, ImVec2 size, bool toggle,
 
 // Add the frame to the pane's own draw list so overlap and menus follow
 // ImGui's window order. The native title still handles mouse input.
-void pane_frame(const char *title, bool expanded) {
+void pane_frame(const char *title, bool expanded, bool closable = false) {
     const auto pos = ImGui::GetWindowPos();
     const auto size = ImGui::GetWindowSize();
     const int width = static_cast<int>(size.x);
@@ -127,13 +129,19 @@ void pane_frame(const char *title, bool expanded) {
                                               : static_cast<ImU32>(minimizer_hover);
     draw->AddText(ImVec2(pos.x + 3, pos.y), button_color, "█");
     std::string top = expanded ? "╞══╡" : "├──┤";
-    const auto visible_title = std::string(title).substr(0, width - 11);
+    const auto visible_title = std::string(title).substr(0, std::max(0, width - (closable ? 17 : 11)));
     top += visible_title;
     top += expanded ? " ╞" : " ├";
     for (int x = 10 + static_cast<int>(visible_title.size()); x < width - 2; ++x)
         top += expanded ? "═" : "─";
     top += expanded ? "╗" : "╴";
     glyph(4, 0, top.c_str());
+    if (closable) {
+        glyph(width - 5, 0, expanded ? "╡ ╞" : "┤ ├");
+        const ImGuiID id = ImGui::GetCurrentWindow()->GetID("#CLOSE");
+        const ImU32 ink = g.ActiveId == id ? ImGui::GetColorU32(ImGuiCol_ButtonActive) : ImU32(fore_red);
+        draw->AddText(ImVec2(pos.x + width - 4, pos.y), ink, g.HoveredId == id ? "×" : "●");
+    }
     if (expanded) {
         for (int y = 1; y < height - 1; ++y) {
             glyph(0, y, "║");
@@ -148,14 +156,14 @@ void pane_frame(const char *title, bool expanded) {
     draw->PopClipRect();
 }
 
-bool begin_pane(const char *name, ImGuiWindowFlags flags = 0) {
+bool begin_pane(const char *name, ImGuiWindowFlags flags = 0, bool *open = nullptr) {
     const ImVec4 transparent(0, 0, 0, 0);
     ImGui::PushStyleColor(ImGuiCol_Text, transparent);
     ImGui::PushStyleColor(ImGuiCol_TitleBg, transparent);
     ImGui::PushStyleColor(ImGuiCol_TitleBgActive, transparent);
     ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, transparent);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2, 0));
-    const bool expanded = ImGui::Begin(name, nullptr, ImGuiWindowFlags_NoBackground | flags);
+    const bool expanded = ImGui::Begin(name, open, ImGuiWindowFlags_NoBackground | flags);
     ImGui::PopStyleVar();
     ImGui::PopStyleColor(4);
     return expanded;
@@ -171,8 +179,13 @@ void draw_transcript() {
         for (size_t line = 0;; ++line) {
             const char ink = line < transcript_inks.size() ? transcript_inks[line] : ' ';
             const char *eol = std::find(start, end, '\n');
-            if (start == eol)
-                transcript_rows.push_back({"", ink});
+            if (start == eol) {
+                std::string text;
+                if (ink == 'd')
+                    for (int col = 0; col < width; ++col)
+                        text += "┄";
+                transcript_rows.push_back({text, ink == 'd' ? 'b' : ink});
+            }
             while (start < eol) {
                 const char *next = ImGui::GetFont()->CalcWordWrapPositionA(1.0f, start, eol, width);
                 if (next == start) {
@@ -252,44 +265,220 @@ struct Action {
     std::vector<Field> fields;
 };
 std::vector<Action> actions;
-std::vector<std::string> known_lines;
-const char *views[] = {"Line topology", "Relay health", "Broadcasts", "Roadmaps", "Configuration"};
-bool open_view[5]{};
-std::string extra_text[4], extra_inks[4], result;
-int active_form = 0, submitted = -1, result_state = 0;
-bool reviewing = false;
-void choose_action(int index) {
-    active_form = index;
-    reviewing = false;
-    if (result_state != 1)
-        result.clear();
+std::vector<std::string> known_lines, relay_lines, relay_labels;
+enum View {
+    Topology,
+    Relays,
+    Broadcasts,
+    Roadmaps,
+    Configuration,
+    CreateLine,
+    AddAgent,
+    ManageLines,
+    ManageAgents,
+    Connect,
+    ClientTools,
+    Operator,
+    Compose,
+    Help,
+    ViewCount
+};
+struct WindowSpec {
+    const char *title;
+    int width, height;
+    const char *help;
+};
+const WindowSpec windows[] = {
+    {"Line topology", 96, 32,
+     "Read the tree from the line to each workstation and actor. A worktree identifies an agent by its "
+     "checkout. A shared seat identifies it by provider configuration. A profile seat can start from "
+     "several checkouts. Local registrations appear alongside the verified relay roster. Remote machines "
+     "keep their checkout paths private."},
+    {"Relays", 108, 38,
+     "A relay connects agents on separate machines. Each local line can attach to one enrolled client "
+     "directory. Select a listed line to observe its checkpoint and connection. Connect to a Relay walks "
+     "through joining. Detach returns the local line to local routing and keeps its credential files. "
+     "Revoke the credential separately to withdraw membership."},
+    {"Broadcasts", 84, 32,
+     "Read announcements, briefings and regroups for the selected line. Compose opens a separate draft. "
+     "Choose recipients, review the message and apply to send."},
+    {"Roadmaps", 142, 36,
+     "Each agent posts an arc of work. Read across its stations to find its current marker. The legend "
+     "describes the stations and any detours. Resize the window to change the space available to the map."},
+    {"Configuration", 74, 34,
+     "Manage local lines and agents with the buttons above the settings. Use Diagnostics for Doctor and "
+     "Resources to inspect or apply the shared resource configuration. Review shows the settings before "
+     "Apply runs the operation."},
+    {"Create a Line", 58, 17,
+     "A line is a named meeting place for agents. Choose a short lowercase name. Review and apply to "
+     "create and select it. Then choose Add Agent to install the first provider. Other local checkouts can "
+     "join by using the same name."},
+    {"Add Agent", 80, 32,
+     "Choose the runtime and the name other agents should call. Worktree installs in an existing checkout. "
+     "Leave the path empty for this checkout. New worktree creates a Git worktree at the path you enter, "
+     "using Git's normal branch naming. Shared seat lets Codex or Antigravity share a checkout. A Codex "
+     "profile can launch from any checkout. After installation, follow the provider instructions in the "
+     "result and run Doctor."},
+    {"Manage Lines", 76, 28,
+     "Select a local line to view its agents, calls and attachment. Create a Line makes a new named line. "
+     "Manage Agents works on the line currently shown as active."},
+    {"Manage Agents", 92, 34,
+     "Inspect the local registrations and relay actor mappings for the active line. Add Agent installs "
+     "runtime configuration. Remove agent uninstalls the named local identity. Manage remote actors and "
+     "credential revocation from Relays."},
+    {"Connect to a Relay", 88, 36,
+     "1. Obtain the signed descriptor and compare its fingerprint with the operator over a trusted "
+     "channel. Verify relay connection checks the origin.\n\n2. Create a workstation request in a private "
+     "client directory. Send the request and compare the signing and encryption fingerprints with the "
+     "operator.\n\n3. Prove workstation keys using the returned challenge and independently verified "
+     "operator key. Return the proof. The operator enrolls the credential and activates the reader "
+     "epoch.\n\n4. Activate this workstation, declare its actor, then attach a local line. Open Relays to "
+     "see the last verified checkpoint. An existing enrolled client can go straight to Attach local line."},
+    {"Relay client", 92, 38,
+     "Use Client tools to inspect or sync a workstation, manage its actors and read or publish registers. "
+     "Relay calls and broadcasts use the actor and credential you specify. Review the identity, recipients "
+     "and content before applying."},
+    {"Relay operator", 92, 38,
+     "On the host, generate a certificate, provision the signed line and serve it. Monitor the local admin "
+     "socket for admission counters and clock state. Enroll workstation checks key fingerprints and issues "
+     "a challenge. Line administration manages offline root and operator authority. Use SSH for host-local "
+     "operations."},
+    {"Compose broadcast", 78, 30,
+     "Choose the broadcast kind and recipients. Enter the message across as many lines as you need. Review "
+     "shows the full draft. Apply sends it with the selected attribution. For a relay broadcast use an "
+     "authorized operator key."},
+    {"Help", 76, 24, ""}};
+struct WindowState {
+    bool open = false, focus = false, reviewing = false;
+    int action = -1, result_state = 0;
+    std::string result;
+    PaneLayout layout{};
+};
+WindowState desk[ViewCount];
+int submitted = -1, last_action = -1, roadmap_width = 65;
+View result_owner = Configuration, help_topic = Topology;
+bool busy = false;
+std::string extra_text[4], extra_inks[4];
+void present(View v) {
+    desk[v].open = true;
+    desk[v].focus = true;
 }
-void config_form() {
-    if (actions.empty())
+bool section(View v, const std::string &group) {
+    switch (v) {
+    case Configuration:
+        return group == "Diagnostics" || group == "Resources" || group == "Calls";
+    case Connect:
+        return group == "Connect to relay";
+    case ClientTools:
+        return group == "Client tools" || group == "Relay calls" || group == "Relay broadcasts";
+    case Operator:
+        return group == "Enroll workstation" || group == "Host a line" || group == "Line administration";
+    case Compose:
+        return group == "Broadcasts";
+    default:
+        return group == windows[v].title;
+    }
+}
+std::string attached_dir;
+void choose_action(View v, int index) {
+    auto &w = desk[v];
+    if (busy && v == result_owner)
         return;
+    w.action = index;
+    w.reviewing = false;
+    w.result.clear();
+    w.result_state = 0;
+    for (auto &f : actions[index].fields) {
+        if (f.label == "Client directory" && actions[index].label != "Create workstation request" &&
+            !attached_dir.empty() && !f.value[0])
+            std::snprintf(f.value.data(), f.value.size(), "%s", attached_dir.c_str());
+        if (f.label == "Local line")
+            std::snprintf(f.value.data(), f.value.size(), "%s", live_line.c_str());
+    }
+}
+void launch_form(View v, const char *label) {
+    for (int i = 0; i < (int)actions.size(); ++i)
+        if (actions[i].label == label && section(v, actions[i].group)) {
+            choose_action(v, i);
+            break;
+        }
+    present(v);
+}
+const char *choice_label(const Field &f, const char *value) {
+    if (f.label == "Provider" || f.label == "Runtime") {
+        const std::string key = value;
+        if (key == "agy")
+            return "Antigravity (Gemini)";
+        if (key == "codex")
+            return "Codex";
+        if (key == "claude")
+            return "Claude Code";
+        if (key == "claude-channels")
+            return "Claude Code · Channels";
+        if (key == "claude-rewake")
+            return "Claude Code · rewake";
+    }
+    return value;
+}
+void choice(Field &f, const std::vector<std::string> &items) {
+    if (items.empty())
+        return;
+    if (std::find(items.begin(), items.end(), std::string(f.value.data())) == items.end())
+        std::snprintf(f.value.data(), f.value.size(), "%s", items.front().c_str());
+    if (ImGui::BeginCombo("##choice", choice_label(f, f.value.data()))) {
+        for (const auto &value : items)
+            if (ImGui::Selectable(choice_label(f, value.c_str()), value == f.value.data()))
+                std::snprintf(f.value.data(), f.value.size(), "%s", value.c_str());
+        ImGui::EndCombo();
+    }
+}
+void config_form(View v) {
+    auto &w = desk[v];
+    std::vector<int> options;
+    std::vector<int> groups;
+    for (int i = 0; i < (int)actions.size(); ++i)
+        if (section(v, actions[i].group)) {
+            options.push_back(i);
+            if (groups.empty() || actions[groups.back()].group != actions[i].group)
+                groups.push_back(i);
+        }
+    if (options.empty())
+        return;
+    if (w.action < 0)
+        choose_action(v, options.front());
+    const int &active_form = w.action;
+    bool &reviewing = w.reviewing;
+    auto &result = w.result;
+    auto &result_state = w.result_state;
     if (result_state != 1 && !reviewing) {
-        if (ImGui::BeginCombo("Section", actions[active_form].group.c_str())) {
-            for (int i = 0; i < (int)actions.size(); ++i) {
-                if (i && actions[i - 1].group == actions[i].group)
-                    continue;
-                if (ImGui::Selectable(actions[i].group.c_str(),
-                                      actions[i].group == actions[active_form].group))
-                    choose_action(i);
-            }
+        if (groups.size() > 1 && ImGui::BeginCombo("Section", actions[active_form].group.c_str())) {
+            for (int i : groups)
+                if (ImGui::Selectable(actions[i].group.c_str()))
+                    choose_action(v, i);
             ImGui::EndCombo();
         }
-        if (ImGui::BeginCombo("Action", actions[active_form].label.c_str())) {
-            for (int i = 0; i < (int)actions.size(); ++i) {
+        if (options.size() > 1 && ImGui::BeginCombo("Action", actions[active_form].label.c_str())) {
+            for (int i : options)
                 if (actions[i].group == actions[active_form].group &&
                     ImGui::Selectable(actions[i].label.c_str(), active_form == i))
-                    choose_action(i);
-            }
+                    choose_action(v, i);
             ImGui::EndCombo();
         }
     }
     auto &action = actions[active_form];
-    ImGui::TextColored(fore_yellow, "%s", action.label.c_str());
-    divider();
+    if ((reviewing || options.size() == 1) && action.label != windows[v].title) {
+        ImGui::TextColored(fore_yellow, "%s", action.label.c_str());
+        divider();
+    }
+    if (v == CreateLine)
+        ImGui::TextWrapped("Choose a name with lowercase letters, digits and hyphens.");
+    if (v == AddAgent)
+        ImGui::TextWrapped("Install the agent in a checkout, a shared seat or a profile.");
+    if (action.label == "Detach local line")
+        ImGui::TextWrapped("Calls on this local line will use local routing. The enrolled workstation "
+                           "keeps its credential.");
+    if (action.label == "Record measurement")
+        ImGui::TextWrapped("Record the proposed measurement command for the participants to review.");
     if (action.label == "Create workstation request")
         ImGui::TextWrapped("Compare the descriptor fingerprint through a trusted channel. Send the request "
                            "file and verify both workstation fingerprints with the operator.");
@@ -303,6 +492,13 @@ void config_form() {
         ImGui::TextWrapped("Apply closes this board and runs the relay in the foreground. Ctrl-C stops the relay.");
     ImGui::PushID(active_form);
     for (auto &field : action.fields) {
+        if (v == AddAgent && ((field.label == "Checkout-local Claude settings" &&
+                               std::string(action.fields[1].value.data()).find("claude") != 0) ||
+                              (field.label.find("Worktree path") == 0 &&
+                               std::string(action.fields[3].value.data()) == "Codex profile") ||
+                              (field.label.find("Profile name") == 0 &&
+                               std::string(action.fields[3].value.data()) != "Codex profile")))
+            continue;
         ImGui::PushID(field.label.c_str());
         if (reviewing || result_state == 1) {
             ImGui::TextWrapped("%s: %s", field.label.c_str(),
@@ -310,23 +506,63 @@ void config_form() {
         } else if (field.checkbox) {
             ImGui::Checkbox(field.label.c_str(), &field.checked);
         } else {
-            ImGui::TextColored(fore_blue, "%s", field.label.c_str());
+            const char *label = field.label.c_str();
+            if (v == AddAgent && field.label.find("Profile name") == 0)
+                label = "Profile name";
+            if (v == AddAgent && field.label.find("Worktree path") == 0 &&
+                std::string(action.fields[3].value.data()) == "New worktree")
+                label = "New worktree path";
+            ImGui::TextColored(fore_blue, "%s", label);
             ImGui::SetNextItemWidth(std::max(8.0f, ImGui::GetContentRegionAvail().x - 3));
-            ImGui::InputText("##value", field.value.data(), field.value.size());
-            if (field.label == "Local line" && !known_lines.empty() &&
-                ImGui::BeginCombo("##known", "Choose existing line")) {
-                for (const auto &line : known_lines)
-                    if (ImGui::Selectable(line.c_str()))
-                        std::snprintf(field.value.data(), field.value.size(), "%s", line.c_str());
-                ImGui::EndCombo();
-            }
+            if (field.label == "Provider" || field.label == "Runtime")
+                choice(field, {"claude", "claude-channels", "claude-rewake", "codex", "agy"});
+            else if (field.label == "Default addressing (true/false)")
+                choice(field, {"true", "false"});
+            else if (field.label == "Kind" && action.group == "Broadcasts")
+                choice(field, {"briefing", "regroup", "announcement"});
+            else if (field.label == "Attachment") {
+                std::vector<std::string> modes = {"Worktree", "New worktree"};
+                const std::string provider = action.fields[1].value.data();
+                if (provider == "codex" || provider == "agy")
+                    modes.push_back("Shared seat");
+                if (provider == "codex")
+                    modes.push_back("Codex profile");
+                choice(field, modes);
+                const std::string mode = field.value.data();
+                ImGui::TextWrapped(
+                    "%s", mode == "Shared seat" ? "Shares an existing checkout under a separate agent name."
+                          : mode == "Codex profile" ? "Launch from any checkout with codex -p PROFILE."
+                          : mode == "New worktree"
+                              ? "Create a Git worktree at a new path, then install the agent there."
+                              : "Use this checkout or enter an existing worktree path.");
+            } else if (field.label == "Message" || field.label == "Resolution")
+                ImGui::InputTextMultiline("##value", field.value.data(), field.value.size(),
+                                          ImVec2(std::max(8.f, ImGui::GetContentRegionAvail().x - 3), 4));
+            else if (field.label == "Local line" && !known_lines.empty())
+                choice(field, known_lines);
+            else
+                ImGui::InputText("##value", field.value.data(), field.value.size());
         }
         ImGui::PopID();
     }
     ImGui::PopID();
-    if (result_state != 1) {
+    if (v == AddAgent && !reviewing && result_state != 1) {
+        const std::string provider = action.fields[1].value.data();
+        std::string hint = provider.find("claude") == 0 ? "claude" : provider;
+        if (provider == "claude-channels")
+            hint = "claude --dangerously-load-development-channels server:yip";
+        if (std::string(action.fields[3].value.data()) == "Codex profile")
+            hint +=
+                " -p " + std::string(action.fields[5].value[0] ? action.fields[5].value.data() : "PROFILE");
+        ImGui::TextWrapped("Launch: %s", hint.c_str());
+    }
+    if (busy && result_owner != v)
+        ImGui::TextDisabled("Another operation is running");
+    else if (result_state != 1) {
         if (reviewing) {
-            if (ImGui::Button("Apply")) {
+            if (ImGui::Button("Apply") && !busy) {
+                last_action = active_form;
+                result_owner = v;
                 submitted = active_form;
                 reviewing = false;
             }
@@ -341,43 +577,209 @@ void config_form() {
         ImGui::PushStyleColor(ImGuiCol_Text, static_cast<ImVec4>(result_state == 2   ? fore_red
                                                                  : result_state == 1 ? fore_blue
                                                                                      : fore_green));
-        ImGui::TextWrapped("%s", result.c_str());
+        std::istringstream output(result);
+        for (std::string line; std::getline(output, line);) {
+            if (line.empty())
+                ImGui::Dummy(ImVec2(0, 1));
+            else
+                ImGui::TextWrapped("%s", line.c_str());
+        }
         ImGui::PopStyleColor();
     }
 }
-void draw_views(int width, int height) {
-    for (int i = 0; i < 5; ++i) {
-        if (!open_view[i])
-            continue;
-        std::string name = std::string(" ") + views[i];
-        ImGui::SetNextWindowPos(ImVec2(std::min(5 + i, width / 12), 3 + i % 3), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(std::min(82, width - 8), std::max(6, height - 8)),
-                                 ImGuiCond_FirstUseEver);
-        bool expanded = begin_pane(name.c_str());
-        pane_frame(views[i], expanded);
-        if (expanded) {
-            clip_pane_content();
-            ImGui::Indent(3);
-            if (ImGui::Button("Close"))
-                open_view[i] = false;
-            if (i == 2 && ImGui::Button("Compose broadcast")) {
-                for (int j = 0; j < (int)actions.size(); ++j)
-                    if (actions[j].group == "Broadcasts") {
-                        if (result_state != 1)
-                            choose_action(j);
-                        break;
-                    }
-                open_view[4] = true;
-            }
-            divider();
-            if (i == 4)
-                config_form();
-            else if (extra_text[i].empty())
-                ImGui::TextDisabled("%s", i == 2 ? "No broadcasts" : "Awaiting line data");
-            else
-                status_lines(extra_text[i], extra_inks[i], true);
-            ImGui::PopClipRect();
+// Wrap toolbars by available cells, leaving their right gutter clear.
+void toolbar(const std::vector<std::pair<const char *, View>> &items) {
+    bool first = true;
+    for (const auto &item : items) {
+        const float end = ImGui::GetItemRectMax().x;
+        if (!first && end + ImGui::CalcTextSize(item.first).x + 5 <
+                          ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x)
+            ImGui::SameLine();
+        if (ImGui::Button(item.first))
+            present(item.second);
+        first = false;
+    }
+}
+void line_picker(View owner, const std::vector<std::string> &lines) {
+    for (size_t n = 0; n < lines.size(); ++n) {
+        const auto &line = lines[n];
+        ImGui::PushID(line.c_str());
+        if (ImGui::Selectable((line + "###line").c_str(), line == live_line) && line != live_line &&
+            !busy && submitted < 0) {
+            for (int i = 0; i < (int)actions.size(); ++i)
+                if (actions[i].group == "Manage Lines") {
+                    auto &f = actions[i].fields.front();
+                    std::snprintf(f.value.data(), f.value.size(), "%s", line.c_str());
+                    result_owner = owner;
+                    submitted = last_action = i;
+                    break;
+                }
         }
+        if (owner == Relays && n < relay_labels.size())
+            status_lines(relay_labels[n], "b", true);
+        ImGui::PopID();
+    }
+    auto &w = desk[owner];
+    if (w.result_state == 2)
+        ImGui::TextWrapped("%s", w.result.c_str());
+}
+void guide_section(const char *title, const char *body) {
+    ImGui::Dummy(ImVec2(0, 1));
+    ImGui::TextColored(fore_blue, "%s", title);
+    ImGui::TextWrapped("%s", body);
+}
+void pane_body(View v) {
+    if (v == Help) {
+        ImGui::TextColored(fore_yellow, "%s", windows[help_topic].title);
+        divider();
+        const bool relay_help = help_topic == Connect || help_topic == Relays ||
+                                help_topic == ClientTools || help_topic == Operator;
+        if (relay_help) {
+            guide_section("WHAT A RELAY DOES",
+                          "A local line links agents on one machine. Attaching it to a relay lets enrolled "
+                          "workstations exchange calls, broadcasts and roadmaps. Delivery into each agent "
+                          "session still runs on its own machine.");
+            guide_section("JOIN AN EXISTING LINE", windows[Connect].help);
+            guide_section(
+                "HOST A LINE",
+                "On the relay machine, open Relays, then Relay operator. Use Host a line to generate the "
+                "certificate. Use Line administration to create the root keys and sign a descriptor for "
+                "the reachable origin. Provision and serve the line, initialize it, and authorize an "
+                "operator. Give invitees the signed descriptor and verify its fingerprint separately. The "
+                "LDR quickstart covers the complete ceremony and tunnel settings.");
+            guide_section("CHECK OR REMOVE A CONNECTION",
+                          "Select the attachment in Relays and read its authentication stage and last "
+                          "verified checkpoint. Detach this line restores local routing. A workstation "
+                          "credential remains enrolled until the operator revokes it.");
+        } else {
+            ImGui::TextWrapped("%s", windows[help_topic].help);
+        }
+        return;
+    }
+    if (v == Relays) {
+        const bool columns =
+            ImGui::GetContentRegionAvail().x >= 82 &&
+            ImGui::BeginTable("##relay-stations", 2,
+                              ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp);
+        if (columns) {
+            ImGui::TableSetupColumn("Attachments", ImGuiTableColumnFlags_WidthStretch, 0.46f);
+            ImGui::TableSetupColumn("Observation", ImGuiTableColumnFlags_WidthStretch, 0.54f);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+        }
+        ImGui::TextColored(fore_yellow, "Attached lines");
+        if (relay_lines.empty())
+            status_lines("Connect a workstation to bring a local line onto the relay.", " ", true);
+        line_picker(v, relay_lines);
+        divider();
+        if (ImGui::Button("Connect to a Relay"))
+            present(Connect);
+        if (std::find(relay_lines.begin(), relay_lines.end(), live_line) != relay_lines.end() &&
+            ImGui::Button("Detach this line"))
+            launch_form(Connect, "Detach local line");
+        if (columns)
+            ImGui::TableNextColumn();
+        else
+            divider();
+        ImGui::TextColored(fore_yellow, "Observing %s", live_line.c_str());
+        status_lines(extra_text[Relays], extra_inks[Relays], true);
+        if (columns)
+            ImGui::EndTable();
+        divider();
+        toolbar({{"Client operations", ClientTools},
+                 {"Relay operator", Operator},
+                 {"Line topology", Topology}});
+        return;
+    }
+    if (v == Topology)
+        toolbar({{"Manage Agents", ManageAgents}, {"Relays", Relays}});
+    if (v == Broadcasts)
+        toolbar({{"Compose broadcast", Compose}});
+    if (v <= Roadmaps) {
+        if (v == Roadmaps)
+            roadmap_width = std::max(20, int(ImGui::GetContentRegionAvail().x) - 4);
+        if (extra_text[v].empty())
+            ImGui::TextDisabled("%s", v == Broadcasts ? "No broadcasts" : "Awaiting line data");
+        else
+            status_lines(extra_text[v], extra_inks[v], true);
+        return;
+    }
+    if (v == Configuration)
+        toolbar({{"Manage Lines", ManageLines}, {"Manage Agents", ManageAgents}, {"Relays", Relays}});
+    if (v == ManageLines) {
+        ImGui::TextColored(fore_yellow, "Active line · %s", live_line.c_str());
+        line_picker(v, known_lines);
+        divider();
+        toolbar({{"Create a Line", CreateLine}, {"Manage Agents", ManageAgents}, {"Relays", Relays}});
+        return;
+    }
+    if (v == ManageAgents) {
+        ImGui::TextColored(fore_yellow, "Agents on %s", live_line.c_str());
+        if (ImGui::Button("Add Agent"))
+            launch_form(AddAgent, "Add Agent");
+        ImGui::SameLine();
+        if (ImGui::Button("Relay actors"))
+            launch_form(ClientTools, "List actors");
+        status_lines(live_topology, topology_colors, true);
+        divider();
+        if (!ImGui::CollapsingHeader("Remove a local agent"))
+            return;
+    }
+    config_form(v);
+    if (v == CreateLine && !desk[v].result.empty() && desk[v].result_state == 0) {
+        if (ImGui::Button("Add Agent"))
+            launch_form(AddAgent, "Add Agent");
+    }
+}
+void draw_views(int width, int height) {
+    for (int index = 0; index < ViewCount; ++index) {
+        View v = static_cast<View>(index);
+        auto &w = desk[v];
+        if (!w.open)
+            continue;
+        const auto &spec = windows[v];
+        std::string name = std::string(" ") + spec.title;
+        const int cols = std::min(spec.width, width - 2), rows = std::min(spec.height, height - 3);
+        ImVec2 size(cols, rows), pos((width - cols - 1) / 2, 1 + (height - 1 - rows) / 2);
+        place_pane(w.layout, pos, size, false, name.c_str());
+        ImGui::SetNextWindowSizeConstraints(ImVec2(30, 6), ImVec2(width - 2, height - 2));
+        if (w.focus) {
+            ImGui::SetNextWindowFocus();
+            ImGui::SetNextWindowCollapsed(false);
+        }
+        bool expanded = begin_pane(
+            name.c_str(), ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse, &w.open);
+        pane_frame(spec.title, expanded, true);
+        if (expanded) {
+            const auto origin = ImGui::GetWindowPos(), bounds = ImGui::GetWindowSize();
+            ImGui::SetCursorPos(ImVec2(3, 2));
+            const int footer = v == Help ? 1 : 3;
+            const float inner_width = std::max(1.f, bounds.x - 7);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(1, 0));
+            if (ImGui::BeginChild(
+                    "##body", ImVec2(inner_width, std::max(1.f, bounds.y - 2 - footer)), false,
+                    ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_AlwaysUseWindowPadding)) {
+                ImGui::Indent(1);
+                ImGui::PushTextWrapPos(inner_width - 2);
+                if (w.focus && v == Help)
+                    ImGui::SetScrollY(0);
+                pane_body(v);
+                ImGui::PopTextWrapPos();
+                ImGui::Unindent(1);
+            }
+            ImGui::EndChild();
+            ImGui::PopStyleVar();
+            if (v != Help) {
+                ImGui::SetCursorScreenPos(ImVec2(origin.x + bounds.x - 8, origin.y + bounds.y - 2));
+                if (ImGui::Button(" ? ")) {
+                    help_topic = v;
+                    present(Help);
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Help for %s", spec.title);
+            }
+        }
+        w.focus = false;
         ImGui::End();
     }
 }
@@ -395,30 +797,69 @@ extern "C" int board_take_action() {
     return index;
 }
 extern "C" const char *board_value(int i) {
-    const auto &f = actions[active_form].fields.at(i);
+    const auto &f = actions[last_action].fields.at(i);
     return f.checkbox ? (f.checked ? "1" : "") : f.value.data();
 }
 extern "C" void board_result(const char *text, int state) {
-    result = text;
-    result_state = state;
+    auto &w = desk[result_owner];
+    w.result = text;
+    w.result_state = state;
+    busy = state == 1;
 }
-extern "C" void board_lines(const char *lines) {
-    known_lines.clear();
-    std::istringstream input(lines);
-    for (std::string line; std::getline(input, line);)
-        if (!line.empty())
-            known_lines.push_back(line);
+extern "C" void board_lines(const char *lines, const char *relays, const char *client, const char *labels) {
+    attached_dir = client;
+    auto split = [](const char *text, std::vector<std::string> &out) {
+        out.clear();
+        std::istringstream input(text);
+        for (std::string line; std::getline(input, line);)
+            if (!line.empty())
+                out.push_back(line);
+    };
+    split(lines, known_lines);
+    split(relays, relay_lines);
+    split(labels, relay_labels);
 }
 extern "C" void board_extra(int i, const char *text, const char *inks) {
     extra_text[i] = text;
     extra_inks[i] = inks;
 }
 extern "C" void board_toggle_view(int i) {
-    if (i >= 0 && i < 5)
-        open_view[i] = !open_view[i];
+    if (i < 0 || i >= ViewCount)
+        return;
+    if (desk[i].open)
+        desk[i].open = false;
+    else
+        present(static_cast<View>(i));
 }
 extern "C" int board_views() {
-    return (open_view[2] ? 1 : 0) | (open_view[3] ? 2 : 0) | (open_view[1] ? 4 : 0);
+    return (desk[Broadcasts].open ? 1 : 0) | (desk[Roadmaps].open ? 2 : 0) | (desk[Relays].open ? 4 : 0) |
+           (std::min(256, roadmap_width) << 8);
+}
+extern "C" void board_help() {
+    auto *window = ImGui::GetCurrentContext()->NavWindow;
+    for (int i = 0; window && i < Help; ++i)
+        if (desk[i].open &&
+            window->RootWindow == ImGui::FindWindowByName((std::string(" ") + windows[i].title).c_str())) {
+            help_topic = static_cast<View>(i);
+            present(Help);
+            return;
+        }
+    if (!desk[Help].open) {
+        help_topic = ManageLines;
+        present(Help);
+    }
+}
+extern "C" int board_dismiss() {
+    auto &g = *ImGui::GetCurrentContext();
+    if (!g.NavWindow || g.OpenPopupStack.Size || g.ActiveId)
+        return false;
+    for (int i = 0; i < ViewCount; ++i)
+        if (desk[i].open && g.NavWindow->RootWindow ==
+                                ImGui::FindWindowByName((std::string(" ") + windows[i].title).c_str())) {
+            desk[i].open = false;
+            return true;
+        }
+    return false;
 }
 extern "C" int board_editing() {
     return ImGui::GetIO().WantTextInput;
@@ -446,13 +887,17 @@ extern "C" void board_init(const char *unicode_sample, uint32_t foreground[256])
     io.KeyMap[ImGuiKey_End] = 259;
     io.KeyMap[ImGuiKey_Delete] = 260;
     io.KeyMap[ImGuiKey_Tab] = 9;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.KeyMap[ImGuiKey_Space] = 32;
+    io.KeyMap[ImGuiKey_UpArrow] = 261;
+    io.KeyMap[ImGuiKey_DownArrow] = 262;
+    io.KeyMap[ImGuiKey_PageUp] = 263;
+    io.KeyMap[ImGuiKey_PageDown] = 264;
     actions.clear();
-    active_form = 0;
-    submitted = -1;
-    reviewing = false;
-    result.clear();
-    result_state = 0;
-    std::fill_n(open_view, 5, false);
+    for (auto &w : desk)
+        w = WindowState{};
+    submitted = last_action = -1;
+    busy = false;
     ImTui_ImplText_Init();
     auto &style = ImGui::GetStyle();
     style.WindowMinSize = ImVec2(18, 5);
@@ -551,16 +996,26 @@ extern "C" int board_frame(int width, int height, float seconds, int mouse_x, in
             ImGui::PopStyleColor();
             ImGui::EndMenu();
         }
+        if (live && ImGui::BeginMenu("Actions")) {
+            for (View v : {CreateLine, AddAgent, ManageLines, ManageAgents, Connect, Compose})
+                if (ImGui::MenuItem(windows[v].title))
+                    present(v);
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("View")) {
             toggle_calls |= ImGui::MenuItem("Toggle Calls", "1");
             toggle_chat |= ImGui::MenuItem("Toggle Transcript", "2");
             if (live) {
                 for (int i=0;i<5;++i)
-                    ImGui::MenuItem(views[i],(std::string("F")+std::to_string(i+3)).c_str(),&open_view[i]);
+                    if (ImGui::MenuItem(windows[i].title,
+                                        (std::string("F") + std::to_string(i + 3)).c_str(), desk[i].open))
+                        board_toggle_view(i);
             }
             reset_layout |= ImGui::MenuItem("Reset layout");
             ImGui::EndMenu();
         }
+        if (live && ImGui::MenuItem("Help", "F1"))
+            board_help();
         ImGui::EndMainMenuBar();
     }
     ImGui::PopStyleVar(2);
@@ -583,6 +1038,13 @@ extern "C" int board_frame(int width, int height, float seconds, int mouse_x, in
         else
             ImGui::TextDisabled("3 sample calls");
         divider();
+        if (live && !count && live_error.empty()) {
+            ImGui::TextWrapped("No calls on this line.");
+            if (ImGui::Button("Add Agent"))
+                launch_form(AddAgent, "Add Agent");
+            if (ImGui::Button("Create a Line"))
+                present(CreateLine);
+        }
         for (int i = 0; i < count; ++i) {
             const LiveCall sample = live ? LiveCall{} : LiveCall{
                 std::to_string(i), calls[i], "Sample", "",

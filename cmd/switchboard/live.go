@@ -23,8 +23,8 @@ type callSnapshot struct {
 }
 
 type boardSnapshot struct {
-	Lines                                            []string
-	Line, Error, TranscriptID, Transcript            string
+	Lines, RelayLines, RelayLabels                   []string
+	Line, ClientDir, Error, TranscriptID, Transcript string
 	Calls                                            []callSnapshot
 	Overview, Topology, Health, Broadcasts, Roadmaps []string
 	HealthInks, BroadcastInks, RoadmapInks           string
@@ -85,7 +85,8 @@ func readSnapshots(ctx context.Context, yip, dir string, selected *atomic.Value,
 		err = send.Encode(struct {
 			Selected                     string
 			Broadcasts, Roadmaps, Health bool
-		}{selected.Load().(string), v&1 != 0, v&2 != 0, v&4 != 0})
+			RoadmapWidth                 int
+		}{selected.Load().(string), v&1 != 0, v&2 != 0, v&4 != 0, int(v >> 8)})
 		if err == nil {
 			err = receive.Decode(&next)
 		}
@@ -143,7 +144,7 @@ func applySnapshot(next boardSnapshot, selected string) string {
 		}
 	}()
 
-	C.board_lines(copyString(strings.Join(next.Lines, "\n")))
+	C.board_lines(copyString(strings.Join(next.Lines, "\n")), copyString(strings.Join(next.RelayLines, "\n")), copyString(next.ClientDir), copyString(terminalCells(strings.Join(next.RelayLabels, "\n"))))
 	C.board_snapshot(copyString(terminalCells(next.Line)), copyString(terminalCells(next.Error)),
 		copyString(next.TranscriptID), copyString(terminalCells(next.Transcript)),
 		copyString(terminalCells(strings.Join(next.Overview, "\n"))),

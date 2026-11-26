@@ -54,6 +54,10 @@ var seatField = optional("Seat name", "--as")
 var actorField = field("Actor", "--actor")
 var byField = optional("Attribution", "--by")
 var rootKey = field("Root key file", "--root-key")
+var callID = field("Call ID", "--call")
+var fromActor = field("Sending actor", "--from")
+var message = field("Message", "--body")
+var dispute = field("Dispute ID", "--dispute")
 var actions = []boardAction{
 	form("Connect to relay", "Inspect signed descriptor", "ldr inspect", descriptor),
 	form("Connect to relay", "Verify relay connection", "ldr inspect --probe", descriptor, digest),
@@ -68,14 +72,33 @@ var actions = []boardAction{
 	form("Enroll workstation", "Enroll verified workstation", "ldr join enroll", adminDir, operatorKey, requestFile, challengeFile, field("Local challenge secret file", "--secret"), field("Workstation proof file", "--proof")),
 	form("Enroll workstation", "Activate reader epoch", "ldr epoch activate", adminDir, operatorKey),
 	form("Enroll workstation", "Revoke credential", "ldr join revoke", adminDir, operatorKey, field("Credential ID", "--cred-id")),
-	form("Lines and seats", "View another line", "@line", lineField),
-	form("Lines and seats", "Inspect seats and profiles", "line", lineField),
-	form("Lines and seats", "Install line or seat", "install", lineField, runtimeField, seatField, profileField, toggle("Use a shared seat", "--seat"), toggle("Local checkout settings", "--local")),
-	form("Lines and seats", "Remove seat or profile", "uninstall", lineField, field("Seat name", "--as"), runtimeField, profileField),
+	form("Create a Line", "Create a Line", "switchboard --create-line", field("Line name", "")),
+	form("Add Agent", "Add Agent", "@agent", lineField, field("Provider", ""), field("Agent name", ""), field("Attachment", ""), optional("Worktree path", ""), optional("Profile name", ""), toggle("Checkout-local Claude settings", "--local")),
+	form("Manage Lines", "View another line", "@line", lineField),
+	form("Manage Agents", "Remove agent", "uninstall", lineField, field("Agent name", "--as"), runtimeField, profileField),
 	form("Diagnostics", "Run Doctor", "doctor", runtimeField, profileField, optional("Line", "--line")),
-	form("Diagnostics", "Re-probe overdue local endpoints", "switchboard --reprobe", byField),
-	form("Diagnostics", "Client status", "ldr status", clientDir),
-	form("Diagnostics", "Sync client", "ldr sync", clientDir),
+	form("Diagnostics", "Re-probe overdue local endpoints", "switchboard --reprobe", lineField, byField),
+	form("Client tools", "Client status", "ldr status", clientDir),
+	form("Client tools", "Sync client", "ldr sync", clientDir),
+	form("Client tools", "List actors", "ldr actor list", clientDir),
+	form("Client tools", "Set actor addressing", "ldr actor addressing", clientDir, actorField, field("Default addressing (true/false)", "--default")),
+	form("Client tools", "List registers", "ldr register list", clientDir, optional("Register", "--register")),
+	form("Client tools", "Update actor register", "ldr register put", clientDir, actorField, field("Register", "--register"), message),
+	form("Relay calls", "List calls", "ldr call list", clientDir, optional("Actor", "--actor"), toggle("Include all", "--all")),
+	form("Relay calls", "Read call", "ldr call read", clientDir, callID),
+	form("Relay calls", "Open call", "ldr call open", clientDir, fromActor, field("Recipient", "--to"), callID, field("Subject", "--subject"), message),
+	form("Relay calls", "Send turn", "ldr call say", clientDir, fromActor, callID, message, toggle("Barge", "--barge")),
+	form("Relay calls", "Say bye", "ldr call bye", clientDir, fromActor, callID),
+	form("Relay calls", "Add actor note", "ldr call note", clientDir, fromActor, callID, message),
+	form("Relay calls", "Set call status", "ldr call status", clientDir, fromActor, callID, field("State", "--state"), optional("Reason", "--reason"), optional("Related call", "--related")),
+	form("Relay calls", "Attach file", "ldr call attach", clientDir, fromActor, callID, field("Attachment file", "--path")),
+	form("Relay calls", "Ratify as operator", "ldr call ratify", adminDir, operatorKey, callID, message),
+	form("Relay calls", "Record dispute", "ldr call dispute", clientDir, fromActor, callID, field("Claim", "--claim")),
+	form("Relay calls", "Record measurement", "ldr call measure", clientDir, fromActor, callID, dispute, field("Command", "--cmd")),
+	form("Relay calls", "Resolve dispute", "ldr call resolve", clientDir, fromActor, callID, dispute, field("Kind", "--kind"), field("Detail", "--detail")),
+	form("Relay broadcasts", "List broadcasts", "ldr broadcast list", clientDir, optional("Actor", "--actor"), toggle("Include all", "--all")),
+	form("Relay broadcasts", "Read broadcast", "ldr broadcast read", clientDir, actorField, field("Broadcast ID", "--id")),
+	form("Relay broadcasts", "Reply to broadcast", "ldr broadcast reply", clientDir, actorField, field("Broadcast ID", "--id"), message),
 	form("Resources", "Inspect resource configuration", "config show"),
 	form("Resources", "Initialize resource configuration", "config init", toggle("All line clients have restarted", "--clients-restarted")),
 	form("Resources", "Migrate resource configuration", "config migrate", toggle("All line clients have restarted", "--clients-restarted")),
@@ -95,13 +118,84 @@ var actions = []boardAction{
 	form("Line administration", "Initialize provisioned line", "ldr root init-line", adminDir, descriptor, rootKey),
 	form("Line administration", "Authorize operator", "ldr root authorize-operator", adminDir, rootKey, field("Operator public key", "--operator-pub")),
 	form("Line administration", "Revoke operator", "ldr root revoke-operator", adminDir, rootKey, field("Operator public key", "--operator-pub")),
-	form("Broadcasts", "Send local briefing", "broadcast briefing", byField, field("Recipients (comma-separated)", "--to"), field("Message", "@stdin")),
-	form("Broadcasts", "Send local announcement", "broadcast announcement", byField, field("Recipients (comma-separated)", "--to"), field("Message", "@stdin")),
-	form("Broadcasts", "Send local regroup", "broadcast regroup", byField, field("Recipients (comma-separated)", "--to"), field("Message", "@stdin")),
+	form("Broadcasts", "Send local briefing", "broadcast briefing", lineField, byField, field("Recipients (comma-separated)", "--to"), field("Message", "@stdin")),
+	form("Broadcasts", "Send local announcement", "broadcast announcement", lineField, byField, field("Recipients (comma-separated)", "--to"), field("Message", "@stdin")),
+	form("Broadcasts", "Send local regroup", "broadcast regroup", lineField, byField, field("Recipients (comma-separated)", "--to"), field("Message", "@stdin")),
 	form("Broadcasts", "Send relay broadcast", "ldr broadcast create", adminDir, operatorKey, field("Kind", "--kind"), field("Recipients (comma-separated)", "--to"), byField, field("Message", "--body")),
-	form("Calls", "Add human note", "ratify", field("Call ID", ""), byField, field("Message", "@stdin")),
+	form("Calls", "Add human note", "ratify", lineField, field("Call ID", ""), byField, field("Message", "@stdin")),
 	form("Calls", "Add signed human note", "ldr call ratify", adminDir, operatorKey, field("Call ID", "--call"), field("Message", "--body")),
-	form("Calls", "Arbitrate local dispute", "switchboard --arbitrate", field("Call ID", "--call"), field("Dispute ID", "--dispute"), byField, field("Resolution", "@stdin")),
+	form("Calls", "Arbitrate local dispute", "switchboard --arbitrate", lineField, field("Call ID", "--call"), field("Dispute ID", "--dispute"), byField, field("Resolution", "@stdin")),
+}
+
+// Resolve the setup choices before invoking install in the requested checkout.
+func agentArguments(values []string) ([]string, string, error) {
+	line, provider, agent, mode := strings.TrimSpace(values[0]), values[1], strings.TrimSpace(values[2]), values[3]
+	if line == "" || agent == "" || strings.HasPrefix(line, "-") || strings.HasPrefix(agent, "-") {
+		return nil, "", fmt.Errorf("enter a line and an agent name")
+	}
+	switch provider {
+	case "codex", "agy", "claude", "claude-channels", "claude-rewake":
+	default:
+		return nil, "", fmt.Errorf("choose a provider")
+	}
+	args := []string{"install", "--line", line, "--as", agent, "--runtime", provider}
+	switch mode {
+	case "Worktree", "New worktree":
+		if mode == "New worktree" && strings.TrimSpace(values[4]) == "" {
+			return nil, "", fmt.Errorf("enter a new worktree path")
+		}
+	case "Shared seat":
+		if provider != "codex" && provider != "agy" {
+			return nil, "", fmt.Errorf("shared seats require Codex or Antigravity")
+		}
+		args = append(args, "--seat")
+	case "Codex profile":
+		if provider != "codex" || strings.TrimSpace(values[5]) == "" || strings.HasPrefix(values[5], "-") {
+			return nil, "", fmt.Errorf("choose Codex and enter a profile name")
+		}
+		args = append(args, "--profile", strings.TrimSpace(values[5]))
+	default:
+		return nil, "", fmt.Errorf("choose an attachment")
+	}
+	if strings.HasPrefix(provider, "claude") && values[6] != "" {
+		args = append(args, "--local")
+	}
+	return args, "", nil
+}
+
+func installBoardAgent(ctx context.Context, yip, dir string, args, values []string) (string, error) {
+	path := strings.TrimSpace(values[4])
+	if path != "" && values[3] != "Codex profile" {
+		if strings.HasPrefix(path, "~/") {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return "", err
+			}
+			path = filepath.Join(home, path[2:])
+		}
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(dir, path)
+		}
+		path, err := filepath.Abs(path)
+		if err != nil {
+			return "", err
+		}
+		if values[3] == "New worktree" {
+			if _, err := os.Lstat(path); !os.IsNotExist(err) {
+				return "", fmt.Errorf("choose an unused worktree path")
+			}
+			output, err := runAction(ctx, "git", dir, []string{"worktree", "add", "--", path}, "")
+			if err != nil {
+				return output, err
+			}
+		}
+		dir = path
+	}
+	msg, err := runAction(ctx, yip, dir, args, "")
+	if err != nil && values[3] == "New worktree" {
+		msg += "\nWorktree created at " + dir + ". Select Worktree to retry installation there."
+	}
+	return msg, err
 }
 
 func cstrings(values ...string) ([]*C.char, func()) {
@@ -138,6 +232,9 @@ func registerActions() {
 func (a boardAction) arguments(values []string) (args []string, body string, err error) {
 	if len(values) != len(a.fields) {
 		return nil, "", fmt.Errorf("invalid field count")
+	}
+	if a.command == "@agent" {
+		return agentArguments(values)
 	}
 	args = strings.Fields(a.command)
 	for i, f := range a.fields {

@@ -178,6 +178,11 @@ func (v *view) relayTopology(p palette) []string {
 				name += " · retired"
 				style = p.muted
 			}
+			addressing := "direct address"
+			if a.DefaultAddressed {
+				addressing = "default audience"
+			}
+			name += fmt.Sprintf(" · %s · binding %d", addressing, a.BindingGen)
 			actors = append(actors, p.text(style, glyph+" "+name))
 		}
 		for j, name := range actors {

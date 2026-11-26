@@ -827,6 +827,8 @@ func main() {
 			return
 		}
 		switch first(args) {
+		case "--create-line":
+			check(createSwitchboardLine(args[1:]))
 		case "--arbitrate", "--reprobe":
 			message, err := switchboardOperator(args[0], args[1:])
 			check(err)
@@ -834,6 +836,11 @@ func main() {
 		case "--reference":
 			check(Switchboard(parseSwitchboardArgs(args)))
 		default:
+			if line == "" && os.Getenv("YIP_LINE") == "" && os.Getenv("YIP_ROOT") == "" {
+				if hosts := linesHosting(checkoutRoot("")); len(hosts) == 1 {
+					activeLine = hosts[0]
+				}
+			}
 			check(launchSwitchboard(args))
 		}
 	case "doctor":

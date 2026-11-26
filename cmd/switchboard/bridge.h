@@ -13,12 +13,14 @@ void board_field(const char *label, int checkbox);
 int board_take_action(void);
 const char *board_value(int index);
 void board_result(const char *text, int state);
-void board_lines(const char *lines);
+void board_lines(const char *lines, const char *relays, const char *client,const char *labels);
 void board_extra(int index, const char *text, const char *inks);
 int board_views(void);
 void board_toggle_view(int index);
 void board_key(int code, unsigned int rune);
 int board_editing(void);
+void board_help(void);
+int board_dismiss(void);
 void board_snapshot(const char *line, const char *error, const char *transcript_id,
                     const char *transcript, const char *overview, const char *topology, const char *text_inks, const char *overview_inks, const char *topology_inks);
 void board_add_call(const char *id, const char *subject, const char *status, const char *floor, const char *participants, const char *route, const char *progress);
