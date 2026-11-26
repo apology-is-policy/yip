@@ -242,6 +242,11 @@ func main() {
 	case "config":
 		check(ResourceConfigCLI(args))
 	case "broadcast":
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			check(fmt.Errorf("local `yip broadcast` is not supported on LDR-attached lines; operator broadcasts require the operator key via `yip ldr broadcast create --dir <client-dir> --operator-key <key> ...`"))
+		}
 		check(BroadcastCLI(args))
 	case "delivery":
 		if first(args) == "listen" {
@@ -637,6 +642,14 @@ func main() {
 		check(Beat(me, ""))
 	case "calls":
 		me, _ := WhoAmI(as, "")
+		if att, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			out, err := ldrCallsListText(att, me)
+			check(err)
+			fmt.Println(out)
+			return
+		}
 		calls, err := ListCalls()
 		check(err)
 		if len(calls) == 0 {
@@ -654,6 +667,14 @@ func main() {
 		}
 	case "note":
 		me := must(WhoAmI(as, ""))
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			out, err := (&server{me: me}).call("note", map[string]any{"call": first(args), "body": stdinBody()})
+			check(err)
+			fmt.Println(out)
+			return
+		}
 		c, err := ResolveCall(first(args), me)
 		check(err)
 		body := stdinBody()
@@ -661,6 +682,11 @@ func main() {
 		check(err)
 		fmt.Printf("note %d on %s (floor unchanged: %s)\n", n, c.ID, floorOf(c))
 	case "ratify":
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			check(fmt.Errorf("local `yip ratify` is not supported on LDR-attached lines; human ratification requires the operator key via `yip ldr call ratify --dir <client-dir> --operator-key <key> --call <id> --body ...`"))
+		}
 		// The human seat. No MCP tool exists for this on purpose.
 		by := os.Getenv("USER")
 		args, by = takeFlag(args, "--by", by)
@@ -674,6 +700,11 @@ func main() {
 		check(err)
 		fmt.Printf("ratification %d recorded on %s as %s (human)\n", n, c.ID, by)
 	case "watch":
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			check(fmt.Errorf("local `yip watch` is not supported on LDR-attached lines; use `yip delivery listen` or `yip api wait`"))
+		}
 		me := must(WhoAmI(as, ""))
 		launch := must(launchIdentity(as, ""))
 		explicit := as != "" || os.Getenv("YIP_AGENT") != ""
@@ -705,6 +736,14 @@ func main() {
 		me := must(WhoAmI(as, ""))
 		var callID string
 		args, callID = takeFlag(args, "--call", "")
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			out, err := (&server{me: me}).call("dispute", map[string]any{"call": callID, "claim": first(args)})
+			check(err)
+			fmt.Println(out)
+			return
+		}
 		c, err := ResolveCall(callID, me)
 		check(err)
 		if claim := first(args); claim != "" {
@@ -730,17 +769,30 @@ func main() {
 		me := must(WhoAmI(as, ""))
 		var callID string
 		args, callID = takeFlag(args, "--call", "")
-		c, err := ResolveCall(callID, me)
-		check(err)
 		id, cmdStr := "", first(args)
 		if len(args) > 1 {
 			id, cmdStr = args[0], args[1]
 		}
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			out, err := (&server{me: me}).call("measure", map[string]any{"call": callID, "dispute": id, "cmd": cmdStr})
+			check(err)
+			fmt.Println(out)
+			return
+		}
+		c, err := ResolveCall(callID, me)
+		check(err)
 		d, err := ResolveDispute(c, id)
 		check(err)
 		check(SetMeasurement(c, d, me, cmdStr))
 		fmt.Printf("%s recorded for %s\n%s\n", me, d.ID, DisputeStatus(c, d))
 	case "settled":
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			check(fmt.Errorf("local `yip settled` is not supported on LDR-attached lines; use `yip ldr call resolve --dir <client-dir> --from <actor> --call <id> --dispute <id> --detail ...`"))
+		}
 		me := must(WhoAmI(as, ""))
 		var callID string
 		args, callID = takeFlag(args, "--call", "")
@@ -766,6 +818,11 @@ func main() {
 		me := must(WhoAmI(as, ""))
 		printSetup(me)
 	case "switchboard":
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			check(fmt.Errorf("local `yip switchboard` is not supported on LDR-attached lines; use `yip ldr` or `yip api`"))
+		}
 		// The human's live seat. It can ratify and arbitrate; it deliberately
 		// has no key that speaks as an agent -- see switchboard.go.
 		if err := Switchboard(parseSwitchboardArgs(args)); err != nil {

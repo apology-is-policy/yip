@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/json"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -511,7 +513,10 @@ func newLDRBridgeFixture(t *testing.T) *ldrBridgeFixture {
 	r2, _ := ldrclient.GenerateSigningKey(ldrcrypto.AlgECDSAP256)
 	opKey, _ := ldrclient.GenerateSigningKey(ldrcrypto.AlgEd25519)
 	opCredKeys, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
-	lineID := bytes.Repeat([]byte{0x78}, 16)
+	lineID := make([]byte, 16)
+	if _, err := rand.Read(lineID); err != nil {
+		t.Fatal(err)
+	}
 	origin := ldrcrypto.RelayOrigin{
 		URL:            "https://" + rawLn.Addr().String(),
 		TLSPolicy:      ldrcrypto.TLSPolicyPinSPKISHA256,
@@ -824,11 +829,15 @@ func TestLDRBridgeAckDeliveryPersistsLDRFirstAndConvergesOnRetry(t *testing.T) {
 
 	// 3. Partial-crash convergence: LDR notice already acked while endpoint.json still shows "accepted".
 	ev2 := dispatchOne("partial-crash")
+	_, _, ev2NoticeID, qualified := parseLDRDeliverySource(ev2.Source)
+	if !qualified {
+		t.Fatalf("expected line-qualified LDR delivery source, got %q", ev2.Source)
+	}
 	cl, err = ldrclient.OpenClient(bobClientDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cl.AckNotice(strings.TrimPrefix(ev2.Source, "ldr:")); err != nil {
+	if err := cl.AckNotice(ev2NoticeID); err != nil {
 		_ = cl.Close()
 		t.Fatalf("pre-ack LDR notice: %v", err)
 	}
@@ -1112,5 +1121,377 @@ func TestLDRBridgeMalformedOrUnreadableAttachmentFailsClosedPreservingLocalResou
 	_ = os.Unsetenv("YIP_LDR_DIR")
 	if _, ok, err := loadLDRAttachment(); err != nil || ok {
 		t.Fatalf("expected (false, nil) after detach + unset YIP_LDR_DIR, got ok=%v err=%v", ok, err)
+	}
+}
+
+func TestLDRBridgeDeliveryLineBindingAndLegacyUnqualifiedEvents(t *testing.T) {
+	// Two completely independent LDR lines with distinct line_ids and identical
+	// actor/sequence progression so both generate identical raw ldrclient notice IDs.
+	fxA := newLDRBridgeFixture(t)
+	aliceACK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	bobACK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	aAg, aArid, aArdig := fxA.enroll(t, "ns-alice", aliceACK, 4, 0x71)
+	bAg, bArid, bArdig := fxA.enroll(t, "ns-bob", bobACK, 4, 0x72)
+	fxA.activateEpoch(t, "ep-a-1")
+
+	aliceADir := filepath.Join(t.TempDir(), "alice-a-ldr")
+	bobADir := filepath.Join(t.TempDir(), "bob-a-ldr")
+	fxA.setupWorkstation(t, aliceADir, aliceACK, aAg, aArid, aArdig, "alice-gemini")
+	fxA.setupWorkstation(t, bobADir, bobACK, bAg, bArid, bArdig, "bob-codex")
+
+	fxB := newLDRBridgeFixture(t)
+	aliceBCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	bobBCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	aBg, aBrid, aBrdig := fxB.enroll(t, "ns-alice", aliceBCK, 4, 0x73)
+	bBg, bBrid, bBrdig := fxB.enroll(t, "ns-bob", bobBCK, 4, 0x74)
+	fxB.activateEpoch(t, "ep-b-1")
+
+	aliceBDir := filepath.Join(t.TempDir(), "alice-b-ldr")
+	bobBDir := filepath.Join(t.TempDir(), "bob-b-ldr")
+	fxB.setupWorkstation(t, aliceBDir, aliceBCK, aBg, aBrid, aBrdig, "alice-gemini")
+	fxB.setupWorkstation(t, bobBDir, bobBCK, bBg, bBrid, bBrdig, "bob-codex")
+
+	aliceAHome := filepath.Join(t.TempDir(), "alice-a-home")
+	aliceBHome := filepath.Join(t.TempDir(), "alice-b-home")
+	// ONE shared Bob local line/endpoint that switches attachment from Line A -> Line B -> Line A.
+	bobHome := filepath.Join(t.TempDir(), "bob-switch-home")
+
+	useAliceA := func() { _ = os.Setenv("YIP_HOME", aliceAHome); activeLine = "line-a" }
+	useAliceB := func() { _ = os.Setenv("YIP_HOME", aliceBHome); activeLine = "line-b" }
+	useBob := func() { _ = os.Setenv("YIP_HOME", bobHome); activeLine = "bob-shared-local" }
+
+	useAliceA()
+	if _, err := AttachLDRLine(aliceADir, "gemini", "alice-gemini"); err != nil {
+		t.Fatal(err)
+	}
+	useAliceB()
+	if _, err := AttachLDRLine(aliceBDir, "gemini", "alice-gemini"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Attach Bob's local endpoint to Line A and register Codex delivery endpoint.
+	useBob()
+	if _, err := AttachLDRLine(bobADir, "codex", "bob-codex"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RegisterEndpoint("codex", "22222222-3333-4444-5555-666666666666", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Alice-A opens call 0001 on Line A -> Bob receives notice evA (un-acked).
+	useAliceA()
+	if _, err := (&server{me: "gemini"}).call("call", map[string]any{
+		"peer": "bob-codex", "subject": "Matching coords", "body": "from line A",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	useBob()
+	if n, err := Dispatch("codex", func(context.Context, string, string) error { return nil }); err != nil || n != 1 {
+		t.Fatalf("dispatch line A: n=%d err=%v", n, err)
+	}
+	ep, err := readEndpoint("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ep.Events) != 1 {
+		t.Fatalf("expected 1 event after line A dispatch, got %+v", ep.Events)
+	}
+	evA := ep.Events[0]
+	lineAHex, descAHex, rawNoticeA, qualA := parseLDRDeliverySource(evA.Source)
+	if !qualA {
+		t.Fatalf("expected qualified LDR source on line A, got %q", evA.Source)
+	}
+
+	// Reattach the SAME local endpoint from Line A to Line B!
+	if err := DetachLDRLine(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AttachLDRLine(bobBDir, "codex", "bob-codex"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Alice-B opens call 0001 on Line B with identical sequence/actor/kind coordinates.
+	useAliceB()
+	if _, err := (&server{me: "gemini"}).call("call", map[string]any{
+		"peer": "bob-codex", "subject": "Matching coords", "body": "from line B",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Dispatch on Bob (now attached to Line B) MUST NOT be suppressed by Line A's ep.Known entry!
+	useBob()
+	if n, err := Dispatch("codex", func(context.Context, string, string) error { return nil }); err != nil || n != 1 {
+		t.Fatalf("expected line B notice not suppressed by line A ep.Known: n=%d err=%v", n, err)
+	}
+	ep, err = readEndpoint("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ep.Events) != 2 {
+		t.Fatalf("expected 2 distinct events across line A and line B, got %+v", ep.Events)
+	}
+	evB := ep.Events[1]
+	lineBHex, descBHex, rawNoticeB, qualB := parseLDRDeliverySource(evB.Source)
+	if !qualB {
+		t.Fatalf("expected qualified LDR source on line B, got %q", evB.Source)
+	}
+	if rawNoticeA != rawNoticeB {
+		t.Fatalf("test precondition failed: expected matching raw notice coordinates, got A=%q B=%q", rawNoticeA, rawNoticeB)
+	}
+	if lineAHex == lineBHex && descAHex == descBHex {
+		t.Fatalf("expected distinct line identity between A and B")
+	}
+	if evA.ID == evB.ID || evA.Source == evB.Source {
+		t.Fatalf("expected distinct delivery IDs and sources across lines, got A=%+v B=%+v", evA, evB)
+	}
+
+	countUnacked := func(dir string) int {
+		t.Helper()
+		cl, err := ldrclient.OpenClient(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cl.Close()
+		return len(cl.DeliverableNotices())
+	}
+
+	// 1. Acking Line A's old event while attached to Line B MUST fail and MUST NOT ack Line B's notice!
+	if err := AckDelivery("codex", evA.ID); err == nil {
+		t.Fatal("expected AckDelivery(evA) to fail while attached to Line B")
+	}
+	if got := countUnacked(bobBDir); got != 1 {
+		t.Fatalf("wrong-line ack mutated Line B notice state: unacked=%d", got)
+	}
+	ep, _ = readEndpoint("codex")
+	if ep.Events[0].Status == "read" {
+		t.Fatalf("evA was falsely marked read during wrong-line ack: %+v", ep.Events[0])
+	}
+
+	// 2. Inject a preexisting unqualified legacy event ("ldr:" + rawNoticeB): AckDelivery MUST refuse without guessing!
+	legacySource := "ldr:" + rawNoticeB
+	legacyID := deliveryID("codex", legacySource)
+	if err := editEndpoint("codex", func(e *Endpoint) error {
+		e.Known[legacySource] = true
+		e.Events = append(e.Events, Delivery{
+			ID: legacyID, Source: legacySource, Text: "legacy unqualified notice", Created: now(), Status: "accepted",
+		})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := AckDelivery("codex", legacyID); err == nil {
+		t.Fatal("expected AckDelivery on legacy unqualified ldr: source to fail without guessing")
+	}
+	if got := countUnacked(bobBDir); got != 1 {
+		t.Fatalf("legacy unqualified ack mutated Line B notice state: unacked=%d", got)
+	}
+	ep, _ = readEndpoint("codex")
+	if ep.Events[2].Status == "read" {
+		t.Fatalf("legacy unqualified event falsely marked read: %+v", ep.Events[2])
+	}
+
+	// 3. Acking Line B's event while attached to Line B succeeds and leaves Line A's notice un-acked!
+	if err := AckDelivery("codex", evB.ID); err != nil {
+		t.Fatalf("AckDelivery(evB) on Line B failed: %v", err)
+	}
+	if got := countUnacked(bobBDir); got != 0 {
+		t.Fatalf("expected 0 unacked notices on Line B after evB ack, got %d", got)
+	}
+	if got := countUnacked(bobADir); got != 1 {
+		t.Fatalf("expected Line A notice to remain unacked, got %d", got)
+	}
+
+	// 4. Reattaching Line A allows AckDelivery(evA) to succeed cleanly!
+	if err := DetachLDRLine(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AttachLDRLine(bobADir, "codex", "bob-codex"); err != nil {
+		t.Fatal(err)
+	}
+	if err := AckDelivery("codex", evA.ID); err != nil {
+		t.Fatalf("AckDelivery(evA) after reattaching Line A failed: %v", err)
+	}
+	if got := countUnacked(bobADir); got != 0 {
+		t.Fatalf("expected 0 unacked notices on Line A after evA ack, got %d", got)
+	}
+}
+
+func TestLDRBridgeCLIRoutingAndRefusalThroughActualBinary(t *testing.T) {
+	// Build the actual yip CLI binary once to exercise main.go dispatch end to end.
+	binPath := filepath.Join(t.TempDir(), "yip")
+	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build yip binary failed: %v\n%s", err, string(out))
+	}
+
+	fx := newLDRBridgeFixture(t)
+	aliceCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	bobCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	ag, arid, ardig := fx.enroll(t, "ns-alice", aliceCK, 4, 0x75)
+	bg, brid, brdig := fx.enroll(t, "ns-bob", bobCK, 4, 0x76)
+	fx.activateEpoch(t, "ep-cli-1")
+
+	aliceClientDir := filepath.Join(t.TempDir(), "alice-cli-ldr")
+	bobClientDir := filepath.Join(t.TempDir(), "bob-cli-ldr")
+	fx.setupWorkstation(t, aliceClientDir, aliceCK, ag, arid, ardig, "alice-gemini")
+	fx.setupWorkstation(t, bobClientDir, bobCK, bg, brid, brdig, "bob-codex")
+
+	aliceHome := filepath.Join(t.TempDir(), "alice-cli-home")
+	bobHome := filepath.Join(t.TempDir(), "bob-cli-home")
+	const aliceLine = "cli-alice"
+	const bobLine = "cli-bob"
+
+	_ = os.Setenv("YIP_HOME", bobHome)
+	activeLine = bobLine
+	if _, err := AttachLDRLine(bobClientDir, "codex", "bob-codex"); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = os.Setenv("YIP_HOME", aliceHome)
+	activeLine = aliceLine
+	if _, err := AttachLDRLine(aliceClientDir, "gemini", "alice-gemini"); err != nil {
+		t.Fatal(err)
+	}
+	// Configure host-local resource "gpu" and seed a local decoy call involving "gemini".
+	if err := os.WriteFile(resourceConfigPath(), []byte(`{"version":1,"resources":[{"name":"gpu","description":"local GPU","machine":"cli-host"}]}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	decoy, err := NewCall("other", "gemini", "Local decoy call")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AppendTurn(decoy, "other", "decoy turn 1", false); err != nil {
+		t.Fatal(err)
+	}
+
+	runCLI := func(extraEnv []string, stdin string, args ...string) (string, error) {
+		cmd := exec.Command(binPath, args...)
+		env := make([]string, 0, len(os.Environ())+len(extraEnv)+3)
+		for _, kv := range os.Environ() {
+			if strings.HasPrefix(kv, "YIP_HOME=") || strings.HasPrefix(kv, "YIP_ROOT=") ||
+				strings.HasPrefix(kv, "YIP_LINE=") || strings.HasPrefix(kv, "YIP_LDR_DIR=") ||
+				strings.HasPrefix(kv, "YIP_AGENT=") {
+				continue
+			}
+			env = append(env, kv)
+		}
+		env = append(env, "YIP_HOME="+aliceHome)
+		env = append(env, extraEnv...)
+		cmd.Env = env
+		if stdin != "" {
+			cmd.Stdin = strings.NewReader(stdin)
+		}
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	// 1. Valid LDR attachment: CLI `call`, `note`, `calls`, `dispute`, `measure`, `roadmap` route to LDR, never the decoy!
+	out, err := runCLI(nil, "hello over CLI", "--line", aliceLine, "--as", "gemini", "call", "bob-codex", "CLI note routing")
+	if err != nil || !strings.Contains(out, "0001-cli-note-routing") {
+		t.Fatalf("cli call: err=%v out=%q", err, out)
+	}
+	out, err = runCLI(nil, "verified encrypted CLI note", "--line", aliceLine, "--as", "gemini", "note", "0001-cli-note-routing")
+	if err != nil || !strings.Contains(out, "note 1 left on 0001-cli-note-routing") {
+		t.Fatalf("cli note with valid attachment: err=%v out=%q", err, out)
+	}
+	// Confirm Bob reads Alice's encrypted CLI note on the LDR relay!
+	_ = os.Setenv("YIP_HOME", bobHome)
+	activeLine = bobLine
+	bobTr, err := (&server{me: "codex"}).call("read", map[string]any{"call": "0001-cli-note-routing"})
+	if err != nil || !strings.Contains(bobTr, "verified encrypted CLI note") {
+		t.Fatalf("bob failed to read Alice's LDR CLI note: err=%v tr=%q", err, bobTr)
+	}
+	// Confirm local decoy call received ZERO notes!
+	_ = os.Setenv("YIP_HOME", aliceHome)
+	activeLine = aliceLine
+	if decoyNotes, err := Notes(decoy); err != nil || len(decoyNotes) != 0 {
+		t.Fatalf("local decoy call mutated by LDR cli note: err=%v notes=%+v", err, decoyNotes)
+	}
+
+	// Verify `yip calls`, `yip dispute`, `yip measure`, `yip roadmap post|show` route to LDR!
+	if out, err = runCLI(nil, "", "--line", aliceLine, "--as", "gemini", "calls"); err != nil ||
+		!strings.Contains(out, "0001-cli-note-routing") || strings.Contains(out, "Local decoy call") {
+		t.Fatalf("cli calls: err=%v out=%q", err, out)
+	}
+	if out, err = runCLI(nil, "", "--line", aliceLine, "--as", "gemini", "dispute", "cli factual check"); err != nil ||
+		!strings.Contains(out, "opened on 0001-cli-note-routing") {
+		t.Fatalf("cli dispute: err=%v out=%q", err, out)
+	}
+	if decoyDisputes, err := ListDisputes(decoy); err != nil || len(decoyDisputes) != 0 {
+		t.Fatalf("local decoy call mutated by LDR cli dispute: err=%v disputes=%+v", err, decoyDisputes)
+	}
+	if out, err = runCLI(nil, "", "--line", aliceLine, "--as", "gemini", "measure", "go test ./..."); err != nil ||
+		!strings.Contains(out, "recorded measurement") {
+		t.Fatalf("cli measure: err=%v out=%q", err, out)
+	}
+	rmJSON := `{"arc":"CLI Arc","stations":[{"id":"s1","name":"One"}],"active":"s1","note":"running"}`
+	if out, err = runCLI(nil, rmJSON, "--line", aliceLine, "--as", "gemini", "roadmap", "post"); err != nil ||
+		!strings.Contains(out, "CLI Arc") {
+		t.Fatalf("cli roadmap post: err=%v out=%q", err, out)
+	}
+	if out, err = runCLI(nil, "", "--line", aliceLine, "--as", "gemini", "roadmap", "show"); err != nil ||
+		!strings.Contains(out, "CLI Arc") {
+		t.Fatalf("cli roadmap show: err=%v out=%q", err, out)
+	}
+
+	// 2. Unsupported remote / human-only CLI operations MUST be explicitly refused on LDR-attached lines!
+	refusedValid := []struct {
+		name  string
+		stdin string
+		args  []string
+	}{
+		{"ratify", "human note", []string{"--line", aliceLine, "--as", "gemini", "ratify"}},
+		{"broadcast", "operator broadcast", []string{"--line", aliceLine, "broadcast", "announcement", "--to", "bob-codex"}},
+		{"settled", "", []string{"--line", aliceLine, "--as", "gemini", "settled", "measured"}},
+		{"watch", "", []string{"--line", aliceLine, "--as", "gemini", "watch", "--once", "--timeout", "1s"}},
+	}
+	for _, tc := range refusedValid {
+		if out, err := runCLI(nil, tc.stdin, tc.args...); err == nil {
+			t.Fatalf("expected %s to be refused on LDR-attached line, succeeded with out=%q", tc.name, out)
+		}
+	}
+	if decoyNotes, err := Notes(decoy); err != nil || len(decoyNotes) != 0 {
+		t.Fatalf("refused cli ratify mutated local decoy call: err=%v notes=%+v", err, decoyNotes)
+	}
+
+	// 3. Malformed ldr.json + YIP_LDR_DIR set + local decoy call: `yip note` (and other remote CLIs) MUST fail closed!
+	if err := os.WriteFile(ldrAttachmentPath(), []byte("{malformed-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	envWithFallback := []string{"YIP_LDR_DIR=" + aliceClientDir}
+	if out, err := runCLI(envWithFallback, "must not land on local decoy", "--line", aliceLine, "--as", "gemini", "note"); err == nil {
+		t.Fatalf("expected cli note to fail with malformed ldr.json, succeeded with out=%q", out)
+	}
+	if decoyNotes, err := Notes(decoy); err != nil || len(decoyNotes) != 0 {
+		t.Fatalf("malformed-ldr cli note wrote to local decoy call: err=%v notes=%+v", err, decoyNotes)
+	}
+	for _, tc := range []struct {
+		name  string
+		stdin string
+		args  []string
+	}{
+		{"calls", "", []string{"--line", aliceLine, "--as", "gemini", "calls"}},
+		{"dispute", "", []string{"--line", aliceLine, "--as", "gemini", "dispute", "bad"}},
+		{"measure", "", []string{"--line", aliceLine, "--as", "gemini", "measure", "bad"}},
+		{"roadmap-show", "", []string{"--line", aliceLine, "--as", "gemini", "roadmap", "show"}},
+		{"ratify", "bad", []string{"--line", aliceLine, "--as", "gemini", "ratify"}},
+		{"broadcast", "bad", []string{"--line", aliceLine, "broadcast", "announcement", "--to", "bob-codex"}},
+		{"settled", "", []string{"--line", aliceLine, "--as", "gemini", "settled", "bad"}},
+		{"watch", "", []string{"--line", aliceLine, "--as", "gemini", "watch", "--once", "--timeout", "1s"}},
+	} {
+		if out, err := runCLI(envWithFallback, tc.stdin, tc.args...); err == nil {
+			t.Fatalf("expected %s to fail with malformed ldr.json, succeeded with out=%q", tc.name, out)
+		}
+	}
+
+	// 4. Host-local resource leases STILL work via the actual CLI even while ldr.json is malformed!
+	if out, err := runCLI(envWithFallback, "", "--line", aliceLine, "--as", "gemini", "resources"); err != nil || !strings.Contains(out, "gpu") {
+		t.Fatalf("cli resources failed under malformed ldr.json: err=%v out=%q", err, out)
+	}
+	if out, err := runCLI(envWithFallback, "", "--line", aliceLine, "--as", "gemini", "hold", "gpu", "cli local gate", "--now"); err != nil || !strings.Contains(out, "HELD") {
+		t.Fatalf("cli hold failed under malformed ldr.json: err=%v out=%q", err, out)
+	}
+	if out, err := runCLI(envWithFallback, "", "--line", aliceLine, "--as", "gemini", "release", "gpu"); err != nil || !strings.Contains(out, "released") {
+		t.Fatalf("cli release failed under malformed ldr.json: err=%v out=%q", err, out)
 	}
 }

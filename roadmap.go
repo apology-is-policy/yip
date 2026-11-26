@@ -670,6 +670,10 @@ func RoadmapCLI(args []string, me string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: yip roadmap post [--file path] | at <station> [--note text] [--done] | show [agent] | clear")
 	}
+	_, ldrAttached, ldrErr := loadLDRAttachment()
+	if ldrErr != nil {
+		return ldrErr
+	}
 	switch args[0] {
 	case "post":
 		rest, path := takeFlag(args[1:], "--file", "")
@@ -690,6 +694,22 @@ func RoadmapCLI(args []string, me string) error {
 		if err := dec.Decode(&r); err != nil {
 			return fmt.Errorf("roadmap JSON: %v", err)
 		}
+		if ldrAttached {
+			raw, err := json.Marshal(r)
+			if err != nil {
+				return err
+			}
+			var a map[string]any
+			if err := json.Unmarshal(raw, &a); err != nil {
+				return err
+			}
+			out, err := (&server{me: me}).call("roadmap_post", a)
+			if err != nil {
+				return err
+			}
+			fmt.Println(out)
+			return nil
+		}
 		out, err := PostRoadmap(me, r)
 		if err != nil {
 			return err
@@ -707,6 +727,18 @@ func RoadmapCLI(args []string, me string) error {
 				station = append(station, a)
 			}
 		}
+		if ldrAttached {
+			out, err := (&server{me: me}).call("roadmap_at", map[string]any{
+				"station": strings.Join(station, " "),
+				"note":    note,
+				"done":    done,
+			})
+			if err != nil {
+				return err
+			}
+			fmt.Println(out)
+			return nil
+		}
 		out, err := MoveRoadmap(me, strings.Join(station, " "), note, done)
 		if err != nil {
 			return err
@@ -718,6 +750,14 @@ func RoadmapCLI(args []string, me string) error {
 		if len(args) > 1 {
 			agent = args[1]
 		}
+		if ldrAttached {
+			out, err := (&server{me: me}).call("roadmaps", map[string]any{"agent": agent})
+			if err != nil {
+				return err
+			}
+			fmt.Println(out)
+			return nil
+		}
 		text, err := RoadmapText(agent)
 		if err != nil {
 			return err
@@ -725,6 +765,14 @@ func RoadmapCLI(args []string, me string) error {
 		fmt.Println(text)
 		return nil
 	case "clear":
+		if ldrAttached {
+			out, err := (&server{me: me}).call("roadmap_clear", map[string]any{})
+			if err != nil {
+				return err
+			}
+			fmt.Println(out)
+			return nil
+		}
 		if err := ClearRoadmap(me); err != nil {
 			return err
 		}

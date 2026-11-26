@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -943,11 +944,12 @@ func ldrDeliverySnapshot(att LDRAttachment, localAgent string) map[string]string
 	_ = withLDRSession(ctx, att, func(cl *ldrclient.Client, sess *ldrrelay.SessionClient) error {
 		_, _ = cl.Sync(ctx, sess)
 		_, _ = cl.ScanDelivery()
+		desc, cd, _, _ := cl.Descriptor()
 		for _, n := range cl.DeliverableNotices() {
 			if n.Actor != actor {
 				continue
 			}
-			out["ldr:"+n.ID] = fmt.Sprintf("LDR %s %s (seq %d) for %s -- inspect via Yip tools",
+			out[formatLDRDeliverySource(desc.LineID, cd, n.ID)] = fmt.Sprintf("LDR %s %s (seq %d) for %s -- inspect via Yip tools",
 				strings.ToUpper(n.Kind), n.Target, n.Seq, n.Actor)
 		}
 		return nil
@@ -955,9 +957,56 @@ func ldrDeliverySnapshot(att LDRAttachment, localAgent string) map[string]string
 	return out
 }
 
+const ldrDeliveryLinePrefix = "ldr:line:"
+
+func isLowerHex(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
+// formatLDRDeliverySource binds an LDR delivery notice to its originating line_id
+// and creation descriptor digest prefix so switching a local endpoint to another
+// LDR line with matching (gen, seq, actor, kind) coordinates cannot suppress new
+// notices via ep.Known or route an old ack to the wrong line.
+func formatLDRDeliverySource(lineID []byte, descDigest [32]byte, noticeID string) string {
+	return fmt.Sprintf("%s%x:%x:%s", ldrDeliveryLinePrefix, lineID, descDigest[:8], noticeID)
+}
+
+func parseLDRDeliverySource(source string) (lineHex, descHex, noticeID string, qualified bool) {
+	if !strings.HasPrefix(source, ldrDeliveryLinePrefix) {
+		return "", "", "", false
+	}
+	rest := strings.TrimPrefix(source, ldrDeliveryLinePrefix)
+	p1 := strings.IndexByte(rest, ':')
+	if p1 <= 0 {
+		return "", "", "", false
+	}
+	lineHex = rest[:p1]
+	rest = rest[p1+1:]
+	p2 := strings.IndexByte(rest, ':')
+	if p2 <= 0 {
+		return "", "", "", false
+	}
+	descHex = rest[:p2]
+	noticeID = rest[p2+1:]
+	if len(lineHex) != 32 || len(descHex) != 16 || noticeID == "" || !isLowerHex(lineHex) || !isLowerHex(descHex) {
+		return "", "", "", false
+	}
+	return lineHex, descHex, noticeID, true
+}
+
 func ldrAckNotice(source string) error {
 	if !strings.HasPrefix(source, "ldr:") {
 		return nil
+	}
+	lineHex, descHex, noticeID, qualified := parseLDRDeliverySource(source)
+	if !qualified {
+		return fmt.Errorf("cannot acknowledge legacy unqualified LDR delivery %q without originating line identifier (refusing to guess current attachment)", source)
 	}
 	att, ok, err := loadLDRAttachment()
 	if err != nil {
@@ -966,7 +1015,6 @@ func ldrAckNotice(source string) error {
 	if !ok {
 		return errors.New("cannot acknowledge LDR delivery notice: no LDR attachment configured")
 	}
-	noticeID := strings.TrimPrefix(source, "ldr:")
 	ctx, cancel := context.WithTimeout(context.Background(), ldrAckTimeout)
 	defer cancel()
 	cl, err := ldrclient.OpenClientWait(ctx, att.ClientDir)
@@ -974,10 +1022,47 @@ func ldrAckNotice(source string) error {
 		return fmt.Errorf("cannot open LDR client for delivery ack: %w", err)
 	}
 	defer cl.Close()
+	desc, cd, _, _ := cl.Descriptor()
+	curLineHex := hex.EncodeToString(desc.LineID)
+	curDescHex := hex.EncodeToString(cd[:8])
+	if curLineHex != lineHex || curDescHex != descHex {
+		return fmt.Errorf("cannot acknowledge LDR delivery for line %s (%s): local line is currently attached to line %s (%s)",
+			lineHex, descHex, curLineHex, curDescHex)
+	}
 	if err := cl.AckNotice(noticeID); err != nil {
 		return fmt.Errorf("LDR delivery ack failed: %w", err)
 	}
 	return nil
+}
+
+func ldrCallsListText(att LDRAttachment, me string) (string, error) {
+	actor := att.actorFor(me)
+	ctx, cancel := ldrTimeoutCtx()
+	defer cancel()
+	var sums []ldrclient.CallSummary
+	err := withLDRSession(ctx, att, func(cl *ldrclient.Client, sess *ldrrelay.SessionClient) error {
+		if _, err := cl.Sync(ctx, sess); err != nil {
+			return err
+		}
+		var lerr error
+		sums, lerr = cl.ListCallSummaries(ctx, sess, actor, true)
+		return lerr
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(sums) == 0 {
+		return "no calls", nil
+	}
+	var b strings.Builder
+	for _, s := range sums {
+		mark := "  "
+		if s.Status == "open" && s.Floor == actor {
+			mark = "* "
+		}
+		fmt.Fprintf(&b, "%s%-40s %s->%s  %d turns  %s  %s\n", mark, s.ID, s.From, s.To, s.TurnCount, s.Status, s.Subject)
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
 }
 
 func ldrHookRings(att LDRAttachment, me string) ([]ldrclient.CallSummary, []ldrclient.BroadcastView) {
