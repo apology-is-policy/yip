@@ -994,7 +994,7 @@ func parseLDRDeliverySource(source string) (lineHex, descHex, noticeID string, q
 	}
 	descHex = rest[:p2]
 	noticeID = rest[p2+1:]
-	if len(lineHex) != 32 || len(descHex) != 16 || noticeID == "" || !isLowerHex(lineHex) || !isLowerHex(descHex) {
+	if len(lineHex) < 32 || len(lineHex) > 128 || len(lineHex)%2 != 0 || len(descHex) != 16 || noticeID == "" || !isLowerHex(lineHex) || !isLowerHex(descHex) {
 		return "", "", "", false
 	}
 	return lineHex, descHex, noticeID, true

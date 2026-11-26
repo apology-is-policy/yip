@@ -460,6 +460,10 @@ type ldrBridgeFixture struct {
 }
 
 func newLDRBridgeFixture(t *testing.T) *ldrBridgeFixture {
+	return newLDRBridgeFixtureWithLineIDLen(t, 16)
+}
+
+func newLDRBridgeFixtureWithLineIDLen(t *testing.T, lineIDLen int) *ldrBridgeFixture {
 	t.Helper()
 	origActiveLine := activeLine
 	origYipHome := os.Getenv("YIP_HOME")
@@ -513,7 +517,7 @@ func newLDRBridgeFixture(t *testing.T) *ldrBridgeFixture {
 	r2, _ := ldrclient.GenerateSigningKey(ldrcrypto.AlgECDSAP256)
 	opKey, _ := ldrclient.GenerateSigningKey(ldrcrypto.AlgEd25519)
 	opCredKeys, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
-	lineID := make([]byte, 16)
+	lineID := make([]byte, lineIDLen)
 	if _, err := rand.Read(lineID); err != nil {
 		t.Fatal(err)
 	}
@@ -1125,9 +1129,39 @@ func TestLDRBridgeMalformedOrUnreadableAttachmentFailsClosedPreservingLocalResou
 }
 
 func TestLDRBridgeDeliveryLineBindingAndLegacyUnqualifiedEvents(t *testing.T) {
-	// Two completely independent LDR lines with distinct line_ids and identical
-	// actor/sequence progression so both generate identical raw ldrclient notice IDs.
-	fxA := newLDRBridgeFixture(t)
+	// Verify parseLDRDeliverySource accepts all supported 16..64-byte lowercase hex
+	// line IDs and strictly rejects out-of-range, odd-nibble, uppercase, and legacy forms.
+	var dummyCD [32]byte
+	for i := range dummyCD {
+		dummyCD[i] = byte(i + 1)
+	}
+	for _, nBytes := range []int{16, 17, 32, 64} {
+		lid := bytes.Repeat([]byte{0xab}, nBytes)
+		src := formatLDRDeliverySource(lid, dummyCD, "g1:s7:bob-codex:call_turn")
+		gotLine, gotDesc, gotNotice, ok := parseLDRDeliverySource(src)
+		if !ok || len(gotLine) != nBytes*2 || len(gotDesc) != 16 || gotNotice != "g1:s7:bob-codex:call_turn" {
+			t.Fatalf("round-trip failed for %d-byte line_id: src=%q ok=%v line=%q desc=%q notice=%q",
+				nBytes, src, ok, gotLine, gotDesc, gotNotice)
+		}
+	}
+	for _, bad := range []string{
+		"ldr:g1:s7:bob-codex:call_turn",                                           // legacy unqualified
+		"ldr:line:" + strings.Repeat("ab", 15) + ":0102030405060708:g1:s1:a:turn", // 15 bytes (<16)
+		"ldr:line:" + strings.Repeat("ab", 65) + ":0102030405060708:g1:s1:a:turn", // 65 bytes (>64)
+		"ldr:line:" + strings.Repeat("a", 33) + ":0102030405060708:g1:s1:a:turn",  // odd hex length
+		"ldr:line:" + strings.Repeat("AB", 16) + ":0102030405060708:g1:s1:a:turn", // uppercase hex
+		"ldr:line:" + strings.Repeat("ab", 16) + ":0102030405060708:",             // empty notice ID
+		"ldr:line:" + strings.Repeat("ab", 16) + ":01020304:g1:s1:a:turn",         // short desc prefix
+	} {
+		if _, _, _, ok := parseLDRDeliverySource(bad); ok {
+			t.Fatalf("expected parseLDRDeliverySource to reject %q", bad)
+		}
+	}
+
+	// Two completely independent LDR lines with distinct line_ids (16-byte Line A and
+	// 64-byte Line B) and identical actor/sequence progression so both generate
+	// identical raw ldrclient notice IDs while exercising longer valid line IDs in AckDelivery.
+	fxA := newLDRBridgeFixtureWithLineIDLen(t, 16)
 	aliceACK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
 	bobACK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
 	aAg, aArid, aArdig := fxA.enroll(t, "ns-alice", aliceACK, 4, 0x71)
@@ -1139,7 +1173,7 @@ func TestLDRBridgeDeliveryLineBindingAndLegacyUnqualifiedEvents(t *testing.T) {
 	fxA.setupWorkstation(t, aliceADir, aliceACK, aAg, aArid, aArdig, "alice-gemini")
 	fxA.setupWorkstation(t, bobADir, bobACK, bAg, bArid, bArdig, "bob-codex")
 
-	fxB := newLDRBridgeFixture(t)
+	fxB := newLDRBridgeFixtureWithLineIDLen(t, 64)
 	aliceBCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
 	bobBCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
 	aBg, aBrid, aBrdig := fxB.enroll(t, "ns-alice", aliceBCK, 4, 0x73)
