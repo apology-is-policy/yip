@@ -355,7 +355,8 @@ func (c *Client) SubmitCallAttach(ctx context.Context, sess *ldrrelay.SessionCli
 	})
 }
 
-// SubmitDisputeOpen opens a dispute on callID and returns the commit result + assigned dispute ID.
+// SubmitDisputeOpen opens a dispute on callID and returns the commit result + the
+// exact dispute ID assigned at the caller's committed sequence number.
 func (c *Client) SubmitDisputeOpen(ctx context.Context, sess *ldrrelay.SessionClient, actor, callID, claim string) (OpCommitResult, string, error) {
 	call := c.State().Calls[callID]
 	if call == nil {
@@ -373,12 +374,24 @@ func (c *Client) SubmitDisputeOpen(ctx context.Context, sess *ldrrelay.SessionCl
 	if err != nil {
 		return OpCommitResult{}, "", err
 	}
-	after := c.State().Calls[callID]
-	dispID := ""
-	if after != nil {
-		dispID = strconv.FormatInt(after.DisputeCount, 10)
+	dispID, err := c.disputeIDAtSeq(callID, res.Seq)
+	if err != nil {
+		return res, "", err
 	}
 	return res, dispID, nil
+}
+
+func (c *Client) disputeIDAtSeq(callID string, seq uint64) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if seq < 1 || seq > uint64(len(c.entries)) {
+		return "", fmt.Errorf("ldrclient: committed dispute_open seq %d not present in verified store", seq)
+	}
+	ve := c.entries[seq-1]
+	if ve.frame.Seq != seq || ve.decoded == nil || ve.decoded.OpType != "dispute_open" || ve.decoded.Record.Call != callID || ve.disputeID == "" {
+		return "", fmt.Errorf("ldrclient: seq %d is not a committed dispute_open for call %q", seq, callID)
+	}
+	return ve.disputeID, nil
 }
 
 // SubmitDisputeMeasure records actor's proposed measurement on disputeID.
@@ -729,21 +742,41 @@ func readStatusFallback(rs string, epoch uint64) string {
 	}
 }
 
-func (c *Client) readDecryptedEntry(ctx context.Context, sess *ldrrelay.SessionClient, e verifiedEntry) ([]byte, string) {
+func (c *Client) readDecryptedEntry(ctx context.Context, sess *ldrrelay.SessionClient, e verifiedEntry) ([]byte, string, error) {
 	if e.decoded == nil || e.decoded.PayloadCommit.Length == 0 {
-		return nil, ldrcore.ReadNone
+		return nil, ldrcore.ReadNone, nil
 	}
 	pt, rs, err := c.ReadPayload(ctx, sess, e.frame.Seq)
 	if err != nil {
-		return nil, ldrcore.ReadUndecryptable
+		return nil, "", err
 	}
-	return pt, rs
+	return pt, rs, nil
+}
+
+func (c *Client) checkReadReadyLocked() error {
+	if c.outboxUncertain {
+		return ErrOutboxUncertain
+	}
+	if c.epochsUncertain {
+		return ErrEpochsUncertain
+	}
+	if c.outbox.Halted != "" {
+		return fmt.Errorf("%w: %s", ErrViolation, c.outbox.Halted)
+	}
+	if !c.outbox.Activated {
+		return ErrNotActivated
+	}
+	return nil
 }
 
 // ReadCallTranscript builds a verified, decrypted transcript for callID directly
 // from local verified.wal entries and epoch-verified payload reads.
 func (c *Client) ReadCallTranscript(ctx context.Context, sess *ldrrelay.SessionClient, callID string) (*CallTranscript, error) {
 	c.mu.Lock()
+	if err := c.checkReadReadyLocked(); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
 	call := c.state.Calls[callID]
 	if call == nil {
 		c.mu.Unlock()
@@ -774,7 +807,10 @@ func (c *Client) ReadCallTranscript(ctx context.Context, sess *ldrrelay.SessionC
 
 	for _, e := range matching {
 		r := e.decoded.Record
-		pt, rs := c.readDecryptedEntry(ctx, sess, e)
+		pt, rs, err := c.readDecryptedEntry(ctx, sess, e)
+		if err != nil {
+			return nil, err
+		}
 		m := decodePayloadJSONMap(pt)
 		epoch := uint64(e.decoded.Record.KeyEpoch)
 
@@ -944,6 +980,10 @@ func (c *Client) ReadCallTranscript(ctx context.Context, sess *ldrrelay.SessionC
 // ListCallSummaries returns verified call summaries for actor (or all calls if actor=="").
 func (c *Client) ListCallSummaries(ctx context.Context, sess *ldrrelay.SessionClient, actor string, includeAll bool) ([]CallSummary, error) {
 	c.mu.Lock()
+	if err := c.checkReadReadyLocked(); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
 	var ids []string
 	for id, call := range c.state.Calls {
 		if actor != "" && !call.Involves(actor) {
@@ -1001,7 +1041,10 @@ func (c *Client) ListCallSummaries(ctx context.Context, sess *ldrrelay.SessionCl
 		opened := uint64(0)
 		if oe, ok := openEntry[id]; ok {
 			opened = oe.frame.SeqTime
-			pt, rs := c.readDecryptedEntry(ctx, sess, oe)
+			pt, rs, err := c.readDecryptedEntry(ctx, sess, oe)
+			if err != nil {
+				return nil, err
+			}
 			if rs == ldrcore.ReadOK {
 				if m := decodePayloadJSONMap(pt); m != nil {
 					subj = m["subject"]
@@ -1034,6 +1077,10 @@ func (c *Client) ListCallSummaries(ctx context.Context, sess *ldrrelay.SessionCl
 // ReadBroadcast returns the verified, decrypted view of broadcastID.
 func (c *Client) ReadBroadcast(ctx context.Context, sess *ldrrelay.SessionClient, actor, broadcastID string) (*BroadcastView, error) {
 	c.mu.Lock()
+	if err := c.checkReadReadyLocked(); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
 	b := c.state.Broadcasts[broadcastID]
 	if b == nil {
 		c.mu.Unlock()
@@ -1060,7 +1107,10 @@ func (c *Client) ReadBroadcast(ctx context.Context, sess *ldrrelay.SessionClient
 
 	for _, e := range matching {
 		r := e.decoded.Record
-		pt, rs := c.readDecryptedEntry(ctx, sess, e)
+		pt, rs, err := c.readDecryptedEntry(ctx, sess, e)
+		if err != nil {
+			return nil, err
+		}
 		m := decodePayloadJSONMap(pt)
 		epoch := uint64(e.decoded.Record.KeyEpoch)
 		switch r.Type {
@@ -1094,6 +1144,10 @@ func (c *Client) ReadBroadcast(ctx context.Context, sess *ldrrelay.SessionClient
 // ListBroadcasts lists broadcasts addressed to actor (or all broadcasts if actor=="").
 func (c *Client) ListBroadcasts(ctx context.Context, sess *ldrrelay.SessionClient, actor string, includeAll bool) ([]BroadcastView, error) {
 	c.mu.Lock()
+	if err := c.checkReadReadyLocked(); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
 	var ids []string
 	for id, b := range c.state.Broadcasts {
 		if actor != "" && !containsStr(b.Recipients, actor) {

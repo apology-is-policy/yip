@@ -81,10 +81,20 @@ func (rc *replayContext) prune(headTime, validityMaxMS uint64) {
 }
 
 type verifiedEntry struct {
-	frame   ldrrelay.ControlFrameWire
-	decoded *ldrrelay.DecodedIntent // nil for time_anchor
-	touched []string
-	owed    []LocalNotice
+	frame     ldrrelay.ControlFrameWire
+	decoded   *ldrrelay.DecodedIntent // nil for time_anchor
+	touched   []string
+	owed      []LocalNotice
+	disputeID string // populated for committed dispute_open at this exact seq
+}
+
+type committedRegisterActivation struct {
+	Actor       string
+	Register    string
+	WriterRev   uint64
+	BindingGen  uint64
+	Incarnation string
+	Cred        string
 }
 
 // Client is the durable local LDR client for one pinned line and local directory.
@@ -108,21 +118,23 @@ type Client struct {
 	rootKey     *SigningKeyMaterial
 
 	// Authoritative verified local state (rebuilt from verified.wal on Open).
-	state   ldrcore.State
-	entries []verifiedEntry
-	ckGen   uint64
-	ckSeq   uint64
-	ckHead  [32]byte
-	rctx    *replayContext
-	touched map[string]projCoord
-	source  map[string]projCoord
-	viewOf  map[string]string
+	state          ldrcore.State
+	entries        []verifiedEntry
+	ckGen          uint64
+	ckSeq          uint64
+	ckHead         [32]byte
+	rctx           *replayContext
+	touched        map[string]projCoord
+	source         map[string]projCoord
+	viewOf         map[string]string
+	regActivations map[string]map[uint64]committedRegisterActivation
 
 	// Durable outbox, epoch keys, and projection/delivery cursors.
 	outbox                 persistedOutbox
 	outboxUncertain        bool
 	outboxUncertainReason  string
-	slots                  map[string]string // slot -> unsettled op_id
+	pendingStops           map[string]*KeyStop // validated Rule 8 stops awaiting durable outbox.cbor write
+	slots                  map[string]string   // slot -> unsettled op_id
 	epochs                 persistedEpochs
 	epochsUncertain        bool
 	epochsUncertainReason  string
@@ -444,25 +456,27 @@ func openClientLocked(dir string, lf *os.File, syncFile func(*os.File) error, sy
 	}
 
 	c := &Client{
-		dir:        dir,
-		lockFile:   lf,
-		cfg:        cfg,
-		desc:       desc,
-		profDigest: profDigest,
-		coreProf:   ldrcore.Profile{FreshnessMS: int64(desc.Profile.FreshnessMS), ValidityMaxMS: int64(desc.Profile.MaxValidityMS)},
-		validityMS: min(60_000, desc.Profile.MaxValidityMS),
-		ckHead:     genesis,
-		rctx:       newReplayContext(),
-		touched:    make(map[string]projCoord),
-		source:     make(map[string]projCoord),
-		viewOf:     make(map[string]string),
-		outbox:     ob,
-		slots:      make(map[string]string),
-		epochs:     ep,
-		cursors:    cur,
-		registers:  regs,
-		syncFileFn: syncFile,
-		syncDirFn:  syncDir,
+		dir:            dir,
+		lockFile:       lf,
+		cfg:            cfg,
+		desc:           desc,
+		profDigest:     profDigest,
+		coreProf:       ldrcore.Profile{FreshnessMS: int64(desc.Profile.FreshnessMS), ValidityMaxMS: int64(desc.Profile.MaxValidityMS)},
+		validityMS:     min(60_000, desc.Profile.MaxValidityMS),
+		ckHead:         genesis,
+		rctx:           newReplayContext(),
+		touched:        make(map[string]projCoord),
+		source:         make(map[string]projCoord),
+		viewOf:         make(map[string]string),
+		regActivations: make(map[string]map[uint64]committedRegisterActivation),
+		outbox:         ob,
+		pendingStops:   make(map[string]*KeyStop),
+		slots:          make(map[string]string),
+		epochs:         ep,
+		cursors:        cur,
+		registers:      regs,
+		syncFileFn:     syncFile,
+		syncDirFn:      syncDir,
 	}
 	// If cred.key exists on disk, it MUST decode cleanly — never ignore a
 	// corrupt or unreadable cred.key (which could allow later replacement!).
@@ -753,6 +767,8 @@ func (c *Client) Stops() []KeyStop {
 		if c.signsNoMoreLocked(p) {
 			ks := KeyStop{Key: p}
 			if t := c.outbox.KeyStops[p]; t != nil {
+				ks = *t
+			} else if t := c.pendingStops[p]; t != nil {
 				ks = *t
 			}
 			ks.Verified = c.revokedInRecordsLocked(p)
@@ -1253,24 +1269,26 @@ func (c *Client) ReconcileDurability() error {
 
 	// Reconstruct and verify a fresh candidate strictly from durable WAL frames.
 	cand := &Client{
-		dir:         c.dir,
-		cfg:         c.cfg,
-		desc:        c.desc,
-		profDigest:  c.profDigest,
-		coreProf:    c.coreProf,
-		validityMS:  c.validityMS,
-		credKeys:    c.credKeys,
-		operatorKey: c.operatorKey,
-		rootKey:     c.rootKey,
-		ckHead:      c.cfg.GenesisAnchor,
-		rctx:        newReplayContext(),
-		touched:     make(map[string]projCoord),
-		source:      make(map[string]projCoord),
-		viewOf:      make(map[string]string),
-		outbox:      ob,
-		slots:       make(map[string]string),
-		epochs:      ep,
-		cursors:     cur,
+		dir:            c.dir,
+		cfg:            c.cfg,
+		desc:           c.desc,
+		profDigest:     c.profDigest,
+		coreProf:       c.coreProf,
+		validityMS:     c.validityMS,
+		credKeys:       c.credKeys,
+		operatorKey:    c.operatorKey,
+		rootKey:        c.rootKey,
+		ckHead:         c.cfg.GenesisAnchor,
+		rctx:           newReplayContext(),
+		touched:        make(map[string]projCoord),
+		source:         make(map[string]projCoord),
+		viewOf:         make(map[string]string),
+		regActivations: make(map[string]map[uint64]committedRegisterActivation),
+		outbox:         ob,
+		pendingStops:   make(map[string]*KeyStop),
+		slots:          make(map[string]string),
+		epochs:         ep,
+		cursors:        cur,
 	}
 	for _, fr := range frames {
 		if err := cand.verifyAndApplyFrameLocked(fr, false); err != nil {
@@ -1297,10 +1315,22 @@ func (c *Client) ReconcileDurability() error {
 			}
 		}
 	}
-	slots := make(map[string]string)
-	for _, e := range ob.Entries {
-		if e.Status == ldrcore.OutPending || e.Status == ldrcore.OutReconcile {
-			slots[e.Slot] = e.OpID
+	// Carry forward any validated Rule 8 stops whose prior outbox write failed
+	// (including ErrPreWrite) and durably persist them BEFORE clearing
+	// pendingStops or outboxUncertain.
+	if len(c.pendingStops) > 0 {
+		for p, st := range c.pendingStops {
+			if ob.KeyStops == nil {
+				ob.KeyStops = make(map[string]*KeyStop)
+			}
+			if ob.KeyStops[p] == nil {
+				cp := *st
+				ob.KeyStops[p] = &cp
+			}
+			c.suspendSignerOnLocked(&ob, p)
+		}
+		if err := c.persistOutboxLocked(ob); err != nil {
+			return err
 		}
 	}
 	// If register counter durability was uncertain, durably persist the
@@ -1312,6 +1342,12 @@ func (c *Client) ReconcileDurability() error {
 			return err
 		}
 	}
+	slots := make(map[string]string)
+	for _, e := range ob.Entries {
+		if e.Status == ldrcore.OutPending || e.Status == ldrcore.OutReconcile {
+			slots[e.Slot] = e.OpID
+		}
+	}
 	c.state = cand.state
 	c.entries = cand.entries
 	c.ckGen = cand.ckGen
@@ -1321,8 +1357,10 @@ func (c *Client) ReconcileDurability() error {
 	c.touched = cand.touched
 	c.source = cand.source
 	c.viewOf = cand.viewOf
+	c.regActivations = cand.regActivations
 	c.epochs = ep
 	c.outbox = ob
+	c.pendingStops = make(map[string]*KeyStop)
 	c.cursors = cur
 	c.registers = regs
 	c.registersUncertain = false
@@ -1495,10 +1533,35 @@ func (c *Client) verifyAndApplyFrameLocked(fr ldrrelay.ControlFrameWire, persist
 	coord := projCoord{gen: fr.Gen, seq: fr.Seq}
 	touched := diffTouchedObjects(c.state, next)
 	var owed []LocalNotice
+	var disputeID string
 	if dec != nil {
 		owed = c.deriveOwedNoticesLocked(&next, fr, dec)
+		if dec.OpType == "dispute_open" {
+			if call := next.Calls[dec.Record.Call]; call != nil {
+				disputeID = fmt.Sprintf("%d", call.DisputeCount)
+			}
+		}
+		if dec.OpType == "register_activate" {
+			rkey := dec.Record.Actor + "/" + dec.Record.Register
+			if w := next.Line.RegisterWriters[rkey]; w != nil {
+				if c.regActivations == nil {
+					c.regActivations = make(map[string]map[uint64]committedRegisterActivation)
+				}
+				if c.regActivations[rkey] == nil {
+					c.regActivations[rkey] = make(map[uint64]committedRegisterActivation)
+				}
+				c.regActivations[rkey][uint64(w.WriterRev)] = committedRegisterActivation{
+					Actor:       dec.Record.Actor,
+					Register:    dec.Record.Register,
+					WriterRev:   uint64(w.WriterRev),
+					BindingGen:  uint64(w.BindingGen),
+					Incarnation: w.Incarnation,
+					Cred:        dec.Record.Cred,
+				}
+			}
+		}
 	}
-	c.entries = append(c.entries, verifiedEntry{frame: fr, decoded: dec, touched: touched, owed: owed})
+	c.entries = append(c.entries, verifiedEntry{frame: fr, decoded: dec, touched: touched, owed: owed, disputeID: disputeID})
 	for _, obj := range touched {
 		c.touched[obj] = coord
 		c.viewOf[projViewPath(obj)] = obj
@@ -2579,7 +2642,7 @@ func (c *Client) revokedInRecordsLocked(p string) bool {
 }
 
 func (c *Client) signsNoMoreInOutboxLocked(ob *persistedOutbox, p string) bool {
-	return ob.KeyStops[p] != nil || c.revokedInRecordsLocked(p)
+	return ob.KeyStops[p] != nil || c.pendingStops[p] != nil || c.revokedInRecordsLocked(p)
 }
 
 func (c *Client) signsNoMoreLocked(p string) bool {

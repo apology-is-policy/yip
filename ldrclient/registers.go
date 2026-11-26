@@ -183,13 +183,26 @@ func (c *Client) markRegistersUncertainOnErrLocked(err error) {
 }
 
 func (c *Client) recordValidatedRevokedStopLocked(prinTok, code string) error {
+	stop := &KeyStop{Key: prinTok, Told: true, Seq: c.ckSeq, Head: c.ckHead, Code: code}
 	cand := clonePersistedOutbox(c.outbox)
 	c.recordToldRevokedOnLocked(&cand, prinTok, code)
 	if err := c.persistOutboxLocked(cand); err != nil {
-		c.markOutboxUncertainOnErrLocked(err)
+		// Never discard a validated Rule 8 stop even on ErrPreWrite: stop the
+		// exact principal immediately in memory, suspend its pending entries,
+		// and fence outboxUncertain until ReconcileDurability persists it.
+		if c.pendingStops == nil {
+			c.pendingStops = make(map[string]*KeyStop)
+		}
+		if c.pendingStops[prinTok] == nil {
+			c.pendingStops[prinTok] = stop
+		}
+		c.suspendSignerOnLocked(&c.outbox, prinTok)
+		c.outboxUncertain = true
+		c.outboxUncertainReason = fmt.Sprintf("pending Rule 8 stop persistence for %s: %v", prinTok, err)
 		return err
 	}
 	c.outbox = cand
+	delete(c.pendingStops, prinTok)
 	return nil
 }
 
@@ -595,22 +608,18 @@ func (c *Client) ReadRegisters(ctx context.Context, sess *ldrrelay.SessionClient
 			return nil, fmt.Errorf("%w: register envelope signature invalid: %v", ErrViolation, err)
 		}
 
-		// Validate signed writer_rev, incarnation, and binding_gen against the
-		// committed writer activation in verified.wal (§9).
+		// Verify exact committed activation tuple (writer_rev, incarnation,
+		// binding_gen, owning credential) against verified.wal history for
+		// BOTH current and superseded revisions (§9).
+		rkey := env.ActorID + "/" + env.Register
 		actor := c.state.Line.Actors[env.ActorID]
-		w := c.state.Line.RegisterWriters[env.ActorID+"/"+env.Register]
-		if w == nil || env.WriterRev > uint64(w.WriterRev) {
-			return nil, fmt.Errorf("%w: register writer_rev %d exceeds committed activation for %s/%s", ErrViolation, env.WriterRev, env.ActorID, env.Register)
+		w := c.state.Line.RegisterWriters[rkey]
+		act, ok := c.regActivations[rkey][env.WriterRev]
+		if !ok {
+			return nil, fmt.Errorf("%w: register writer_rev %d was never committed for %s", ErrViolation, env.WriterRev, rkey)
 		}
-		if env.WriterRev == uint64(w.WriterRev) {
-			if env.Incarnation != w.Incarnation || env.BindingGen != uint64(w.BindingGen) {
-				return nil, fmt.Errorf("%w: register writer_rev %d contradicts committed activation (incarnation/binding_gen) for %s/%s", ErrViolation, env.WriterRev, env.ActorID, env.Register)
-			}
-			if actor != nil && w.BindingGen == actor.BindingGen && credTok != actor.Cred {
-				return nil, fmt.Errorf("%w: register writer_rev %d signed by non-owning credential for %s/%s", ErrViolation, env.WriterRev, env.ActorID, env.Register)
-			}
-		} else if env.BindingGen > uint64(w.BindingGen) || (actor != nil && env.BindingGen > uint64(actor.BindingGen)) {
-			return nil, fmt.Errorf("%w: register superseded writer_rev %d has impossible binding_gen %d for %s/%s", ErrViolation, env.WriterRev, env.BindingGen, env.ActorID, env.Register)
+		if env.Incarnation != act.Incarnation || env.BindingGen != act.BindingGen || credTok != act.Cred {
+			return nil, fmt.Errorf("%w: register writer_rev %d contradicts committed activation (incarnation/binding_gen/cred) for %s", ErrViolation, env.WriterRev, rkey)
 		}
 
 		// Compute Historical locally against verified.wal state (§9); never trust relay boolean.
@@ -618,6 +627,7 @@ func (c *Client) ReadRegisters(ctx context.Context, sess *ldrrelay.SessionClient
 			actor == nil || !actor.Live ||
 			actor.Cred != credTok ||
 			uint64(actor.BindingGen) != env.BindingGen ||
+			w == nil ||
 			w.BindingGen != actor.BindingGen ||
 			uint64(w.WriterRev) != env.WriterRev ||
 			w.Incarnation != env.Incarnation

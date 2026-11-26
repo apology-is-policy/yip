@@ -17,6 +17,7 @@ import (
 	"github.com/apology-is-policy/yip/ldrcore"
 	"github.com/apology-is-policy/yip/ldrcrypto"
 	"github.com/apology-is-policy/yip/ldrrelay"
+	"github.com/apology-is-policy/yip/ldrstore"
 )
 
 type registerTestRig struct {
@@ -575,6 +576,14 @@ func TestClientRegistersIncarnationBindingGenAndSupersededValidation(t *testing.
 	}
 	rig.env.setHTTPHook(nil)
 
+	// 2b-extra. Wrong owning credential on same writer_rev=1 & binding_gen=1 after actor_move
+	//           (Bob signs under w1.WriterRev=1, w1.BindingGen=1, w1.Incarnation, even though Alice committed w1!) MUST be rejected!
+	injectList(craftEntry(rig.bob.credKeys.Signing.Signer, bobCID, 1, uint64(w1.WriterRev), w1.Incarnation, 1, `{"v":"wrong-owner-cred"}`))
+	if _, err := rig.bob.ReadRegisters(ctx, rig.sBob, "presence"); !errors.Is(err, ErrViolation) {
+		t.Fatalf("expected ErrViolation for non-activating credential on writer_rev=1 after actor_move, got %v", err)
+	}
+	rig.env.setHTTPHook(nil)
+
 	// 2c. Genuine pre-move cached value on the real relay (WriterRev=1, BindingGen=1, Incarnation=w1.Incarnation
 	//     while actor.BindingGen is now 2) MUST be accepted as Historical=true!
 	regsPreMove, err := rig.bob.ReadRegisters(ctx, rig.sBob, "presence")
@@ -597,6 +606,151 @@ func TestClientRegistersIncarnationBindingGenAndSupersededValidation(t *testing.
 	if err != nil || len(regsSuperseded) != 1 || !regsSuperseded[0].Historical || regsSuperseded[0].WriterRev != 1 {
 		t.Fatalf("expected genuine superseded writer_rev=1 accepted as Historical=true, got %+v err=%v", regsSuperseded, err)
 	}
+
+	// 2e. Superseded writer_rev=1 with a bogus incarnation that NEVER appeared in any activation
+	//     MUST be rejected with ErrViolation (never labeled historical)!
+	injectList(craftEntry(rig.alice.credKeys.Signing.Signer, aliceCID, 1, uint64(w1.WriterRev), "inc-never-committed", 1, `{"v":"bogus-inc"}`))
+	if _, err := rig.bob.ReadRegisters(ctx, rig.sBob, "presence"); !errors.Is(err, ErrViolation) {
+		t.Fatalf("expected ErrViolation for bogus incarnation on superseded writer_rev=1, got %v", err)
+	}
+	rig.env.setHTTPHook(nil)
+
+	// 2f. Reopen bob from disk -> regActivations rebuilds identically from verified.wal and still
+	//     rejects both bogus superseded incarnation and wrong owning credential!
+	rig.sBob.Close()
+	if err := rig.bob.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rig.bob, err = OpenClient(rig.bobDir)
+	if err != nil {
+		t.Fatalf("OpenClient(bob): %v", err)
+	}
+	rig.sBob, err = rig.bob.Dial(ctx, ldrcrypto.PrincipalCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injectList(craftEntry(rig.alice.credKeys.Signing.Signer, aliceCID, 1, uint64(w1.WriterRev), "inc-never-committed", 1, `{"v":"bogus-inc-reopen"}`))
+	if _, err := rig.bob.ReadRegisters(ctx, rig.sBob, "presence"); !errors.Is(err, ErrViolation) {
+		t.Fatalf("expected ErrViolation after reopen for bogus superseded incarnation, got %v", err)
+	}
+	injectList(craftEntry(rig.bob.credKeys.Signing.Signer, bobCID, 1, uint64(w1.WriterRev), w1.Incarnation, 1, `{"v":"wrong-owner-reopen"}`))
+	if _, err := rig.bob.ReadRegisters(ctx, rig.sBob, "presence"); !errors.Is(err, ErrViolation) {
+		t.Fatalf("expected ErrViolation after reopen for wrong owning credential on superseded rev, got %v", err)
+	}
+	rig.env.setHTTPHook(nil)
+}
+
+// Turn 4 Finding 1 regression:
+//   - Pre-rename ErrPreWrite failure while recording a validated bound revoked
+//     reply MUST keep the exact key stopped immediately, fence outboxUncertain,
+//     carry the pending stop through ReconcileDurability, and durably persist it
+//     before clearing uncertainty (surviving close+reopen).
+func TestClientRegistersPreWriteRevokedStopCarriedThroughReconcile(t *testing.T) {
+	rig := newRegisterTestRig(t, 4, 4)
+	ctx := context.Background()
+
+	rig.env.tick(1000)
+	if _, err := rig.alice.SubmitActorDeclare(ctx, rig.sAlice, "alice-1", "ns-alice"); err != nil {
+		t.Fatal(err)
+	}
+	rig.env.tick(1000)
+	if rep, err := rig.alice.PublishRegister(ctx, rig.sAlice, "alice-1", "presence", []byte(`{"v":1}`)); err != nil || rep.Class != "ok" {
+		t.Fatalf("initial publish: %+v %v", rep, err)
+	}
+
+	// Revoke Alice on relay while Alice still holds an active session & trusted writer.
+	rig.env.tick(1000)
+	if _, err := rig.admin.Sync(ctx, rig.sOp); err != nil {
+		t.Fatal(err)
+	}
+	aliceCID, _ := rig.alice.CredID()
+	if _, err := rig.admin.SubmitCredentialRevoke(ctx, rig.sOp, aliceCID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inject a pre-rename ErrPreWrite failure ONLY on outbox.cbor temp file sync so
+	// registers.cbor advances cleanly, PutRegister receives the real bound unresolved/revoked
+	// reply, and recordValidatedRevokedStopLocked fails with ErrPreWrite!
+	rig.alice.SetSyncHooks(func(f *os.File) error {
+		if strings.Contains(filepath.Base(f.Name()), "outbox.cbor") {
+			return errors.New("injected pre-rename outbox sync failure")
+		}
+		return ldrstore.SyncFile(f)
+	}, nil)
+
+	_, err := rig.alice.PublishRegister(ctx, rig.sAlice, "alice-1", "presence", []byte(`{"v":2}`))
+	if !errors.Is(err, ldrstore.ErrPreWrite) {
+		t.Fatalf("expected ErrPreWrite from failed outbox stop persist, got %v", err)
+	}
+
+	// 1. Key MUST be stopped immediately in memory AND outboxUncertain MUST be fenced!
+	if stops := rig.alice.Stops(); len(stops) != 1 || !stops[0].Told {
+		t.Fatalf("expected immediate Rule 8 stop in Stops() after ErrPreWrite, got %+v", stops)
+	}
+	if !rig.alice.Status().OutboxUncertain {
+		t.Fatal("expected OutboxUncertain=true while pending Rule 8 stop awaits durable write")
+	}
+
+	// 2. Subsequent calls BEFORE reconciliation MUST refuse locally with ZERO HTTP requests!
+	var reqCount atomic.Int64
+	rig.env.setHTTPHook(func(next http.Handler, w http.ResponseWriter, r *http.Request) {
+		reqCount.Add(1)
+		next.ServeHTTP(w, r)
+	})
+	if err := rig.alice.EnsureRegisterActivated(ctx, rig.sAlice, "alice-1", "presence"); err == nil {
+		t.Fatal("EnsureRegisterActivated succeeded with pending Rule 8 stop")
+	}
+	if _, err := rig.alice.PublishRegister(ctx, rig.sAlice, "alice-1", "presence", []byte(`{"v":3}`)); err == nil {
+		t.Fatal("PublishRegister succeeded with pending Rule 8 stop")
+	}
+	if _, err := rig.alice.ReadRegisters(ctx, rig.sAlice, "presence"); err == nil {
+		t.Fatal("ReadRegisters succeeded with pending Rule 8 stop")
+	}
+	if got := reqCount.Load(); got != 0 {
+		t.Fatalf("expected 0 HTTP requests while pending Rule 8 stop is fenced, got %d", got)
+	}
+
+	// 3. ReconcileDurability while outbox sync still fails MUST fail and keep stop + fence intact.
+	if err := rig.alice.ReconcileDurability(); err == nil {
+		t.Fatal("ReconcileDurability succeeded while outbox sync still failed")
+	}
+	if !rig.alice.Status().OutboxUncertain || len(rig.alice.Stops()) != 1 {
+		t.Fatalf("expected stop + OutboxUncertain preserved after failed reconcile, status=%+v stops=%+v", rig.alice.Status(), rig.alice.Stops())
+	}
+
+	// 4. Restore healthy storage -> ReconcileDurability durably persists the pending stop to outbox.cbor!
+	rig.alice.SetSyncHooks(nil, nil)
+	if err := rig.alice.ReconcileDurability(); err != nil {
+		t.Fatalf("ReconcileDurability after storage recovery: %v", err)
+	}
+	if rig.alice.Status().OutboxUncertain {
+		t.Fatal("expected OutboxUncertain cleared after durable reconcile")
+	}
+
+	// 5. Close and reopen from disk -> stop survives on disk and still blocks with ErrKeyRevoked and 0 HTTP requests!
+	if err := rig.alice.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rig.alice, err = OpenClient(rig.aliceDir)
+	if err != nil {
+		t.Fatalf("OpenClient after reconcile: %v", err)
+	}
+	if len(rig.alice.Stops()) != 1 {
+		t.Fatalf("expected persisted Rule 8 stop after reopen, got %+v", rig.alice.Stops())
+	}
+	if err := rig.alice.EnsureRegisterActivated(ctx, rig.sAlice, "alice-1", "presence"); !errors.Is(err, ErrKeyRevoked) {
+		t.Fatalf("expected ErrKeyRevoked on reopened fast path, got %v", err)
+	}
+	if _, err := rig.alice.PublishRegister(ctx, rig.sAlice, "alice-1", "presence", []byte(`{"v":4}`)); !errors.Is(err, ErrKeyRevoked) {
+		t.Fatalf("expected ErrKeyRevoked on reopened PublishRegister, got %v", err)
+	}
+	if _, err := rig.alice.ReadRegisters(ctx, rig.sAlice, "presence"); !errors.Is(err, ErrKeyRevoked) {
+		t.Fatalf("expected ErrKeyRevoked on reopened ReadRegisters, got %v", err)
+	}
+	if got := reqCount.Load(); got != 0 {
+		t.Fatalf("expected 0 HTTP requests after reopen with persisted Rule 8 stop, got %d", got)
+	}
+	rig.env.setHTTPHook(nil)
 }
 
 // Finding 3 regression:

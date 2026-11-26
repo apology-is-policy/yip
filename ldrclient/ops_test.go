@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -337,4 +340,222 @@ func TestHighLevelOpsCallsDisputesBroadcastsActorsAndOpenWait(t *testing.T) {
 	if bob.State().Line.Actors["bob"].DefaultAddressed {
 		t.Fatal("expected bob default_addressed=false")
 	}
+}
+
+// Turn 4 D2 Finding 1 regression:
+//   - SubmitDisputeOpen MUST derive its returned dispute ID at the caller's exact
+//     committed sequence even when another participant commits an intervening
+//     dispute_open before the caller's post-Send Sync runs.
+func TestSubmitDisputeOpenConcurrentInterveningDispute(t *testing.T) {
+	rig := newRegisterTestRig(t, 4, 4)
+	ctx := context.Background()
+
+	rig.env.tick(1000)
+	if _, err := rig.alice.SubmitActorDeclare(ctx, rig.sAlice, "alice", "ns-alice"); err != nil {
+		t.Fatal(err)
+	}
+	rig.env.tick(1000)
+	if err := rig.bob.PrepareForMutation(ctx, rig.sBob, ldrcrypto.PrincipalCredential); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rig.bob.SubmitActorDeclare(ctx, rig.sBob, "bob", "ns-bob"); err != nil {
+		t.Fatal(err)
+	}
+	rig.env.tick(1000)
+	if err := rig.alice.PrepareForMutation(ctx, rig.sAlice, ldrcrypto.PrincipalCredential); err != nil {
+		t.Fatal(err)
+	}
+	callID := "0001-concurrent-disputes"
+	if _, err := rig.alice.SubmitCallOpen(ctx, rig.sAlice, "alice", "bob", callID, "Race", "hello", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := rig.bob.PrepareForMutation(ctx, rig.sBob, ldrcrypto.PrincipalCredential); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-compose Bob's dispute_open so the HTTP hook can submit Bob's dispute
+	// right AFTER Alice's dispute_open commits on /submit and BEFORE Alice runs Sync!
+	bobOpID, err := rig.bob.ComposeAndPersist(ComposeParams{
+		Action:    "dispute_open:" + callID,
+		Origin:    ldrcore.OriginActor,
+		OpType:    "dispute_open",
+		ActorID:   "bob",
+		Fields:    ldrcrypto.Map{{Key: "call_id", Value: callID}},
+		Plaintext: []byte(`{"claim":"bob intervening claim"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var injected atomic.Bool
+	var bobSendErr error
+	rig.env.setHTTPHook(func(next http.Handler, w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r)
+		if strings.HasSuffix(r.URL.Path, "/submit") && injected.CompareAndSwap(false, true) {
+			// Alice's dispute_open just committed; immediately commit Bob's dispute_open
+			// BEFORE Alice's SubmitDisputeOpen runs Sync!
+			rig.env.setHTTPHook(nil)
+			rig.env.tick(100)
+			rep, serr := rig.bob.Send(ctx, rig.sBob, bobOpID)
+			if serr != nil {
+				bobSendErr = serr
+			} else if rep.Outcome.Kind != ldrcore.Committed {
+				bobSendErr = errors.New("bob dispute_open not committed: " + rep.Outcome.Reason)
+			}
+		}
+	})
+
+	rig.env.tick(1000)
+	res, aliceDispID, err := rig.alice.SubmitDisputeOpen(ctx, rig.sAlice, "alice", callID, "alice first claim")
+	rig.env.setHTTPHook(nil)
+	if err != nil {
+		t.Fatalf("alice.SubmitDisputeOpen: %v", err)
+	}
+	if bobSendErr != nil {
+		t.Fatalf("bob intervening dispute_open failed: %v", bobSendErr)
+	}
+	if gotCount := rig.alice.State().Calls[callID].DisputeCount; gotCount != 2 {
+		t.Fatalf("expected Alice to have synced both disputes (DisputeCount=2), got %d", gotCount)
+	}
+	if aliceDispID != "1" {
+		t.Fatalf("SubmitDisputeOpen returned %q (seq=%d), want caller's exact ID \"1\" despite intervening dispute \"2\"", aliceDispID, res.Seq)
+	}
+	// Verify transcript maps dispute 1 -> Alice's claim and dispute 2 -> Bob's claim.
+	tr, err := rig.alice.ReadCallTranscript(ctx, rig.sAlice, callID)
+	if err != nil || len(tr.Disputes) != 2 || tr.Disputes[0].Claim != "alice first claim" || tr.Disputes[1].Claim != "bob intervening claim" {
+		t.Fatalf("unexpected disputes in transcript: %+v err=%v", tr, err)
+	}
+}
+
+// Turn 4 D2 Finding 2 regression:
+//   - Legitimate per-entry ReadNoKey / ReadUndecryptable statuses still succeed
+//     in ReadCallTranscript / ListCallSummaries / ReadBroadcast / ListBroadcasts.
+//   - Operational/durability errors (ErrOutboxUncertain, ErrEpochsUncertain,
+//     ErrNotActivated) from ReadPayload MUST propagate as non-nil errors instead
+//     of being converted to ReadUndecryptable with nil error.
+func TestReadTranscriptAndListsPropagateOperationalErrors(t *testing.T) {
+	rig := newRegisterTestRig(t, 4, 4)
+	ctx := context.Background()
+
+	rig.env.tick(1000)
+	if _, err := rig.alice.SubmitActorDeclare(ctx, rig.sAlice, "alice", "ns-alice"); err != nil {
+		t.Fatal(err)
+	}
+	rig.env.tick(1000)
+	if err := rig.bob.PrepareForMutation(ctx, rig.sBob, ldrcrypto.PrincipalCredential); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rig.bob.SubmitActorDeclare(ctx, rig.sBob, "bob", "ns-bob"); err != nil {
+		t.Fatal(err)
+	}
+	rig.env.tick(1000)
+	if err := rig.alice.PrepareForMutation(ctx, rig.sAlice, ldrcrypto.PrincipalCredential); err != nil {
+		t.Fatal(err)
+	}
+	callID := "0001-read-errors"
+	if _, err := rig.alice.SubmitCallOpen(ctx, rig.sAlice, "alice", "bob", callID, "Epoch1 Subject", "Epoch1 Body", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	rig.env.tick(1000)
+	if err := rig.admin.PrepareForMutation(ctx, rig.sOp, ldrcrypto.PrincipalOperator); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rig.admin.SubmitBroadcastCreate(ctx, rig.sOp, "bc-ep1", "briefing", "operator", "Epoch1 Broadcast", nil, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Enroll Charlie AFTER epoch 1 and activate epoch 2 -> Charlie has NO epoch-1 key (legitimate ReadNoKey!).
+	charlieCK, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	cg, crid, crdig := rig.enroll("ns-charlie", charlieCK, 2, 0x71)
+	rig.env.tick(1000)
+	ep2Op, _, err := rig.admin.ComposeEpochActivate("epoch-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := rig.admin.Send(ctx, rig.sOp, ep2Op); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+		t.Fatalf("epoch-2 activate: %+v %v", rep, err)
+	}
+	if _, err := rig.admin.Sync(ctx, rig.sOp); err != nil {
+		t.Fatal(err)
+	}
+
+	charlieDir := t.TempDir()
+	charlie, err := InitClientDir(InitDirOptions{
+		Dir: charlieDir, SignedDescriptor: rig.env.rawDesc, CredKeys: charlieCK,
+		ExpectedGrant: &cg, ExpectedJoinReq: crid, ExpectedJoinReqDigest: &crdig,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer charlie.Close()
+	sCharlie, err := charlie.Dial(ctx, ldrcrypto.PrincipalCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sCharlie.Close()
+
+	// Unactivated Charlie MUST fail with ErrNotActivated across all read/list helpers!
+	if _, err := charlie.ListCallSummaries(ctx, sCharlie, "", true); !errors.Is(err, ErrNotActivated) {
+		t.Fatalf("unactivated ListCallSummaries: got %v, want ErrNotActivated", err)
+	}
+	if _, err := charlie.ListBroadcasts(ctx, sCharlie, "", true); !errors.Is(err, ErrNotActivated) {
+		t.Fatalf("unactivated ListBroadcasts: got %v, want ErrNotActivated", err)
+	}
+
+	if err := charlie.VerifyEnrollmentAndActivate(ctx, sCharlie); err != nil {
+		t.Fatal(err)
+	}
+
+	// Activated Charlie reading epoch-1 call & broadcast MUST succeed with legitimate ReadNoKey!
+	trNoKey, err := charlie.ReadCallTranscript(ctx, sCharlie, callID)
+	if err != nil || len(trNoKey.Turns) != 1 || trNoKey.Turns[0].ReadStatus != ldrcore.ReadNoKey {
+		t.Fatalf("expected legitimate ReadNoKey transcript for Charlie, got tr=%+v err=%v", trNoKey, err)
+	}
+	bvNoKey, err := charlie.ReadBroadcast(ctx, sCharlie, "", "bc-ep1")
+	if err != nil || bvNoKey.ReadStatus != ldrcore.ReadNoKey {
+		t.Fatalf("expected legitimate ReadNoKey broadcast for Charlie, got bv=%+v err=%v", bvNoKey, err)
+	}
+
+	// Sync Bob so Bob holds epoch-1 payloads, then fence ErrOutboxUncertain & ErrEpochsUncertain!
+	if _, err := rig.bob.Sync(ctx, rig.sBob); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. ErrOutboxUncertain MUST propagate from all 4 read/list helpers!
+	rig.bob.mu.Lock()
+	rig.bob.outboxUncertain = true
+	rig.bob.mu.Unlock()
+	if _, err := rig.bob.ReadCallTranscript(ctx, rig.sBob, callID); !errors.Is(err, ErrOutboxUncertain) {
+		t.Fatalf("ReadCallTranscript masked ErrOutboxUncertain: %v", err)
+	}
+	if _, err := rig.bob.ListCallSummaries(ctx, rig.sBob, "bob", true); !errors.Is(err, ErrOutboxUncertain) {
+		t.Fatalf("ListCallSummaries masked ErrOutboxUncertain: %v", err)
+	}
+	if _, err := rig.bob.ReadBroadcast(ctx, rig.sBob, "bob", "bc-ep1"); !errors.Is(err, ErrOutboxUncertain) {
+		t.Fatalf("ReadBroadcast masked ErrOutboxUncertain: %v", err)
+	}
+	if _, err := rig.bob.ListBroadcasts(ctx, rig.sBob, "bob", true); !errors.Is(err, ErrOutboxUncertain) {
+		t.Fatalf("ListBroadcasts masked ErrOutboxUncertain: %v", err)
+	}
+
+	// 2. ErrEpochsUncertain MUST propagate from all 4 read/list helpers!
+	rig.bob.mu.Lock()
+	rig.bob.outboxUncertain = false
+	rig.bob.epochsUncertain = true
+	rig.bob.mu.Unlock()
+	if _, err := rig.bob.ReadCallTranscript(ctx, rig.sBob, callID); !errors.Is(err, ErrEpochsUncertain) {
+		t.Fatalf("ReadCallTranscript masked ErrEpochsUncertain: %v", err)
+	}
+	if _, err := rig.bob.ListCallSummaries(ctx, rig.sBob, "bob", true); !errors.Is(err, ErrEpochsUncertain) {
+		t.Fatalf("ListCallSummaries masked ErrEpochsUncertain: %v", err)
+	}
+	if _, err := rig.bob.ReadBroadcast(ctx, rig.sBob, "bob", "bc-ep1"); !errors.Is(err, ErrEpochsUncertain) {
+		t.Fatalf("ReadBroadcast masked ErrEpochsUncertain: %v", err)
+	}
+	if _, err := rig.bob.ListBroadcasts(ctx, rig.sBob, "bob", true); !errors.Is(err, ErrEpochsUncertain) {
+		t.Fatalf("ListBroadcasts masked ErrEpochsUncertain: %v", err)
+	}
+	rig.bob.mu.Lock()
+	rig.bob.epochsUncertain = false
+	rig.bob.mu.Unlock()
 }
