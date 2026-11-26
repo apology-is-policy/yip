@@ -441,3 +441,116 @@ func contains(s []string, v string) bool {
 	}
 	return false
 }
+
+// TestClientThreeGenerationRollbackWithProfileChange verifies Codex Turn 58:
+// When generation 1 -> generation 2 changes profile bounds (widening FreshnessMS
+// and tightening ValidityMaxMS), and generation 2 -> generation 3 later rolls
+// back a witnessed tail, Client.applyRecoveryEntry replays the full prefix from
+// generation 1 using the retained genesis profile (c.genesisProf) rather than
+// generation 2's profile (c.prof), so valid generation-1 records remain verifiable.
+func TestClientThreeGenerationRollbackWithProfileChange(t *testing.T) {
+	gen1Prof := Profile{FreshnessMS: 10_000, ValidityMaxMS: 600_000}
+	gen2Prof := Profile{FreshnessMS: 60_000, ValidityMaxMS: 60_000}
+	gen3Prof := Profile{FreshnessMS: 30_000, ValidityMaxMS: 120_000}
+
+	// Generation 1: commit a time_anchor valid under gen1Prof (dt=15s > 10s,
+	// invalid under gen2Prof's 60s FreshnessMS) and a client record committed
+	// 200s after its anchor (valid under gen1Prof's 600s ValidityMaxMS,
+	// expired under gen2Prof's 60s ValidityMaxMS).
+	full := newLineWith(t, gen1Prof)
+	full.now += 15_000
+	_, _, wroteAnc, anc := full.q.AnchorRequest(RootPrincipal("rootK1"), At(full.now))
+	if anc.Class != "" || !wroteAnc {
+		t.Fatalf("gen-1 time_anchor: wrote=%v ans=%s", wroteAnc, showAnswer(anc))
+	}
+	in := full.intent(note("a1"))
+	in.ValidityMS = gen1Prof.ValidityMaxMS
+	full.now += 200_000
+	a := full.q.Submit(in, At(full.now))
+	if a.Class != ClassOutcome || a.Outcome.Kind != Committed {
+		t.Fatalf("gen-1 long-validity note: %s", showAnswer(a))
+	}
+
+	ca := NewClient("L", "credA", gen1Prof)
+	if err := ca.Run(full.q.Log()); err != nil {
+		t.Fatalf("client gen-1 Run: %v", err)
+	}
+
+	// Generation 1 -> Generation 2: planned transition changing profile bounds.
+	_, g1Head := full.q.Head()
+	rec12, err := BuildRecoveryFromWitness(full.q.State(), g1Head, gen1Prof, full.q.State().Line.HeadSeq, nil, "rootK1", gen2Prof, "")
+	if err != nil {
+		t.Fatalf("BuildRecoveryFromWitness(1->2): %v", err)
+	}
+	full.now += 100
+	if ans := full.q.CommitRecovery(rec12, "rec-1-to-2", "d-rec-12", At(full.now)); ans.Class != ClassOutcome || ans.Outcome.Kind != Committed {
+		t.Fatalf("CommitRecovery(1->2): %s", showAnswer(ans))
+	}
+	if full.q.Generation() != 2 {
+		t.Fatalf("expected generation 2, got %d", full.q.Generation())
+	}
+
+	// Commit gen-2 activation + base record at (2, 3), then a gen-2 tail (2, 4..5)
+	// that will be rolled back and reconciled in generation 3.
+	full.commit(activate(full.q.State().Line.KeyEpoch, "credA", "credB")) // (2, 2)
+	_, baseSeq2 := full.commit(note("a1"))                                // (2, 3)
+	full.commit(revoke("credB"))                                          // (2, 4) - tail
+	full.commit(activate(full.q.State().Line.KeyEpoch, "credA"))          // (2, 5) - tail
+	full.commit(openCall("a1", "a2", "cTailGen2"))                        // (2, 6) - tail
+
+	// Client witnesses the entire generation-2 log including the tail (2, 4..6),
+	// so ca.prof is now gen2Prof and ca.ckSeq == 6 > baseSeq2 == 3.
+	if err := ca.Run(full.q.Log()); err != nil {
+		t.Fatalf("client gen-2 Run: %v", err)
+	}
+	if ca.Generation() != 2 || ca.ckSeq != 6 {
+		t.Fatalf("expected client at (2, 6), got (%d, %d)", ca.Generation(), ca.ckSeq)
+	}
+
+	// Generation 2 -> Generation 3: roll back sequencer to (2, baseSeq2) and commit
+	// reconciled recovery from the witnessed gen-2 tail.
+	rb2, err := full.q.RollbackTo(baseSeq2)
+	if err != nil {
+		t.Fatalf("RollbackTo(gen 2, seq %d): %v", baseSeq2, err)
+	}
+	tail2 := full.q.Log()[baseSeq2:]
+	_, baseHead2 := rb2.Head()
+	rec23, err := BuildRecoveryFromWitness(rb2.State(), baseHead2, gen2Prof, full.q.State().Line.HeadSeq, tail2, "rootK2", gen3Prof, "")
+	if err != nil {
+		t.Fatalf("BuildRecoveryFromWitness(2->3): %v", err)
+	}
+	recTime3 := full.now + 100
+	if ans := rb2.CommitRecovery(rec23, "rec-2-to-3", "d-rec-23", At(recTime3)); ans.Class != ClassOutcome || ans.Outcome.Kind != Committed {
+		t.Fatalf("CommitRecovery(2->3): %s", showAnswer(ans))
+	}
+	e3 := &env{t: t, q: rb2, now: recTime3}
+	e3.commit(activate(rb2.State().Line.KeyEpoch, "credA"))
+	e3.commit(note("a1"))
+
+	// Witness client MUST transition cleanly from (2, 6) -> (3, 3) without halting
+	// on its own valid gen-1 history!
+	if err := ca.Run(rb2.Log()); err != nil {
+		t.Fatalf("client Run across gen 2->3 rollback with profile change failed: %v", err)
+	}
+	if ca.Halted() != "" || ca.Generation() != 3 {
+		t.Fatalf("unexpected client state after gen 3 recovery: gen=%d halted=%q", ca.Generation(), ca.Halted())
+	}
+	if !ca.State().Line.Credentials["credB"].Revoked || !contains(ca.State().Line.Tombstones.Calls, "cTailGen2") {
+		t.Fatalf("reconciled gen-2 tail security state missing in gen 3")
+	}
+	if len(ca.ArchivedTail()) != len(tail2) {
+		t.Fatalf("archived tail len = %d, want %d", len(ca.ArchivedTail()), len(tail2))
+	}
+	if len(diff(ca.State(), rb2.State())) > 0 {
+		t.Fatalf("client gen-3 state diverges from sequencer: %v", diff(ca.State(), rb2.State()))
+	}
+
+	// Fresh client replaying the full 3-generation log from genesis also matches.
+	fresh := NewClient("L", "credA", gen1Prof)
+	if err := fresh.Run(rb2.FullLog()); err != nil {
+		t.Fatalf("fresh client full 3-gen replay: %v", err)
+	}
+	if len(diff(fresh.State(), rb2.State())) > 0 {
+		t.Fatalf("fresh client 3-gen state diverges from sequencer: %v", diff(fresh.State(), rb2.State()))
+	}
+}

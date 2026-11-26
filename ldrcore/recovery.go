@@ -681,7 +681,7 @@ func (c *Client) applyRecoveryEntry(e Entry) error {
 		}
 		prefix = append(prefix, c.store[:r.BaseSeq]...)
 		var err error
-		baseState, _, err = ReplayVerifiedFull(c.LineID, prefix, c.prof)
+		baseState, _, err = ReplayVerifiedFull(c.LineID, prefix, c.genesisProf)
 		if err != nil {
 			return c.halt(e.Seq, fmt.Sprintf("internal error replaying verified base prefix: %v", err))
 		}

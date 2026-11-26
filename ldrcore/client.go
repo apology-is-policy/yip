@@ -49,7 +49,8 @@ type Client struct {
 	// Fault names the point at which the next procedure dies. It fires once.
 	Fault string
 
-	prof Profile
+	genesisProf Profile // immutable generation-1 profile for full-prefix replay
+	prof        Profile // active profile of current verified generation c.ckGen
 
 	// The verified local log store. A record, the state derived from it, the
 	// checkpoint and the indexes below advance together in one step (spec
@@ -126,6 +127,7 @@ func NewClient(lineID, cred string, prof Profile) *Client {
 		LineID:      lineID,
 		Cred:        cred,
 		ValidityMS:  min(60000, prof.ValidityMaxMS),
+		genesisProf: prof,
 		prof:        prof,
 		ckHead:      genesisHead(lineID),
 		priorStores: map[int64][]Entry{},
