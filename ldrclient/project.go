@@ -325,6 +325,10 @@ func (c *Client) Project(ctx context.Context, sess *ldrrelay.SessionClient) erro
 			c.mu.Unlock()
 			return ErrOutboxUncertain
 		}
+		if c.epochsUncertain {
+			c.mu.Unlock()
+			return ErrEpochsUncertain
+		}
 		if c.cursorsUncertain {
 			c.mu.Unlock()
 			return ErrCursorsUncertain
@@ -364,6 +368,10 @@ func (c *Client) Project(ctx context.Context, sess *ldrrelay.SessionClient) erro
 		if c.outboxUncertain {
 			c.mu.Unlock()
 			return ErrOutboxUncertain
+		}
+		if c.epochsUncertain {
+			c.mu.Unlock()
+			return ErrEpochsUncertain
 		}
 		if c.cursorsUncertain {
 			c.mu.Unlock()
@@ -434,6 +442,10 @@ func (c *Client) Rebuild(ctx context.Context, sess *ldrrelay.SessionClient) erro
 	if c.outboxUncertain {
 		c.mu.Unlock()
 		return ErrOutboxUncertain
+	}
+	if c.epochsUncertain {
+		c.mu.Unlock()
+		return ErrEpochsUncertain
 	}
 	if c.cursorsUncertain {
 		c.mu.Unlock()
@@ -511,6 +523,10 @@ func (c *Client) VerifiedRead(ctx context.Context, sess *ldrrelay.SessionClient,
 	if c.outboxUncertain {
 		c.mu.Unlock()
 		return "", ErrOutboxUncertain
+	}
+	if c.epochsUncertain {
+		c.mu.Unlock()
+		return "", ErrEpochsUncertain
 	}
 	if c.cursorsUncertain {
 		c.mu.Unlock()
@@ -754,10 +770,13 @@ func (c *Client) ProjectionDir() string {
 	return c.projDir()
 }
 
-// HasEpochKey reports whether this client holds the symmetric key for epoch.
+// HasEpochKey reports whether this client durably holds the symmetric key for epoch.
 func (c *Client) HasEpochKey(epoch uint64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.epochsUncertain {
+		return false
+	}
 	_, ok := c.epochs.Keys[epoch]
 	return ok
 }

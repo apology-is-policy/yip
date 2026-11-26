@@ -29,6 +29,7 @@ var (
 	ErrKeyRevoked       = errors.New("ldrclient: key is revoked and signs nothing more")
 	ErrNotActivated     = errors.New("ldrclient: member has not completed O25 enrollment verification")
 	ErrOutboxUncertain  = errors.New("ldrclient: durable outbox state uncertain after persistence failure; reconcile required")
+	ErrEpochsUncertain  = errors.New("ldrclient: durable epoch key state uncertain after persistence failure; reconcile required")
 	ErrCursorsUncertain = errors.New("ldrclient: durable cursor state uncertain after persistence failure; reconcile required")
 	ErrNoEpochKey       = errors.New("ldrclient: no epoch key available for payload encryption")
 	ErrEnrollmentCheck  = errors.New("ldrclient: committed enrollment disagrees with saved P3 request")
@@ -123,6 +124,8 @@ type Client struct {
 	outboxUncertainReason  string
 	slots                  map[string]string // slot -> unsettled op_id
 	epochs                 persistedEpochs
+	epochsUncertain        bool
+	epochsUncertainReason  string
 	cursors                persistedCursors
 	cursorsUncertain       bool
 	cursorsUncertainReason string
@@ -152,6 +155,34 @@ func (c *Client) markOutboxUncertainOnErrLocked(err error) {
 	}
 	c.outboxUncertain = true
 	c.outboxUncertainReason = err.Error()
+}
+
+func (c *Client) persistEpochsLocked(ep persistedEpochs) error {
+	return saveEpochsWithHooks(c.epochsPath(), ep, c.syncFileFn, c.syncDirFn)
+}
+
+func (c *Client) markEpochsUncertainOnErrLocked(err error) {
+	if err == nil || errors.Is(err, ldrstore.ErrPreWrite) {
+		return
+	}
+	c.epochsUncertain = true
+	c.epochsUncertainReason = err.Error()
+}
+
+func clonePersistedEpochs(ep persistedEpochs) persistedEpochs {
+	cp := persistedEpochs{
+		Keys:     make(map[uint64][]byte, len(ep.Keys)),
+		BadWraps: make(map[uint64]bool, len(ep.BadWraps)),
+	}
+	for k, v := range ep.Keys {
+		cp.Keys[k] = bytes.Clone(v)
+	}
+	for k, v := range ep.BadWraps {
+		if v {
+			cp.BadWraps[k] = true
+		}
+	}
+	return cp
 }
 
 func (c *Client) persistCursorsLocked(cur persistedCursors) error {
@@ -726,6 +757,8 @@ type ClientStatus struct {
 	Activated              bool     `json:"activated"`
 	OutboxUncertain        bool     `json:"outbox_uncertain,omitempty"`
 	OutboxUncertainReason  string   `json:"outbox_uncertain_reason,omitempty"`
+	EpochsUncertain        bool     `json:"epochs_uncertain,omitempty"`
+	EpochsUncertainReason  string   `json:"epochs_uncertain_reason,omitempty"`
 	CursorsUncertain       bool     `json:"cursors_uncertain,omitempty"`
 	CursorsUncertainReason string   `json:"cursors_uncertain_reason,omitempty"`
 	Generation             uint64   `json:"generation"`
@@ -768,6 +801,8 @@ func (c *Client) Status() ClientStatus {
 		Activated:              c.outbox.Activated,
 		OutboxUncertain:        c.outboxUncertain,
 		OutboxUncertainReason:  c.outboxUncertainReason,
+		EpochsUncertain:        c.epochsUncertain,
+		EpochsUncertainReason:  c.epochsUncertainReason,
 		CursorsUncertain:       c.cursorsUncertain,
 		CursorsUncertainReason: c.cursorsUncertainReason,
 		Generation:             c.ckGen,
@@ -870,6 +905,10 @@ func (c *Client) Sync(ctx context.Context, sess *ldrrelay.SessionClient) (int, e
 	if c.outboxUncertain {
 		c.mu.Unlock()
 		return 0, ErrOutboxUncertain
+	}
+	if c.epochsUncertain {
+		c.mu.Unlock()
+		return 0, ErrEpochsUncertain
 	}
 	if c.outbox.Halted != "" {
 		reason := c.outbox.Halted
@@ -1040,6 +1079,10 @@ func (c *Client) VerifyEnrollmentAndActivate(ctx context.Context, sess *ldrrelay
 		c.mu.Unlock()
 		return ErrOutboxUncertain
 	}
+	if c.epochsUncertain {
+		c.mu.Unlock()
+		return ErrEpochsUncertain
+	}
 	if c.outbox.Halted != "" || c.outbox.Suspect {
 		c.mu.Unlock()
 		return ErrFailClosed
@@ -1054,6 +1097,9 @@ func (c *Client) VerifyEnrollmentAndActivate(ctx context.Context, sess *ldrrelay
 	defer c.mu.Unlock()
 	if c.outboxUncertain {
 		return ErrOutboxUncertain
+	}
+	if c.epochsUncertain {
+		return ErrEpochsUncertain
 	}
 	if c.outbox.Halted != "" || c.outbox.Suspect {
 		return ErrFailClosed
@@ -1135,6 +1181,17 @@ func (c *Client) ReconcileDurability() error {
 	ep, err := loadEpochs(c.epochsPath())
 	if err != nil {
 		return err
+	}
+	for id, prevKey := range c.epochs.Keys {
+		gotKey, ok := ep.Keys[id]
+		if !ok || !bytes.Equal(prevKey, gotKey) {
+			return fmt.Errorf("%w: reconciled epochs.cbor lost or altered epoch %d key", ldrstore.ErrCorruptWAL, id)
+		}
+	}
+	for id, bad := range c.epochs.BadWraps {
+		if bad && !ep.BadWraps[id] && ep.Keys[id] == nil {
+			return fmt.Errorf("%w: reconciled epochs.cbor lost bad_wrap marker for epoch %d", ldrstore.ErrCorruptWAL, id)
+		}
 	}
 	cur, err := loadCursors(c.cursorsPath())
 	if err != nil {
@@ -1230,6 +1287,8 @@ func (c *Client) ReconcileDurability() error {
 	c.slots = slots
 	c.outboxUncertain = false
 	c.outboxUncertainReason = ""
+	c.epochsUncertain = false
+	c.epochsUncertainReason = ""
 	c.cursorsUncertain = false
 	c.cursorsUncertainReason = ""
 	return nil
@@ -1490,6 +1549,10 @@ func BuildEpochWrapContext(lineID []byte, gen uint64, profDigest [32]byte, newEp
 
 func (c *Client) unwrapAvailableEpochs(ctx context.Context, sess *ldrrelay.SessionClient) error {
 	c.mu.Lock()
+	if c.epochsUncertain {
+		c.mu.Unlock()
+		return ErrEpochsUncertain
+	}
 	if c.credKeys == nil {
 		c.mu.Unlock()
 		return nil
@@ -1547,38 +1610,46 @@ func (c *Client) unwrapAvailableEpochs(ctx context.Context, sess *ldrrelay.Sessi
 	if len(tasks) == 0 {
 		return nil
 	}
-	changed := false
+	var firstFetchErr error
 	for _, tk := range tasks {
 		raw, err := c.fetchVerifiedSidecar(ctx, sess, ldrstore.SidecarWrap, tk.commit)
 		if err != nil {
-			// Failed wrap MUST NOT stop replay (§6.3, §10.2).
-			c.mu.Lock()
-			c.epochs.BadWraps[tk.epoch] = true
-			c.mu.Unlock()
-			changed = true
+			// Transport, cancellation, missing-sidecar, or commitment-mismatch
+			// fetch errors are retryable — NEVER poison durable BadWraps until
+			// verified committed bytes themselves fail unwrap!
+			if firstFetchErr == nil {
+				firstFetchErr = err
+			}
+			if ctx.Err() != nil {
+				break
+			}
 			continue
 		}
-		epochKey, err := ldrcrypto.UnwrapEpochKey(myEncPriv, raw, tk.wctx)
-		if err != nil {
-			c.mu.Lock()
-			c.epochs.BadWraps[tk.epoch] = true
+		epochKey, unwrapErr := ldrcrypto.UnwrapEpochKey(myEncPriv, raw, tk.wctx)
+
+		c.mu.Lock()
+		if c.epochsUncertain {
 			c.mu.Unlock()
-			changed = true
-			continue
+			return ErrEpochsUncertain
 		}
-		c.mu.Lock()
-		c.epochs.Keys[tk.epoch] = epochKey
-		delete(c.epochs.BadWraps, tk.epoch)
+		cand := clonePersistedEpochs(c.epochs)
+		if unwrapErr != nil {
+			// Verified committed wrap bytes failed cryptographic unwrap:
+			// permanently bad wrap (§6.3, §10.2; does not stop control replay).
+			cand.BadWraps[tk.epoch] = true
+		} else {
+			cand.Keys[tk.epoch] = epochKey
+			delete(cand.BadWraps, tk.epoch)
+		}
+		if saveErr := c.persistEpochsLocked(cand); saveErr != nil {
+			c.markEpochsUncertainOnErrLocked(saveErr)
+			c.mu.Unlock()
+			return saveErr
+		}
+		c.epochs = cand
 		c.mu.Unlock()
-		changed = true
 	}
-	if changed {
-		c.mu.Lock()
-		err := saveEpochs(c.epochsPath(), c.epochs)
-		c.mu.Unlock()
-		return err
-	}
-	return nil
+	return firstFetchErr
 }
 
 // PayloadContextBytes constructs the non-circular AAD/KDF context binding all
@@ -1679,6 +1750,10 @@ func (c *Client) ReadPayload(ctx context.Context, sess *ldrrelay.SessionClient, 
 		c.mu.Unlock()
 		return nil, "", ErrOutboxUncertain
 	}
+	if c.epochsUncertain {
+		c.mu.Unlock()
+		return nil, "", ErrEpochsUncertain
+	}
 	if !c.outbox.Activated {
 		c.mu.Unlock()
 		return nil, "", ErrNotActivated
@@ -1756,6 +1831,9 @@ func (c *Client) ComposeAndPersist(p ComposeParams) (string, error) {
 
 	if c.outboxUncertain {
 		return "", ErrOutboxUncertain
+	}
+	if c.epochsUncertain {
+		return "", ErrEpochsUncertain
 	}
 	if c.outbox.Halted != "" || c.outbox.Suspect {
 		return "", ErrFailClosed
@@ -1899,6 +1977,9 @@ func (c *Client) ComposeEpochActivate(action string) (string, []byte, error) {
 
 	if c.outboxUncertain {
 		return "", nil, ErrOutboxUncertain
+	}
+	if c.epochsUncertain {
+		return "", nil, ErrEpochsUncertain
 	}
 	if c.outbox.Halted != "" || c.outbox.Suspect {
 		return "", nil, ErrFailClosed

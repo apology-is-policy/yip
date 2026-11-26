@@ -3,11 +3,13 @@ package ldrclient
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -836,6 +838,12 @@ func TestClientActivationPersistenceFailureAndAmbiguousWriteReconcile(t *testing
 		}
 		defer sess.Close()
 
+		// Sync epochs durably first so the injected sync failure hits outbox.cbor
+		// activation persistence rather than epochs.cbor unwrap.
+		if _, err := cl.Sync(ctx, sess); err != nil {
+			t.Fatal(err)
+		}
+
 		// Inject clean pre-rename failure via SyncFile on temp outbox file (removed before rename!).
 		cl.SetSyncHooks(func(*os.File) error {
 			return errors.New("injected temp outbox fsync EIO")
@@ -903,6 +911,12 @@ func TestClientActivationPersistenceFailureAndAmbiguousWriteReconcile(t *testing
 			t.Fatal(err)
 		}
 		defer sess.Close()
+
+		// Sync epochs durably first so the injected dir-sync failure hits outbox.cbor
+		// activation persistence rather than epochs.cbor unwrap.
+		if _, err := cl.Sync(ctx, sess); err != nil {
+			t.Fatal(err)
+		}
 
 		// Inject post-rename SyncDir failure: os.Rename ALREADY made outbox.cbor
 		// with Activated=true visible on disk, while directory durability failed!
@@ -1008,6 +1022,10 @@ func TestClientActivationPersistenceFailureAndAmbiguousWriteReconcile(t *testing
 		}
 		defer sess.Close()
 
+		if _, err := cl.Sync(ctx, sess); err != nil {
+			t.Fatal(err)
+		}
+
 		var syncMu sync.Mutex
 		dirSyncFails := true
 		cl.SetSyncHooks(nil, func(d string) error {
@@ -1104,6 +1122,10 @@ func TestClientReconcileDurabilityCandidateReplayAndPrefixProtection(t *testing.
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { sess.Close() })
+
+		if _, err := cl.Sync(ctx, sess); err != nil {
+			t.Fatal(err)
+		}
 
 		var syncMu sync.Mutex
 		dirSyncFails := true
@@ -3238,6 +3260,409 @@ func TestProjectionDirSyncBarrierAndCompleteWipeRetry(t *testing.T) {
 		}
 		if _, err := cl2.VerifiedRead(ctx, sess, "calls/call-bob-p22-wipe/turn-1"); err != nil {
 			t.Fatalf("VerifiedRead after completed wipe retry: %v", err)
+		}
+	})
+}
+
+// TestClientEpochDurabilityAndTransientWrapFetchRetry verifies Codex Turn 26 (Slice 5 Findings 1 & 2):
+//  1. unwrapAvailableEpochs persists staged epochs.cbor changes BEFORE publishing Keys/BadWraps:
+//     - Definite ErrPreWrite leaves HasEpochKey=false and ReadPayload=ReadNoKey both in-process
+//     and after reopen, and a subsequent Sync retries and persists the key cleanly.
+//     - Ambiguous ErrUncertainWrite fences epoch reliance (ErrEpochsUncertain / HasEpochKey=false)
+//     in-process and fails closed on reopen until ReconcileDurability or clean reopen passes
+//     the epochs.cbor barrier.
+//  2. Transient/interrupted fetchVerifiedSidecar failures (503 / cancellation) do NOT poison
+//     durable BadWraps — a later Sync retries and acquires the valid epoch key. Only verified
+//     committed wrap bytes that fail cryptographic UnwrapEpochKey set permanent BadWraps.
+func TestClientEpochDurabilityAndTransientWrapFetchRetry(t *testing.T) {
+	fx := startOnboardingFixture(t)
+	ctx := context.Background()
+
+	_, _ = fx.alice.Sync(ctx, fx.sAlice)
+	opDeclAlice, err := fx.alice.ComposeAndPersist(ComposeParams{
+		Action: "decl_alice_ep", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+		Fields: ldrcrypto.Map{{Key: "actor_id", Value: "alice-ep"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: fx.aliceGrant.NamespaceID}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := fx.alice.Send(ctx, fx.sAlice, opDeclAlice); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+		t.Fatalf("decl alice-ep: %+v err=%v", rep, err)
+	}
+	_, _ = fx.alice.Sync(ctx, fx.sAlice)
+
+	setupActivatedMember := func(t *testing.T, ns, actor string, reqByte byte) (*Client, string, *ldrrelay.SessionClient, *CredentialKeyBundle) {
+		t.Helper()
+		keys, _ := GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+		grant := ldrcrypto.JoinGrant{NamespaceID: ns, ActorLimit: 4, Reader: true}
+		reqID, reqDig := fx.enrollP3(t, keys, grant, reqByte)
+		fx.activateNextEpoch(t)
+		dir := t.TempDir()
+		cl, err := InitClientDir(InitDirOptions{
+			Dir: dir, DirKind: DirKindMember, SignedDescriptor: fx.env.rawDesc, CredKeys: keys,
+			ExpectedGrant: &grant, ExpectedJoinReq: reqID, ExpectedJoinReqDigest: &reqDig, Activated: false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = cl.Close() })
+		sess, err := cl.Dial(ctx, ldrcrypto.PrincipalCredential)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { sess.Close() })
+		if err := cl.VerifyEnrollmentAndActivate(ctx, sess); err != nil {
+			t.Fatal(err)
+		}
+		opD, err := cl.ComposeAndPersist(ComposeParams{
+			Action: "decl_" + actor, Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: actor}, {Key: "label", Value: false}, {Key: "namespace_id", Value: ns}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rep, err := cl.Send(ctx, sess, opD); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+			t.Fatalf("decl %s: %+v err=%v", actor, rep, err)
+		}
+		_, _ = cl.Sync(ctx, sess)
+		return cl, dir, sess, keys
+	}
+
+	openEncryptedCallAtCurrentEpoch := func(t *testing.T, callID, toActor, msg string) (uint64, uint64) {
+		t.Helper()
+		if _, err := fx.alice.Sync(ctx, fx.sAlice); err != nil {
+			t.Fatal(err)
+		}
+		curEp := uint64(fx.alice.Status().KeyEpoch)
+		op, err := fx.alice.ComposeAndPersist(ComposeParams{
+			Action: "call_" + callID, Origin: ldrcore.OriginActor, OpType: "call_open", ActorID: "alice-ep",
+			Fields:    ldrcrypto.Map{{Key: "call_id", Value: callID}, {Key: "to", Value: toActor}},
+			Plaintext: []byte(`{"subject":"` + callID + `","body":"` + msg + `"}`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rep, err := fx.alice.Send(ctx, fx.sAlice, op)
+		if err != nil || rep.Outcome.Kind != ldrcore.Committed {
+			t.Fatalf("call_open %s: %+v err=%v", callID, rep, err)
+		}
+		return curEp, rep.Outcome.Seq
+	}
+
+	t.Run("epochs_pre_write_failure_hides_key_and_retries_cleanly", func(t *testing.T) {
+		bob, dir, sBob, _ := setupActivatedMember(t, "ns-ep-prewrite", "bob-ep-pw", 0xf1)
+		fx.activateNextEpoch(t)
+		newEp, callSeq := openEncryptedCallAtCurrentEpoch(t, "call-ep-pw", "bob-ep-pw", "epoch pre-write payload")
+
+		// Inject definite ErrPreWrite specifically on epochs.cbor!
+		var failEpochs atomic.Bool
+		failEpochs.Store(true)
+		bob.SetSyncHooks(func(f *os.File) error {
+			if failEpochs.Load() && strings.Contains(filepath.Base(f.Name()), "epochs.cbor") {
+				return errors.New("injected epochs.cbor pre-write fsync failure")
+			}
+			return ldrstore.SyncFile(f)
+		}, nil)
+
+		if _, err := bob.Sync(ctx, sBob); !errors.Is(err, ldrstore.ErrPreWrite) {
+			t.Fatalf("Sync with epochs.cbor pre-write failure: got %v, want ErrPreWrite", err)
+		}
+		// Live client MUST NOT expose the unpersisted epoch key or set EpochsUncertain!
+		if bob.Status().EpochsUncertain {
+			t.Fatalf("clean pre-write epochs failure should not set EpochsUncertain")
+		}
+		if bob.HasEpochKey(newEp) {
+			t.Fatalf("live client exposed unpersisted epoch %d key after ErrPreWrite!", newEp)
+		}
+		if _, rs, err := bob.ReadPayload(ctx, sBob, callSeq); err != nil || rs != ldrcore.ReadNoKey {
+			t.Fatalf("ReadPayload before durable epoch save: rs=%s err=%v, want ReadNoKey/nil", rs, err)
+		}
+
+		// Immediate retry while epochs.cbor write STILL fails MUST NOT skip newEp and return nil!
+		if _, err := bob.Sync(ctx, sBob); !errors.Is(err, ldrstore.ErrPreWrite) {
+			t.Fatalf("retry Sync while epochs.cbor pre-write still fails: got %v, want ErrPreWrite", err)
+		}
+		if bob.HasEpochKey(newEp) {
+			t.Fatalf("retry Sync exposed unpersisted epoch %d key!", newEp)
+		}
+
+		// Reopen agrees: disk lacks newEp!
+		_ = bob.Close()
+		bob2, err := OpenClient(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer bob2.Close()
+		if bob2.HasEpochKey(newEp) {
+			t.Fatalf("reopened client unexpectedly held epoch %d key after ErrPreWrite!", newEp)
+		}
+
+		// Healthy Sync retries unwrap, persists epochs.cbor, and decrypts payload both in-process and after reopen!
+		if _, err := bob2.Sync(ctx, sBob); err != nil {
+			t.Fatalf("healthy Sync retry for epoch %d: %v", newEp, err)
+		}
+		if !bob2.HasEpochKey(newEp) {
+			t.Fatalf("expected HasEpochKey(%d)=true after healthy Sync retry", newEp)
+		}
+		if _, rs, err := bob2.ReadPayload(ctx, sBob, callSeq); err != nil || rs != ldrcore.ReadOK {
+			t.Fatalf("ReadPayload after healthy Sync retry: rs=%s err=%v, want ReadOK/nil", rs, err)
+		}
+		_ = bob2.Close()
+		bob3, err := OpenClient(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer bob3.Close()
+		if !bob3.HasEpochKey(newEp) {
+			t.Fatalf("reopened client missing durably saved epoch %d key", newEp)
+		}
+		if _, rs, err := bob3.ReadPayload(ctx, sBob, callSeq); err != nil || rs != ldrcore.ReadOK {
+			t.Fatalf("reopened ReadPayload: rs=%s err=%v, want ReadOK/nil", rs, err)
+		}
+	})
+
+	t.Run("epochs_ambiguous_post_rename_dir_sync_fences_until_reconcile_and_reopen", func(t *testing.T) {
+		// Case A: in-process ReconcileDurability recovery.
+		bobA, dirA, sBobA, _ := setupActivatedMember(t, "ns-ep-ambig-a", "bob-ep-aa", 0xf2)
+		fx.activateNextEpoch(t)
+		epA, callSeqA := openEncryptedCallAtCurrentEpoch(t, "call-ep-aa", "bob-ep-aa", "ambig A")
+
+		var syncMuA sync.Mutex
+		dirFailsA := true
+		cleanDirA := filepath.Clean(dirA)
+		dirHookA := func(d string) error {
+			syncMuA.Lock()
+			fail := dirFailsA
+			syncMuA.Unlock()
+			if fail && filepath.Clean(d) == cleanDirA {
+				return errors.New("injected epochs.cbor post-rename dir sync failure")
+			}
+			return ldrstore.SyncDir(d)
+		}
+		bobA.SetSyncHooks(nil, dirHookA)
+
+		if _, err := bobA.Sync(ctx, sBobA); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("Sync ambiguous epochs write: got %v, want ErrUncertainWrite", err)
+		}
+		if !bobA.Status().EpochsUncertain || bobA.HasEpochKey(epA) {
+			t.Fatalf("expected EpochsUncertain=true and HasEpochKey(%d)=false, got st=%+v", epA, bobA.Status())
+		}
+		// All epoch-dependent surfaces MUST refuse while EpochsUncertain!
+		if _, _, err := bobA.ReadPayload(ctx, sBobA, callSeqA); !errors.Is(err, ErrEpochsUncertain) {
+			t.Fatalf("ReadPayload while epochsUncertain: got %v, want ErrEpochsUncertain", err)
+		}
+		if _, err := bobA.Sync(ctx, sBobA); !errors.Is(err, ErrEpochsUncertain) {
+			t.Fatalf("Sync while epochsUncertain: got %v, want ErrEpochsUncertain", err)
+		}
+		if err := bobA.Project(ctx, sBobA); !errors.Is(err, ErrEpochsUncertain) {
+			t.Fatalf("Project while epochsUncertain: got %v, want ErrEpochsUncertain", err)
+		}
+		if _, err := bobA.ComposeAndPersist(ComposeParams{
+			Action: "blocked_ep_uncertain", Origin: ldrcore.OriginCredential, OpType: "actor_declare",
+			Fields: ldrcrypto.Map{{Key: "actor_id", Value: "x-ep"}, {Key: "label", Value: false}, {Key: "namespace_id", Value: "ns-ep-ambig-a"}},
+		}); !errors.Is(err, ErrEpochsUncertain) {
+			t.Fatalf("Compose while epochsUncertain: got %v, want ErrEpochsUncertain", err)
+		}
+		if err := bobA.ReconcileDurability(); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("ReconcileDurability while dirSync still fails: got %v, want ErrUncertainWrite", err)
+		}
+
+		// Restore dirSync -> same-process ReconcileDurability enforces epochs.cbor barrier,
+		// lifts fence, and exposes durable epA!
+		syncMuA.Lock()
+		dirFailsA = false
+		syncMuA.Unlock()
+		if err := bobA.ReconcileDurability(); err != nil {
+			t.Fatalf("ReconcileDurability after restoring dirSync: %v", err)
+		}
+		if bobA.Status().EpochsUncertain || !bobA.HasEpochKey(epA) {
+			t.Fatalf("expected reconciled EpochsUncertain=false HasEpochKey(%d)=true, got st=%+v", epA, bobA.Status())
+		}
+		if _, rs, err := bobA.ReadPayload(ctx, sBobA, callSeqA); err != nil || rs != ldrcore.ReadOK {
+			t.Fatalf("ReadPayload after ReconcileDurability: rs=%s err=%v, want ReadOK/nil", rs, err)
+		}
+
+		// Case B: reopen while dirSync still fails -> fails closed; reopen after restore -> succeeds!
+		bobB, dirB, sBobB, _ := setupActivatedMember(t, "ns-ep-ambig-b", "bob-ep-ab", 0xf3)
+		fx.activateNextEpoch(t)
+		epB, callSeqB := openEncryptedCallAtCurrentEpoch(t, "call-ep-ab", "bob-ep-ab", "ambig B")
+
+		var syncMuB sync.Mutex
+		dirFailsB := true
+		cleanDirB := filepath.Clean(dirB)
+		dirHookB := func(d string) error {
+			syncMuB.Lock()
+			fail := dirFailsB
+			syncMuB.Unlock()
+			if fail && filepath.Clean(d) == cleanDirB {
+				return errors.New("injected epochs.cbor reopen dir sync failure")
+			}
+			return ldrstore.SyncDir(d)
+		}
+		bobB.SetSyncHooks(nil, dirHookB)
+		if _, err := bobB.Sync(ctx, sBobB); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("Sync ambiguous epochs write B: got %v, want ErrUncertainWrite", err)
+		}
+		_ = bobB.Close()
+		if _, err := OpenClientWithSyncHooks(dirB, nil, dirHookB); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("OpenClientWithSyncHooks while epochs dirSync still fails: got %v, want ErrUncertainWrite", err)
+		}
+		syncMuB.Lock()
+		dirFailsB = false
+		syncMuB.Unlock()
+		bobB2, err := OpenClientWithSyncHooks(dirB, nil, dirHookB)
+		if err != nil {
+			t.Fatalf("OpenClient after epochs dirSync restored: %v", err)
+		}
+		defer bobB2.Close()
+		if !bobB2.HasEpochKey(epB) {
+			t.Fatalf("expected HasEpochKey(%d)=true after barrier-verified reopen", epB)
+		}
+		if _, rs, err := bobB2.ReadPayload(ctx, sBobB, callSeqB); err != nil || rs != ldrcore.ReadOK {
+			t.Fatalf("ReadPayload after barrier-verified reopen: rs=%s err=%v", rs, err)
+		}
+	})
+
+	t.Run("interrupted_wrap_fetch_stays_retryable_while_verified_bad_wrap_is_permanent", func(t *testing.T) {
+		bob, dir, sBob, bobKeys := setupActivatedMember(t, "ns-ep-fetch", "bob-ep-fetch", 0xf4)
+		fx.activateNextEpoch(t)
+		newEp, callSeq := openEncryptedCallAtCurrentEpoch(t, "call-ep-fetch", "bob-ep-fetch", "retryable wrap fetch")
+
+		// Part A: interrupt the wrap /sidecar fetch with a temporary 503 failure!
+		var failNextSidecar atomic.Bool
+		failNextSidecar.Store(true)
+		fx.env.setHTTPHook(func(next http.Handler, w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/sidecar") && failNextSidecar.CompareAndSwap(true, false) {
+				http.Error(w, "temporary relay outage", http.StatusServiceUnavailable)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+		t.Cleanup(func() { fx.env.setHTTPHook(nil) })
+
+		if _, err := bob.Sync(ctx, sBob); err == nil {
+			t.Fatalf("expected Sync to report interrupted wrap sidecar fetch error")
+		}
+		if bob.HasEpochKey(newEp) {
+			t.Fatalf("unexpectedly acquired epoch %d key despite failed fetch", newEp)
+		}
+		// Durable epochs.cbor MUST NOT mark newEp in BadWraps!
+		epDisk, err := loadEpochs(filepath.Join(dir, "epochs.cbor"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if epDisk.BadWraps[newEp] {
+			t.Fatalf("transient wrap fetch error poisoned durable BadWraps for epoch %d!", newEp)
+		}
+
+		// Subsequent Sync (without the outage) MUST retry fetching the wrap and acquire newEp!
+		fx.env.setHTTPHook(nil)
+		if _, err := bob.Sync(ctx, sBob); err != nil {
+			t.Fatalf("retry Sync after interrupted wrap fetch: %v", err)
+		}
+		if !bob.HasEpochKey(newEp) {
+			t.Fatalf("retry Sync did not acquire epoch %d key after transient fetch failure!", newEp)
+		}
+		if _, rs, err := bob.ReadPayload(ctx, sBob, callSeq); err != nil || rs != ldrcore.ReadOK {
+			t.Fatalf("ReadPayload after retryable wrap acquisition: rs=%s err=%v, want ReadOK/nil", rs, err)
+		}
+
+		// Part B: commit a genuine key_epoch_activate whose manifest commits to corrupt wrap
+		// bytes for Bob (so fetchVerifiedSidecar succeeds with verified committed bytes,
+		// while UnwrapEpochKey fails) -> MUST permanently mark BadWraps[badEp]=true!
+		_, _ = fx.admin.Sync(ctx, fx.sOp)
+		st := fx.admin.State()
+		curEp := uint64(st.Line.KeyEpoch)
+		badEp := curEp + 1
+		entitled := st.Line.EntitledReaders()
+		badWrapBytes := []byte("verified-committed-but-corrupt-hpke-wrap-ciphertext")
+		badWrapCommit, err := ldrcrypto.CommitWrap(badWrapBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		goodKey, _ := ldrcrypto.GenerateEpochKey()
+		credIDs := make([][32]byte, 0, len(entitled))
+		encKeys := make(map[[32]byte]ldrcrypto.PublicKey, len(entitled))
+		for _, tok := range entitled {
+			var cid [32]byte
+			idB, _ := hex.DecodeString(tok)
+			copy(cid[:], idB)
+			ek, _ := ldrrelay.ParseKeyToken(st.Line.Credentials[tok].EncryptionKey)
+			credIDs = append(credIDs, cid)
+			encKeys[cid] = ek
+		}
+		slices.SortFunc(credIDs, func(a, b [32]byte) int { return bytes.Compare(a[:], b[:]) })
+		rsDig, _ := ldrcrypto.ReaderSetDigest(credIDs)
+		opPrin := ldrcrypto.OperatorPrincipal(fx.opKey.Signer.PublicKey())
+		_, ckSeq, ckHead := fx.admin.Checkpoint()
+		badOpID := "op-bad-wrap-test"
+		manifest := make([]ldrcrypto.WrapManifestEntry, 0, len(credIDs))
+		wrapSidecars := make(map[[32]byte][]byte, len(credIDs))
+		for _, cid := range credIDs {
+			if cid == bobKeys.CredID {
+				manifest = append(manifest, ldrcrypto.WrapManifestEntry{CredID: cid, Commit: badWrapCommit})
+				wrapSidecars[cid] = badWrapBytes
+				continue
+			}
+			wctx, err := BuildEpochWrapContext(fx.env.lineID, 1, fx.env.profDigest, badEp, curEp, uint64(st.Line.AuthEpoch), opPrin, ckSeq, badOpID, cid, encKeys[cid], rsDig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wb, err := ldrcrypto.WrapEpochKey(goodKey, wctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wc, _ := ldrcrypto.CommitWrap(wb)
+			manifest = append(manifest, ldrcrypto.WrapManifestEntry{CredID: cid, Commit: wc})
+			wrapSidecars[cid] = wb
+		}
+		body, err := ldrrelay.BuildWireIntentBody(ldrrelay.WireIntentInput{
+			ProfileDigest: fx.env.profDigest, LineID: fx.env.lineID, Generation: 1,
+			Origin: ldrcore.OriginOperator, Principal: opPrin,
+			OpID: badOpID, OpType: "key_epoch_activate",
+			AuthEpoch: uint64(st.Line.AuthEpoch), KeyEpoch: curEp,
+			SeenSeq: ckSeq, SeenHead: ckHead, ValidityMS: 60_000,
+			PayloadCommit: ldrcrypto.EmptyPayloadCommit(),
+			Expect:        ldrcrypto.ExpectMap{"key_epoch": curEp},
+			Manifest:      manifest,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		env, err := ldrcrypto.SignIntent(fx.opKey.Signer, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rep, err := fx.sOp.Submit(ctx, env.RawBytes, nil, wrapSidecars); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+			t.Fatalf("submit bad-wrap epoch activate: rep=%+v err=%v", rep, err)
+		}
+
+		// Bob syncs: fetchVerifiedSidecar succeeds on verified committed bytes,
+		// UnwrapEpochKey fails -> Sync completes without halting replay and persists BadWraps[badEp]!
+		if _, err := bob.Sync(ctx, sBob); err != nil {
+			t.Fatalf("Sync with permanently bad committed wrap should not stop replay: %v", err)
+		}
+		if bob.HasEpochKey(badEp) {
+			t.Fatalf("unexpectedly acquired key for permanently bad wrap epoch %d", badEp)
+		}
+		epDisk, err = loadEpochs(filepath.Join(dir, "epochs.cbor"))
+		if err != nil || !epDisk.BadWraps[badEp] {
+			t.Fatalf("expected permanent BadWraps[%d]=true on disk, got %+v err=%v", badEp, epDisk, err)
+		}
+
+		// Subsequent Sync MUST skip badEp without re-fetching /sidecar!
+		var sidecarHits atomic.Int32
+		fx.env.setHTTPHook(func(next http.Handler, w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/sidecar") {
+				sidecarHits.Add(1)
+			}
+			next.ServeHTTP(w, r)
+		})
+		if _, err := bob.Sync(ctx, sBob); err != nil {
+			t.Fatalf("follow-up Sync after BadWraps persisted: %v", err)
+		}
+		if sidecarHits.Load() != 0 {
+			t.Fatalf("follow-up Sync unexpectedly re-fetched sidecar %d times for permanently bad epoch %d", sidecarHits.Load(), badEp)
 		}
 	})
 }

@@ -2,11 +2,79 @@ package ldrclient
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/apology-is-policy/yip/ldrcrypto"
-	"github.com/apology-is-policy/yip/ldrstore"
 )
+
+// PathsAlias reports whether paths a and b refer to the same destination,
+// resolving symlinks along existing ancestor directories as well as checking
+// os.SameFile when both already exist.
+func PathsAlias(a, b string) (bool, error) {
+	if a == "" || b == "" {
+		return false, nil
+	}
+	if fiA, errA := os.Lstat(a); errA == nil {
+		if fiB, errB := os.Lstat(b); errB == nil && os.SameFile(fiA, fiB) {
+			return true, nil
+		}
+	}
+	if fiA, errA := os.Stat(a); errA == nil {
+		if fiB, errB := os.Stat(b); errB == nil && os.SameFile(fiA, fiB) {
+			return true, nil
+		}
+	}
+	ca, err := canonicalPathForAliasCheck(a)
+	if err != nil {
+		return false, err
+	}
+	cb, err := canonicalPathForAliasCheck(b)
+	if err != nil {
+		return false, err
+	}
+	return ca == cb, nil
+}
+
+func canonicalPathForAliasCheck(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+	cur := abs
+	var tail []string
+	for {
+		resolved, err := filepath.EvalSymlinks(cur)
+		if err == nil {
+			parts := make([]string, 0, 1+len(tail))
+			parts = append(parts, resolved)
+			for i := len(tail) - 1; i >= 0; i-- {
+				parts = append(parts, tail[i])
+			}
+			return filepath.Clean(filepath.Join(parts...)), nil
+		}
+		if !os.IsNotExist(err) {
+			return abs, nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = parent
+	}
+}
+
+// SaveCreationDescriptor verifies and publishes a signed creation descriptor
+// atomically without clobbering any existing destination.
+func SaveCreationDescriptor(path string, raw []byte) error {
+	if _, _, _, _, err := ldrcrypto.VerifyCreationDescriptor(raw); err != nil {
+		return err
+	}
+	return publishFileNoClobber(path, raw, 0o644, false)
+}
 
 func marshalJoinRequest(req ldrcrypto.JoinRequest) ([]byte, error) {
 	if _, err := ldrcrypto.VerifyJoinRequest(req); err != nil {
@@ -125,21 +193,20 @@ func LoadJoinRequest(path string) (ldrcrypto.JoinRequest, [32]byte, error) {
 	return req, dig, nil
 }
 
-// SaveJoinChallenge writes an operator-created P3 JoinChallenge to path (never includes secret).
-func SaveJoinChallenge(path string, ch ldrcrypto.JoinChallenge) error {
+func marshalJoinChallenge(ch ldrcrypto.JoinChallenge) ([]byte, error) {
 	opC, err := ch.OperatorKey.ToCBOR()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sigC, err := ch.SigningKey.ToCBOR()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	encC, err := ch.EncryptionKey.ToCBOR()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	raw, err := ldrcrypto.MarshalCBOR(ldrcrypto.Map{
+	return ldrcrypto.MarshalCBOR(ldrcrypto.Map{
 		{Key: "challenge_id", Value: ch.ChallengeID},
 		{Key: "ciphertext", Value: ch.Ciphertext},
 		{Key: "enc", Value: ch.Enc},
@@ -153,18 +220,9 @@ func SaveJoinChallenge(path string, ch ldrcrypto.JoinChallenge) error {
 		{Key: "signing_key", Value: sigC},
 		{Key: "v", Value: uint64(1)},
 	})
-	if err != nil {
-		return err
-	}
-	return ldrstore.AtomicWriteFile(path, raw, 0o644)
 }
 
-// LoadJoinChallenge reads a P3 JoinChallenge file.
-func LoadJoinChallenge(path string) (ldrcrypto.JoinChallenge, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return ldrcrypto.JoinChallenge{}, err
-	}
+func unmarshalJoinChallenge(raw []byte) (ldrcrypto.JoinChallenge, error) {
 	dec, err := ldrcrypto.UnmarshalCBORDefault(raw)
 	if err != nil {
 		return ldrcrypto.JoinChallenge{}, err
@@ -195,7 +253,27 @@ func LoadJoinChallenge(path string) (ldrcrypto.JoinChallenge, error) {
 	return ch, nil
 }
 
-// SaveJoinProof writes a joiner's signed P3 JoinProof to path.
+// SaveJoinChallenge publishes an operator-created P3 JoinChallenge to path
+// without clobbering any existing destination (never includes secret).
+func SaveJoinChallenge(path string, ch ldrcrypto.JoinChallenge) error {
+	raw, err := marshalJoinChallenge(ch)
+	if err != nil {
+		return err
+	}
+	return publishFileNoClobber(path, raw, 0o644, false)
+}
+
+// LoadJoinChallenge reads a P3 JoinChallenge file.
+func LoadJoinChallenge(path string) (ldrcrypto.JoinChallenge, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ldrcrypto.JoinChallenge{}, err
+	}
+	return unmarshalJoinChallenge(raw)
+}
+
+// SaveJoinProof publishes a joiner's signed P3 JoinProof to path without
+// clobbering conflicting destinations (accepts an existing byte-identical regular file).
 func SaveJoinProof(path string, pr ldrcrypto.JoinProof) error {
 	raw, err := ldrcrypto.MarshalCBOR(ldrcrypto.Map{
 		{Key: "challenge_id", Value: pr.ChallengeID},
@@ -208,7 +286,7 @@ func SaveJoinProof(path string, pr ldrcrypto.JoinProof) error {
 	if err != nil {
 		return err
 	}
-	return ldrstore.AtomicWriteFile(path, raw, 0o644)
+	return publishFileNoClobber(path, raw, 0o644, true)
 }
 
 // LoadJoinProof reads a P3 JoinProof file.
@@ -237,8 +315,12 @@ func LoadJoinProof(path string) (ldrcrypto.JoinProof, error) {
 	return pr, nil
 }
 
-// SaveJoinSecret saves the operator's ephemeral 32-byte challenge secret with 0600 permissions.
+// SaveJoinSecret publishes the operator's ephemeral 32-byte challenge secret
+// with 0600 permissions without clobbering any existing destination.
 func SaveJoinSecret(path string, secret []byte) error {
+	if len(secret) != 32 {
+		return errors.New("ldrclient: join secret must be 32 bytes")
+	}
 	raw, err := ldrcrypto.MarshalCBOR(ldrcrypto.Map{
 		{Key: "schema", Value: "ldr.join-secret-file.v1"},
 		{Key: "secret", Value: secret},
@@ -247,7 +329,31 @@ func SaveJoinSecret(path string, secret []byte) error {
 	if err != nil {
 		return err
 	}
-	return ldrstore.AtomicWriteFile(path, raw, 0o600)
+	return publishFileNoClobber(path, raw, 0o600, false)
+}
+
+// SaveJoinSecretWithChallenge publishes the operator's 32-byte challenge secret
+// along with the exact matching canonical JoinChallenge bytes (0600, non-clobbering)
+// so a failed challenge-file export can be retried cleanly without regenerating
+// or replacing the ceremony secret.
+func SaveJoinSecretWithChallenge(path string, secret []byte, ch ldrcrypto.JoinChallenge) error {
+	if len(secret) != 32 {
+		return errors.New("ldrclient: join secret must be 32 bytes")
+	}
+	chRaw, err := marshalJoinChallenge(ch)
+	if err != nil {
+		return err
+	}
+	raw, err := ldrcrypto.MarshalCBOR(ldrcrypto.Map{
+		{Key: "challenge", Value: chRaw},
+		{Key: "schema", Value: "ldr.join-secret-file.v1"},
+		{Key: "secret", Value: secret},
+		{Key: "v", Value: uint64(1)},
+	})
+	if err != nil {
+		return err
+	}
+	return publishFileNoClobber(path, raw, 0o600, false)
 }
 
 // LoadJoinSecret loads the operator's ephemeral 32-byte challenge secret.
@@ -265,4 +371,45 @@ func LoadJoinSecret(path string) ([]byte, error) {
 		return nil, errors.New("ldrclient: invalid join secret file")
 	}
 	return ldrcrypto.MapBytesLen(m, "secret", 32)
+}
+
+// LoadJoinSecretWithChallenge loads a regular join-secret file together with its
+// embedded JoinChallenge for resuming an interrupted challenge export.
+func LoadJoinSecretWithChallenge(path string) ([]byte, ldrcrypto.JoinChallenge, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return nil, ldrcrypto.JoinChallenge{}, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, ldrcrypto.JoinChallenge{}, fmt.Errorf("%w: %s is not a regular file", ErrOutputExists, path)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, ldrcrypto.JoinChallenge{}, err
+	}
+	dec, err := ldrcrypto.UnmarshalCBORDefault(raw)
+	if err != nil {
+		return nil, ldrcrypto.JoinChallenge{}, err
+	}
+	m, ok := dec.(map[string]any)
+	if !ok {
+		return nil, ldrcrypto.JoinChallenge{}, errors.New("ldrclient: invalid join secret file")
+	}
+	schema, _ := ldrcrypto.MapString(m, "schema")
+	if schema != "ldr.join-secret-file.v1" {
+		return nil, ldrcrypto.JoinChallenge{}, errors.New("ldrclient: invalid join secret schema")
+	}
+	sec, err := ldrcrypto.MapBytesLen(m, "secret", 32)
+	if err != nil {
+		return nil, ldrcrypto.JoinChallenge{}, err
+	}
+	chRaw, err := ldrcrypto.MapBytes(m, "challenge")
+	if err != nil {
+		return nil, ldrcrypto.JoinChallenge{}, errors.New("ldrclient: join secret file has no resumable challenge")
+	}
+	ch, err := unmarshalJoinChallenge(chRaw)
+	if err != nil {
+		return nil, ldrcrypto.JoinChallenge{}, err
+	}
+	return sec, ch, nil
 }

@@ -32,6 +32,7 @@ var (
 	ErrCredentialExists = errors.New("ldrclient: credential key already exists in client directory")
 	ErrDirInitialized   = errors.New("ldrclient: client directory already initialized or non-empty; choose a fresh directory")
 	ErrOutputExists     = errors.New("ldrclient: output destination already exists")
+	ErrOutputCollision  = errors.New("ldrclient: output paths refer to the same destination")
 )
 
 // SigningKeyMaterial holds a Profile v1 signing private key (Ed25519 or ECDSA P-256).
@@ -101,7 +102,8 @@ func signingKeyFromSecret(alg string, secret []byte) (*SigningKeyMaterial, error
 	}
 }
 
-// SaveSigningKey writes a root or operator signing key atomically with 0600 permissions.
+// SaveSigningKey publishes a root or operator signing key without clobbering
+// any existing destination, with 0600 permissions.
 func SaveSigningKey(path string, km *SigningKeyMaterial) error {
 	if km == nil || km.Signer == nil {
 		return ErrKeyFile
@@ -120,7 +122,7 @@ func SaveSigningKey(path string, km *SigningKeyMaterial) error {
 	if err != nil {
 		return err
 	}
-	return ldrstore.AtomicWriteFile(path, raw, 0o600)
+	return publishFileNoClobber(path, raw, 0o600, false)
 }
 
 // LoadSigningKey loads and validates a saved signing key file.
@@ -166,13 +168,14 @@ func LoadSigningKey(path string) (*SigningKeyMaterial, error) {
 	return km, nil
 }
 
-// SavePublicKey writes a normalized public key `[alg, bytes]` to a portable file.
+// SavePublicKey publishes a normalized public key `[alg, bytes]` to a portable
+// file without clobbering any existing destination.
 func SavePublicKey(path string, pk ldrcrypto.PublicKey) error {
 	raw, err := pk.CanonicalBytes()
 	if err != nil {
 		return err
 	}
-	return ldrstore.AtomicWriteFile(path, raw, 0o644)
+	return publishFileNoClobber(path, raw, 0o644, false)
 }
 
 // LoadPublicKey loads either a standalone public key file OR extracts the public

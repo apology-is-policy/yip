@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -88,10 +89,70 @@ func ldrRootCLI(args []string, out io.Writer) error {
 		var outPath, pubPath, alg string
 		rest, outPath = takeFlag(rest, "--out", "")
 		rest, pubPath = takeFlag(rest, "--pub", "")
-		rest, alg = takeFlag(rest, "--alg", ldrcrypto.AlgEd25519)
+		rest, alg = takeFlag(rest, "--alg", "")
 		if outPath == "" {
 			return errors.New("root keygen requires --out <keyfile>")
 		}
+		if pubPath != "" {
+			alias, err := ldrclient.PathsAlias(outPath, pubPath)
+			if err != nil {
+				return err
+			}
+			if alias {
+				return fmt.Errorf("%w: root keygen --out and --pub refer to the same destination %s", ldrclient.ErrOutputCollision, outPath)
+			}
+		}
+
+		// Inspect destination state before generating or writing either artifact:
+		//  - Rerunning over an existing key without a pending missing --pub refuses.
+		//  - If --out already holds a valid regular signing key and --pub does not
+		//    yet exist (retry after a failed second-output write), resume without
+		//    replacing the existing private key.
+		outInfo, outStatErr := os.Lstat(outPath)
+		if outStatErr == nil {
+			if pubPath == "" {
+				return fmt.Errorf("%w: %s", ldrclient.ErrOutputExists, outPath)
+			}
+			if _, pubStatErr := os.Lstat(pubPath); pubStatErr == nil {
+				return fmt.Errorf("%w: %s and %s already exist", ldrclient.ErrOutputExists, outPath, pubPath)
+			} else if !os.IsNotExist(pubStatErr) {
+				return pubStatErr
+			}
+			if !outInfo.Mode().IsRegular() {
+				return fmt.Errorf("%w: %s is not a regular signing key file", ldrclient.ErrOutputExists, outPath)
+			}
+			km, err := ldrclient.LoadSigningKey(outPath)
+			if err != nil {
+				return fmt.Errorf("%w: existing %s is not a valid signing key: %v", ldrclient.ErrOutputExists, outPath, err)
+			}
+			if alg != "" && km.Alg != alg {
+				return fmt.Errorf("%w: existing signing key %s uses alg %s, not %s", ldrclient.ErrOutputExists, outPath, km.Alg, alg)
+			}
+			if err := ldrclient.SavePublicKey(pubPath, km.Signer.PublicKey()); err != nil {
+				return err
+			}
+			fp, err := ldrclient.KeyFingerprint(km.Signer.PublicKey())
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(out).Encode(map[string]any{
+				"key":         outPath,
+				"pub":         pubPath,
+				"alg":         km.Alg,
+				"fingerprint": fp,
+				"resumed":     true,
+			})
+		} else if !os.IsNotExist(outStatErr) {
+			return outStatErr
+		}
+		if pubPath != "" {
+			if _, pubStatErr := os.Lstat(pubPath); pubStatErr == nil {
+				return fmt.Errorf("%w: %s", ldrclient.ErrOutputExists, pubPath)
+			} else if !os.IsNotExist(pubStatErr) {
+				return pubStatErr
+			}
+		}
+
 		km, err := ldrclient.GenerateSigningKey(alg)
 		if err != nil {
 			return err
@@ -113,6 +174,7 @@ func ldrRootCLI(args []string, out io.Writer) error {
 			"pub":         pubPath,
 			"alg":         km.Alg,
 			"fingerprint": fp,
+			"resumed":     false,
 		})
 
 	case "descriptor":
@@ -127,6 +189,25 @@ func ldrRootCLI(args []string, out io.Writer) error {
 		rest, outPath = takeFlag(rest, "--out", "")
 		if r1Path == "" || r2Path == "" || rawURL == "" || signerPath == "" || outPath == "" {
 			return errors.New("root descriptor requires --root1, --root2, --url, --signer, --out")
+		}
+		for _, inPath := range []string{r1Path, r2Path, signerPath} {
+			if alias, err := ldrclient.PathsAlias(outPath, inPath); err != nil {
+				return err
+			} else if alias {
+				return fmt.Errorf("%w: root descriptor --out aliases input %s", ldrclient.ErrOutputCollision, inPath)
+			}
+		}
+		if tlsPol == ldrcrypto.TLSPolicyPinCARootPEM && tlsPinArg != "" {
+			if alias, err := ldrclient.PathsAlias(outPath, tlsPinArg); err != nil {
+				return err
+			} else if alias {
+				return fmt.Errorf("%w: root descriptor --out aliases --tls-pin input %s", ldrclient.ErrOutputCollision, tlsPinArg)
+			}
+		}
+		if _, err := os.Lstat(outPath); err == nil {
+			return fmt.Errorf("%w: %s", ldrclient.ErrOutputExists, outPath)
+		} else if !os.IsNotExist(err) {
+			return err
 		}
 		var lineID []byte
 		if lineHex == "auto" {
@@ -195,10 +276,7 @@ func ldrRootCLI(args []string, out io.Writer) error {
 		if err != nil {
 			return err
 		}
-		if err := os.MkdirAll(filepath.Dir(outPath), 0o700); err != nil {
-			return err
-		}
-		if err := os.WriteFile(outPath, raw, 0o644); err != nil {
+		if err := ldrclient.SaveCreationDescriptor(outPath, raw); err != nil {
 			return err
 		}
 		return json.NewEncoder(out).Encode(map[string]any{
@@ -443,6 +521,18 @@ func ldrJoinCLI(args []string, out io.Writer) error {
 		if dir == "" || descPath == "" || ns == "" || outPath == "" {
 			return errors.New("join request requires --dir, --descriptor, --namespace, --out")
 		}
+		if alias, err := ldrclient.PathsAlias(outPath, descPath); err != nil {
+			return err
+		} else if alias {
+			return fmt.Errorf("%w: join request --out aliases --descriptor %s", ldrclient.ErrOutputCollision, descPath)
+		}
+		for _, reserved := range []string{"cred.key", "config.cbor", "verified.wal", "outbox.cbor", "epochs.cbor", "cursors.cbor"} {
+			if alias, err := ldrclient.PathsAlias(outPath, filepath.Join(dir, reserved)); err != nil {
+				return err
+			} else if alias {
+				return fmt.Errorf("%w: join request --out collides with reserved client file %s", ldrclient.ErrOutputCollision, reserved)
+			}
+		}
 		if _, err := os.Lstat(outPath); err == nil {
 			return fmt.Errorf("%w: %s", ldrclient.ErrOutputExists, outPath)
 		} else if !os.IsNotExist(err) {
@@ -522,28 +612,83 @@ func ldrJoinCLI(args []string, out io.Writer) error {
 		if opKeyPath == "" || reqPath == "" || outCh == "" || outSec == "" {
 			return errors.New("join challenge requires --operator-key, --request, --out-challenge, --out-secret")
 		}
+		if alias, err := ldrclient.PathsAlias(outCh, outSec); err != nil {
+			return err
+		} else if alias {
+			return fmt.Errorf("%w: join challenge --out-challenge and --out-secret refer to the same destination %s", ldrclient.ErrOutputCollision, outCh)
+		}
+		for _, inPath := range []string{opKeyPath, reqPath} {
+			if alias, err := ldrclient.PathsAlias(outCh, inPath); err != nil {
+				return err
+			} else if alias {
+				return fmt.Errorf("%w: join challenge --out-challenge aliases input %s", ldrclient.ErrOutputCollision, inPath)
+			}
+			if alias, err := ldrclient.PathsAlias(outSec, inPath); err != nil {
+				return err
+			} else if alias {
+				return fmt.Errorf("%w: join challenge --out-secret aliases input %s", ldrclient.ErrOutputCollision, inPath)
+			}
+		}
+		if _, err := os.Lstat(outCh); err == nil {
+			return fmt.Errorf("%w: %s", ldrclient.ErrOutputExists, outCh)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
 		opKM, err := ldrclient.LoadSigningKey(opKeyPath)
 		if err != nil {
 			return err
 		}
-		req, _, err := ldrclient.LoadJoinRequest(reqPath)
+		req, reqDig, err := ldrclient.LoadJoinRequest(reqPath)
 		if err != nil {
 			return err
 		}
+		// If --out-secret already exists while --out-challenge does not, allow
+		// safe resume ONLY when --out-secret holds a valid matching ceremony for
+		// this exact operator key and JoinRequest (retry after failed challenge write).
+		if _, secStatErr := os.Lstat(outSec); secStatErr == nil {
+			_, embeddedCh, err := ldrclient.LoadJoinSecretWithChallenge(outSec)
+			if err != nil {
+				return fmt.Errorf("%w: existing %s cannot resume join challenge: %v", ldrclient.ErrOutputExists, outSec, err)
+			}
+			if embeddedCh.RequestDigest != reqDig ||
+				!bytes.Equal(embeddedCh.RequestID, req.RequestID) ||
+				!bytes.Equal(embeddedCh.LineID, req.LineID) ||
+				embeddedCh.Generation != req.Generation ||
+				!embeddedCh.OperatorKey.Equal(opKM.Signer.PublicKey()) ||
+				!embeddedCh.SigningKey.Equal(req.SigningKey) ||
+				!embeddedCh.EncryptionKey.Equal(req.EncryptionKey) {
+				return fmt.Errorf("%w: existing %s belongs to a different operator key or join request", ldrclient.ErrOutputExists, outSec)
+			}
+			if err := ldrclient.SaveJoinChallenge(outCh, embeddedCh); err != nil {
+				return err
+			}
+			return json.NewEncoder(out).Encode(map[string]any{
+				"challenge":    outCh,
+				"secret":       outSec,
+				"challenge_id": hex.EncodeToString(embeddedCh.ChallengeID),
+				"resumed":      true,
+			})
+		} else if !os.IsNotExist(secStatErr) {
+			return secStatErr
+		}
+
 		ch, sec, err := ldrcrypto.CreateJoinChallenge(opKM.Signer.PublicKey(), req)
 		if err != nil {
 			return err
 		}
-		if err := ldrclient.SaveJoinChallenge(outCh, ch); err != nil {
+		// Persist the secret+challenge bundle FIRST (0600, non-clobbering) so a
+		// failed challenge export can be retried without replacing the ceremony.
+		if err := ldrclient.SaveJoinSecretWithChallenge(outSec, sec, ch); err != nil {
 			return err
 		}
-		if err := ldrclient.SaveJoinSecret(outSec, sec); err != nil {
+		if err := ldrclient.SaveJoinChallenge(outCh, ch); err != nil {
 			return err
 		}
 		return json.NewEncoder(out).Encode(map[string]any{
 			"challenge":    outCh,
 			"secret":       outSec,
 			"challenge_id": hex.EncodeToString(ch.ChallengeID),
+			"resumed":      false,
 		})
 
 	case "prove":
@@ -555,6 +700,13 @@ func ldrJoinCLI(args []string, out io.Writer) error {
 		rest, outPath = takeFlag(rest, "--out", "")
 		if dir == "" || opPubPath == "" || reqPath == "" || chPath == "" || outPath == "" {
 			return errors.New("join prove requires --dir, --operator-pub, --request, --challenge, --out")
+		}
+		for _, inPath := range []string{opPubPath, reqPath, chPath, filepath.Join(dir, "cred.key")} {
+			if alias, err := ldrclient.PathsAlias(outPath, inPath); err != nil {
+				return err
+			} else if alias {
+				return fmt.Errorf("%w: join prove --out aliases input %s", ldrclient.ErrOutputCollision, inPath)
+			}
 		}
 		ck, err := ldrclient.LoadCredentialKeys(filepath.Join(dir, "cred.key"))
 		if err != nil {

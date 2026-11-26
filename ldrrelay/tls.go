@@ -15,6 +15,8 @@ import (
 	"math/big"
 	"net"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -90,13 +92,124 @@ func InitSelfSignedCert(certPath, keyPath string, hosts []string) ([32]byte, err
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 
-	if err := ldrstore.AtomicWriteFile(certPath, certPEM, 0o644); err != nil {
+	if certPath == "" || keyPath == "" {
+		return zero, errors.New("ldrrelay: empty cert or key path")
+	}
+	alias, err := tlsPathsAlias(certPath, keyPath)
+	if err != nil {
 		return zero, err
 	}
-	if err := ldrstore.AtomicWriteFile(keyPath, keyPEM, 0o600); err != nil {
+	if alias {
+		return zero, errors.New("ldrrelay: cert and key paths must not alias")
+	}
+	for _, p := range []string{certPath, keyPath} {
+		if _, err := os.Lstat(p); err == nil {
+			return zero, fmt.Errorf("ldrrelay: TLS output %s already exists", p)
+		} else if !os.IsNotExist(err) {
+			return zero, err
+		}
+	}
+
+	if err := publishFileCreateOnly(keyPath, keyPEM, 0o600); err != nil {
+		return zero, err
+	}
+	if err := publishFileCreateOnly(certPath, certPEM, 0o644); err != nil {
+		_ = os.Remove(keyPath)
+		_ = ldrstore.SyncDir(filepath.Dir(keyPath))
 		return zero, err
 	}
 	return spkiPin, nil
+}
+
+func tlsPathsAlias(a, b string) (bool, error) {
+	if fiA, errA := os.Lstat(a); errA == nil {
+		if fiB, errB := os.Lstat(b); errB == nil && os.SameFile(fiA, fiB) {
+			return true, nil
+		}
+	}
+	if fiA, errA := os.Stat(a); errA == nil {
+		if fiB, errB := os.Stat(b); errB == nil && os.SameFile(fiA, fiB) {
+			return true, nil
+		}
+	}
+	ca, err := canonicalTLSPath(a)
+	if err != nil {
+		return false, err
+	}
+	cb, err := canonicalTLSPath(b)
+	if err != nil {
+		return false, err
+	}
+	return ca == cb, nil
+}
+
+func canonicalTLSPath(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+	cur := abs
+	var tail []string
+	for {
+		resolved, err := filepath.EvalSymlinks(cur)
+		if err == nil {
+			parts := make([]string, 0, 1+len(tail))
+			parts = append(parts, resolved)
+			for i := len(tail) - 1; i >= 0; i-- {
+				parts = append(parts, tail[i])
+			}
+			return filepath.Clean(filepath.Join(parts...)), nil
+		}
+		if !os.IsNotExist(err) {
+			return abs, nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = parent
+	}
+}
+
+func publishFileCreateOnly(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".tls.tmp.*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := ldrstore.SyncFile(tmp); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Link(tmpPath, path); err != nil {
+		return err
+	}
+	_ = os.Remove(tmpPath)
+	cleanup = false
+	return ldrstore.SyncDir(dir)
 }
 
 // ServerTLSConfig loads a cert/key pair and enforces TLS 1.3 minimum.

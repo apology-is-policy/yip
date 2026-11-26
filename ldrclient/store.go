@@ -939,7 +939,7 @@ func loadOutbox(path string) (persistedOutbox, error) {
 	return ob, nil
 }
 
-func saveEpochs(path string, ep persistedEpochs) error {
+func marshalEpochs(ep persistedEpochs) ([]byte, error) {
 	keysArr := make([]any, 0, len(ep.Keys))
 	ids := make([]uint64, 0, len(ep.Keys))
 	for id := range ep.Keys {
@@ -969,9 +969,21 @@ func saveEpochs(path string, ep persistedEpochs) error {
 		{Key: "v", Value: uint64(1)},
 	})
 	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ldrstore.ErrPreWrite, err)
+	}
+	return raw, nil
+}
+
+func saveEpochs(path string, ep persistedEpochs) error {
+	return saveEpochsWithHooks(path, ep, nil, nil)
+}
+
+func saveEpochsWithHooks(path string, ep persistedEpochs, syncFile func(*os.File) error, syncDir func(string) error) error {
+	raw, err := marshalEpochs(ep)
+	if err != nil {
 		return err
 	}
-	return ldrstore.AtomicWriteFile(path, raw, 0o600)
+	return atomicWriteFileWithHooks(path, raw, 0o600, syncFile, syncDir)
 }
 
 func loadEpochs(path string) (persistedEpochs, error) {
