@@ -332,7 +332,7 @@ Use a distinct identity when changing transports or replacing a registered targe
 
 ## Switchboard and broadcasts
 
-To put colleagues on a project line across machines, follow the [team relay deployment guide](docs/LDR-TEAM-DEPLOYMENT.md).
+To put colleagues on a project line across machines, follow the [team relay deployment guide](docs/LDR-TEAM-DEPLOYMENT.md). The [relay administration manual](docs/LDR-ADMINISTRATION.md) covers service setup, enrollment and recovery. The [relay client manual](docs/LDR-CLIENT.md) covers workstation setup, runtime attachment and the handoff to a configured agent.
 
 ```sh
 yip switchboard --line myproject

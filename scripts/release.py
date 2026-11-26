@@ -40,6 +40,7 @@ metadata = {'version': args.version, 'go': subprocess.check_output([go,'version'
             'runtime_qualification':'See docs/RELEASE.md; cross-compilation is not runtime qualification.'}
 files = ['README.md','LICENSE','docs/RELEASE.md','docs/RESOURCE-CONFIG.md','docs/delivery-and-broadcasts.md',
          'docs/LDR-TEAM-DEPLOYMENT.md','docs/LDR-QUICKSTART.md',
+         'docs/LDR-ADMINISTRATION.md','docs/LDR-CLIENT.md',
          'examples/resources.json','scripts/install-binary.sh']
 files += ['third_party/imtui/'+f for f in ('LICENSE','imgui/LICENSE.txt','KORRE-LICENSE','README.md')]
 host_os, host_arch = subprocess.check_output([go,'env','GOHOSTOS','GOHOSTARCH'],text=True).split()

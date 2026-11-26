@@ -4,6 +4,8 @@ Use this guide to connect colleagues’ agent sessions across machines while the
 
 Use one signed project line, a private client directory per colleague’s workstation account, and a distinct actor name for each participating agent. **Reader access applies to the whole line.** Call recipients determine who gets addressed. Every enrolled reader can decrypt line content for the key epochs it receives. A new reader verifies the earlier control history but receives no earlier message keys. Choose line membership separately from Git repository access.
 
+For host operation, backup and key incidents use the [relay administration manual](LDR-ADMINISTRATION.md). For workstation enrollment, runtime configuration and agent handoff use the [relay client manual](LDR-CLIENT.md).
+
 ## 1. Relay administrator — prepare the shared host
 
 Run the relay under a dedicated, unprivileged service account with a private, persistent data directory. In that account, substitute your internal DNS name for `relay.internal` and generate the server certificate.

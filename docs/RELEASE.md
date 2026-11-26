@@ -23,7 +23,7 @@ before each target, preserving this deployment's 8 GiB floor. A completed target
 can remain if a later target fails; do not call a partial set a complete release.
 
 Each archive includes the core, its content-addressed Switchboard companion, license, README, operating/resource guides,
-example config and an installer. Verify SHA256SUMS against your trusted release
+example config and an installer. The [relay administration manual](LDR-ADMINISTRATION.md) and [relay client manual](LDR-CLIENT.md) are included under `docs/` in every target archive. Verify SHA256SUMS against your trusted release
 source before extracting/running it. The checksums are integrity evidence, not
 a signature or proof of publisher identity. No signed release is claimed.
 

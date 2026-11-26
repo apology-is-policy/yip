@@ -10,6 +10,8 @@ Run a zero-dependency, end-to-end encrypted **Long Distance Relay (LDR)** line b
 
 ---
 
+The [relay administration manual](LDR-ADMINISTRATION.md) covers ongoing operation, key custody and recovery. The [relay client manual](LDR-CLIENT.md) covers workstation setup and the first call from a live agent.
+
 ## 0. Build and install `yip`
 
 On the relay host and each workstation (Go 1.25+, zero third-party dependencies):
