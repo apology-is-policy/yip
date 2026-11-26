@@ -442,7 +442,675 @@ func TestLDRBridgeTwoWorkstationsMCPHooksLiveDeliveryAndHostLocalResources(t *te
 	if err := json.Unmarshal(detachBuf.Bytes(), &detachResp); err != nil || detachResp["detached"] != true {
 		t.Fatalf("unexpected detach output: %s", detachBuf.String())
 	}
-	if _, ok := loadLDRAttachment(); ok {
-		t.Fatal("expected loadLDRAttachment=false after detach")
+	if _, ok, err := loadLDRAttachment(); err != nil || ok {
+		t.Fatalf("expected loadLDRAttachment=(false, nil) after detach, got ok=%v err=%v", ok, err)
+	}
+}
+
+type ldrBridgeFixture struct {
+	relayDir string
+	rawDesc  []byte
+	lineID   []byte
+	provDig  [32]byte
+	opKey    *ldrclient.SigningKeyMaterial
+	admin    *ldrclient.Client
+	sOp      *ldrrelay.SessionClient
+}
+
+func newLDRBridgeFixture(t *testing.T) *ldrBridgeFixture {
+	t.Helper()
+	origActiveLine := activeLine
+	origYipHome := os.Getenv("YIP_HOME")
+	origYipRoot := os.Getenv("YIP_ROOT")
+	origYipLDR := os.Getenv("YIP_LDR_DIR")
+	t.Cleanup(func() {
+		activeLine = origActiveLine
+		_ = os.Setenv("YIP_HOME", origYipHome)
+		_ = os.Setenv("YIP_ROOT", origYipRoot)
+		_ = os.Setenv("YIP_LDR_DIR", origYipLDR)
+	})
+	_ = os.Unsetenv("YIP_ROOT")
+	_ = os.Unsetenv("YIP_LDR_DIR")
+
+	relayDir := t.TempDir()
+	certP := filepath.Join(relayDir, "tls", "server.crt")
+	keyP := filepath.Join(relayDir, "tls", "server.key")
+	pin, err := ldrrelay.InitSelfSignedCert(certP, keyP, []string{"127.0.0.1", "localhost"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsCfg, err := ldrrelay.ServerTLSConfig(certP, keyP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsLn := tls.NewListener(rawLn, tlsCfg)
+	st, err := ldrstore.OpenFileStore(relayDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng, err := ldrrelay.NewRelayEngine(st, ldrrelay.DefaultClockConfig(), ldrrelay.RealClockSource())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := ldrrelay.NewRelayServer(eng)
+	hs := &http.Server{Handler: rs}
+	go func() { _ = hs.Serve(tlsLn) }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = hs.Shutdown(ctx)
+		_ = eng.Shutdown()
+	})
+
+	ctx := context.Background()
+	r1, _ := ldrclient.GenerateSigningKey(ldrcrypto.AlgEd25519)
+	r2, _ := ldrclient.GenerateSigningKey(ldrcrypto.AlgECDSAP256)
+	opKey, _ := ldrclient.GenerateSigningKey(ldrcrypto.AlgEd25519)
+	opCredKeys, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	lineID := bytes.Repeat([]byte{0x78}, 16)
+	origin := ldrcrypto.RelayOrigin{
+		URL:            "https://" + rawLn.Addr().String(),
+		TLSPolicy:      ldrcrypto.TLSPolicyPinSPKISHA256,
+		TLSPin:         pin[:],
+		SessionBinding: ldrcrypto.SessionBindingTLS13Exporter,
+	}
+	desc := ldrcrypto.CreationDescriptor{
+		Version:     1,
+		LineID:      lineID,
+		Generation:  1,
+		RootKeys:    []ldrcrypto.PublicKey{r1.Signer.PublicKey(), r2.Signer.PublicKey()},
+		RelayOrigin: origin,
+		Profile:     ldrcrypto.ProfileV1(),
+	}
+	signedDesc, err := ldrcrypto.SignCreationDescriptor(r1.Signer, desc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawDesc, err := signedDesc.MarshalCanonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prov, err := eng.Provision(rawDesc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adminDir := filepath.Join(t.TempDir(), "admin")
+	admin, err := ldrclient.InitClientDir(ldrclient.InitDirOptions{
+		Dir: adminDir, SignedDescriptor: rawDesc, CredKeys: opCredKeys, Activated: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin.AttachRootKey(r1)
+	admin.AttachOperatorKey(opKey)
+
+	sRoot, err := admin.Dial(ctx, ldrcrypto.PrincipalRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rk0, _ := desc.RootKeys[0].ToCBOR()
+	rk1, _ := desc.RootKeys[1].ToCBOR()
+	profMap, _ := desc.Profile.ToCBORMap()
+	initOp, err := admin.ComposeAndPersist(ldrclient.ComposeParams{
+		Action: "line_init", Origin: ldrcore.OriginRoot, OpType: "line_init",
+		Fields: ldrcrypto.Map{
+			{Key: "descriptor_digest", Value: prov.DescriptorDigest[:]},
+			{Key: "profile", Value: profMap},
+			{Key: "root_keys", Value: []any{rk0, rk1}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := admin.Send(ctx, sRoot, initOp); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+		t.Fatalf("line_init: %+v %v", rep, err)
+	}
+	if _, err := admin.Sync(ctx, sRoot); err != nil {
+		t.Fatal(err)
+	}
+	opPubC, _ := opKey.Signer.PublicKey().ToCBOR()
+	authOp, err := admin.ComposeAndPersist(ldrclient.ComposeParams{
+		Action: "auth_op", Origin: ldrcore.OriginRoot, OpType: "operator_key_authorize",
+		Expect: ldrcrypto.ExpectMap{"root_rev": 1},
+		Fields: ldrcrypto.Map{{Key: "operator_key", Value: opPubC}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := admin.Send(ctx, sRoot, authOp); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+		t.Fatalf("auth_op: %+v %v", rep, err)
+	}
+	if _, err := admin.Sync(ctx, sRoot); err != nil {
+		t.Fatal(err)
+	}
+	sRoot.Close()
+
+	sOp, err := admin.Dial(ctx, ldrcrypto.PrincipalOperator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		sOp.Close()
+		_ = admin.Close()
+	})
+	fx := &ldrBridgeFixture{
+		relayDir: relayDir,
+		rawDesc:  rawDesc,
+		lineID:   lineID,
+		provDig:  prov.DescriptorDigest,
+		opKey:    opKey,
+		admin:    admin,
+		sOp:      sOp,
+	}
+	fx.enroll(t, "ns-op", opCredKeys, 0, 0x60)
+	return fx
+}
+
+func (fx *ldrBridgeFixture) enroll(t *testing.T, ns string, ck *ldrclient.CredentialKeyBundle, limit uint64, seed byte) (ldrcrypto.JoinGrant, []byte, [32]byte) {
+	t.Helper()
+	ctx := context.Background()
+	grant := ldrcrypto.JoinGrant{NamespaceID: ns, ActorLimit: limit, Reader: true}
+	req, err := ldrcrypto.SignJoinRequest(ck.Signing.Signer, ldrcrypto.JoinRequest{
+		RequestID: bytes.Repeat([]byte{seed}, 16), LineID: fx.lineID, Generation: 1,
+		DescriptorDigest: fx.provDig, EncryptionKey: ck.Encryption.PublicKey(), Grant: grant,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, sec, err := ldrcrypto.CreateJoinChallenge(fx.opKey.Signer.PublicKey(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr, err := ldrcrypto.RespondJoinChallenge(ck.Signing.Signer, ck.Encryption, fx.opKey.Signer.PublicKey(), req, ch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ldrcrypto.VerifyJoinProof(fx.opKey.Signer.PublicKey(), req, ch, sec, pr); err != nil {
+		t.Fatal(err)
+	}
+	reqDig, err := ldrcrypto.VerifyJoinRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skC, _ := req.SigningKey.ToCBOR()
+	ekC, _ := req.EncryptionKey.ToCBOR()
+	enrOp, err := fx.admin.ComposeAndPersist(ldrclient.ComposeParams{
+		Action: "enroll:" + ns, Origin: ldrcore.OriginOperator, OpType: "credential_enroll",
+		Fields: ldrcrypto.Map{
+			{Key: "cred_id", Value: ck.CredID[:]},
+			{Key: "encryption_key", Value: ekC},
+			{Key: "grant", Value: ldrcrypto.Map{
+				{Key: "actor_limit", Value: grant.ActorLimit},
+				{Key: "namespace_id", Value: grant.NamespaceID},
+				{Key: "reader", Value: grant.Reader},
+			}},
+			{Key: "join_request_digest", Value: reqDig[:]},
+			{Key: "join_request_id", Value: req.RequestID},
+			{Key: "signing_key", Value: skC},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := fx.admin.Send(ctx, fx.sOp, enrOp); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+		t.Fatalf("enroll %s: %+v %v", ns, rep, err)
+	}
+	if _, err := fx.admin.Sync(ctx, fx.sOp); err != nil {
+		t.Fatal(err)
+	}
+	return grant, req.RequestID, reqDig
+}
+
+func (fx *ldrBridgeFixture) activateEpoch(t *testing.T, action string) {
+	t.Helper()
+	ctx := context.Background()
+	epOp, _, err := fx.admin.ComposeEpochActivate(action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := fx.admin.Send(ctx, fx.sOp, epOp); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+		t.Fatalf("epoch activate: %+v %v", rep, err)
+	}
+	if _, err := fx.admin.Sync(ctx, fx.sOp); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (fx *ldrBridgeFixture) setupWorkstation(t *testing.T, dir string, ck *ldrclient.CredentialKeyBundle, g ldrcrypto.JoinGrant, rid []byte, rdig [32]byte, actors ...string) {
+	t.Helper()
+	ctx := context.Background()
+	cl, err := ldrclient.InitClientDir(ldrclient.InitDirOptions{
+		Dir: dir, SignedDescriptor: fx.rawDesc, CredKeys: ck,
+		ExpectedGrant: &g, ExpectedJoinReq: rid, ExpectedJoinReqDigest: &rdig,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	sess, err := cl.Dial(ctx, ldrcrypto.PrincipalCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	if err := cl.VerifyEnrollmentAndActivate(ctx, sess); err != nil {
+		t.Fatalf("activate %v: %v", actors, err)
+	}
+	for _, actorID := range actors {
+		if err := cl.PrepareForMutation(ctx, sess, ldrcrypto.PrincipalCredential); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cl.SubmitActorDeclare(ctx, sess, actorID, ""); err != nil {
+			t.Fatalf("declare %s: %v", actorID, err)
+		}
+	}
+}
+
+func TestLDRBridgeAckDeliveryPersistsLDRFirstAndConvergesOnRetry(t *testing.T) {
+	fx := newLDRBridgeFixture(t)
+	aliceCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	bobCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	ag, arid, ardig := fx.enroll(t, "ns-alice", aliceCK, 4, 0x61)
+	bg, brid, brdig := fx.enroll(t, "ns-bob", bobCK, 4, 0x62)
+	fx.activateEpoch(t, "ep-ack-1")
+
+	aliceClientDir := filepath.Join(t.TempDir(), "alice-ldr")
+	bobClientDir := filepath.Join(t.TempDir(), "bob-ldr")
+	fx.setupWorkstation(t, aliceClientDir, aliceCK, ag, arid, ardig, "alice-gemini")
+	fx.setupWorkstation(t, bobClientDir, bobCK, bg, brid, brdig, "bob-codex")
+
+	aliceHome := filepath.Join(t.TempDir(), "alice-home")
+	bobHome := filepath.Join(t.TempDir(), "bob-home")
+	useAlice := func() { _ = os.Setenv("YIP_HOME", aliceHome); activeLine = "ack-alice" }
+	useBob := func() { _ = os.Setenv("YIP_HOME", bobHome); activeLine = "ack-bob" }
+
+	useAlice()
+	if _, err := AttachLDRLine(aliceClientDir, "gemini", "alice-gemini"); err != nil {
+		t.Fatal(err)
+	}
+	useBob()
+	if _, err := AttachLDRLine(bobClientDir, "codex", "bob-codex"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RegisterEndpoint("codex", "11111111-2222-3333-4444-555555555555", false); err != nil {
+		t.Fatal(err)
+	}
+
+	origTimeout := ldrAckTimeout
+	ldrAckTimeout = 120 * time.Millisecond
+	t.Cleanup(func() { ldrAckTimeout = origTimeout })
+
+	dispatchOne := func(subject string) Delivery {
+		t.Helper()
+		useAlice()
+		if _, err := (&server{me: "gemini"}).call("call", map[string]any{
+			"peer": "bob-codex", "subject": subject, "body": "ping " + subject,
+		}); err != nil {
+			t.Fatalf("alice call %s: %v", subject, err)
+		}
+		useBob()
+		n, err := Dispatch("codex", func(context.Context, string, string) error { return nil })
+		if err != nil || n == 0 {
+			t.Fatalf("dispatch %s: n=%d err=%v", subject, n, err)
+		}
+		ep, err := readEndpoint("codex")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := len(ep.Events) - 1; i >= 0; i-- {
+			if strings.HasPrefix(ep.Events[i].Source, "ldr:") && ep.Events[i].Status != "read" {
+				return ep.Events[i]
+			}
+		}
+		t.Fatalf("no unread ldr delivery event found after %s", subject)
+		return Delivery{}
+	}
+
+	findEvent := func(id string) Delivery {
+		t.Helper()
+		ep, err := readEndpoint("codex")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, ev := range ep.Events {
+			if ev.ID == id {
+				return ev
+			}
+		}
+		t.Fatalf("event %s missing", id)
+		return Delivery{}
+	}
+
+	// 1. Holding bobClientDir lock must fail AckDelivery AND keep endpoint event unread + LDR notice un-acked.
+	ev1 := dispatchOne("lock-contention")
+	held, err := ldrclient.OpenClient(bobClientDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := AckDelivery("codex", ev1.ID); err == nil {
+		_ = held.Close()
+		t.Fatal("expected AckDelivery to fail while LDR client directory is locked")
+	}
+	if got := findEvent(ev1.ID); got.Status == "read" {
+		_ = held.Close()
+		t.Fatalf("endpoint event marked read despite LDR ack failure: %+v", got)
+	}
+	if rem := held.DeliverableNotices(); len(rem) == 0 {
+		_ = held.Close()
+		t.Fatal("expected LDR notice to remain un-acked after failed AckDelivery")
+	}
+	_ = held.Close()
+
+	// 2. Retrying AckDelivery after the lock releases converges BOTH stores cleanly.
+	if err := AckDelivery("codex", ev1.ID); err != nil {
+		t.Fatalf("retry AckDelivery after lock release: %v", err)
+	}
+	if got := findEvent(ev1.ID); got.Status != "read" {
+		t.Fatalf("expected endpoint event read after retry, got %+v", got)
+	}
+	cl, err := ldrclient.OpenClient(bobClientDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rem := cl.DeliverableNotices(); len(rem) != 0 {
+		_ = cl.Close()
+		t.Fatalf("expected 0 un-acked LDR notices after retry, got %+v", rem)
+	}
+	_ = cl.Close()
+
+	// 3. Partial-crash convergence: LDR notice already acked while endpoint.json still shows "accepted".
+	ev2 := dispatchOne("partial-crash")
+	cl, err = ldrclient.OpenClient(bobClientDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.AckNotice(strings.TrimPrefix(ev2.Source, "ldr:")); err != nil {
+		_ = cl.Close()
+		t.Fatalf("pre-ack LDR notice: %v", err)
+	}
+	_ = cl.Close()
+	if got := findEvent(ev2.ID); got.Status == "read" {
+		t.Fatalf("expected endpoint event still unread before retry, got %+v", got)
+	}
+	if err := AckDelivery("codex", ev2.ID); err != nil {
+		t.Fatalf("converging retry AckDelivery failed: %v", err)
+	}
+	if got := findEvent(ev2.ID); got.Status != "read" {
+		t.Fatalf("expected endpoint event read after converging retry, got %+v", got)
+	}
+
+	// 4. Malformed ldr.json must fail AckDelivery for ldr: sources without marking endpoint read.
+	ev3 := dispatchOne("broken-config")
+	if err := os.WriteFile(ldrAttachmentPath(), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := AckDelivery("codex", ev3.ID); err == nil {
+		t.Fatal("expected AckDelivery to fail when ldr.json is malformed")
+	}
+	if got := findEvent(ev3.ID); got.Status == "read" {
+		t.Fatalf("endpoint event marked read despite malformed ldr.json: %+v", got)
+	}
+}
+
+func TestLDRBridgeSharedDirectoryWaitAllowsCoresidentReply(t *testing.T) {
+	fx := newLDRBridgeFixture(t)
+	sharedCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	g, rid, rdig := fx.enroll(t, "ns-shared", sharedCK, 4, 0x63)
+	fx.activateEpoch(t, "ep-shared-1")
+
+	sharedClientDir := filepath.Join(t.TempDir(), "shared-ldr")
+	fx.setupWorkstation(t, sharedClientDir, sharedCK, g, rid, rdig, "shared-a", "shared-b")
+
+	sharedHome := filepath.Join(t.TempDir(), "shared-home")
+	_ = os.Setenv("YIP_HOME", sharedHome)
+	activeLine = "shared-line"
+	if _, err := AttachLDRLine(sharedClientDir, "a", "shared-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AttachLDRLine(sharedClientDir, "b", "shared-b"); err != nil {
+		t.Fatal(err)
+	}
+
+	srvA := &server{me: "a"}
+	srvB := &server{me: "b"}
+	openOut, err := srvA.call("call", map[string]any{
+		"peer":    "b",
+		"subject": "Shared dir wait test",
+		"body":    "ping from co-resident a",
+	})
+	if err != nil || !strings.Contains(openOut, "0001-shared-dir-wait-test") {
+		t.Fatalf("a call: out=%q err=%v", openOut, err)
+	}
+	const callID = "0001-shared-dir-wait-test"
+
+	type waitRes struct {
+		out string
+		err error
+	}
+	waitCh := make(chan waitRes, 1)
+	go func() {
+		out, werr := srvA.call("wait", map[string]any{"call": callID, "timeout_s": 10})
+		waitCh <- waitRes{out: out, err: werr}
+	}()
+
+	// Give agent "a"'s wait goroutine time to complete its initial poll and enter sleep.
+	time.Sleep(150 * time.Millisecond)
+
+	// Co-resident peer "b" sharing sharedClientDir must be able to inspect ring, run Stop hook, and reply!
+	ringOut, err := srvB.call("ring", nil)
+	if err != nil || !strings.Contains(ringOut, callID) {
+		t.Fatalf("co-resident b ring during a's wait: out=%q err=%v", ringOut, err)
+	}
+	stopRes := hookStop("b")
+	stopMap, _ := stopRes.(map[string]any)
+	if stopMap == nil || stopMap["decision"] != "block" {
+		t.Fatalf("co-resident b Stop hook during a's wait: got %#v", stopRes)
+	}
+	sayOut, err := srvB.call("say", map[string]any{
+		"call": callID,
+		"body": "pong from co-resident b",
+	})
+	if err != nil || !strings.Contains(sayOut, "turn 2 sent") {
+		t.Fatalf("co-resident b say during a's wait: out=%q err=%v", sayOut, err)
+	}
+
+	select {
+	case res := <-waitCh:
+		if res.err != nil {
+			t.Fatalf("a wait returned error: %v", res.err)
+		}
+		if !strings.Contains(res.out, "shared-b replied") || !strings.Contains(res.out, "turn 2") {
+			t.Fatalf("unexpected a wait output: %q", res.out)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a wait did not wake promptly after co-resident b replied")
+	}
+
+	tr, err := srvA.call("read", map[string]any{"call": callID})
+	if err != nil || !strings.Contains(tr, "pong from co-resident b") {
+		t.Fatalf("a read after wait: out=%q err=%v", tr, err)
+	}
+}
+
+func TestLDRBridgeMalformedOrUnreadableAttachmentFailsClosedPreservingLocalResources(t *testing.T) {
+	fx := newLDRBridgeFixture(t)
+	aliceCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	ag, arid, ardig := fx.enroll(t, "ns-alice", aliceCK, 4, 0x64)
+	fx.activateEpoch(t, "ep-bad-1")
+
+	validClientDir := filepath.Join(t.TempDir(), "valid-ldr")
+	fx.setupWorkstation(t, validClientDir, aliceCK, ag, arid, ardig, "alice-gemini")
+
+	homeDir := filepath.Join(t.TempDir(), "bad-attach-home")
+	_ = os.Setenv("YIP_HOME", homeDir)
+	activeLine = "bad-attach-line"
+	if err := EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	// Configure a host-local resource and seed a local-only call to ensure broken ldr.json
+	// NEVER falls back to local calls or YIP_LDR_DIR while keeping host-local leases working.
+	if err := os.WriteFile(resourceConfigPath(), []byte(`{"version":1,"resources":[{"name":"gpu","description":"local GPU","machine":"local-host"}]}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	decoy, err := NewCall("other", "gemini", "Local decoy call")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AppendTurn(decoy, "other", "should not be visible when ldr.json is broken", false); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Setenv("YIP_LDR_DIR", validClientDir)
+
+	type brokenCase struct {
+		name  string
+		setup func(t *testing.T, p string)
+	}
+	cases := []brokenCase{
+		{
+			name: "malformed-json",
+			setup: func(t *testing.T, p string) {
+				if err := os.WriteFile(p, []byte("{not-json"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "unknown-field",
+			setup: func(t *testing.T, p string) {
+				if err := os.WriteFile(p, []byte(`{"version":1,"client_dir":"`+validClientDir+`","unknown":true}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "unsupported-version",
+			setup: func(t *testing.T, p string) {
+				if err := os.WriteFile(p, []byte(`{"version":2,"client_dir":"`+validClientDir+`"}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "empty-client-dir",
+			setup: func(t *testing.T, p string) {
+				if err := os.WriteFile(p, []byte(`{"version":1,"client_dir":"   "}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "unreadable-file",
+			setup: func(t *testing.T, p string) {
+				if os.Geteuid() == 0 {
+					t.Skip("root ignores chmod 000")
+				}
+				if err := os.WriteFile(p, []byte(`{"version":1,"client_dir":"`+validClientDir+`"}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(p, 0o000); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(p, 0o600) })
+			},
+		},
+	}
+
+	srv := &server{me: "gemini"}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := ldrAttachmentPath()
+			_ = os.Chmod(p, 0o600)
+			tc.setup(t, p)
+			defer func() { _ = os.Chmod(p, 0o600) }()
+
+			if _, ok, err := loadLDRAttachment(); !ok || err == nil {
+				t.Fatalf("expected loadLDRAttachment=(true, err), got ok=%v err=%v", ok, err)
+			}
+			if _, err := AttachLDRLine(validClientDir, "gemini", "alice-gemini"); err == nil {
+				t.Fatal("expected AttachLDRLine to refuse overwriting invalid/unreadable ldr.json")
+			}
+
+			// Remote coordination tools must fail closed without falling back to YIP_LDR_DIR or local writes.
+			remoteCalls := []struct {
+				tool string
+				args map[string]any
+			}{
+				{"call", map[string]any{"peer": "other", "subject": "Must fail", "body": "no local write"}},
+				{"ring", nil},
+				{"presence", nil},
+				{"inbox", nil},
+				{"broadcasts", nil},
+				{"roadmaps", nil},
+				{"busy", map[string]any{"text": "should fail"}},
+			}
+			for _, rc := range remoteCalls {
+				if out, err := srv.call(rc.tool, rc.args); err == nil {
+					t.Fatalf("tool %s unexpectedly succeeded with broken ldr.json: out=%q", rc.tool, out)
+				}
+			}
+			// Verify no second local call was created by the failed `call` tool.
+			localCalls, err := ListCalls()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(localCalls) != 1 {
+				t.Fatalf("expected only the seeded decoy local call, got %d", len(localCalls))
+			}
+
+			// Delivery snapshot must report ldr-config-error and NEVER surface the local decoy call.
+			snap := deliverySnapshot("gemini")
+			foundErr := false
+			for k := range snap {
+				if strings.HasPrefix(k, "ldr-config-error:") {
+					foundErr = true
+				}
+				if strings.HasPrefix(k, "call:") || strings.HasPrefix(k, "turn:") {
+					t.Fatalf("deliverySnapshot fell back to local call %q under broken ldr.json", k)
+				}
+			}
+			if !foundErr {
+				t.Fatalf("expected ldr-config-error in deliverySnapshot, got %v", snap)
+			}
+
+			// Hooks must not fall back to local calls; SessionStart surfaces the config error.
+			if got := hookStop("gemini"); got != nil {
+				t.Fatalf("hookStop fell back to local call under broken ldr.json: %#v", got)
+			}
+			if got := hookPostToolUse("gemini", hookInput{}); got != nil {
+				t.Fatalf("hookPostToolUse fell back to local call under broken ldr.json: %#v", got)
+			}
+			startOut, _ := hookSessionStart("gemini").(map[string]any)
+			hso, _ := startOut["hookSpecificOutput"].(map[string]any)
+			if addCtx, _ := hso["additionalContext"].(string); !strings.Contains(addCtx, "[yip ldr] configuration error:") {
+				t.Fatalf("expected SessionStart configuration error notice, got %#v", startOut)
+			}
+
+			// Host-local resource tools MUST remain fully usable even while ldr.json is broken!
+			resOut, err := srv.call("resources", nil)
+			if err != nil || !strings.Contains(resOut, "gpu") {
+				t.Fatalf("host-local resources failed under broken ldr.json: out=%q err=%v", resOut, err)
+			}
+			holdOut, err := srv.call("hold", map[string]any{"resource": "gpu", "reason": "local emergency"})
+			if err != nil || !strings.Contains(holdOut, "HELD") {
+				t.Fatalf("host-local hold failed under broken ldr.json: out=%q err=%v", holdOut, err)
+			}
+			if relOut, err := srv.call("release", map[string]any{"resource": "gpu"}); err != nil || !strings.Contains(relOut, "released") {
+				t.Fatalf("host-local release failed under broken ldr.json: out=%q err=%v", relOut, err)
+			}
+		})
+	}
+
+	// Detach removes ldr.json; unsetting YIP_LDR_DIR restores genuinely unattached (false, nil) state.
+	_ = os.Chmod(ldrAttachmentPath(), 0o600)
+	if err := DetachLDRLine(); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Unsetenv("YIP_LDR_DIR")
+	if _, ok, err := loadLDRAttachment(); err != nil || ok {
+		t.Fatalf("expected (false, nil) after detach + unset YIP_LDR_DIR, got ok=%v err=%v", ok, err)
 	}
 }

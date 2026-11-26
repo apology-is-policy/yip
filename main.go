@@ -301,7 +301,9 @@ func main() {
 		fmt.Println(out)
 	case "inbox":
 		me := must(WhoAmI(as, ""))
-		if _, ok := loadLDRAttachment(); ok {
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
 			out, err := (&server{me: me}).call("inbox", map[string]any{"all": first(args) == "--all"})
 			check(err)
 			fmt.Println(out)
@@ -312,7 +314,9 @@ func main() {
 		fmt.Println(out)
 	case "retire":
 		me := must(WhoAmI(as, ""))
-		if _, ok := loadLDRAttachment(); ok {
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
 			out, err := (&server{me: me}).call("retire", map[string]any{"undo": first(args) == "--undo"})
 			check(err)
 			fmt.Println(out)
@@ -466,7 +470,9 @@ func main() {
 		RunHookRuntime(args[0], as, runtime)
 	case "ring":
 		me := must(WhoAmI(as, ""))
-		if _, ok := loadLDRAttachment(); ok {
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
 			out, err := (&server{me: me}).call("ring", nil)
 			check(err)
 			fmt.Println(out)
@@ -502,7 +508,9 @@ func main() {
 		fmt.Println(out)
 	case "bye":
 		me := must(WhoAmI(as, ""))
-		if _, ok := loadLDRAttachment(); ok {
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
 			out, err := (&server{me: me}).call("bye", map[string]any{"call": first(args)})
 			check(err)
 			fmt.Println(out)
@@ -518,7 +526,9 @@ func main() {
 		}
 	case "presence":
 		me, _ := WhoAmI(as, "")
-		if _, ok := loadLDRAttachment(); ok {
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
 			out, err := (&server{me: me}).call("presence", map[string]any{"peer": first(args)})
 			check(err)
 			fmt.Println(out)
@@ -541,7 +551,9 @@ func main() {
 				pids = append(pids, n)
 			}
 		}
-		if _, ok := loadLDRAttachment(); ok {
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
 			rawPids := make([]any, len(pids))
 			for i, p := range pids {
 				rawPids[i] = float64(p)

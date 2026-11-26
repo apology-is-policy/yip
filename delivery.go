@@ -81,7 +81,11 @@ func deliveryID(agent, source string) string {
 // Source and outbox need no dual-write transaction: a crash before this write
 // leaves the source discoverable; a crash after it finds the same source ID.
 func deliverySnapshot(agent string) map[string]string {
-	if att, ok := loadLDRAttachment(); ok {
+	if att, ok, err := loadLDRAttachment(); err != nil {
+		out := ldrHostLocalResourceSnapshot(agent)
+		out["ldr-config-error:"+err.Error()] = "LDR CONFIGURATION ERROR: " + err.Error()
+		return out
+	} else if ok {
 		return ldrDeliverySnapshot(att, agent)
 	}
 	out := map[string]string{}
@@ -187,24 +191,23 @@ func PauseEndpoint(agent string, paused bool) error {
 	return editEndpoint(agent, func(ep *Endpoint) error { ep.Paused = paused; return nil })
 }
 func AckDelivery(agent, id string) error {
-	var ackedSource string
-	err := editEndpoint(agent, func(ep *Endpoint) error {
+	return editEndpoint(agent, func(ep *Endpoint) error {
 		for i := range ep.Events {
 			if ep.Events[i].ID == id {
 				if ep.Runtime == "claude-channels" && (ep.Events[i].ID == ep.ChannelProbe || strings.HasPrefix(ep.Events[i].Source, probePrefix(ep.Thread))) {
 					return fmt.Errorf("use channel_ack through the receiving MCP session for the probe")
 				}
+				if strings.HasPrefix(ep.Events[i].Source, "ldr:") {
+					if err := ldrAckNotice(ep.Events[i].Source); err != nil {
+						return err
+					}
+				}
 				ep.Events[i].Status = "read"
-				ackedSource = ep.Events[i].Source
 				return nil
 			}
 		}
 		return fmt.Errorf("unknown delivery for this recipient")
 	})
-	if err == nil && ackedSource != "" {
-		ldrAckNotice(ackedSource)
-	}
-	return err
 }
 func RetryDelivery(agent, id string) error {
 	return editEndpoint(agent, func(ep *Endpoint) error {

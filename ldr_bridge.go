@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -40,20 +41,45 @@ func (a LDRAttachment) actorFor(localName string) string {
 func ldrAttachmentPath() string { return filepath.Join(Root(), "ldr.json") }
 func ldrCursorsPath() string    { return filepath.Join(Root(), "ldr-cursors.json") }
 
-func loadLDRAttachment() (LDRAttachment, bool) {
-	var att LDRAttachment
-	if b, err := os.ReadFile(ldrAttachmentPath()); err == nil {
-		if json.Unmarshal(b, &att) == nil && att.Version == 1 && strings.TrimSpace(att.ClientDir) != "" {
-			if att.Actors == nil {
-				att.Actors = map[string]string{}
-			}
-			return att, true
+var ldrAckTimeout = 5 * time.Second
+
+// loadLDRAttachment distinguishes three states:
+//   - (att, true, nil):  valid LDR attachment active (from ldr.json or YIP_LDR_DIR)
+//   - (zero, false, nil): genuinely unattached local-only line (ldr.json absent & YIP_LDR_DIR empty)
+//   - (zero, true, err): ldr.json exists or cannot be stat/read, or is malformed/unsupported
+//
+// Callers MUST NOT fall back to YIP_LDR_DIR or local-only writes when err != nil.
+func loadLDRAttachment() (LDRAttachment, bool, error) {
+	p := ldrAttachmentPath()
+	b, err := os.ReadFile(p)
+	if err == nil {
+		var att LDRAttachment
+		dec := json.NewDecoder(bytes.NewReader(b))
+		dec.DisallowUnknownFields()
+		if derr := dec.Decode(&att); derr != nil {
+			return LDRAttachment{}, true, fmt.Errorf("invalid LDR attachment %s: %w", p, derr)
 		}
+		if derr := dec.Decode(new(any)); derr != io.EOF {
+			return LDRAttachment{}, true, fmt.Errorf("invalid LDR attachment %s: trailing data", p)
+		}
+		if att.Version != 1 {
+			return LDRAttachment{}, true, fmt.Errorf("unsupported LDR attachment %s version %d (want 1)", p, att.Version)
+		}
+		if strings.TrimSpace(att.ClientDir) == "" {
+			return LDRAttachment{}, true, fmt.Errorf("invalid LDR attachment %s: empty client_dir", p)
+		}
+		if att.Actors == nil {
+			att.Actors = map[string]string{}
+		}
+		return att, true, nil
+	}
+	if !os.IsNotExist(err) {
+		return LDRAttachment{}, true, fmt.Errorf("cannot read LDR attachment %s: %w", p, err)
 	}
 	if envDir := strings.TrimSpace(os.Getenv("YIP_LDR_DIR")); envDir != "" {
-		return LDRAttachment{Version: 1, ClientDir: envDir, Actors: map[string]string{}}, true
+		return LDRAttachment{Version: 1, ClientDir: envDir, Actors: map[string]string{}}, true, nil
 	}
-	return LDRAttachment{}, false
+	return LDRAttachment{}, false, nil
 }
 
 // AttachLDRLine validates clientDir and records the attachment in the active local line.
@@ -76,7 +102,10 @@ func AttachLDRLine(clientDir, localAs, actorID string) (LDRAttachment, error) {
 	if err := EnsureRoot(); err != nil {
 		return LDRAttachment{}, err
 	}
-	att, _ := loadLDRAttachment()
+	att, _, err := loadLDRAttachment()
+	if err != nil {
+		return LDRAttachment{}, fmt.Errorf("existing LDR attachment is invalid (fix or run `yip ldr detach` first): %w", err)
+	}
 	att.Version = 1
 	att.ClientDir = absDir
 	if att.Actors == nil {
@@ -229,19 +258,23 @@ func ldrPublishPresence(ctx context.Context, cl *ldrclient.Client, sess *ldrrela
 // --- MCP & API Tool Dispatch when LDR Attached ---
 
 // ldrToolCall intercepts Yip MCP / API tools when the active local line is
-// attached to an LDR client directory. Host-local resource leases, local bind,
-// and local delivery endpoint tools ALWAYS return handled=false so they run
-// strictly against host-local state.
+// attached to an LDR client directory (or has a malformed/unreadable ldr.json).
+// Host-local resource leases, local bind, and local delivery endpoint tools
+// ALWAYS return handled=false BEFORE consulting ldr.json so host-local leases
+// remain usable even if ldr.json is broken.
 func ldrToolCall(me, name string, a map[string]any) (string, bool, error) {
-	att, ok := loadLDRAttachment()
-	if !ok {
-		return "", false, nil
-	}
 	// Host-local invariant: resource leases, local session bindings, and local
 	// delivery endpoints are NEVER routed to the remote relay.
 	switch name {
 	case "resources", "hold", "release", "steal", "request", "cancel_request", "queue_history", "lease_update",
 		"bind", "channel_ack", "deliveries", "delivery_ack":
+		return "", false, nil
+	}
+	att, ok, err := loadLDRAttachment()
+	if err != nil {
+		return "", true, err
+	}
+	if !ok {
 		return "", false, nil
 	}
 
@@ -370,56 +403,103 @@ func ldrToolCall(me, name string, a map[string]any) (string, bool, error) {
 		waitCtx, waitCancel := context.WithTimeout(context.Background(), timeout+15*time.Second)
 		defer waitCancel()
 
-		var result string
-		err := withLDRSession(waitCtx, att, func(cl *ldrclient.Client, sess *ldrrelay.SessionClient) error {
-			if _, err := cl.Sync(waitCtx, sess); err != nil {
-				return err
-			}
-			cid, err := cl.ResolveCallID(actor, argStr(a, "call"))
+		callArg := argStr(a, "call")
+
+		// Dial one TLS 1.3 session without holding the exclusive client-directory
+		// lock across poll sleeps so co-resident peers, hooks, and delivery
+		// listeners sharing att.ClientDir can acquire it freely between polls.
+		dialSess := func() (*ldrrelay.SessionClient, error) {
+			cl, err := ldrclient.OpenClientWait(waitCtx, att.ClientDir)
 			if err != nil {
-				return err
+				return nil, err
+			}
+			defer cl.Close()
+			return cl.Dial(waitCtx, ldrcrypto.PrincipalCredential)
+		}
+		sess, err := dialSess()
+		if err != nil {
+			return "", true, err
+		}
+		defer func() {
+			if sess != nil {
+				sess.Close()
+			}
+		}()
+
+		syncAndInspect := func(targetCID string) (cid, status, floor, peer string, turnCount int, err error) {
+			cl, err := ldrclient.OpenClientWait(waitCtx, att.ClientDir)
+			if err != nil {
+				return "", "", "", "", 0, err
+			}
+			defer cl.Close()
+			if _, serr := cl.Sync(waitCtx, sess); serr != nil {
+				// If the long-lived TLS session dropped, re-dial once and retry sync.
+				if !errors.Is(serr, ldrclient.ErrKeyRevoked) && !errors.Is(serr, ldrclient.ErrViolation) &&
+					!errors.Is(serr, ldrclient.ErrOutboxUncertain) && !errors.Is(serr, ldrclient.ErrEpochsUncertain) {
+					if newSess, derr := cl.Dial(waitCtx, ldrcrypto.PrincipalCredential); derr == nil {
+						sess.Close()
+						sess = newSess
+						_, serr = cl.Sync(waitCtx, sess)
+					}
+				}
+				if serr != nil {
+					return "", "", "", "", 0, serr
+				}
+			}
+			if targetCID == "" {
+				cid, err = cl.ResolveCallID(actor, callArg)
+				if err != nil {
+					return "", "", "", "", 0, err
+				}
+			} else {
+				cid = targetCID
 			}
 			call := cl.State().Calls[cid]
-			if st := call.Status(); st != "open" {
-				result = "not waiting: call is " + st + "; reopen explicitly to resume"
-				return nil
+			if call == nil {
+				return cid, "", "", "", 0, nil
 			}
-			peer := call.To
+			peer = call.To
 			if peer == actor {
 				peer = call.From
 			}
-			start := int(call.TurnCount)
-			if call.Floor() == actor && start > 0 {
-				result = fmt.Sprintf("nothing to wait for -- the floor is already yours on %s (turn %d). Read it.", cid, start)
-				return nil
+			return cid, call.Status(), call.Floor(), peer, int(call.TurnCount), nil
+		}
+
+		cid, status, floor, peer, start, err := syncAndInspect("")
+		if err != nil {
+			return "", true, err
+		}
+		if status != "open" {
+			return "not waiting: call is " + status + "; reopen explicitly to resume", true, nil
+		}
+		if floor == actor && start > 0 {
+			return fmt.Sprintf("nothing to wait for -- the floor is already yours on %s (turn %d). Read it.", cid, start), true, nil
+		}
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			select {
+			case <-waitCtx.Done():
+				return "", true, waitCtx.Err()
+			case <-time.After(250 * time.Millisecond):
 			}
-			deadline := time.Now().Add(timeout)
-			for time.Now().Before(deadline) {
-				select {
-				case <-waitCtx.Done():
-					return waitCtx.Err()
-				case <-time.After(250 * time.Millisecond):
-				}
-				if _, err := cl.Sync(waitCtx, sess); err != nil {
-					return err
-				}
-				cur := cl.State().Calls[cid]
-				if cur == nil {
-					break
-				}
-				if int(cur.TurnCount) > start {
-					result = fmt.Sprintf("%s replied -- %s is now at turn %d and the floor is yours. Read it.", peer, cid, cur.TurnCount)
-					return nil
-				}
-				if st := cur.Status(); st != "open" {
-					result = "call is now " + st
-					return nil
-				}
+			_, curStatus, curFloor, _, curTurns, err := syncAndInspect(cid)
+			if err != nil {
+				return "", true, err
 			}
-			result = fmt.Sprintf("no reply within %s. %s has not sent a new turn -- check ring later.", timeout, peer)
-			return nil
-		})
-		return result, true, err
+			if curStatus == "" {
+				break
+			}
+			if curTurns > start {
+				if curFloor == actor {
+					return fmt.Sprintf("%s replied -- %s is now at turn %d and the floor is yours. Read it.", peer, cid, curTurns), true, nil
+				}
+				return fmt.Sprintf("%s is now at turn %d (floor: %s). Read it.", cid, curTurns, curFloor), true, nil
+			}
+			if curStatus != "open" {
+				return "call is now " + curStatus, true, nil
+			}
+		}
+		return fmt.Sprintf("no reply within %s. %s has not sent a new turn -- check ring later.", timeout, peer), true, nil
 
 	case "bye":
 		var callID, peer, status string
@@ -819,12 +899,10 @@ func ldrToolCall(me, name string, a map[string]any) (string, bool, error) {
 
 // --- Delivery & Hook Integration for LDR-Attached Lines ---
 
-// ldrDeliverySnapshot pulls verified LDR notices for localAgent and merges ONLY
-// host-local resource lease events (resources stay strictly host-local).
-func ldrDeliverySnapshot(att LDRAttachment, localAgent string) map[string]string {
+// ldrHostLocalResourceSnapshot collects strictly host-local resource events
+// (never remote LDR calls/broadcasts).
+func ldrHostLocalResourceSnapshot(localAgent string) map[string]string {
 	out := map[string]string{}
-
-	// 1. Host-local resource notices (strictly local to this machine).
 	if _, e := LoadResourceConfig(); e != nil {
 		out["config-error:"+e.Error()] = "RESOURCE CONFIGURATION ERROR: " + e.Error()
 	}
@@ -850,6 +928,13 @@ func ldrDeliverySnapshot(att LDRAttachment, localAgent string) map[string]string
 			}
 		}
 	}
+	return out
+}
+
+// ldrDeliverySnapshot pulls verified LDR notices for localAgent and merges ONLY
+// host-local resource lease events (resources stay strictly host-local).
+func ldrDeliverySnapshot(att LDRAttachment, localAgent string) map[string]string {
+	out := ldrHostLocalResourceSnapshot(localAgent)
 
 	// 2. Remote verified LDR notices (sync + ScanDelivery + DeliverableNotices).
 	actor := att.actorFor(localAgent)
@@ -870,23 +955,29 @@ func ldrDeliverySnapshot(att LDRAttachment, localAgent string) map[string]string
 	return out
 }
 
-func ldrAckNotice(source string) {
+func ldrAckNotice(source string) error {
 	if !strings.HasPrefix(source, "ldr:") {
-		return
+		return nil
 	}
-	att, ok := loadLDRAttachment()
+	att, ok, err := loadLDRAttachment()
+	if err != nil {
+		return err
+	}
 	if !ok {
-		return
+		return errors.New("cannot acknowledge LDR delivery notice: no LDR attachment configured")
 	}
 	noticeID := strings.TrimPrefix(source, "ldr:")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), ldrAckTimeout)
 	defer cancel()
 	cl, err := ldrclient.OpenClientWait(ctx, att.ClientDir)
 	if err != nil {
-		return
+		return fmt.Errorf("cannot open LDR client for delivery ack: %w", err)
 	}
 	defer cl.Close()
-	_ = cl.AckNotice(noticeID)
+	if err := cl.AckNotice(noticeID); err != nil {
+		return fmt.Errorf("LDR delivery ack failed: %w", err)
+	}
+	return nil
 }
 
 func ldrHookRings(att LDRAttachment, me string) ([]ldrclient.CallSummary, []ldrclient.BroadcastView) {

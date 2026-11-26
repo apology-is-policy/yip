@@ -190,7 +190,9 @@ func withContext(result any, event, line string) any {
 // changed. NotifiedAt is what keeps it from repeating itself: one notice per
 // new turn, not one per tool call until the agent reads.
 func hookPostToolUse(me string, in hookInput) any {
-	if att, ok := loadLDRAttachment(); ok {
+	if att, ok, err := loadLDRAttachment(); err != nil {
+		return nil
+	} else if ok {
 		return ldrHookPostToolUse(att, me, in)
 	}
 	_ = Beat(me, in.toolName())
@@ -274,7 +276,9 @@ func ringLine(r Ring, me string) string {
 // second Stop with nothing changed does not block again -- and speaking
 // advances the count, which re-arms it for the next turn.
 func hookStop(me string) any {
-	if att, ok := loadLDRAttachment(); ok {
+	if att, ok, err := loadLDRAttachment(); err != nil {
+		return nil
+	} else if ok {
 		return ldrHookStop(att, me)
 	}
 	defer func() { _ = MeasureTip(me) }() // bounded; after the decision
@@ -320,7 +324,12 @@ func hookStop(me string) any {
 // Catches the cold open, a resume, and the turn after a compaction -- so a
 // long session gets re-told what it owes.
 func hookSessionStart(me string) any {
-	if att, ok := loadLDRAttachment(); ok {
+	if att, ok, err := loadLDRAttachment(); err != nil {
+		return map[string]any{"hookSpecificOutput": map[string]any{
+			"hookEventName":     "SessionStart",
+			"additionalContext": "[yip ldr] configuration error: " + err.Error(),
+		}}
+	} else if ok {
 		return ldrHookSessionStart(att, me)
 	}
 	_ = Beat(me, "")

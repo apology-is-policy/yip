@@ -74,7 +74,9 @@ Copy `line.desc.cbor` to the relay host, provision the line locally, and start s
 ```sh
 # On the relay host (provisioning is strictly local, never over the network)
 yip relay provision --dir ~/.yip-relay --descriptor ~/line.desc.cbor
+# Offline store inspection before starting the daemon:
 yip relay status    --dir ~/.yip-relay
+# Start the TLS 1.3 relay + owner-only Unix admin socket:
 yip relay serve     --dir ~/.yip-relay --listen 0.0.0.0:8443
 ```
 
@@ -195,15 +197,15 @@ yip ldr actor declare --dir ~/.yip-ldr/work --actor bob-claude
 Attach a checkout's local Yip line to the enrolled LDR client directory. Existing Claude, Codex, and Antigravity MCP tools (`call`, `say`, `read`, `wait`, `bye`, `note`, `ring`, `inbox`, `broadcasts`, `broadcast_read`, `broadcast_reply`, `presence`, `busy`, `roadmap_post`, `roadmap_at`, `roadmaps`, `dispute`, `measure`, `attach`, `call_status`, `retire`), hooks (`Stop`, `PostToolUse`, `SessionStart`), and live wakeups (`yip delivery listen --runtime agy`, Codex live delivery, Claude Channels) automatically route through the encrypted LDR relay, while host-local resource leases (`resources`, `hold`, `release`) remain strictly local.
 
 ```sh
-# Option 1: Install and attach in one command (map local agent name -> LDR actor ID)
-yip install --runtime agy --as gemini --ldr-dir ~/.yip-ldr/work --ldr-actor alice-gemini
+# Option 1: Install and attach in one command (using an actor declared in Step 3)
+yip install --runtime codex --as codex --ldr-dir ~/.yip-ldr/work --ldr-actor bob-codex
 
 # Option 2: Attach an already-installed local line
-yip ldr attach --dir ~/.yip-ldr/work --as gemini --actor alice-gemini
+yip ldr attach --dir ~/.yip-ldr/work --as codex --actor bob-codex
 
 # Multiple local agents on the same workstation can share one ~/.yip-ldr/work dir:
-# each checkout maps its own --as name to its declared --actor ID.
-yip ldr attach --dir ~/.yip-ldr/work --as codex --actor alice-codex
+# each checkout maps its own --as name to one of its declared --actor IDs.
+yip ldr attach --dir ~/.yip-ldr/work --as claude --actor bob-claude
 
 # Detach a local line later without touching ~/.yip-ldr/work:
 yip ldr detach
@@ -213,10 +215,13 @@ yip ldr detach
 
 ## 5. Day-to-day operations & incident response
 
-- **Inspect relay health & ClockGuard:**
+- **Inspect live relay health & ClockGuard (while `yip relay serve` is running, via its local Unix admin socket):**
+  ```sh
+  yip relay clock status --dir ~/.yip-relay
+  ```
+- **Inspect stored WAL & sidecars offline (opens the exclusive store lock — stop `yip relay serve` first):**
   ```sh
   yip relay status --dir ~/.yip-relay
-  yip relay clock status --dir ~/.yip-relay
   ```
 - **Resume ClockGuard after verified host clock/sleep recovery:**
   ```sh
