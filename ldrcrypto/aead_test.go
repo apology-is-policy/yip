@@ -3,6 +3,7 @@ package ldrcrypto
 import (
 	"bytes"
 	"errors"
+	"runtime"
 	"testing"
 )
 
@@ -187,5 +188,90 @@ func TestPayloadAEADNegativeRejections(t *testing.T) {
 	})
 	if _, err := OpenPayload(epochKey, ctxBytes, shortCTPkg); !errors.Is(err, ErrPayloadDecryptFailed) {
 		t.Fatalf("short ct accepted: got %v", err)
+	}
+}
+
+// TestPayloadAEADExactSizeBoundaryAndPreflight verifies Codex Turn 38:
+//   - payloadPackageEncodedLen matches exact canonical CBOR package bytes across
+//     all ciphertext length header width transitions (1/2/3/5-byte bstr headers).
+//   - Largest accepted plaintext produces a package of exactly PayloadMaxBytes
+//     and round-trips through OpenPayload cleanly.
+//   - Plaintext one byte above the limit (and multi-MiB oversized inputs) are
+//     rejected with ErrCBORLimitExceeded BEFORE allocating ciphertext / calling GCM.Seal.
+func TestPayloadAEADExactSizeBoundaryAndPreflight(t *testing.T) {
+	epochKey, err := GenerateEpochKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	salt := bytes.Repeat([]byte{0x42}, PayloadSaltSize)
+	ctxBytes := []byte("ldr.payload-size-boundary-test")
+
+	// Exact largest plaintext fitting PayloadMaxBytes (384 KiB = 393216 B):
+	// fixed overhead = 72 B, ct header (5 B for >65535), GCM tag = 16 B -> maxPT = 393123 B.
+	const maxPT = PayloadMaxBytes - 72 - 5 - PayloadTagSize
+	if maxPT != 393123 {
+		t.Fatalf("unexpected maxPT calculation: %d", maxPT)
+	}
+
+	// Verify exact size prediction across every CBOR bstr header width transition.
+	transitionLens := []int{0, 7, 8, 239, 240, 65519, 65520, maxPT}
+	for _, ptLen := range transitionLens {
+		wantPkgLen, err := payloadPackageEncodedLen(ptLen)
+		if err != nil {
+			t.Fatalf("payloadPackageEncodedLen(%d): %v", ptLen, err)
+		}
+		pt := make([]byte, ptLen)
+		for i := range pt {
+			pt[i] = byte((i*17 + 3) & 0xff)
+		}
+		pkg, err := sealPayloadWithSalt(epochKey, salt, ctxBytes, pt)
+		if err != nil {
+			t.Fatalf("sealPayloadWithSalt(len=%d): %v", ptLen, err)
+		}
+		if len(pkg) != wantPkgLen {
+			t.Fatalf("ptLen=%d: actual pkg len %d != predicted %d", ptLen, len(pkg), wantPkgLen)
+		}
+		if ptLen == maxPT {
+			if len(pkg) != PayloadMaxBytes {
+				t.Fatalf("maxPT package len = %d, want exact PayloadMaxBytes (%d)", len(pkg), PayloadMaxBytes)
+			}
+			// Also verify SealPayload (with fresh CSPRNG salt) round-trips cleanly at maxPT!
+			livePkg, err := SealPayload(epochKey, ctxBytes, pt)
+			if err != nil {
+				t.Fatalf("SealPayload(maxPT): %v", err)
+			}
+			if len(livePkg) != PayloadMaxBytes {
+				t.Fatalf("SealPayload(maxPT) len = %d, want %d", len(livePkg), PayloadMaxBytes)
+			}
+			got, err := OpenPayload(epochKey, ctxBytes, livePkg)
+			if err != nil {
+				t.Fatalf("OpenPayload(maxPT): %v", err)
+			}
+			if !bytes.Equal(got, pt) {
+				t.Fatalf("OpenPayload(maxPT) plaintext mismatch")
+			}
+		}
+	}
+
+	// One byte above maxPT MUST fail with ErrCBORLimitExceeded on both SealPayload and sealPayloadWithSalt.
+	overByOne := make([]byte, maxPT+1)
+	if _, err := SealPayload(epochKey, ctxBytes, overByOne); !errors.Is(err, ErrCBORLimitExceeded) {
+		t.Fatalf("SealPayload(maxPT+1): got %v, want ErrCBORLimitExceeded", err)
+	}
+	if _, err := sealPayloadWithSalt(epochKey, salt, ctxBytes, overByOne); !errors.Is(err, ErrCBORLimitExceeded) {
+		t.Fatalf("sealPayloadWithSalt(maxPT+1): got %v, want ErrCBORLimitExceeded", err)
+	}
+
+	// Oversized input (2 MiB) MUST be rejected BEFORE allocating ciphertext / encrypting.
+	hugePT := make([]byte, 2*1024*1024)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err = SealPayload(epochKey, ctxBytes, hugePT)
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, ErrCBORLimitExceeded) {
+		t.Fatalf("SealPayload(2MiB): got %v, want ErrCBORLimitExceeded", err)
+	}
+	if delta := after.TotalAlloc - before.TotalAlloc; delta > 64*1024 {
+		t.Fatalf("SealPayload(2MiB) allocated %d bytes before failing size preflight (want <= 65536)", delta)
 	}
 }

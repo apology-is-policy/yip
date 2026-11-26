@@ -45,11 +45,53 @@ func GenerateEpochKey() ([]byte, error) {
 //
 // Returns the canonical CBOR payload package: {"alg", "ct", "salt", "v": 1}.
 func SealPayload(epochKey, contextBytes, plaintext []byte) ([]byte, error) {
+	if len(epochKey) != EpochKeySize {
+		return nil, fmt.Errorf("%w: epoch key length %d != %d", ErrPayloadInvalidInput, len(epochKey), EpochKeySize)
+	}
+	if len(contextBytes) == 0 {
+		return nil, fmt.Errorf("%w: empty payload context", ErrPayloadInvalidInput)
+	}
+	if err := preflightPayloadPlaintextLen(len(plaintext)); err != nil {
+		return nil, err
+	}
 	salt := make([]byte, PayloadSaltSize)
 	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
 		return nil, err
 	}
 	return sealPayloadWithSalt(epochKey, salt, contextBytes, plaintext)
+}
+
+func payloadPackageFixedOverhead() int {
+	return typeArgLen(4) + // 4-entry canonical CBOR map header
+		(typeArgLen(1) + 1 + typeArgLen(1)) + // "v": 1
+		(typeArgLen(2) + 2) + // "ct" key
+		(typeArgLen(3) + 3 + typeArgLen(uint64(len(AlgPayloadHKDFSHA256AES256GCM))) + len(AlgPayloadHKDFSHA256AES256GCM)) + // "alg": alg
+		(typeArgLen(4) + 4 + typeArgLen(PayloadSaltSize) + PayloadSaltSize) // "salt": 32B bstr
+}
+
+// payloadPackageEncodedLen returns the exact canonical CBOR package size in bytes
+// for a plaintext of length plaintextLen, accounting for the GCM tag and exact
+// RFC 8949 framing widths.
+func payloadPackageEncodedLen(plaintextLen int) (int, error) {
+	if plaintextLen < 0 {
+		return 0, fmt.Errorf("%w: negative plaintext length", ErrPayloadInvalidInput)
+	}
+	overhead := payloadPackageFixedOverhead()
+	// Guard against int overflow before adding PayloadTagSize and ct header width.
+	if plaintextLen > PayloadMaxBytes-overhead-PayloadTagSize {
+		return 0, fmt.Errorf("%w: payload package exceeds %d bytes", ErrCBORLimitExceeded, PayloadMaxBytes)
+	}
+	ctLen := plaintextLen + PayloadTagSize
+	total := overhead + typeArgLen(uint64(ctLen)) + ctLen
+	if total > PayloadMaxBytes {
+		return 0, fmt.Errorf("%w: payload package %d > %d", ErrCBORLimitExceeded, total, PayloadMaxBytes)
+	}
+	return total, nil
+}
+
+func preflightPayloadPlaintextLen(plaintextLen int) error {
+	_, err := payloadPackageEncodedLen(plaintextLen)
+	return err
 }
 
 func derivePayloadKeyAndNonce(epochKey, salt, contextBytes []byte) (msgKey, nonce []byte, err error) {
@@ -74,6 +116,18 @@ func derivePayloadKeyAndNonce(epochKey, salt, contextBytes []byte) (msgKey, nonc
 }
 
 func sealPayloadWithSalt(epochKey, salt, contextBytes, plaintext []byte) ([]byte, error) {
+	if len(epochKey) != EpochKeySize {
+		return nil, fmt.Errorf("%w: epoch key length %d != %d", ErrPayloadInvalidInput, len(epochKey), EpochKeySize)
+	}
+	if len(salt) != PayloadSaltSize {
+		return nil, fmt.Errorf("%w: salt length %d != %d", ErrPayloadInvalidInput, len(salt), PayloadSaltSize)
+	}
+	if len(contextBytes) == 0 {
+		return nil, fmt.Errorf("%w: empty payload context", ErrPayloadInvalidInput)
+	}
+	if err := preflightPayloadPlaintextLen(len(plaintext)); err != nil {
+		return nil, err
+	}
 	msgKey, nonce, err := derivePayloadKeyAndNonce(epochKey, salt, contextBytes)
 	if err != nil {
 		return nil, err
@@ -87,12 +141,14 @@ func sealPayloadWithSalt(epochKey, salt, contextBytes, plaintext []byte) ([]byte
 		return nil, err
 	}
 	ct := gcm.Seal(nil, nonce, plaintext, contextBytes)
-	pkg, err := MarshalCBOR(Map{
+	lim := DefaultLimits()
+	lim.MaxBytes = PayloadMaxBytes
+	pkg, err := MarshalCBORWithLimits(Map{
 		{Key: "alg", Value: AlgPayloadHKDFSHA256AES256GCM},
 		{Key: "ct", Value: ct},
 		{Key: "salt", Value: bytes.Clone(salt)},
 		{Key: "v", Value: uint64(1)},
-	})
+	}, lim)
 	if err != nil {
 		return nil, err
 	}
