@@ -95,6 +95,8 @@ type lineRuntime struct {
 	logIndex          map[ldrstore.StoredOpKey]ldrstore.CommittedReceipt
 	hot               map[ldrstore.StoredOpKey]ldrstore.HotEntry
 	quota             map[string]int
+	registers         *ldrcore.Registers
+	regData           map[string]storedRegister
 	clock             *ClockGuard
 	recoveredTornTail bool
 	quarantined       bool
@@ -325,6 +327,8 @@ func (e *RelayEngine) loadAndVerifyLine(lineID []byte) (*lineRuntime, error) {
 		logIndex:          make(map[ldrstore.StoredOpKey]ldrstore.CommittedReceipt),
 		hot:               make(map[ldrstore.StoredOpKey]ldrstore.HotEntry),
 		quota:             make(map[string]int),
+		registers:         ldrcore.NewRegisters(hex.EncodeToString(lineID)),
+		regData:           make(map[string]storedRegister),
 		clock:             NewClockGuard(snap.TimeFloor, e.clockCfg, e.nowFn),
 		recoveredTornTail: snap.RecoveredTornTail,
 	}

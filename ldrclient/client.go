@@ -129,6 +129,9 @@ type Client struct {
 	cursors                persistedCursors
 	cursorsUncertain       bool
 	cursorsUncertainReason string
+	registers              persistedRegisters
+	registersUncertain     bool
+	registersUncertainMsg  string
 
 	// Optional durability hooks (nil defaults to OS SyncFile/SyncDir).
 	syncFileFn func(*os.File) error
@@ -430,6 +433,11 @@ func openClientLocked(dir string, lf *os.File, syncFile func(*os.File) error, sy
 		cleanupLock()
 		return nil, err
 	}
+	regs, err := loadRegisters(filepath.Join(dir, "registers.cbor"))
+	if err != nil {
+		cleanupLock()
+		return nil, err
+	}
 
 	c := &Client{
 		dir:        dir,
@@ -448,6 +456,7 @@ func openClientLocked(dir string, lf *os.File, syncFile func(*os.File) error, sy
 		slots:      make(map[string]string),
 		epochs:     ep,
 		cursors:    cur,
+		registers:  regs,
 		syncFileFn: syncFile,
 		syncDirFn:  syncDir,
 	}
@@ -1284,6 +1293,16 @@ func (c *Client) ReconcileDurability() error {
 	c.epochs = ep
 	c.outbox = ob
 	c.cursors = cur
+	if regs, rerr := loadRegisters(c.registersPath()); rerr == nil {
+		if c.registersUncertain {
+			for _, w := range regs.Writers {
+				w.TrustedCounter = false
+			}
+		}
+		c.registers = regs
+		c.registersUncertain = false
+		c.registersUncertainMsg = ""
+	}
 	c.slots = slots
 	c.outboxUncertain = false
 	c.outboxUncertainReason = ""

@@ -191,6 +191,10 @@ func (s *RelayServer) handleLine(w http.ResponseWriter, r *http.Request) {
 		s.handleLog(w, lineID, cb, body, reqDigest)
 	case "sidecar":
 		s.handleSidecar(w, lineID, cb, body, reqDigest)
+	case "register/put":
+		s.handleRegisterPut(w, lineID, cb, body, reqDigest)
+	case "register/list":
+		s.handleRegisterList(w, lineID, cb, body, reqDigest)
 	default:
 		http.NotFound(w, r)
 	}
