@@ -29,22 +29,25 @@ const ldrUsage = `yip ldr -- Long Distance Relay client, equal-roots admin, and 
         [--tls-pin <hex-or-pem-file>] --signer <root-keyfile> --out <desc.cbor>
     yip ldr root init-line --dir <client-dir> --descriptor <desc.cbor> --root-key <file>
     yip ldr root authorize-operator --dir <client-dir> --root-key <file> --operator-pub <file>
+    yip ldr root revoke-operator --dir <client-dir> --root-key <file> --operator-pub <file>
     yip ldr root replace-root --dir <client-dir> --root-key <file> --old-root-pub <file> --new-root-pub <file>
     yip ldr root reader-request --dir <admin-dir> --namespace <ns> [--alg ed25519|ecdsa-p256-sha256] --out <req.cbor>
 
-  P3 KEY-FIRST ENROLLMENT & O25 FULL-REPLAY ONBOARDING
+  P3 KEY-FIRST ENROLLMENT, REVOCATION & O25 FULL-REPLAY ONBOARDING
     yip ldr join request --dir <client-dir> --descriptor <desc.cbor> --namespace <ns> [--actor-limit 4] [--reader] --out <req.cbor>
     yip ldr join challenge --operator-key <file> --request <req.cbor> --out-challenge <ch.cbor> --out-secret <sec.cbor>
     yip ldr join prove --dir <client-dir> --operator-pub <file> --request <req.cbor> --challenge <ch.cbor> --out <proof.cbor>
     yip ldr join enroll --dir <client-dir> --operator-key <file> --request <req.cbor> --challenge <ch.cbor> --secret <sec.cbor> --proof <proof.cbor>
+    yip ldr join revoke --dir <admin-dir> --operator-key <file> --cred-id <hex>
     yip ldr join activate --dir <client-dir>
 
-  EPOCHS, SYNC, ACTORS, CALLS & STATUS (host-local resource leases stay local)
+  EPOCHS, SYNC, ACTORS, CALLS, BROADCASTS, REGISTERS & STATUS (host-local resources stay local)
     yip ldr epoch activate --dir <client-dir> --operator-key <file>
     yip ldr sync --dir <client-dir> [--role credential|operator|root] [--key <file>] [--project] [--scan]
-    yip ldr actor declare --dir <client-dir> --actor <id> [--namespace <ns>]
-    yip ldr call open --dir <client-dir> --from <actor> --to <actor> --call <id> --subject <text> --body <text>
-    yip ldr call say --dir <client-dir> --from <actor> --call <id> --body <text>
+    yip ldr actor declare|remove|addressing|list --dir <client-dir> ...
+    yip ldr call open|say|bye|note|read|status|attach|ratify|dispute|measure|resolve|list --dir <client-dir> ...
+    yip ldr broadcast create|list|read|reply --dir <client-dir> ...
+    yip ldr register put|list --dir <client-dir> ...
     yip ldr status --dir <client-dir>
 `
 
@@ -68,6 +71,10 @@ func LDRCLI(args []string, out io.Writer) error {
 		return ldrActorCLI(rest, out)
 	case "call":
 		return ldrCallCLI(rest, out)
+	case "broadcast":
+		return ldrBroadcastCLI(rest, out)
+	case "register":
+		return ldrRegisterCLI(rest, out)
 	case "status":
 		return ldrStatusCLI(rest, out)
 	default:
@@ -402,6 +409,9 @@ func ldrRootCLI(args []string, out io.Writer) error {
 		}
 		_, _ = cl.Sync(ctx, sess)
 		return json.NewEncoder(out).Encode(map[string]any{"op_id": opID, "seq": rep.Outcome.Seq})
+
+	case "revoke-operator":
+		return ldrRootRevokeOperatorCLI(rest, out)
 
 	case "replace-root":
 		var dir, rootKeyPath, oldPath, newPath string
@@ -819,6 +829,9 @@ func ldrJoinCLI(args []string, out io.Writer) error {
 			"op_id": opID, "seq": rep.Outcome.Seq, "cred_id": hex.EncodeToString(req.CredID[:]),
 		})
 
+	case "revoke":
+		return ldrJoinRevokeCLI(rest, out)
+
 	case "activate":
 		var dir string
 		rest, dir = takeFlag(rest, "--dir", "")
@@ -952,8 +965,11 @@ func ldrSyncCLI(args []string, out io.Writer) error {
 }
 
 func ldrActorCLI(args []string, out io.Writer) error {
-	if len(args) == 0 || args[0] != "declare" {
-		return errors.New("usage: yip ldr actor declare --dir <client-dir> --actor <id> [--namespace <ns>]")
+	if len(args) == 0 {
+		return errors.New("usage: yip ldr actor <declare|remove|addressing|list> --dir <client-dir> ...")
+	}
+	if args[0] != "declare" {
+		return ldrActorExtraCLI(args[0], args[1:], out)
 	}
 	rest := args[1:]
 	var dir, actorID, ns string
@@ -1110,7 +1126,7 @@ func ldrCallCLI(args []string, out io.Writer) error {
 		return json.NewEncoder(out).Encode(map[string]any{"op_id": opID, "seq": rep.Outcome.Seq, "call": callID})
 
 	default:
-		return fmt.Errorf("unknown call subcommand %q", sub)
+		return ldrCallExtraCLI(sub, rest, out)
 	}
 }
 
