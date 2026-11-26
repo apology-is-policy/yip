@@ -25,8 +25,10 @@ const ldrUsage = `yip ldr -- Long Distance Relay client, equal-roots admin, and 
   ROOT & LINE BOOTSTRAP (equal 1-of-2 roots, Ed25519 or ECDSA P-256)
     yip ldr root keygen --out <keyfile> [--pub <pubfile>] [--alg ed25519|ecdsa-p256-sha256]
     yip ldr root descriptor --line-id <hex|auto> --root1 <file> --root2 <file> \
-        --url <https://...> --tls-policy <pin_spki_sha256|pin_ca_root_pem|webpki> \
-        [--tls-pin <hex-or-pem-file>] --signer <root-keyfile> --out <desc.cbor>
+        --url <https://...> [--session-binding <tls13_exporter|ws_tls13_exporter>] \
+        --tls-policy <pin_spki_sha256|pin_ca_root_pem|webpki> [--tls-pin <hex-or-pem-file>] \
+        [--outer-tls-policy <webpki|pin_ca_root_pem|pin_spki_sha256>] [--outer-tls-pin <hex-or-pem-file>] \
+        [--inner-server-name <host>] --signer <root-keyfile> --out <desc.cbor>
     yip ldr root init-line --dir <client-dir> --descriptor <desc.cbor> --root-key <file>
     yip ldr root authorize-operator --dir <client-dir> --root-key <file> --operator-pub <file>
     yip ldr root revoke-operator --dir <client-dir> --root-key <file> --operator-pub <file>
@@ -191,17 +193,27 @@ func ldrRootCLI(args []string, out io.Writer) error {
 		})
 
 	case "descriptor":
-		var lineHex, r1Path, r2Path, rawURL, tlsPol, tlsPinArg, signerPath, outPath string
+		var lineHex, r1Path, r2Path, rawURL, tlsPol, tlsPinArg, sessionBinding, outerPol, outerPinArg, innerSN, signerPath, outPath string
 		rest, lineHex = takeFlag(rest, "--line-id", "auto")
 		rest, r1Path = takeFlag(rest, "--root1", "")
 		rest, r2Path = takeFlag(rest, "--root2", "")
 		rest, rawURL = takeFlag(rest, "--url", "")
 		rest, tlsPol = takeFlag(rest, "--tls-policy", ldrcrypto.TLSPolicyPinSPKISHA256)
 		rest, tlsPinArg = takeFlag(rest, "--tls-pin", "")
+		rest, sessionBinding = takeFlag(rest, "--session-binding", ldrcrypto.SessionBindingTLS13Exporter)
+		rest, outerPol = takeFlag(rest, "--outer-tls-policy", "")
+		rest, outerPinArg = takeFlag(rest, "--outer-tls-pin", "")
+		rest, innerSN = takeFlag(rest, "--inner-server-name", "")
 		rest, signerPath = takeFlag(rest, "--signer", "")
 		rest, outPath = takeFlag(rest, "--out", "")
 		if r1Path == "" || r2Path == "" || rawURL == "" || signerPath == "" || outPath == "" {
 			return errors.New("root descriptor requires --root1, --root2, --url, --signer, --out")
+		}
+		if sessionBinding != ldrcrypto.SessionBindingWSTLS13Exporter && outerPinArg != "" {
+			return errors.New("--outer-tls-pin requires ws_tls13_exporter")
+		}
+		if sessionBinding == ldrcrypto.SessionBindingWSTLS13Exporter && outerPol == "" {
+			outerPol = ldrcrypto.TLSPolicyWebPKI
 		}
 		for _, inPath := range []string{r1Path, r2Path, signerPath} {
 			if alias, err := ldrclient.PathsAlias(outPath, inPath); err != nil {
@@ -215,6 +227,13 @@ func ldrRootCLI(args []string, out io.Writer) error {
 				return err
 			} else if alias {
 				return fmt.Errorf("%w: root descriptor --out aliases --tls-pin input %s", ldrclient.ErrOutputCollision, tlsPinArg)
+			}
+		}
+		if outerPol == ldrcrypto.TLSPolicyPinCARootPEM && outerPinArg != "" {
+			if alias, err := ldrclient.PathsAlias(outPath, outerPinArg); err != nil {
+				return err
+			} else if alias {
+				return fmt.Errorf("%w: root descriptor --out aliases --outer-tls-pin input %s", ldrclient.ErrOutputCollision, outerPinArg)
 			}
 		}
 		if _, err := os.Lstat(outPath); err == nil {
@@ -247,22 +266,35 @@ func ldrRootCLI(args []string, out io.Writer) error {
 		if err != nil {
 			return err
 		}
-		var tlsPin []byte
-		switch tlsPol {
-		case ldrcrypto.TLSPolicyPinSPKISHA256:
-			tlsPin, err = hex.DecodeString(strings.TrimSpace(tlsPinArg))
-			if err != nil {
-				return fmt.Errorf("invalid hex --tls-pin: %w", err)
+		parsePin := func(pol, arg, flagName string) ([]byte, error) {
+			switch pol {
+			case ldrcrypto.TLSPolicyPinSPKISHA256:
+				b, err := hex.DecodeString(strings.TrimSpace(arg))
+				if err != nil {
+					return nil, fmt.Errorf("invalid hex %s: %w", flagName, err)
+				}
+				return b, nil
+			case ldrcrypto.TLSPolicyPinCARootPEM:
+				return os.ReadFile(arg)
+			case ldrcrypto.TLSPolicyWebPKI:
+				if arg != "" {
+					return nil, fmt.Errorf("%s is incompatible with webpki", flagName)
+				}
+				return nil, nil
+			default:
+				return nil, fmt.Errorf("unsupported policy %q", pol)
 			}
-		case ldrcrypto.TLSPolicyPinCARootPEM:
-			tlsPin, err = os.ReadFile(tlsPinArg)
+		}
+		tlsPin, err := parsePin(tlsPol, tlsPinArg, "--tls-pin")
+		if err != nil {
+			return err
+		}
+		var outerPin []byte
+		if sessionBinding == ldrcrypto.SessionBindingWSTLS13Exporter {
+			outerPin, err = parsePin(outerPol, outerPinArg, "--outer-tls-pin")
 			if err != nil {
 				return err
 			}
-		case ldrcrypto.TLSPolicyWebPKI:
-			tlsPin = nil
-		default:
-			return fmt.Errorf("unsupported --tls-policy %q", tlsPol)
 		}
 		desc := ldrcrypto.CreationDescriptor{
 			Version:    1,
@@ -270,10 +302,13 @@ func ldrRootCLI(args []string, out io.Writer) error {
 			Generation: 1,
 			RootKeys:   []ldrcrypto.PublicKey{pk1, pk2},
 			RelayOrigin: ldrcrypto.RelayOrigin{
-				URL:            rawURL,
-				TLSPolicy:      tlsPol,
-				TLSPin:         tlsPin,
-				SessionBinding: ldrcrypto.SessionBindingTLS13Exporter,
+				URL:             rawURL,
+				TLSPolicy:       tlsPol,
+				TLSPin:          tlsPin,
+				SessionBinding:  sessionBinding,
+				OuterTLSPolicy:  outerPol,
+				OuterTLSPin:     outerPin,
+				InnerServerName: innerSN,
 			},
 			Profile: ldrcrypto.ProfileV1(),
 		}

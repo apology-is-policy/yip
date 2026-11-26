@@ -23,6 +23,28 @@ import (
 	"github.com/apology-is-policy/yip/ldrstore"
 )
 
+type carrierKind int
+
+const (
+	carrierDirect   carrierKind = iota // default for direct TLS 1.3 listeners
+	carrierWSTunnel                    // set ONLY via trusted WS tunnel inner http.Server ConnContext
+)
+
+type carrierCtxKey struct{}
+
+// WithWSTunnelCarrier marks a connection context as arriving via the trusted
+// WebSocket-tunneled inner TLS 1.3 listener (never inferred from HTTP headers).
+func WithWSTunnelCarrier(ctx context.Context) context.Context {
+	return context.WithValue(ctx, carrierCtxKey{}, carrierWSTunnel)
+}
+
+func requestCarrier(r *http.Request) carrierKind {
+	if v, ok := r.Context().Value(carrierCtxKey{}).(carrierKind); ok {
+		return v
+	}
+	return carrierDirect
+}
+
 const (
 	maxHTTPBodyBytes     = 1024 * 1024 // 1 MiB transport frame cap
 	challengeTTL         = 30 * time.Second
@@ -190,6 +212,39 @@ func (s *RelayServer) handleLine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	endpoint := parts[1]
+
+	// Enforce per-line transport carrier binding from trusted listener ConnContext
+	// and verified CreationDescriptor — never from HTTP headers, with no fallback.
+	desc, _, _, exists := s.engine.LineDescriptor(lineID)
+	carrier := requestCarrier(r)
+	var rejectStatus int
+	var rejectCode string
+	switch {
+	case !exists:
+		rejectStatus, rejectCode = http.StatusNotFound, "wrong_line"
+	case desc.RelayOrigin.SessionBinding == ldrcrypto.SessionBindingTLS13Exporter:
+		if carrier != carrierDirect {
+			rejectStatus, rejectCode = http.StatusMisdirectedRequest, "wrong_carrier"
+		}
+	case desc.RelayOrigin.SessionBinding == ldrcrypto.SessionBindingWSTLS13Exporter:
+		if carrier != carrierWSTunnel {
+			rejectStatus, rejectCode = http.StatusMisdirectedRequest, "wrong_carrier"
+		}
+	default:
+		rejectStatus, rejectCode = http.StatusNotImplemented, "unsupported_transport"
+	}
+	if rejectStatus != 0 {
+		if endpoint == "session/challenge" {
+			writeCBOR(w, rejectStatus, ldrcrypto.Map{{Key: "error", Value: rejectCode}, {Key: "v", Value: uint64(1)}})
+		} else {
+			writeCBOR(w, rejectStatus, ldrcrypto.Map{
+				{Key: "class", Value: ldrcore.ClassAdmission},
+				{Key: "code", Value: rejectCode},
+				{Key: "v", Value: uint64(1)},
+			})
+		}
+		return
+	}
 
 	body, err := readBoundedBody(w, r, maxHTTPBodyBytes)
 	if err != nil {
@@ -868,9 +923,11 @@ func encodeSubmitReply(lineID []byte, gen uint64, sid []byte, reqID uint64, reqD
 // --- Pinned TLS 1.3 Channel-Bound SessionClient (for relay transport & e2e tests) ---
 
 // SessionClient binds one authenticated session to a single pinned TLS 1.3
-// connection and fails closed if the connection drops or redirects are attempted.
+// connection (direct or WebSocket-tunneled inner TLS 1.3) and fails closed if
+// the connection drops or redirects are attempted.
 type SessionClient struct {
 	origin     ldrcrypto.RelayOrigin
+	reqBaseURL string
 	lineID     []byte
 	lineHex    string
 	profDigest [32]byte
@@ -879,11 +936,19 @@ type SessionClient struct {
 
 	httpClient *http.Client
 	transport  *http.Transport
+	closeConn  func()
 	cb         [32]byte
 	sessionID  []byte
 	gen        uint64
 	nextReqID  uint64
 	mu         sync.Mutex
+}
+
+func formatHostForURL(host string) string {
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		return "[" + host + "]"
+	}
+	return host
 }
 
 func resolveOriginDialAddr(originURL string) (string, error) {
@@ -902,29 +967,57 @@ func resolveOriginDialAddr(originURL string) (string, error) {
 	return net.JoinHostPort(host, port), nil
 }
 
-// DialSession opens a pinned TLS 1.3 connection to origin, exports RFC 9266
-// tls-exporter channel binding, runs the single-use challenge/auth handshake,
-// and returns an authenticated SessionClient.
+// DialSession opens a pinned TLS 1.3 connection to origin (directly for
+// tls13_exporter, or over an outer HTTPS HTTP/1.1 WebSocket tunnel with pinned
+// inner TLS 1.3 for ws_tls13_exporter), exports RFC 9266 tls-exporter channel
+// binding from the origin-terminated TLS 1.3 connection, runs the single-use
+// challenge/auth handshake, and returns an authenticated SessionClient.
 func DialSession(ctx context.Context, origin ldrcrypto.RelayOrigin, lineID []byte, profDigest [32]byte, gen uint64, principal ldrcrypto.Principal, signer ldrcrypto.Signer) (*SessionClient, error) {
-	tlsCfg, err := ClientTLSConfig(origin)
+	innerTLSCfg, err := ClientTLSConfig(origin)
 	if err != nil {
 		return nil, err
 	}
-	tlsCfg.NextProtos = []string{"h2", "http/1.1"}
-	addr, err := resolveOriginDialAddr(origin.URL)
-	if err != nil {
-		return nil, err
+
+	var outerTLSCfg *tls.Config
+	var reqBaseURL string
+	var forceH2 bool
+	var dialAddr string
+
+	switch origin.SessionBinding {
+	case ldrcrypto.SessionBindingTLS13Exporter:
+		innerTLSCfg.NextProtos = []string{"h2", "http/1.1"}
+		dialAddr, err = resolveOriginDialAddr(origin.URL)
+		if err != nil {
+			return nil, err
+		}
+		reqBaseURL = strings.TrimRight(origin.URL, "/")
+		forceH2 = true
+
+	case ldrcrypto.SessionBindingWSTLS13Exporter:
+		outerTLSCfg, err = ClientOuterTLSConfig(origin)
+		if err != nil {
+			return nil, err
+		}
+		innerTLSCfg.NextProtos = []string{"http/1.1"}
+		reqBaseURL = "https://" + formatHostForURL(origin.InnerServerName)
+		forceH2 = false
+
+	default:
+		return nil, fmt.Errorf("%w: %q", ErrUnsupportedTransport, origin.SessionBinding)
 	}
 
 	var dialMu sync.Mutex
 	var dialedOnce bool
 	var capturedCB [32]byte
+	var activeConn net.Conn
+	handshakeCtx, cancelHandshake := context.WithCancel(ctx)
+	defer cancelHandshake()
 
 	tr := &http.Transport{
 		MaxConnsPerHost:     1,
 		MaxIdleConnsPerHost: 1,
 		DisableKeepAlives:   false,
-		ForceAttemptHTTP2:   true,
+		ForceAttemptHTTP2:   forceH2,
 		DialTLSContext: func(dctx context.Context, network, _ string) (net.Conn, error) {
 			dialMu.Lock()
 			defer dialMu.Unlock()
@@ -932,21 +1025,48 @@ func DialSession(ctx context.Context, origin ldrcrypto.RelayOrigin, lineID []byt
 				// Never silently reconnect a bound session onto a new TLS handshake!
 				return nil, errors.New("ldrrelay: TLS session connection dropped; re-authentication required")
 			}
-			dialer := &tls.Dialer{Config: tlsCfg}
-			conn, err := dialer.DialContext(dctx, network, addr)
-			if err != nil {
-				return nil, err
+			// net/http detaches its dial context from the request. Preserve the
+			// caller's cancellation throughout both handshakes.
+			dialCtx, cancelDial := context.WithCancel(dctx)
+			stop := context.AfterFunc(handshakeCtx, cancelDial)
+			defer stop()
+			defer cancelDial()
+			var tc *tls.Conn
+			if origin.SessionBinding == ldrcrypto.SessionBindingWSTLS13Exporter {
+				tunnelCtx, cancel := context.WithTimeout(dialCtx, wsDefaultHandshakeTTL)
+				defer cancel()
+				wsConn, err := DialWSTunnel(tunnelCtx, origin.URL, outerTLSCfg)
+				if err != nil {
+					return nil, err
+				}
+				tc = tls.Client(wsConn, innerTLSCfg)
+				if err := tc.HandshakeContext(tunnelCtx); err != nil {
+					_ = tc.Close()
+					_ = wsConn.Close()
+					return nil, err
+				}
+			} else {
+				dialer := &tls.Dialer{Config: innerTLSCfg}
+				conn, err := dialer.DialContext(dialCtx, network, dialAddr)
+				if err != nil {
+					return nil, err
+				}
+				tc = conn.(*tls.Conn)
 			}
-			tc := conn.(*tls.Conn)
 			cb, err := ExportTLSChannelBinding(tc.ConnectionState())
 			if err != nil {
-				_ = conn.Close()
+				_ = tc.Close()
 				return nil, err
 			}
 			capturedCB = cb
+			activeConn = tc
 			dialedOnce = true
-			return conn, nil
+			return tc, nil
 		},
+	}
+	if !forceH2 {
+		// Explicitly serve HTTP/1.1 inside inner ws_tls13_exporter tunnel matching inner ALPN.
+		tr.TLSNextProto = map[string]func(authority string, c *tls.Conn) http.RoundTripper{}
 	}
 
 	hc := &http.Client{
@@ -958,6 +1078,7 @@ func DialSession(ctx context.Context, origin ldrcrypto.RelayOrigin, lineID []byt
 
 	sc := &SessionClient{
 		origin:     origin,
+		reqBaseURL: reqBaseURL,
 		lineID:     bytes.Clone(lineID),
 		lineHex:    hex.EncodeToString(lineID),
 		profDigest: profDigest,
@@ -965,7 +1086,17 @@ func DialSession(ctx context.Context, origin ldrcrypto.RelayOrigin, lineID []byt
 		signer:     signer,
 		httpClient: hc,
 		transport:  tr,
-		gen:        gen,
+		closeConn: func() {
+			cancelHandshake()
+			dialMu.Lock()
+			c := activeConn
+			activeConn = nil
+			dialMu.Unlock()
+			if c != nil {
+				_ = c.Close()
+			}
+		},
+		gen: gen,
 	}
 
 	// Step 1: request single-use challenge over the pinned TLS 1.3 connection.
@@ -1130,9 +1261,12 @@ func (e *AuthError) Error() string {
 	return fmt.Sprintf("ldrrelay: auth refused (%s / %s)", e.Class, e.Code)
 }
 
-// Close closes the underlying TLS 1.3 connection.
+// Close closes the underlying TLS 1.3 connection (and outer WebSocket tunnel, if any).
 func (c *SessionClient) Close() {
 	c.transport.CloseIdleConnections()
+	if c.closeConn != nil {
+		c.closeConn()
+	}
 }
 
 // SessionID returns the authenticated session ID.
@@ -1145,7 +1279,7 @@ func (c *SessionClient) Principal() ldrcrypto.Principal { return c.principal }
 func (c *SessionClient) ChannelBinding() [32]byte { return c.cb }
 
 func (c *SessionClient) postRawCBOR(ctx context.Context, endpoint string, raw []byte) (map[string]any, error) {
-	reqURL := strings.TrimRight(c.origin.URL, "/") + "/v1/lines/" + c.lineHex + "/" + endpoint
+	reqURL := c.reqBaseURL + "/v1/lines/" + c.lineHex + "/" + endpoint
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err

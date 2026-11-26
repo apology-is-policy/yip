@@ -2329,6 +2329,10 @@ func (c *Client) Send(ctx context.Context, sess *ldrrelay.SessionClient, opID st
 		c.mu.Unlock()
 		return ldrrelay.SubmitReply{}, ErrKeyRevoked
 	}
+	if c.outbox.MustResolve {
+		c.mu.Unlock()
+		return ldrrelay.SubmitReply{}, ErrMustResolve
+	}
 	candSend := clonePersistedOutbox(c.outbox)
 	candSend.Entries[idx].Sends++
 	if err := c.persistOutboxLocked(candSend); err != nil {
@@ -2347,11 +2351,31 @@ func (c *Client) Send(ctx context.Context, sess *ldrrelay.SessionClient, opID st
 	c.mu.Unlock()
 
 	rep, err := sess.Submit(ctx, intentBytes, payloadSidecar, wrapSidecars)
+
+	c.mu.Lock()
 	if err != nil {
+		defer c.mu.Unlock()
+		idx, current := c.findOutboxIndexLocked(opID)
+		if c.outboxUncertain || current == nil || isOutboxFinal(current.Status) || c.signsNoMoreLocked(current.SignerToken) {
+			return ldrrelay.SubmitReply{}, err
+		}
+		// The relay may already have committed these exact bytes. Require a new
+		// query pass before another mutation, including in a long-lived client.
+		cand := clonePersistedOutbox(c.outbox)
+		cand.ResolveEpoch++
+		cand.MustResolve = true
+		cand.Entries[idx].NeedsResolve = true
+		if saveErr := c.persistOutboxLocked(cand); saveErr != nil {
+			// Even a pre-write failure leaves the remote outcome uncertain.
+			// Reopening reconstructs the barrier from the durable pending entry.
+			c.outboxUncertain = true
+			c.outboxUncertainReason = saveErr.Error()
+			return ldrrelay.SubmitReply{}, errors.Join(err, saveErr)
+		}
+		c.outbox = cand
 		return ldrrelay.SubmitReply{}, err
 	}
 
-	c.mu.Lock()
 	if c.outboxUncertain {
 		c.mu.Unlock()
 		return ldrrelay.SubmitReply{}, ErrOutboxUncertain

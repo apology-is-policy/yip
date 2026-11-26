@@ -346,18 +346,51 @@ func TestRelayOriginPoliciesAndSessionAuth(t *testing.T) {
 	leafPEM := makeTestCertPEM(t, "test-leaf", false)
 
 	// Verify all three TLS policies (LAN/closed-net SPKI pin, Enterprise CA pin, Public VM / Workers WebPKI)
-	// and both session binding modes (tls13_exporter and app_authenticated_session).
+	// and all three session binding modes (tls13_exporter, ws_tls13_exporter, and reserved app_authenticated_session).
 	validOrigins := []RelayOrigin{
 		{URL: "https://10.0.0.5:8443", TLSPolicy: TLSPolicyPinSPKISHA256, TLSPin: bytes.Repeat([]byte{0x01}, 32), SessionBinding: SessionBindingTLS13Exporter},
 		{URL: "https://[::1]", TLSPolicy: TLSPolicyPinSPKISHA256, TLSPin: bytes.Repeat([]byte{0x02}, 32), SessionBinding: SessionBindingTLS13Exporter},
 		{URL: "https://yip.corp.internal:8443", TLSPolicy: TLSPolicyPinCARootPEM, TLSPin: ca1PEM, SessionBinding: SessionBindingTLS13Exporter},
 		{URL: "https://relay.example.com", TLSPolicy: TLSPolicyWebPKI, TLSPin: nil, SessionBinding: SessionBindingTLS13Exporter},
 		{URL: "https://yip-ldr.example.workers.dev", TLSPolicy: TLSPolicyWebPKI, TLSPin: nil, SessionBinding: SessionBindingAppAuth},
+		{
+			URL:             "https://relay.example.com/v1/tunnel",
+			TLSPolicy:       TLSPolicyPinSPKISHA256,
+			TLSPin:          bytes.Repeat([]byte{0x03}, 32),
+			SessionBinding:  SessionBindingWSTLS13Exporter,
+			OuterTLSPolicy:  TLSPolicyWebPKI,
+			InnerServerName: "relay-origin.internal",
+		},
+		{
+			URL:             "https://edge.corp.example:8443/ldr/v1/tunnel",
+			TLSPolicy:       TLSPolicyPinCARootPEM,
+			TLSPin:          ca1PEM,
+			SessionBinding:  SessionBindingWSTLS13Exporter,
+			OuterTLSPolicy:  TLSPolicyPinCARootPEM,
+			OuterTLSPin:     ca2PEM,
+			InnerServerName: "127.0.0.1",
+		},
+		{
+			URL:             "https://127.0.0.1:8443/v1/tunnel",
+			TLSPolicy:       TLSPolicyPinSPKISHA256,
+			TLSPin:          bytes.Repeat([]byte{0x04}, 32),
+			SessionBinding:  SessionBindingWSTLS13Exporter,
+			OuterTLSPolicy:  TLSPolicyPinSPKISHA256,
+			OuterTLSPin:     bytes.Repeat([]byte{0x05}, 32),
+			InnerServerName: "::1",
+		},
 	}
 	for i, ro := range validOrigins {
 		m, err := ro.ToCBORMap()
 		if err != nil {
 			t.Fatalf("valid origin %d failed: %v", i, err)
+		}
+		wantKeys := 4
+		if ro.SessionBinding == SessionBindingWSTLS13Exporter {
+			wantKeys = 7
+		}
+		if len(m) != wantKeys {
+			t.Fatalf("valid origin %d (%s) key count=%d want=%d", i, ro.SessionBinding, len(m), wantKeys)
 		}
 		raw, err := MarshalCBOR(m)
 		if err != nil {
@@ -367,8 +400,12 @@ func TestRelayOriginPoliciesAndSessionAuth(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := ParseRelayOrigin(dec); err != nil {
+		parsed, err := ParseRelayOrigin(dec)
+		if err != nil {
 			t.Fatalf("ParseRelayOrigin(%d): %v", i, err)
+		}
+		if parsed.SessionBinding != ro.SessionBinding || parsed.OuterTLSPolicy != ro.OuterTLSPolicy || parsed.InnerServerName != ro.InnerServerName {
+			t.Fatalf("ParseRelayOrigin(%d) round-trip mismatch: got %+v want %+v", i, parsed, ro)
 		}
 	}
 
@@ -386,6 +423,22 @@ func TestRelayOriginPoliciesAndSessionAuth(t *testing.T) {
 		{URL: "https://relay.local:8443", TLSPolicy: TLSPolicyPinCARootPEM, TLSPin: append(bytes.Clone(ca1PEM), []byte("trailing-junk\n")...), SessionBinding: SessionBindingTLS13Exporter},
 		{URL: "https://relay.local:8443", TLSPolicy: TLSPolicyPinCARootPEM, TLSPin: leafPEM, SessionBinding: SessionBindingTLS13Exporter},
 		{URL: "https://relay.local:8443", TLSPolicy: TLSPolicyWebPKI, SessionBinding: "bearer_token"},
+		// Direct/app modes MUST forbid ws_tls13_exporter fields:
+		{URL: "https://relay.local:8443", TLSPolicy: TLSPolicyWebPKI, SessionBinding: SessionBindingTLS13Exporter, OuterTLSPolicy: TLSPolicyWebPKI},
+		{URL: "https://relay.local:8443", TLSPolicy: TLSPolicyWebPKI, SessionBinding: SessionBindingTLS13Exporter, InnerServerName: "relay.local"},
+		{URL: "https://relay.local:8443", TLSPolicy: TLSPolicyWebPKI, SessionBinding: SessionBindingAppAuth, InnerServerName: "relay.local"},
+		// ws_tls13_exporter MUST forbid webpki on inner origin leg:
+		{URL: "https://relay.example.com/v1/tunnel", TLSPolicy: TLSPolicyWebPKI, SessionBinding: SessionBindingWSTLS13Exporter, OuterTLSPolicy: TLSPolicyWebPKI, InnerServerName: "relay.example.com"},
+		// ws_tls13_exporter MUST require explicit clean canonical URL path:
+		{URL: "https://relay.example.com", TLSPolicy: TLSPolicyPinSPKISHA256, TLSPin: bytes.Repeat([]byte{0x03}, 32), SessionBinding: SessionBindingWSTLS13Exporter, OuterTLSPolicy: TLSPolicyWebPKI, InnerServerName: "relay.internal"},
+		{URL: "https://relay.example.com/v1/../tunnel", TLSPolicy: TLSPolicyPinSPKISHA256, TLSPin: bytes.Repeat([]byte{0x03}, 32), SessionBinding: SessionBindingWSTLS13Exporter, OuterTLSPolicy: TLSPolicyWebPKI, InnerServerName: "relay.internal"},
+		{URL: "https://relay.example.com/v1/tunnel/", TLSPolicy: TLSPolicyPinSPKISHA256, TLSPin: bytes.Repeat([]byte{0x03}, 32), SessionBinding: SessionBindingWSTLS13Exporter, OuterTLSPolicy: TLSPolicyWebPKI, InnerServerName: "relay.internal"},
+		// ws_tls13_exporter MUST require valid outer_tls_policy and canonical inner_server_name:
+		{URL: "https://relay.example.com/v1/tunnel", TLSPolicy: TLSPolicyPinSPKISHA256, TLSPin: bytes.Repeat([]byte{0x03}, 32), SessionBinding: SessionBindingWSTLS13Exporter, OuterTLSPolicy: "", InnerServerName: "relay.internal"},
+		{URL: "https://relay.example.com/v1/tunnel", TLSPolicy: TLSPolicyPinSPKISHA256, TLSPin: bytes.Repeat([]byte{0x03}, 32), SessionBinding: SessionBindingWSTLS13Exporter, OuterTLSPolicy: TLSPolicyWebPKI, OuterTLSPin: []byte("extra"), InnerServerName: "relay.internal"},
+		{URL: "https://relay.example.com/v1/tunnel", TLSPolicy: TLSPolicyPinSPKISHA256, TLSPin: bytes.Repeat([]byte{0x03}, 32), SessionBinding: SessionBindingWSTLS13Exporter, OuterTLSPolicy: TLSPolicyWebPKI, InnerServerName: ""},
+		{URL: "https://relay.example.com/v1/tunnel", TLSPolicy: TLSPolicyPinSPKISHA256, TLSPin: bytes.Repeat([]byte{0x03}, 32), SessionBinding: SessionBindingWSTLS13Exporter, OuterTLSPolicy: TLSPolicyWebPKI, InnerServerName: "Relay.Internal"},
+		{URL: "https://relay.example.com/v1/tunnel", TLSPolicy: TLSPolicyPinSPKISHA256, TLSPin: bytes.Repeat([]byte{0x03}, 32), SessionBinding: SessionBindingWSTLS13Exporter, OuterTLSPolicy: TLSPolicyWebPKI, InnerServerName: "relay.internal:8443"},
 	}
 	for i, ro := range invalidOrigins {
 		if err := ro.Validate(); !errors.Is(err, ErrInvalidDescriptor) {

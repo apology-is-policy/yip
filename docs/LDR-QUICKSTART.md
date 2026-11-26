@@ -41,6 +41,22 @@ Provide your server certificate/key via `--cert` and `--key` on `yip relay serve
 
 Provide your ACME-issued fullchain certificate and private key via `--cert` and `--key`, and use `--tls-policy webpki` (no `--tls-pin`) with your public `https://<fqdn>:8443` URL in Step 2.
 
+### Option D. Use an HTTPS edge proxy and a WebSocket tunnel
+
+On the relay host, generate the origin certificate and save the printed
+`pin_spki_sha256` value. Share the public pin with the admin over a trusted
+channel. The origin private key stays on the relay host.
+
+```sh
+yip relay init --dir ~/.yip-relay --hosts relay-origin.internal
+```
+
+The admin signs the public edge hostname, tunnel path, inner server name and
+origin pin together in Step 2. The edge forwards HTTP/1.1 WebSocket upgrades
+for that path to the relay's local listener. The relay authenticates the
+session over the inner TLS connection. The edge can observe traffic timing
+and sizes.
+
 ---
 
 ## 2. Root ceremony, provisioning, and line bootstrap
@@ -57,7 +73,7 @@ yip ldr root keygen --out ~/ldr-setup/root2.key --pub ~/ldr-setup/root2.pub --al
 # 2. Generate an operator key for day-to-day enrollment, epochs, and broadcasts
 yip ldr root keygen --out ~/ldr-setup/operator.key --pub ~/ldr-setup/operator.pub --alg ed25519
 
-# 3. Sign the canonical creation descriptor (pinning relay URL + TLS policy)
+# 3. For a direct relay, sign the descriptor. For Option D, use the next block.
 yip ldr root descriptor \
   --line-id auto \
   --root1 ~/ldr-setup/root1.pub \
@@ -69,6 +85,20 @@ yip ldr root descriptor \
   --out ~/ldr-setup/line.desc.cbor
 ```
 
+For Option D, use this descriptor command in place of command 3 above.
+Enter the public SPKI pin from the relay and substitute your edge hostname.
+
+```sh
+read -r origin_pin
+yip ldr root descriptor \
+  --root1 ~/ldr-setup/root1.pub --root2 ~/ldr-setup/root2.pub \
+  --signer ~/ldr-setup/root1.key --out ~/ldr-setup/line.desc.cbor \
+  --session-binding ws_tls13_exporter \
+  --url https://relay.example.com/v1/tunnel --outer-tls-policy webpki \
+  --inner-server-name relay-origin.internal \
+  --tls-policy pin_spki_sha256 --tls-pin "$origin_pin"
+```
+
 Copy `line.desc.cbor` to the relay host, provision the line locally, and start serving:
 
 ```sh
@@ -76,8 +106,16 @@ Copy `line.desc.cbor` to the relay host, provision the line locally, and start s
 yip relay provision --dir ~/.yip-relay --descriptor ~/line.desc.cbor
 # Offline store inspection before starting the daemon:
 yip relay status    --dir ~/.yip-relay
-# Start the TLS 1.3 relay + owner-only Unix admin socket:
+# For a direct relay, start the TLS listener. For Option D, use the next block.
 yip relay serve     --dir ~/.yip-relay --listen 0.0.0.0:8443
+```
+
+For Option D, substitute this serve command, then configure your edge proxy to
+forward the descriptor's hostname and path to `http://127.0.0.1:8080` on the
+relay host. An existing SSH hostname can keep its own route.
+
+```sh
+yip relay serve --dir ~/.yip-relay --listen off --tunnel-listen 127.0.0.1:8080
 ```
 
 Back on the admin workstation, initialize the line and authorize the operator key:

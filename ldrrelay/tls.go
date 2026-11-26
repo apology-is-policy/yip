@@ -504,7 +504,8 @@ func publishFileCreateOnlyWithHooks(
 	return nil
 }
 
-// ServerTLSConfig loads a cert/key pair and enforces TLS 1.3 minimum.
+// ServerTLSConfig loads a cert/key pair and enforces TLS 1.3 minimum for direct
+// TLS 1.3 relay listeners (serving h2 and http/1.1).
 func ServerTLSConfig(certFile, keyFile string) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
@@ -517,27 +518,29 @@ func ServerTLSConfig(certFile, keyFile string) (*tls.Config, error) {
 	}, nil
 }
 
-// ClientTLSConfig builds a strict TLS 1.3 client configuration matching the
-// creation descriptor's pinned relay_origin TLS policy.
-func ClientTLSConfig(origin ldrcrypto.RelayOrigin) (*tls.Config, error) {
-	if err := origin.Validate(); err != nil {
-		return nil, err
-	}
-	if origin.SessionBinding != ldrcrypto.SessionBindingTLS13Exporter {
-		return nil, fmt.Errorf("%w: %q", ErrUnsupportedTransport, origin.SessionBinding)
-	}
-	u, err := url.Parse(origin.URL)
+// InnerTunnelServerTLSConfig loads a cert/key pair for the inner TLS 1.3 server
+// terminated inside ws_tls13_exporter WebSocket tunnels (advertising only http/1.1
+// to match the inner HTTP/1.1 server strictly).
+func InnerTunnelServerTLSConfig(certFile, keyFile string) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return nil, err
 	}
-	host := u.Hostname()
+	return &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"http/1.1"},
+	}, nil
+}
 
-	switch origin.TLSPolicy {
+func buildClientTLSConfig(host, policy string, pin []byte, allowWebPKI bool, nextProtos []string) (*tls.Config, error) {
+	switch policy {
 	case ldrcrypto.TLSPolicyPinSPKISHA256:
-		wantPin := append([]byte(nil), origin.TLSPin...)
+		wantPin := append([]byte(nil), pin...)
 		return &tls.Config{
 			MinVersion:         tls.VersionTLS13,
 			ServerName:         host,
+			NextProtos:         append([]string(nil), nextProtos...),
 			InsecureSkipVerify: true, // strictly verified by VerifyConnection below
 			VerifyConnection: func(cs tls.ConnectionState) error {
 				if cs.Version != tls.VersionTLS13 {
@@ -563,7 +566,7 @@ func ClientTLSConfig(origin ldrcrypto.RelayOrigin) (*tls.Config, error) {
 		}, nil
 
 	case ldrcrypto.TLSPolicyPinCARootPEM:
-		caCert, err := ldrcrypto.ParsePinnedCARootPEM(origin.TLSPin)
+		caCert, err := ldrcrypto.ParsePinnedCARootPEM(pin)
 		if err != nil {
 			return nil, err
 		}
@@ -572,18 +575,64 @@ func ClientTLSConfig(origin ldrcrypto.RelayOrigin) (*tls.Config, error) {
 		return &tls.Config{
 			MinVersion: tls.VersionTLS13,
 			ServerName: host,
+			NextProtos: append([]string(nil), nextProtos...),
 			RootCAs:    pool,
 		}, nil
 
 	case ldrcrypto.TLSPolicyWebPKI:
+		if !allowWebPKI {
+			return nil, errors.New("ldrrelay: webpki is forbidden for inner ws_tls13_exporter origin authentication")
+		}
 		return &tls.Config{
 			MinVersion: tls.VersionTLS13,
 			ServerName: host,
+			NextProtos: append([]string(nil), nextProtos...),
 		}, nil
 
 	default:
-		return nil, fmt.Errorf("ldrrelay: unsupported tls_policy %q", origin.TLSPolicy)
+		return nil, fmt.Errorf("ldrrelay: unsupported tls_policy %q", policy)
 	}
+}
+
+// ClientTLSConfig builds a strict TLS 1.3 client configuration for authenticating
+// the origin relay from the creation descriptor's pinned relay_origin.
+// For ws_tls13_exporter this builds the INNER origin TLS 1.3 config (pinned SPKI
+// or operator CA only, ServerName = InnerServerName, NextProtos = ["http/1.1"]).
+func ClientTLSConfig(origin ldrcrypto.RelayOrigin) (*tls.Config, error) {
+	if err := origin.Validate(); err != nil {
+		return nil, err
+	}
+	switch origin.SessionBinding {
+	case ldrcrypto.SessionBindingTLS13Exporter:
+		u, err := url.Parse(origin.URL)
+		if err != nil {
+			return nil, err
+		}
+		return buildClientTLSConfig(u.Hostname(), origin.TLSPolicy, origin.TLSPin, true, nil)
+
+	case ldrcrypto.SessionBindingWSTLS13Exporter:
+		return buildClientTLSConfig(origin.InnerServerName, origin.TLSPolicy, origin.TLSPin, false, []string{"http/1.1"})
+
+	default:
+		return nil, fmt.Errorf("%w: %q", ErrUnsupportedTransport, origin.SessionBinding)
+	}
+}
+
+// ClientOuterTLSConfig builds the outer TLS 1.3 client configuration for the
+// HTTP/1.1 WebSocket upgrade leg of ws_tls13_exporter. Outer verification NEVER
+// authenticates the origin relay on its own.
+func ClientOuterTLSConfig(origin ldrcrypto.RelayOrigin) (*tls.Config, error) {
+	if err := origin.Validate(); err != nil {
+		return nil, err
+	}
+	if origin.SessionBinding != ldrcrypto.SessionBindingWSTLS13Exporter {
+		return nil, fmt.Errorf("%w: outer TLS config only applies to %q", ErrUnsupportedTransport, ldrcrypto.SessionBindingWSTLS13Exporter)
+	}
+	u, err := url.Parse(origin.URL)
+	if err != nil {
+		return nil, err
+	}
+	return buildClientTLSConfig(u.Hostname(), origin.OuterTLSPolicy, origin.OuterTLSPin, true, []string{"http/1.1"})
 }
 
 // ExportTLSChannelBinding derives the 32-byte RFC 9266 tls-exporter channel

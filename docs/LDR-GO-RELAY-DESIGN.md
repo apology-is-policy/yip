@@ -203,27 +203,80 @@ verifies `session_proof` against the two `root_keys` provisioned in the
 installed creation descriptor (`§1.3`), allowing either provisioned root to
 open a bootstrap session solely to submit `line_init`.
 
-### 2.3 Proxy policy and future Cloudflare Worker / Durable Object compatibility
+### 2.3 Edge-terminated reverse proxies, WebSocket-tunneled inner TLS 1.3, and future Cloudflare Worker compatibility
 
-A reverse proxy or cloud edge (such as Cloudflare Workers) that terminates TLS
-before the relay runtime breaks RFC 9266 `tls-exporter` because client and
-backend see different TLS handshakes. Policy:
+A reverse proxy or cloud edge (such as Cloudflare Tunnel, nginx, Caddy, or
+Cloudflare Workers) that terminates TLS before the relay runtime breaks direct
+RFC 9266 `tls-exporter` because client and backend see different TLS
+handshakes. Policy distinguishes three explicit signed `session_binding` modes
+in `relay_origin`:
 
-- **Go relay default (`session_binding: "tls13_exporter"`):** used for LANs,
-  closed corporate networks, and direct public custom VMs (including behind a
-  TCP/SNI passthrough proxy). TLS 1.3 terminates directly at the Go relay. Any
-  TLS-terminating MITM proxy causes pin or channel-binding failure and fails
-  closed.
-- **Future Cloudflare Worker / TLS-terminating proxy mode
+- **Direct Go relay default (`session_binding: "tls13_exporter"`):** used for
+  LANs, closed corporate networks, and direct public custom VMs (including
+  behind a TCP/SNI passthrough proxy). TLS 1.3 terminates directly at the Go
+  relay (`h2` / `http/1.1`), with the 4-field canonical `relay_origin` map
+  `{session_binding, tls_pin, tls_policy, url}`. Any TLS-terminating MITM proxy
+  causes pin or channel-binding failure and fails closed.
+- **Edge-TLS-terminated / reverse-proxied Go relay
+  (`session_binding: "ws_tls13_exporter"`):** used when an operator-hosted Go
+  relay sits behind an HTTP(S)/WebSocket edge proxy (such as a Cloudflare
+  Tunnel, nginx, Caddy, or ALB) while retaining end-to-end TLS 1.3 and RFC 9266
+  channel binding directly with the origin relay — with zero custom handshake
+  or custom AEAD record layer:
+  - **Signed outer/inner separation (`7`-field `relay_origin`):**
+    - `url` pins the outer HTTPS authority and explicit canonical WebSocket
+      upgrade path (e.g., `https://relay.example.com/v1/tunnel`).
+    - `outer_tls_policy` + `outer_tls_pin` (`webpki`, `pin_ca_root_pem`, or
+      `pin_spki_sha256`) verify only the outer HTTPS hop (`MinVersion: TLS 1.3`,
+      explicit HTTP/1.1 `Upgrade: websocket`, no redirects, no compression or
+      WebSocket extensions). **Outer verification alone never authenticates the
+      origin relay.**
+    - `inner_server_name` + `tls_policy` + `tls_pin` authenticate the origin
+      relay's **inner TLS 1.3** connection carried inside the RFC 6455 binary
+      WebSocket byte stream (`NextProtos: ["http/1.1"]` on both client and
+      inner origin server). Inner `tls_policy` MUST be `pin_spki_sha256` or
+      `pin_ca_root_pem` (`webpki` is forbidden on the inner leg).
+  - **Origin listener & strict per-line carrier isolation:** the origin Go
+    relay accepts `/v1/tunnel` WebSocket upgrades only on an explicit loopback
+    TCP address (`127.0.0.1:<port>`, `[::1]:<port>`, `localhost:<port>`) or an
+    owner-only Unix domain socket (`unix:/path`, mode `0600`), terminates inner
+    TLS 1.3 directly, and tags inner requests via trusted `http.Server.ConnContext`
+    (never HTTP headers, no redirects, no fallback). `tls13_exporter` lines
+    refuse tunneled connections; `ws_tls13_exporter` lines refuse direct
+    connections.
+  - The reader streams binary frames up to 256 KiB and accepts up to 1 MiB
+    per fragmented message. Writers emit complete binary messages in chunks of
+    up to 32 KiB. These boundaries are independent of inner TLS records.
+  - **Liveness, drops, and certificate rotation:** WebSocket Ping/Pong
+    heartbeats maintain carrier liveness only and never extend P7 session
+    authorization or idle lifetime. Any carrier reset ends the inner TLS 1.3
+    and P7 session; on a lost mutation reply, the client reconnects with fresh
+    WebSocket + inner TLS 1.3 + P7 and reconciles the original
+    `(op_id, intent_digest)` before sending any new mutation. Under
+    `outer_tls_policy: "webpki"`, edge certificates rotate independently; under
+    inner `pin_ca_root_pem`, the operator rotates origin leaf certificates
+    under their dedicated CA without changing the descriptor; under inner
+    `pin_spki_sha256`, renewing the origin certificate with the *same* public
+    key and matching `inner_server_name` requires no descriptor change, while
+    replacing the pinned public key requires a root-authorized update.
+  - **Edge visibility:** the edge proxy still observes the outer hostname/path,
+    WebSocket upgrade, outer TLS metadata, packet sizes, timing, and
+    disconnects; inner HTTP paths, `line_id`, `principal`, E2EE payloads, and
+    `revoked` outcomes remain encrypted inside the pinned inner TLS 1.3 stream.
+- **Future native Cloudflare Worker / HTTP-message mode
   (`session_binding: "app_authenticated_session"`):** reserved explicitly in
-  `relay_origin` so a future Cloudflare Durable Object (via Go/Wasm or
-  vector-verified TypeScript) or reverse-proxied VM can establish an
-  application-level mutually-authenticated session inside the backend (for
-  example, HPKE-established ephemeral session keys or a descriptor-pinned
-  relay transport signing key binding challenges, requests, and replies)
-  without weakening `tls13_exporter` or changing any log record, CBOR
-  envelope, or `ldrcore/` rule. Clients refuse `"app_authenticated_session"`
-  until that transport specification and its negative test suite are approved.
+  `relay_origin` (clients continue to fail closed operationally on 4-field
+  reserved descriptors without rewriting signed bytes) for a future native
+  WebCrypto Cloudflare Durable Object or WebSocket-blocking HTTP proxy backend
+  that requires independent HTTP messages rather than an inner TLS 1.3 byte
+  stream. Any future specification for `app_authenticated_session` MUST bind
+  mode/version and `descriptor_digest` into a mutually authenticated handshake,
+  seal both `/session/auth` proof and reply (verifying proof-of-possession
+  before emitting terminal `revoked`), enforce single-flight / serialized
+  `req_id` reservation with strict at-most-once nonce sealing per
+  `(direction, req_id)` (including errors and duplicates), define conservative
+  AEAD record/byte/key lifetime limits, specify root-authorized relay transport
+  key rotation/loss semantics, and ship fixed cross-implementation test vectors.
 
 ### 2.4 Request and reply binding (P7)
 

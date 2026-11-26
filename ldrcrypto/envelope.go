@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
+	"path"
 	"sort"
 	"strings"
 )
@@ -28,8 +30,9 @@ const (
 	TLSPolicyWebPKI        = "webpki"
 
 	// Relay session-binding modes (LDR-GO-RELAY-DESIGN §2.3).
-	SessionBindingTLS13Exporter = "tls13_exporter"
-	SessionBindingAppAuth       = "app_authenticated_session"
+	SessionBindingTLS13Exporter   = "tls13_exporter"
+	SessionBindingWSTLS13Exporter = "ws_tls13_exporter"
+	SessionBindingAppAuth         = "app_authenticated_session"
 
 	// Distinct signing purposes for non-intent signed objects.
 	PurposeDescriptorSig = "ldr.creation-descriptor.sig"
@@ -168,11 +171,25 @@ func ParsePrincipal(v any) (Principal, error) {
 }
 
 // RelayOrigin pins the HTTPS relay endpoint, TLS policy, and session binding mode.
+//
+// For SessionBindingTLS13Exporter and SessionBindingAppAuth, only the 4 base fields
+// (URL, TLSPolicy, TLSPin, SessionBinding) are permitted and encoded in CBOR.
+//
+// For SessionBindingWSTLS13Exporter (RFC 6455 WebSocket-tunneled inner TLS 1.3):
+//   - URL pins the outer HTTPS authority and explicit WebSocket upgrade path (e.g. https://relay.example.com/v1/tunnel)
+//   - OuterTLSPolicy / OuterTLSPin pin outer HTTPS verification (webpki, pin_ca_root_pem, or pin_spki_sha256);
+//     outer verification NEVER authenticates the origin relay
+//   - InnerServerName pins the inner TLS 1.3 SNI/SAN hostname or IP literal of the origin relay
+//   - TLSPolicy / TLSPin pin the origin relay's inner TLS 1.3 identity (pin_spki_sha256 or pin_ca_root_pem ONLY;
+//     webpki is strictly forbidden on the inner leg)
 type RelayOrigin struct {
-	URL            string
-	TLSPolicy      string
-	TLSPin         []byte
-	SessionBinding string
+	URL             string
+	TLSPolicy       string
+	TLSPin          []byte
+	SessionBinding  string
+	OuterTLSPolicy  string
+	OuterTLSPin     []byte
+	InnerServerName string
 }
 
 // ParsePinnedCARootPEM strictly parses a pin_ca_root_pem blob, requiring
@@ -211,6 +228,58 @@ func ParsePinnedCARootPEM(pemBytes []byte) (*x509.Certificate, error) {
 	return cert, nil
 }
 
+func validateTLSPolicyAndPin(policy string, pin []byte, allowWebPKI bool, label string) error {
+	switch policy {
+	case TLSPolicyPinSPKISHA256:
+		if len(pin) != 32 {
+			return fmt.Errorf("%w: %s pin_spki_sha256 requires 32-byte pin", ErrInvalidDescriptor, label)
+		}
+		return nil
+	case TLSPolicyPinCARootPEM:
+		if _, err := ParsePinnedCARootPEM(pin); err != nil {
+			return err
+		}
+		return nil
+	case TLSPolicyWebPKI:
+		if !allowWebPKI {
+			return fmt.Errorf("%w: %s webpki is forbidden; origin identity must be pinned (pin_spki_sha256 or pin_ca_root_pem)", ErrInvalidDescriptor, label)
+		}
+		if len(pin) != 0 {
+			return fmt.Errorf("%w: %s webpki policy must have empty pin", ErrInvalidDescriptor, label)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: unknown %s %q", ErrInvalidDescriptor, label, policy)
+	}
+}
+
+func validateInnerServerName(name string) error {
+	if name == "" || len(name) > 253 {
+		return fmt.Errorf("%w: inner_server_name must be 1..253 bytes", ErrInvalidDescriptor)
+	}
+	if strings.TrimSpace(name) != name {
+		return fmt.Errorf("%w: inner_server_name must not contain surrounding whitespace", ErrInvalidDescriptor)
+	}
+	if ip := net.ParseIP(name); ip != nil {
+		return nil
+	}
+	if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".") {
+		return fmt.Errorf("%w: invalid inner_server_name %q", ErrInvalidDescriptor, name)
+	}
+	for _, label := range strings.Split(name, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return fmt.Errorf("%w: invalid inner_server_name label %q", ErrInvalidDescriptor, label)
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+				return fmt.Errorf("%w: inner_server_name must be canonical lowercase DNS name or IP literal", ErrInvalidDescriptor)
+			}
+		}
+	}
+	return nil
+}
+
 // Validate checks relay_origin syntax and policy consistency.
 func (r RelayOrigin) Validate() error {
 	if !strings.HasPrefix(r.URL, "https://") {
@@ -223,28 +292,28 @@ func (r RelayOrigin) Validate() error {
 	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("%w: relay URL must not contain credentials, query, or fragment", ErrInvalidDescriptor)
 	}
-	switch r.TLSPolicy {
-	case TLSPolicyPinSPKISHA256:
-		if len(r.TLSPin) != 32 {
-			return fmt.Errorf("%w: pin_spki_sha256 requires 32-byte pin", ErrInvalidDescriptor)
-		}
-	case TLSPolicyPinCARootPEM:
-		if _, err := ParsePinnedCARootPEM(r.TLSPin); err != nil {
-			return err
-		}
-	case TLSPolicyWebPKI:
-		if len(r.TLSPin) != 0 {
-			return fmt.Errorf("%w: webpki policy must have empty tls_pin", ErrInvalidDescriptor)
-		}
-	default:
-		return fmt.Errorf("%w: unknown tls_policy %q", ErrInvalidDescriptor, r.TLSPolicy)
-	}
 	switch r.SessionBinding {
 	case SessionBindingTLS13Exporter, SessionBindingAppAuth:
+		if r.OuterTLSPolicy != "" || len(r.OuterTLSPin) != 0 || r.InnerServerName != "" {
+			return fmt.Errorf("%w: outer/inner tunnel fields are forbidden for session_binding %q", ErrInvalidDescriptor, r.SessionBinding)
+		}
+		return validateTLSPolicyAndPin(r.TLSPolicy, r.TLSPin, true, "tls_policy")
+
+	case SessionBindingWSTLS13Exporter:
+		if u.ForceQuery || u.Path == "" || !strings.HasPrefix(u.Path, "/") || u.RawPath != "" || path.Clean(u.Path) != u.Path {
+			return fmt.Errorf("%w: ws_tls13_exporter URL must specify a clean canonical path (e.g. /v1/tunnel)", ErrInvalidDescriptor)
+		}
+		if err := validateTLSPolicyAndPin(r.TLSPolicy, r.TLSPin, false, "inner tls_policy"); err != nil {
+			return err
+		}
+		if err := validateTLSPolicyAndPin(r.OuterTLSPolicy, r.OuterTLSPin, true, "outer_tls_policy"); err != nil {
+			return err
+		}
+		return validateInnerServerName(r.InnerServerName)
+
 	default:
 		return fmt.Errorf("%w: unknown session_binding %q", ErrInvalidDescriptor, r.SessionBinding)
 	}
-	return nil
 }
 
 // ToCBORMap encodes r canonically.
@@ -255,6 +324,21 @@ func (r RelayOrigin) ToCBORMap() (Map, error) {
 	pin := bytes.Clone(r.TLSPin)
 	if pin == nil {
 		pin = []byte{}
+	}
+	if r.SessionBinding == SessionBindingWSTLS13Exporter {
+		outerPin := bytes.Clone(r.OuterTLSPin)
+		if outerPin == nil {
+			outerPin = []byte{}
+		}
+		return Map{
+			{Key: "inner_server_name", Value: r.InnerServerName},
+			{Key: "outer_tls_pin", Value: outerPin},
+			{Key: "outer_tls_policy", Value: r.OuterTLSPolicy},
+			{Key: "session_binding", Value: r.SessionBinding},
+			{Key: "tls_pin", Value: pin},
+			{Key: "tls_policy", Value: r.TLSPolicy},
+			{Key: "url", Value: r.URL},
+		}, nil
 	}
 	return Map{
 		{Key: "session_binding", Value: r.SessionBinding},
@@ -270,12 +354,21 @@ func ParseRelayOrigin(v any) (RelayOrigin, error) {
 	if !ok {
 		return RelayOrigin{}, fmt.Errorf("%w: relay_origin must be map", ErrInvalidDescriptor)
 	}
-	if err := RequireExactKeys(m, []string{"session_binding", "tls_pin", "tls_policy", "url"}); err != nil {
-		return RelayOrigin{}, err
-	}
 	sb, err := MapString(m, "session_binding")
 	if err != nil {
 		return RelayOrigin{}, err
+	}
+	if sb == SessionBindingWSTLS13Exporter {
+		if err := RequireExactKeys(m, []string{
+			"inner_server_name", "outer_tls_pin", "outer_tls_policy",
+			"session_binding", "tls_pin", "tls_policy", "url",
+		}); err != nil {
+			return RelayOrigin{}, err
+		}
+	} else {
+		if err := RequireExactKeys(m, []string{"session_binding", "tls_pin", "tls_policy", "url"}); err != nil {
+			return RelayOrigin{}, err
+		}
 	}
 	pin, err := MapBytes(m, "tls_pin")
 	if err != nil {
@@ -290,6 +383,23 @@ func ParseRelayOrigin(v any) (RelayOrigin, error) {
 		return RelayOrigin{}, err
 	}
 	ro := RelayOrigin{URL: rawURL, TLSPolicy: pol, TLSPin: bytes.Clone(pin), SessionBinding: sb}
+	if sb == SessionBindingWSTLS13Exporter {
+		outerPol, err := MapString(m, "outer_tls_policy")
+		if err != nil {
+			return RelayOrigin{}, err
+		}
+		outerPin, err := MapBytes(m, "outer_tls_pin")
+		if err != nil {
+			return RelayOrigin{}, err
+		}
+		innerSN, err := MapString(m, "inner_server_name")
+		if err != nil {
+			return RelayOrigin{}, err
+		}
+		ro.OuterTLSPolicy = outerPol
+		ro.OuterTLSPin = bytes.Clone(outerPin)
+		ro.InnerServerName = innerSN
+	}
 	if err := ro.Validate(); err != nil {
 		return RelayOrigin{}, err
 	}

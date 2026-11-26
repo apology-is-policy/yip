@@ -32,8 +32,8 @@ const relayUsage = `yip relay -- operator-hosted Long Distance Relay (TLS 1.3 + 
   yip relay status --dir <data_dir>
       Verify stored WAL/sidecars and print JSON status of provisioned lines.
 
-  yip relay serve --dir <data_dir> --listen <addr> [--cert <file>] [--key <file>] [--admin-sock <path>]
-      Run the TLS 1.3 LDR relay server and local owner-only admin socket until SIGINT/SIGTERM.
+  yip relay serve --dir <data_dir> [--listen <addr|off>] [--tunnel-listen <loopback|unix:/path>] [--tunnel-path </v1/tunnel>] [--cert <file>] [--key <file>] [--admin-sock <path>]
+      Run the TLS 1.3 LDR relay server (direct and/or WS-tunneled inner TLS 1.3 behind an edge proxy) and local owner-only admin socket until SIGINT/SIGTERM.
 
   yip relay clock status [--dir <data_dir>] [--admin-sock <path>]
       Query live line and clock-guard status from a running relay via its local admin socket.
@@ -155,26 +155,53 @@ func relayCLIStatus(args []string, out io.Writer) error {
 }
 
 type relayServeOpts struct {
-	Dir       string
-	Listen    string
-	CertPath  string
-	KeyPath   string
-	AdminSock string
-	ClockCfg  ldrrelay.ClockConfig
-	NowFn     ldrrelay.ClockSource
-	ReadyCh   chan<- relayServeReady
+	Dir          string
+	Listen       string // direct TLS 1.3 listen addr, or "off" when TunnelListen is set
+	TunnelListen string // optional loopback TCP (127.0.0.1:port, [::1]:port, localhost:port) or unix:/path
+	TunnelPath   string // optional WebSocket upgrade path (default /v1/tunnel)
+	CertPath     string
+	KeyPath      string
+	AdminSock    string
+	ClockCfg     ldrrelay.ClockConfig
+	NowFn        ldrrelay.ClockSource
+	ReadyCh      chan<- relayServeReady
 }
 
 type relayServeReady struct {
 	ListenAddr string
+	TunnelAddr string
 	AdminSock  string
 	Engine     *ldrrelay.RelayEngine
 }
 
+func validateTunnelListen(addr string) (network, cleanAddr string, err error) {
+	if strings.HasPrefix(addr, "unix:") {
+		p := strings.TrimSpace(strings.TrimPrefix(addr, "unix:"))
+		if p == "" {
+			return "", "", errors.New("relay serve --tunnel-listen unix: requires a socket path")
+		}
+		return "unix", p, nil
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || host == "" || port == "" {
+		return "", "", fmt.Errorf("relay serve --tunnel-listen %q must be loopback host:port or unix:/path", addr)
+	}
+	if strings.EqualFold(host, "localhost") {
+		return "tcp", net.JoinHostPort("127.0.0.1", port), nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return "", "", fmt.Errorf("relay serve --tunnel-listen %q refused: plaintext edge-tunnel listener must bind a loopback address or owner-only unix: socket", addr)
+	}
+	return "tcp", addr, nil
+}
+
 func relayCLIServe(args []string, out io.Writer) error {
-	var dir, listenAddr, certPath, keyPath, adminSock string
+	var dir, listenAddr, tunnelListen, tunnelPath, certPath, keyPath, adminSock string
 	args, dir = takeFlag(args, "--dir", "")
 	args, listenAddr = takeFlag(args, "--listen", "127.0.0.1:8443")
+	args, tunnelListen = takeFlag(args, "--tunnel-listen", "")
+	args, tunnelPath = takeFlag(args, "--tunnel-path", "/v1/tunnel")
 	args, certPath = takeFlag(args, "--cert", "")
 	args, keyPath = takeFlag(args, "--key", "")
 	args, adminSock = takeFlag(args, "--admin-sock", "")
@@ -184,12 +211,14 @@ func relayCLIServe(args []string, out io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return runRelayServe(ctx, relayServeOpts{
-		Dir:       dir,
-		Listen:    listenAddr,
-		CertPath:  certPath,
-		KeyPath:   keyPath,
-		AdminSock: adminSock,
-		ClockCfg:  ldrrelay.DefaultClockConfig(),
+		Dir:          dir,
+		Listen:       listenAddr,
+		TunnelListen: tunnelListen,
+		TunnelPath:   tunnelPath,
+		CertPath:     certPath,
+		KeyPath:      keyPath,
+		AdminSock:    adminSock,
+		ClockCfg:     ldrrelay.DefaultClockConfig(),
 	}, out)
 }
 
@@ -197,9 +226,24 @@ func runRelayServe(ctx context.Context, opts relayServeOpts, out io.Writer) erro
 	if opts.Dir == "" {
 		return errors.New("relay serve requires --dir <data_dir>")
 	}
-	listenAddr := opts.Listen
-	if listenAddr == "" {
+	listenAddr := strings.TrimSpace(opts.Listen)
+	tunnelListen := strings.TrimSpace(opts.TunnelListen)
+	if strings.EqualFold(listenAddr, "off") || strings.EqualFold(listenAddr, "none") {
+		if tunnelListen == "" {
+			return errors.New("relay serve --listen off requires --tunnel-listen")
+		}
+		listenAddr = ""
+	}
+	if listenAddr == "" && tunnelListen == "" {
 		listenAddr = "127.0.0.1:8443"
+	}
+	var tunnelNet, tunnelCleanAddr string
+	if tunnelListen != "" {
+		var err error
+		tunnelNet, tunnelCleanAddr, err = validateTunnelListen(tunnelListen)
+		if err != nil {
+			return err
+		}
 	}
 	certPath := opts.CertPath
 	if certPath == "" {
@@ -231,18 +275,89 @@ func runRelayServe(ctx context.Context, opts relayServeOpts, out io.Writer) erro
 		_ = eng.Shutdown()
 		return err
 	}
-	srv := &http.Server{
-		Addr:              listenAddr,
-		Handler:           ldrrelay.NewRelayServer(eng),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	rawLn, err := net.Listen("tcp", listenAddr)
-	if err != nil {
+	relaySrv := ldrrelay.NewRelayServer(eng)
+
+	var (
+		directSrv  *http.Server
+		directLn   net.Listener
+		directAddr string
+		tunnelSrv  *http.Server
+		tunnelWS   *ldrrelay.WSTunnelServer
+		tunnelLn   net.Listener
+		tunnelAddr string
+	)
+	cleanupPreStart := func() {
+		if directLn != nil {
+			_ = directLn.Close()
+		}
+		if tunnelLn != nil {
+			_ = tunnelLn.Close()
+		}
+		if tunnelWS != nil {
+			_ = tunnelWS.Shutdown(context.Background())
+		}
 		_ = adminSrv.Close(context.Background())
 		_ = eng.Shutdown()
-		return err
 	}
-	tlsLn := tls.NewListener(rawLn, tlsCfg)
+
+	if listenAddr != "" {
+		rawLn, err := net.Listen("tcp", listenAddr)
+		if err != nil {
+			cleanupPreStart()
+			return err
+		}
+		directLn = tls.NewListener(rawLn, tlsCfg)
+		directAddr = rawLn.Addr().String()
+		directSrv = &http.Server{
+			Addr:              listenAddr,
+			Handler:           relaySrv,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+	}
+
+	if tunnelListen != "" {
+		tunnelPath := opts.TunnelPath
+		if tunnelPath == "" {
+			tunnelPath = "/v1/tunnel"
+		}
+		wsSrv, err := ldrrelay.NewWSTunnelServer(relaySrv, tlsCfg, tunnelPath, 0)
+		if err != nil {
+			cleanupPreStart()
+			return err
+		}
+		tunnelWS = wsSrv
+		if tunnelNet == "unix" {
+			if err := os.MkdirAll(filepath.Dir(tunnelCleanAddr), 0o700); err != nil {
+				cleanupPreStart()
+				return err
+			}
+			ln, err := net.Listen("unix", tunnelCleanAddr)
+			if err != nil {
+				cleanupPreStart()
+				return err
+			}
+			if err := os.Chmod(tunnelCleanAddr, 0o600); err != nil {
+				_ = ln.Close()
+				cleanupPreStart()
+				return err
+			}
+			tunnelLn = ln
+			tunnelAddr = "unix:" + tunnelCleanAddr
+		} else {
+			ln, err := net.Listen("tcp", tunnelCleanAddr)
+			if err != nil {
+				cleanupPreStart()
+				return err
+			}
+			tunnelLn = ln
+			tunnelAddr = ln.Addr().String()
+		}
+		tunnelSrv = &http.Server{
+			Handler:           tunnelWS,
+			MaxHeaderBytes:    8192,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+	}
 
 	// Periodic 1s clock-guard sampler for drift/freeze detection during idle stretches.
 	sampleCtx, stopSample := context.WithCancel(ctx)
@@ -267,37 +382,55 @@ func runRelayServe(ctx context.Context, opts relayServeOpts, out io.Writer) erro
 		}
 	}()
 
-	errCh := make(chan error, 1)
-	go func() {
-		if err := srv.Serve(tlsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
-		}
-		close(errCh)
-	}()
+	errCh := make(chan error, 2)
+	if directSrv != nil {
+		go func() {
+			if err := directSrv.Serve(directLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+			}
+		}()
+		fmt.Fprintf(out, "yip relay listening on https://%s (direct TLS 1.3, dir=%s, admin=%s)\n", directAddr, opts.Dir, adminSock)
+	}
+	if tunnelSrv != nil {
+		go func() {
+			if err := tunnelSrv.Serve(tunnelLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+			}
+		}()
+		fmt.Fprintf(out, "yip relay ws-tunnel listening on %s (inner TLS 1.3, path=%s, dir=%s, admin=%s)\n", tunnelAddr, opts.TunnelPath, opts.Dir, adminSock)
+	}
 
-	fmt.Fprintf(out, "yip relay listening on https://%s (TLS 1.3, dir=%s, admin=%s)\n", rawLn.Addr().String(), opts.Dir, adminSock)
 	if opts.ReadyCh != nil {
 		opts.ReadyCh <- relayServeReady{
-			ListenAddr: rawLn.Addr().String(),
+			ListenAddr: directAddr,
+			TunnelAddr: tunnelAddr,
 			AdminSock:  adminSock,
 			Engine:     eng,
 		}
 	}
 
-	select {
-	case <-ctx.Done():
+	shutdownAll := func() error {
 		stopSample()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutCtx)
+		if directSrv != nil {
+			_ = directSrv.Shutdown(shutCtx)
+		}
+		if tunnelSrv != nil {
+			_ = tunnelSrv.Shutdown(shutCtx)
+		}
+		if tunnelWS != nil {
+			_ = tunnelWS.Shutdown(shutCtx)
+		}
 		_ = adminSrv.Close(shutCtx)
 		return eng.Shutdown()
+	}
+
+	select {
+	case <-ctx.Done():
+		return shutdownAll()
 	case err := <-errCh:
-		stopSample()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = adminSrv.Close(shutCtx)
-		_ = eng.Shutdown()
+		_ = shutdownAll()
 		return err
 	}
 }
