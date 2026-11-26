@@ -2,6 +2,7 @@ package ldrcrypto
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"sort"
 	"testing"
@@ -479,5 +480,203 @@ func TestP3CeremonyTamperingRejections(t *testing.T) {
 	wrongSecret[0] ^= 0xff
 	if err := VerifyJoinProof(op1.PublicKey(), req, ch, wrongSecret, proof); !errors.Is(err, ErrInvalidCeremony) {
 		t.Fatalf("VerifyJoinProof accepted wrong secret: %v", err)
+	}
+}
+
+// TestIntentDigestAndChainHeadExactRecordLimit verifies Codex Turn 44:
+//   - A signed intent envelope of EXACTLY DefaultMaxBytes (512 KiB = 524288 B)
+//     is accepted by SignIntent and UnmarshalSignedIntent, verified cleanly,
+//     and hashable by IntentDigest, ClientChainHead, and RecoveryChainHead via
+//     streaming SHA-256 (matching an explicit wide-limit reference CBOR hash).
+//   - One byte over the 512 KiB wire boundary (524289 B) is rejected by both
+//     SignIntent and UnmarshalSignedIntent with ErrCBORLimitExceeded.
+//   - Ordinary records produce 100% unchanged SHA-256 digests identical to
+//     sha256.Sum256(MarshalCBOR(preimage)).
+func TestIntentDigestAndChainHeadExactRecordLimit(t *testing.T) {
+	signer, err := GenerateEd25519Key()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lineID := bytes.Repeat([]byte{0x31}, 16)
+	profDig, err := ProfileV1().Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prevHead := sha256.Sum256([]byte("prev-head"))
+	wideLim := Limits{MaxBytes: 2 * 1024 * 1024, MaxDepth: DefaultMaxDepth, MaxItems: DefaultMaxItems}
+
+	refDigest := func(t *testing.T, purpose string, fields ...any) [32]byte {
+		t.Helper()
+		arr := make([]any, 0, 2+len(fields))
+		arr = append(arr, purpose, uint64(1))
+		arr = append(arr, fields...)
+		enc, err := MarshalCBORWithLimits(arr, wideLim)
+		if err != nil {
+			t.Fatalf("reference MarshalCBORWithLimits(%s): %v", purpose, err)
+		}
+		return sha256.Sum256(enc)
+	}
+
+	// 1. Ordinary record: streaming digests MUST equal sha256.Sum256(MarshalCBOR(...)) verbatim.
+	smallBody, err := MarshalCBOR(Map{
+		{Key: "op_id", Value: "ordinary-1"},
+		{Key: "v", Value: uint64(1)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	smallEnv, err := SignIntent(signer, smallBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotSmallDig, err := smallEnv.Digest()
+	if err != nil {
+		t.Fatalf("smallEnv.Digest: %v", err)
+	}
+	wantSmallDig := refDigest(t, PurposeIntent, smallEnv.RawBytes)
+	if gotSmallDig != wantSmallDig {
+		t.Fatalf("ordinary IntentDigest changed: got %x want %x", gotSmallDig, wantSmallDig)
+	}
+	gotSmallHead, err := ClientChainHead(prevHead, profDig, lineID, 1, 7, 1_700_000_000_000, "actor", smallEnv.RawBytes)
+	if err != nil {
+		t.Fatalf("ordinary ClientChainHead: %v", err)
+	}
+	wantSmallHead := refDigest(t, PurposeChain, Map{
+		{Key: "gen", Value: uint64(1)},
+		{Key: "intent", Value: smallEnv.RawBytes},
+		{Key: "line_id", Value: lineID},
+		{Key: "origin", Value: "actor"},
+		{Key: "prev_head", Value: prevHead[:]},
+		{Key: "profile_digest", Value: profDig[:]},
+		{Key: "seq", Value: uint64(7)},
+		{Key: "seq_time", Value: uint64(1_700_000_000_000)},
+	})
+	if gotSmallHead != wantSmallHead {
+		t.Fatalf("ordinary ClientChainHead changed: got %x want %x", gotSmallHead, wantSmallHead)
+	}
+	gotSmallRecHead, err := RecoveryChainHead(prevHead, profDig, lineID, 2, 1, 1_700_000_000_000, smallEnv.RawBytes)
+	if err != nil {
+		t.Fatalf("ordinary RecoveryChainHead: %v", err)
+	}
+	wantSmallRecHead := refDigest(t, PurposeChainRecovery, Map{
+		{Key: "gen", Value: uint64(2)},
+		{Key: "line_id", Value: lineID},
+		{Key: "prev_head", Value: prevHead[:]},
+		{Key: "profile_digest", Value: profDig[:]},
+		{Key: "recovery", Value: smallEnv.RawBytes},
+		{Key: "seq", Value: uint64(1)},
+		{Key: "seq_time", Value: uint64(1_700_000_000_000)},
+	})
+	if gotSmallRecHead != wantSmallRecHead {
+		t.Fatalf("ordinary RecoveryChainHead changed: got %x want %x", gotSmallRecHead, wantSmallRecHead)
+	}
+
+	// 2. Exact 512 KiB (DefaultMaxBytes = 524288 B) signed intent envelope:
+	//    Ed25519 SignedIntent envelope overhead is 96 B:
+	//      a4 (1) + "v":1 (3) + "alg":"ed25519" (12) + "sig":64B (70) + "body" key+5B hdr (10) = 96 B.
+	//    Body map {"d": bstr} overhead is 8 B: a1 (1) + "d" (2) + 5B bstr hdr (5) = 8 B.
+	const maxBodyLen = DefaultMaxBytes - 96
+	const exactBlobLen = maxBodyLen - 8
+	exactBlob := make([]byte, exactBlobLen)
+	for i := range exactBlob {
+		exactBlob[i] = byte((i*13 + 5) & 0xff)
+	}
+	exactBody, err := MarshalCBOR(Map{{Key: "d", Value: exactBlob}})
+	if err != nil {
+		t.Fatalf("MarshalCBOR(exactBody): %v", err)
+	}
+	if len(exactBody) != maxBodyLen {
+		t.Fatalf("exactBody len = %d, want %d", len(exactBody), maxBodyLen)
+	}
+	exactEnv, err := SignIntent(signer, exactBody)
+	if err != nil {
+		t.Fatalf("SignIntent(exact 512KiB envelope): %v", err)
+	}
+	if len(exactEnv.RawBytes) != DefaultMaxBytes {
+		t.Fatalf("exactEnv.RawBytes len = %d, want exact DefaultMaxBytes (%d)", len(exactEnv.RawBytes), DefaultMaxBytes)
+	}
+
+	// Exact-limit envelope MUST decode and verify under DefaultLimits().
+	parsedExact, err := UnmarshalSignedIntent(exactEnv.RawBytes, DefaultLimits())
+	if err != nil {
+		t.Fatalf("UnmarshalSignedIntent(exact 512KiB): %v", err)
+	}
+	if err := parsedExact.Verify(signer.PublicKey()); err != nil {
+		t.Fatalf("Verify(exact 512KiB): %v", err)
+	}
+
+	// IntentDigest, ClientChainHead, and RecoveryChainHead MUST succeed on the exact 512 KiB envelope
+	// and match the exact reference canonical CBOR SHA-256 preimage!
+	gotExactDig, err := parsedExact.Digest()
+	if err != nil {
+		t.Fatalf("IntentDigest(exact 512KiB): %v", err)
+	}
+	wantExactDig := refDigest(t, PurposeIntent, parsedExact.RawBytes)
+	if gotExactDig != wantExactDig {
+		t.Fatalf("exact 512KiB IntentDigest mismatch: got %x want %x", gotExactDig, wantExactDig)
+	}
+
+	gotExactHead, err := ClientChainHead(prevHead, profDig, lineID, 1, 9, 1_700_000_001_000, "actor", parsedExact.RawBytes)
+	if err != nil {
+		t.Fatalf("ClientChainHead(exact 512KiB): %v", err)
+	}
+	wantExactHead := refDigest(t, PurposeChain, Map{
+		{Key: "gen", Value: uint64(1)},
+		{Key: "intent", Value: parsedExact.RawBytes},
+		{Key: "line_id", Value: lineID},
+		{Key: "origin", Value: "actor"},
+		{Key: "prev_head", Value: prevHead[:]},
+		{Key: "profile_digest", Value: profDig[:]},
+		{Key: "seq", Value: uint64(9)},
+		{Key: "seq_time", Value: uint64(1_700_000_001_000)},
+	})
+	if gotExactHead != wantExactHead {
+		t.Fatalf("exact 512KiB ClientChainHead mismatch: got %x want %x", gotExactHead, wantExactHead)
+	}
+
+	gotExactRecHead, err := RecoveryChainHead(prevHead, profDig, lineID, 2, 1, 1_700_000_002_000, parsedExact.RawBytes)
+	if err != nil {
+		t.Fatalf("RecoveryChainHead(exact 512KiB): %v", err)
+	}
+	wantExactRecHead := refDigest(t, PurposeChainRecovery, Map{
+		{Key: "gen", Value: uint64(2)},
+		{Key: "line_id", Value: lineID},
+		{Key: "prev_head", Value: prevHead[:]},
+		{Key: "profile_digest", Value: profDig[:]},
+		{Key: "recovery", Value: parsedExact.RawBytes},
+		{Key: "seq", Value: uint64(1)},
+		{Key: "seq_time", Value: uint64(1_700_000_002_000)},
+	})
+	if gotExactRecHead != wantExactRecHead {
+		t.Fatalf("exact 512KiB RecoveryChainHead mismatch: got %x want %x", gotExactRecHead, wantExactRecHead)
+	}
+
+	// 3. One byte over the 512 KiB wire record boundary (524289 B) MUST be rejected by both
+	//    SignIntent and UnmarshalSignedIntent!
+	overBody, err := MarshalCBOR(Map{{Key: "d", Value: make([]byte, exactBlobLen+1)}})
+	if err != nil {
+		t.Fatalf("MarshalCBOR(overBody): %v", err)
+	}
+	if _, err := SignIntent(signer, overBody); !errors.Is(err, ErrCBORLimitExceeded) {
+		t.Fatalf("SignIntent(512KiB+1): got %v, want ErrCBORLimitExceeded", err)
+	}
+	overSig, err := SignDomain(signer, PurposeIntentSignatureDigest, 1, overBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overWire, err := MarshalCBORWithLimits(Map{
+		{Key: "alg", Value: AlgEd25519},
+		{Key: "body", Value: overBody},
+		{Key: "sig", Value: overSig},
+		{Key: "v", Value: uint64(1)},
+	}, wideLim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overWire) != DefaultMaxBytes+1 {
+		t.Fatalf("overWire len = %d, want %d", len(overWire), DefaultMaxBytes+1)
+	}
+	if _, err := UnmarshalSignedIntent(overWire, DefaultLimits()); !errors.Is(err, ErrCBORLimitExceeded) {
+		t.Fatalf("UnmarshalSignedIntent(512KiB+1): got %v, want ErrCBORLimitExceeded", err)
 	}
 }

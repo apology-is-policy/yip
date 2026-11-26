@@ -2,7 +2,6 @@ package ldrcrypto
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sort"
@@ -31,7 +30,8 @@ var (
 	ErrInvalidRootKeys    = errors.New("ldrcrypto: invalid equal 1-of-2 root keys")
 )
 
-// DomainDigest computes SHA-256(Enc([purpose, version, fields...])).
+// DomainDigest computes SHA-256(Enc([purpose, version, fields...])) by
+// streaming canonical RFC 8949 §4.2.1 CBOR directly into SHA-256.
 func DomainDigest(purpose string, version uint64, fields ...any) ([32]byte, error) {
 	var zero [32]byte
 	if purpose == "" {
@@ -40,11 +40,7 @@ func DomainDigest(purpose string, version uint64, fields ...any) ([32]byte, erro
 	arr := make([]any, 0, 2+len(fields))
 	arr = append(arr, purpose, version)
 	arr = append(arr, fields...)
-	enc, err := MarshalCBOR(arr)
-	if err != nil {
-		return zero, err
-	}
-	return sha256.Sum256(enc), nil
+	return hashCanonicalCBOR(arr)
 }
 
 // Commitment binds a sidecar's domain-separated SHA-256 digest and exact byte length.

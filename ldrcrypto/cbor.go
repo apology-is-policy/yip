@@ -8,9 +8,11 @@ package ldrcrypto
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"unicode/utf8"
 )
@@ -417,6 +419,242 @@ func (e *cborEncoder) finishEncodedMap(sorted []encodedMapEntry, depth int) erro
 			return err
 		}
 		e.buf = append(e.buf, ent.keyBytes...)
+		if err := e.encodeValue(ent.entry.Value, depth+1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// hashCanonicalCBOR streams the exact RFC 8949 §4.2.1 canonical CBOR encoding
+// of v directly into SHA-256 without buffering the full preimage in memory.
+// Wire inputs remain bounded by their respective profile limits at decode/encode
+// boundaries, while enclosing domain-digest metadata never trips the 512 KiB
+// single-buffer marshal cap.
+func hashCanonicalCBOR(v any) ([32]byte, error) {
+	var zero [32]byte
+	h := sha256.New()
+	enc := cborStreamEncoder{
+		w:        h,
+		maxDepth: DefaultMaxDepth,
+		maxItems: DefaultMaxItems,
+	}
+	if err := enc.encodeValue(v, 0); err != nil {
+		return zero, err
+	}
+	var out [32]byte
+	h.Sum(out[:0])
+	return out, nil
+}
+
+type cborStreamEncoder struct {
+	w        io.Writer
+	maxDepth int
+	maxItems int
+	items    int
+	hdrBuf   [9]byte
+}
+
+func (e *cborStreamEncoder) countItem() error {
+	e.items++
+	if e.items > e.maxItems {
+		return fmt.Errorf("%w: item count > %d", ErrCBORLimitExceeded, e.maxItems)
+	}
+	return nil
+}
+
+func (e *cborStreamEncoder) writeTypeArg(major byte, n uint64) error {
+	b := appendTypeArg(e.hdrBuf[:0], major, n)
+	_, err := e.w.Write(b)
+	return err
+}
+
+func (e *cborStreamEncoder) encodeUint(n uint64) error {
+	if n > MaxCounter {
+		return fmt.Errorf("%w: %d", ErrCBOROutOfDomain, n)
+	}
+	return e.writeTypeArg(0, n)
+}
+
+func (e *cborStreamEncoder) encodeValue(v any, depth int) error {
+	if err := e.countItem(); err != nil {
+		return err
+	}
+	switch x := v.(type) {
+	case uint64:
+		return e.encodeUint(x)
+	case uint:
+		return e.encodeUint(uint64(x))
+	case uint32:
+		return e.encodeUint(uint64(x))
+	case uint16:
+		return e.encodeUint(uint64(x))
+	case uint8:
+		return e.encodeUint(uint64(x))
+	case int:
+		if x < 0 {
+			return fmt.Errorf("%w: negative integer %d", ErrCBORUnsupported, x)
+		}
+		return e.encodeUint(uint64(x))
+	case int64:
+		if x < 0 {
+			return fmt.Errorf("%w: negative integer %d", ErrCBORUnsupported, x)
+		}
+		return e.encodeUint(uint64(x))
+	case bool:
+		if x {
+			e.hdrBuf[0] = 0xf5
+		} else {
+			e.hdrBuf[0] = 0xf4
+		}
+		_, err := e.w.Write(e.hdrBuf[:1])
+		return err
+	case []byte:
+		if uint64(len(x)) > MaxCounter {
+			return ErrCBOROutOfDomain
+		}
+		if err := e.writeTypeArg(2, uint64(len(x))); err != nil {
+			return err
+		}
+		if len(x) > 0 {
+			if _, err := e.w.Write(x); err != nil {
+				return err
+			}
+		}
+		return nil
+	case string:
+		if uint64(len(x)) > MaxCounter {
+			return ErrCBOROutOfDomain
+		}
+		if !utf8.ValidString(x) {
+			return fmt.Errorf("%w: invalid UTF-8 string", ErrCBORInvalid)
+		}
+		if err := e.writeTypeArg(3, uint64(len(x))); err != nil {
+			return err
+		}
+		if len(x) > 0 {
+			if _, err := io.WriteString(e.w, x); err != nil {
+				return err
+			}
+		}
+		return nil
+	case []any:
+		if depth >= e.maxDepth {
+			return fmt.Errorf("%w: depth > %d", ErrCBORLimitExceeded, e.maxDepth)
+		}
+		if len(x) > e.maxItems-e.items {
+			return fmt.Errorf("%w: array length %d exceeds remaining budget", ErrCBORLimitExceeded, len(x))
+		}
+		if err := e.writeTypeArg(4, uint64(len(x))); err != nil {
+			return err
+		}
+		for _, elem := range x {
+			if err := e.encodeValue(elem, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	case []string:
+		if depth >= e.maxDepth {
+			return fmt.Errorf("%w: depth > %d", ErrCBORLimitExceeded, e.maxDepth)
+		}
+		if len(x) > e.maxItems-e.items {
+			return fmt.Errorf("%w: array length %d exceeds remaining budget", ErrCBORLimitExceeded, len(x))
+		}
+		if err := e.writeTypeArg(4, uint64(len(x))); err != nil {
+			return err
+		}
+		for _, elem := range x {
+			if err := e.encodeValue(elem, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	case Map:
+		return e.encodeMapSlice(x, depth)
+	case map[string]any:
+		return e.encodeGoMap(x, depth)
+	case nil:
+		return fmt.Errorf("%w: null is disallowed", ErrCBORUnsupported)
+	default:
+		return fmt.Errorf("%w: %T", ErrCBORUnsupported, v)
+	}
+}
+
+func (e *cborStreamEncoder) preflightMap(n int, depth int) error {
+	if depth >= e.maxDepth {
+		return fmt.Errorf("%w: depth > %d", ErrCBORLimitExceeded, e.maxDepth)
+	}
+	if n < 0 || uint64(n) > MaxCounter {
+		return ErrCBOROutOfDomain
+	}
+	if n > (e.maxItems-e.items)/2 {
+		return fmt.Errorf("%w: map length %d exceeds remaining budget", ErrCBORLimitExceeded, n)
+	}
+	return nil
+}
+
+func (e *cborStreamEncoder) encodeMapSlice(entries []MapEntry, depth int) error {
+	if err := e.preflightMap(len(entries), depth); err != nil {
+		return err
+	}
+	remKeyBytes := DefaultMaxBytes
+	for _, ent := range entries {
+		if err := preflightMapKey(ent.Key, &remKeyBytes, DefaultMaxBytes); err != nil {
+			return err
+		}
+	}
+	sorted := make([]encodedMapEntry, len(entries))
+	for i, ent := range entries {
+		kb, err := encodeASCIIKey(ent.Key)
+		if err != nil {
+			return err
+		}
+		sorted[i] = encodedMapEntry{keyBytes: kb, entry: ent}
+	}
+	return e.finishEncodedMap(sorted, depth)
+}
+
+func (e *cborStreamEncoder) encodeGoMap(m map[string]any, depth int) error {
+	if err := e.preflightMap(len(m), depth); err != nil {
+		return err
+	}
+	remKeyBytes := DefaultMaxBytes
+	for k := range m {
+		if err := preflightMapKey(k, &remKeyBytes, DefaultMaxBytes); err != nil {
+			return err
+		}
+	}
+	sorted := make([]encodedMapEntry, 0, len(m))
+	for k, val := range m {
+		kb, err := encodeASCIIKey(k)
+		if err != nil {
+			return err
+		}
+		sorted = append(sorted, encodedMapEntry{keyBytes: kb, entry: MapEntry{Key: k, Value: val}})
+	}
+	return e.finishEncodedMap(sorted, depth)
+}
+
+func (e *cborStreamEncoder) finishEncodedMap(sorted []encodedMapEntry, depth int) error {
+	sort.Slice(sorted, func(i, j int) bool {
+		return bytes.Compare(sorted[i].keyBytes, sorted[j].keyBytes) < 0
+	})
+	for i := 1; i < len(sorted); i++ {
+		if bytes.Equal(sorted[i-1].keyBytes, sorted[i].keyBytes) {
+			return fmt.Errorf("%w: duplicate map key %q", ErrCBORNonCanonical, sorted[i].entry.Key)
+		}
+	}
+	if err := e.writeTypeArg(5, uint64(len(sorted))); err != nil {
+		return err
+	}
+	for _, ent := range sorted {
+		if err := e.countItem(); err != nil {
+			return err
+		}
+		if _, err := e.w.Write(ent.keyBytes); err != nil {
+			return err
+		}
 		if err := e.encodeValue(ent.entry.Value, depth+1); err != nil {
 			return err
 		}
