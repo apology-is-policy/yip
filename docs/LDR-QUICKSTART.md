@@ -253,6 +253,15 @@ yip ldr detach
 
 ## 5. Day-to-day operations & incident response
 
+On an enrolled workstation, open Switchboard for the attached local line:
+
+```sh
+yip --line <local-line-name> switchboard
+```
+
+Use **1** for the selected call’s transcript, **n/p** to change calls, **2** for the relay URL, transport and last verified checkpoint, and **5** for the line’s credential and actor topology. The graph shows enrollment. Local dispatcher status appears under **Local delivery**. Viewing a transcript leaves agent delivery receipts and read cursors alone. If a refresh fails, the board shows the error and retains the last verified view for that attachment.
+
+
 - **Inspect live relay health & ClockGuard (while `yip relay serve` is running, via its local Unix admin socket):**
   ```sh
   yip relay clock status --dir ~/.yip-relay

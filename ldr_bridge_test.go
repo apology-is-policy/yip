@@ -347,6 +347,61 @@ func TestLDRBridgeTwoWorkstationsMCPHooksLiveDeliveryAndHostLocalResources(t *te
 	if !strings.Contains(delivered[0], "LDR ") {
 		t.Fatalf("expected LDR notice text in delivery batch, got %q", delivered[0])
 	}
+	t.Run("Switchboard reads the transcript and preserves pending delivery", func(t *testing.T) {
+		att, ok, err := loadLDRAttachment()
+		if err != nil || !ok {
+			t.Fatalf("attachment: ok=%v err=%v", ok, err)
+		}
+		files := []string{endpointPath("codex"), ldrCursorsPath(), filepath.Join(bobClientDir, "cursors.cbor"), filepath.Join(bobClientDir, "outbox.cbor")}
+		read := func(path string) []byte {
+			t.Helper()
+			data, err := os.ReadFile(path)
+			if os.IsNotExist(err) && path == ldrCursorsPath() {
+				return nil // An unread call may have no local read cursor yet.
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			return data
+		}
+		before := make(map[string][]byte)
+		for _, file := range files {
+			before[file] = read(file)
+		}
+		board := loadRelayBoard(ctx, att, "", sbState{relay: &sbRelay{}})
+		if board.err != "" || len(board.calls) != 1 || board.relay.VerifiedAt.IsZero() {
+			t.Fatalf("board refresh: calls=%d error=%q", len(board.calls), board.err)
+		}
+		v := view{st: board}
+		if got := strings.Join(v.styledTranscript(90, colors()), " "); !strings.Contains(got, "Hello from Alice workstation over TLS 1.3!") {
+			t.Fatalf("transcript: %q", got)
+		}
+		if got := strings.Join(v.relayTopology(), " "); !strings.Contains(got, "bob-codex") || !strings.Contains(got, "alice-gemini") {
+			t.Fatalf("topology: %q", got)
+		}
+		for _, key := range "arbP4" {
+			v.key(key)
+			if v.prompt != "" || v.tab != 0 || v.flash != "Read-only relay view" {
+				t.Fatalf("unexpected relay action on %q", key)
+			}
+		}
+		// A co-resident agent holding the directory must leave the last snapshot visible.
+		other, err := ldrclient.OpenClient(bobClientDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stale := loadRelayBoard(ctx, att, board.calls[0].call.ID, board)
+		other.Close()
+		if stale.err == "" || stale.relay != board.relay {
+			t.Fatal("failed refresh lost the last verified snapshot")
+		}
+		for _, file := range files {
+			if !bytes.Equal(before[file], read(file)) {
+				t.Fatalf("viewing the call changed %s", filepath.Base(file))
+			}
+		}
+	})
+
 	// Ack the delivered notices via standard delivery_ack MCP tool and confirm LDR client acks them too!
 	ep, err := readEndpoint("codex")
 	if err != nil {

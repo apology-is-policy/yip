@@ -364,7 +364,7 @@ func InitClientDir(opts InitDirOptions) (*Client, error) {
 		return nil, err
 	}
 	// Hand the already-held exclusive lock directly to openClientLocked (zero TOCTOU gap).
-	return openClientLocked(opts.Dir, lf, nil, nil)
+	return openClientLocked(opts.Dir, lf, nil, nil, true)
 }
 
 // OpenClient opens an existing client directory, acquires its exclusive OS lock,
@@ -379,6 +379,10 @@ func OpenClient(dir string) (*Client, error) {
 // OpenClientWithSyncHooks opens an existing client directory using the provided
 // file/directory durability hooks (nil defaults to OS SyncFile/SyncDir).
 func OpenClientWithSyncHooks(dir string, syncFile func(*os.File) error, syncDir func(string) error) (*Client, error) {
+	return openClient(dir, syncFile, syncDir, true)
+}
+
+func openClient(dir string, syncFile func(*os.File) error, syncDir func(string) error, recoverOutbox bool) (*Client, error) {
 	if dir == "" {
 		return nil, errors.New("ldrclient: empty client directory")
 	}
@@ -391,10 +395,10 @@ func OpenClientWithSyncHooks(dir string, syncFile func(*os.File) error, syncDir 
 		_ = lf.Close()
 		return nil, err
 	}
-	return openClientLocked(dir, lf, syncFile, syncDir)
+	return openClientLocked(dir, lf, syncFile, syncDir, recoverOutbox)
 }
 
-func openClientLocked(dir string, lf *os.File, syncFile func(*os.File) error, syncDir func(string) error) (*Client, error) {
+func openClientLocked(dir string, lf *os.File, syncFile func(*os.File) error, syncDir func(string) error, recoverOutbox bool) (*Client, error) {
 	cleanupLock := func() {
 		_ = funlock(lf)
 		_ = lf.Close()
@@ -507,7 +511,7 @@ func openClientLocked(dir string, lf *os.File, syncFile func(*os.File) error, sy
 			hasUnsettled = true
 		}
 	}
-	if hasUnsettled {
+	if recoverOutbox && hasUnsettled {
 		candidate := clonePersistedOutbox(c.outbox)
 		candidate.ResolveEpoch++
 		candidate.MustResolve = true

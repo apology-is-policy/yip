@@ -1974,6 +1974,20 @@ func TestOutboxResolveAllMultiSignerProgressAndMustResolve(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		// A Switchboard refresh may share this directory before the sending agent restarts.
+		outboxPath := filepath.Join(dirA, "outbox.cbor")
+		before, err := os.ReadFile(outboxPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ObserveCalls(ctx, dirA, "", nil); err != nil {
+			t.Fatalf("observe with pending sends: %v", err)
+		}
+		after, err := os.ReadFile(outboxPath)
+		if err != nil || !bytes.Equal(before, after) {
+			t.Fatalf("observing changed pending sends: %v", err)
+		}
+
 		// Reopen dirA: openClientLocked MUST set MustResolve=true and NeedsResolve=true on BOTH!
 		reopened, err := OpenClient(dirA)
 		if err != nil {

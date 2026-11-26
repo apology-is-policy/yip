@@ -192,7 +192,7 @@ func (v *view) mouse(m sbMouse) {
 		}
 		return
 	}
-	if button == 0 && pane == 2 && v.tab == 4 {
+	if button == 0 && pane == 2 && v.tab == 4 && v.st.relay == nil {
 		v.mapClick(m.y-l.top+v.scroll, m.x-l.centerX-2)
 		return
 	}

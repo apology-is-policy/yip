@@ -72,6 +72,9 @@ func (v *view) frameLines(rows, cols int) []string {
 	}
 	header := p.text(p.cyan, "  ╭─ YIP ") + p.text(p.ink, "/ SWITCHBOARD")
 	right := fmt.Sprintf("%s  %d active · %d stale  ", name, open, stale)
+	if v.st.relay != nil {
+		right = "LDR · " + name + "  "
+	}
 	put(fitCells(header, max(1, cols-plainWidth(right)), true) + p.text(p.muted, right))
 	put(p.text(p.line, "  ╰"+strings.Repeat("─", max(0, cols-5))) + p.text(p.cyan, "╮"))
 	sc := v.selectedConversation()
@@ -92,6 +95,20 @@ func (v *view) frameLines(rows, cols int) []string {
 	if v.tab == 4 {
 		title, detail = "Where everyone is", "n/p or click: whose stations are listed · click a station: its description"
 	}
+	if v.st.relay != nil {
+		if sc == nil && v.st.relay.VerifiedAt.IsZero() {
+			title, detail = "Relay calls", "Connecting to the enrolled line…"
+		}
+		if v.tab == 4 {
+			title, detail = "Relay topology", "Enrolled credentials and their declared actors"
+		}
+		if v.tab == 1 {
+			title, detail = "Relay status", v.st.relay.Origin.URL
+		}
+		if v.st.err != "" {
+			detail = "Refresh failed · " + v.st.err
+		}
+	}
 	put("  " + p.text(p.ink, title))
 	put("  " + p.text(p.muted, detail))
 	put("")
@@ -106,7 +123,11 @@ func (v *view) frameLines(rows, cols int) []string {
 	case 3:
 		transcript = v.memoBroadcasts(centerW-4, p)
 	case 4:
-		transcript = v.mapLines(centerW-4, p)
+		if v.st.relay != nil {
+			transcript = v.relayTopology()
+		} else {
+			transcript = v.mapLines(centerW-4, p)
+		}
 	default:
 		transcript = v.memoTranscript(max(8, centerW-4), p)
 	}
@@ -156,6 +177,9 @@ func (v *view) frameLines(rows, cols int) []string {
 		help := "  click call · wheel over pane · tab/n next · p prev · j/k scroll · f follow · 1 chat 2 desk 3 calls 4 broadcasts 5 map · b compose · r ratify · a arbitrate · q quit"
 		if cols < 125 {
 			help = "  1 chat 2 desk 3 calls 4 broadcasts 5 map · b compose · r ratify · a arbitrate · ? help · q quit"
+		}
+		if v.st.relay != nil {
+			help = "  " + sbRelayKeys
 		}
 		if v.flash != "" {
 			help = "  " + v.flash
@@ -213,6 +237,15 @@ func (v *view) memoTranscript(w int, p palette) []string {
 }
 func (v *view) styledTranscript(w int, p palette) []string {
 	sc := v.selectedConversation()
+	if v.st.relay != nil && sc != nil && (v.st.relay.Transcript == nil || v.st.relay.Transcript.ID != sc.call.ID) {
+		return []string{"Fetching transcript…"}
+	}
+	if sc == nil && v.st.relay != nil {
+		if v.st.relay.VerifiedAt.IsZero() {
+			return []string{"Awaiting verified line state"}
+		}
+		return []string{"No calls on this line."}
+	}
 	if sc == nil {
 		return []string{"", p.text(p.cyan, "A quiet line."), "", p.text(p.muted, "Open a call to begin a conversation.")}
 	}
@@ -284,6 +317,9 @@ func (v *view) callRail(w int, p palette) []string {
 func (v *view) dashboard(w int, p palette) []string {
 	if w < 8 {
 		return nil
+	}
+	if v.st.relay != nil {
+		return v.relayDashboard(w, p)
 	}
 	out := []string{}
 	if sc := v.selectedCall(); sc != nil && len(sc.disputes) > 0 {

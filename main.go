@@ -818,11 +818,6 @@ func main() {
 		me := must(WhoAmI(as, ""))
 		printSetup(me)
 	case "switchboard":
-		if _, ok, err := loadLDRAttachment(); err != nil {
-			check(err)
-		} else if ok {
-			check(fmt.Errorf("local `yip switchboard` is not supported on LDR-attached lines; use `yip ldr` or `yip api`"))
-		}
 		// The human's live seat. It can ratify and arbitrate; it deliberately
 		// has no key that speaks as an agent -- see switchboard.go.
 		if err := Switchboard(parseSwitchboardArgs(args)); err != nil {
