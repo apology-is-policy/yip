@@ -54,23 +54,60 @@ type activeSession struct {
 type RelayServer struct {
 	engine *RelayEngine
 
-	mu       sync.Mutex
-	pending  map[string]pendingChallenge // hex(session_id)
-	sessions map[string]*activeSession   // hex(session_id)
-	mux      *http.ServeMux
+	mu          sync.Mutex
+	pending     map[string]pendingChallenge // hex(session_id)
+	sessions    map[string]*activeSession   // hex(session_id)
+	nowFn       func() time.Time            // nil defaults to time.Now (test hook)
+	idleTimeout time.Duration               // <=0 defaults to sessionIdleTimeout
+	mux         *http.ServeMux
 }
 
 // NewRelayServer creates an HTTP handler serving the LDR v1 relay API.
 func NewRelayServer(engine *RelayEngine) *RelayServer {
 	s := &RelayServer{
-		engine:   engine,
-		pending:  make(map[string]pendingChallenge),
-		sessions: make(map[string]*activeSession),
-		mux:      http.NewServeMux(),
+		engine:      engine,
+		pending:     make(map[string]pendingChallenge),
+		sessions:    make(map[string]*activeSession),
+		idleTimeout: sessionIdleTimeout,
+		mux:         http.NewServeMux(),
 	}
 	s.mux.HandleFunc("/v1/health", s.handleHealth)
 	s.mux.HandleFunc("/v1/lines/", s.handleLine)
 	return s
+}
+
+func (s *RelayServer) now() time.Time {
+	s.mu.Lock()
+	fn := s.nowFn
+	s.mu.Unlock()
+	if fn != nil {
+		return fn()
+	}
+	return time.Now()
+}
+
+func (s *RelayServer) idleLimitLocked() time.Duration {
+	if s.idleTimeout > 0 {
+		return s.idleTimeout
+	}
+	return sessionIdleTimeout
+}
+
+func (s *RelayServer) isSessionExpiredLocked(as *activeSession, now time.Time) bool {
+	return now.Sub(as.lastSeen) > s.idleLimitLocked()
+}
+
+// setTestSessionClock overrides the server session clock and idle timeout for
+// deterministic unit testing without wall-clock sleeps.
+func (s *RelayServer) setTestSessionClock(nowFn func() time.Time, idle time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nowFn = nowFn
+	if idle > 0 {
+		s.idleTimeout = idle
+	} else {
+		s.idleTimeout = sessionIdleTimeout
+	}
 }
 
 // ServeHTTP satisfies http.Handler. Every line endpoint requires TLS 1.3.
@@ -183,7 +220,7 @@ func (s *RelayServer) sweepLocked(now time.Time) {
 		}
 	}
 	for k, as := range s.sessions {
-		if now.Sub(as.lastSeen) > sessionIdleTimeout {
+		if s.isSessionExpiredLocked(as, now) {
 			delete(s.sessions, k)
 		}
 	}
@@ -201,6 +238,14 @@ func (s *RelayServer) handleChallenge(w http.ResponseWriter, lineID []byte, cb [
 		return
 	}
 	if err := ldrcrypto.RequireExactKeys(m, []string{"generation", "line_id", "principal", "profile_digest", "v"}); err != nil {
+		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "error", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
+		return
+	}
+	if v, err := ldrcrypto.MapUint(m, "v"); err != nil || v != 1 {
+		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "error", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
+		return
+	}
+	if reqGen, err := ldrcrypto.MapUint(m, "generation"); err != nil || reqGen < 1 {
 		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "error", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
 		return
 	}
@@ -235,7 +280,7 @@ func (s *RelayServer) handleChallenge(w http.ResponseWriter, lineID []byte, cb [
 		http.Error(w, "rng failure", http.StatusInternalServerError)
 		return
 	}
-	now := time.Now()
+	now := s.now()
 	exp := now.Add(challengeTTL)
 
 	s.mu.Lock()
@@ -277,6 +322,10 @@ func (s *RelayServer) handleAuth(w http.ResponseWriter, lineID []byte, cb [32]by
 		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
 		return
 	}
+	if v, err := ldrcrypto.MapUint(m, "v"); err != nil || v != 1 {
+		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
+		return
+	}
 	sid, err := ldrcrypto.MapBytesLen(m, "session_id", 16)
 	if err != nil {
 		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
@@ -294,7 +343,7 @@ func (s *RelayServer) handleAuth(w http.ResponseWriter, lineID []byte, cb [32]by
 	}
 
 	sidHex := hex.EncodeToString(sid)
-	now := time.Now()
+	now := s.now()
 	s.mu.Lock()
 	pc, found := s.pending[sidHex]
 	// Burn challenge immediately on first attempt (single-use!).
@@ -374,10 +423,18 @@ func (s *RelayServer) handleAuth(w http.ResponseWriter, lineID []byte, cb [32]by
 
 func (s *RelayServer) validateSession(sid []byte, lineID []byte, cb [32]byte, reqID uint64, requireMonotonic bool) (ldrcrypto.Principal, uint64, bool) {
 	sidHex := hex.EncodeToString(sid)
+	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess, ok := s.sessions[sidHex]
-	if !ok || !bytes.Equal(sess.lineID, lineID) || sess.cb != cb {
+	if !ok {
+		return ldrcrypto.Principal{}, 0, false
+	}
+	if s.isSessionExpiredLocked(sess, now) {
+		delete(s.sessions, sidHex)
+		return ldrcrypto.Principal{}, 0, false
+	}
+	if !bytes.Equal(sess.lineID, lineID) || sess.cb != cb {
 		return ldrcrypto.Principal{}, 0, false
 	}
 	if requireMonotonic {
@@ -386,7 +443,7 @@ func (s *RelayServer) validateSession(sid []byte, lineID []byte, cb [32]byte, re
 		}
 		sess.lastReqID = reqID
 	}
-	sess.lastSeen = time.Now()
+	sess.lastSeen = now
 	return sess.principal, sess.gen, true
 }
 
@@ -402,6 +459,10 @@ func (s *RelayServer) handleSubmit(w http.ResponseWriter, lineID []byte, cb [32]
 		return
 	}
 	if err := ldrcrypto.RequireExactKeys(m, []string{"intent", "req_id", "session_id", "v"}, "payload", "wraps"); err != nil {
+		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
+		return
+	}
+	if v, err := ldrcrypto.MapUint(m, "v"); err != nil || v != 1 {
 		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
 		return
 	}
@@ -479,6 +540,10 @@ func (s *RelayServer) handleQuery(w http.ResponseWriter, lineID []byte, cb [32]b
 		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
 		return
 	}
+	if v, err := ldrcrypto.MapUint(m, "v"); err != nil || v != 1 {
+		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
+		return
+	}
 	sid, err := ldrcrypto.MapBytesLen(m, "session_id", 16)
 	if err != nil {
 		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
@@ -547,6 +612,10 @@ func (s *RelayServer) handleAnchor(w http.ResponseWriter, lineID []byte, cb [32]
 		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
 		return
 	}
+	if v, err := ldrcrypto.MapUint(m, "v"); err != nil || v != 1 {
+		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
+		return
+	}
 	sid, err1 := ldrcrypto.MapBytesLen(m, "session_id", 16)
 	reqID, err2 := ldrcrypto.MapUint(m, "req_id")
 	sig, err3 := ldrcrypto.MapBytes(m, "sig")
@@ -583,6 +652,7 @@ func (s *RelayServer) handleAnchor(w http.ResponseWriter, lineID []byte, cb [32]
 		{Key: "req_id", Value: reqID},
 		{Key: "seq", Value: rep.Seq},
 		{Key: "seq_time", Value: rep.SeqTime},
+		{Key: "session_gen", Value: gen},
 		{Key: "session_id", Value: sid},
 		{Key: "v", Value: uint64(1)},
 		{Key: "wrote", Value: rep.Wrote},
@@ -601,6 +671,10 @@ func (s *RelayServer) handleLog(w http.ResponseWriter, lineID []byte, cb [32]byt
 		return
 	}
 	if err := ldrcrypto.RequireExactKeys(m, []string{"from_seq", "max_count", "req_id", "session_id", "v"}); err != nil {
+		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
+		return
+	}
+	if v, err := ldrcrypto.MapUint(m, "v"); err != nil || v != 1 {
 		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
 		return
 	}
@@ -629,6 +703,7 @@ func (s *RelayServer) handleLog(w http.ResponseWriter, lineID []byte, cb [32]byt
 			{Key: "line_id", Value: lineID},
 			{Key: "req_digest", Value: reqDigest[:]},
 			{Key: "req_id", Value: reqID},
+			{Key: "session_gen", Value: gen},
 			{Key: "session_id", Value: sid},
 			{Key: "v", Value: uint64(1)},
 		})
@@ -672,6 +747,7 @@ func (s *RelayServer) handleLog(w http.ResponseWriter, lineID []byte, cb [32]byt
 		{Key: "line_id", Value: lineID},
 		{Key: "req_digest", Value: reqDigest[:]},
 		{Key: "req_id", Value: reqID},
+		{Key: "session_gen", Value: gen},
 		{Key: "session_id", Value: sid},
 		{Key: "v", Value: uint64(1)},
 	})
@@ -692,6 +768,10 @@ func (s *RelayServer) handleSidecar(w http.ResponseWriter, lineID []byte, cb [32
 		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
 		return
 	}
+	if v, err := ldrcrypto.MapUint(m, "v"); err != nil || v != 1 {
+		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
+		return
+	}
 	sid, err1 := ldrcrypto.MapBytesLen(m, "session_id", 16)
 	reqID, err2 := ldrcrypto.MapUint(m, "req_id")
 	kind, err3 := ldrcrypto.MapString(m, "kind")
@@ -700,7 +780,7 @@ func (s *RelayServer) handleSidecar(w http.ResponseWriter, lineID []byte, cb [32
 		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
 		return
 	}
-	prin, _, ok := s.validateSession(sid, lineID, cb, reqID, true)
+	prin, gen, ok := s.validateSession(sid, lineID, cb, reqID, true)
 	if !ok {
 		writeCBOR(w, http.StatusUnauthorized, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "invalid_session"}, {Key: "v", Value: uint64(1)}})
 		return
@@ -719,6 +799,7 @@ func (s *RelayServer) handleSidecar(w http.ResponseWriter, lineID []byte, cb [32
 			{Key: "line_id", Value: lineID},
 			{Key: "req_digest", Value: reqDigest[:]},
 			{Key: "req_id", Value: reqID},
+			{Key: "session_gen", Value: gen},
 			{Key: "session_id", Value: sid},
 			{Key: "v", Value: uint64(1)},
 		})
@@ -730,6 +811,7 @@ func (s *RelayServer) handleSidecar(w http.ResponseWriter, lineID []byte, cb [32
 		{Key: "line_id", Value: lineID},
 		{Key: "req_digest", Value: reqDigest[:]},
 		{Key: "req_id", Value: reqID},
+		{Key: "session_gen", Value: gen},
 		{Key: "session_id", Value: sid},
 		{Key: "v", Value: uint64(1)},
 	})
@@ -751,6 +833,7 @@ func encodeSubmitReply(lineID []byte, gen uint64, sid []byte, reqID uint64, reqD
 		{Key: "req_digest", Value: reqDigest[:]},
 		{Key: "req_id", Value: reqID},
 		{Key: "seq_time", Value: rep.SeqTime},
+		{Key: "session_gen", Value: gen},
 		{Key: "session_id", Value: sid},
 		{Key: "v", Value: uint64(1)},
 	}
@@ -864,9 +947,21 @@ func DialSession(ctx context.Context, origin ldrcrypto.RelayOrigin, lineID []byt
 		sc.Close()
 		return nil, err
 	}
+	if v, err := ldrcrypto.MapUint(chResp, "v"); err != nil || v != 1 {
+		sc.Close()
+		return nil, errors.New("ldrrelay: malformed challenge reply version")
+	}
 	if errStr, ok := chResp["error"].(string); ok {
 		sc.Close()
 		return nil, fmt.Errorf("ldrrelay: challenge refused: %s", errStr)
+	}
+	if err := ldrcrypto.RequireExactKeys(chResp, []string{"expires_ms", "server_nonce", "session_id", "v"}); err != nil {
+		sc.Close()
+		return nil, fmt.Errorf("ldrrelay: malformed challenge reply: %w", err)
+	}
+	if exp, err := ldrcrypto.MapUint(chResp, "expires_ms"); err != nil || exp == 0 {
+		sc.Close()
+		return nil, errors.New("ldrrelay: malformed challenge reply expires_ms")
 	}
 	sid, err := ldrcrypto.MapBytesLen(chResp, "session_id", 16)
 	if err != nil {
@@ -909,14 +1004,82 @@ func DialSession(ctx context.Context, origin ldrcrypto.RelayOrigin, lineID []byt
 		sc.Close()
 		return nil, err
 	}
-	cls, _ := ldrcrypto.MapString(authResp, "class")
-	if cls != "authenticated" {
-		code, _ := ldrcrypto.MapString(authResp, "code")
+	if err := validateAuthReply(authResp, lineID, gen, sid, nonce, principal); err != nil {
 		sc.Close()
-		return nil, &AuthError{Class: cls, Code: code}
+		return nil, err
 	}
 	sc.sessionID = bytes.Clone(sid)
 	return sc, nil
+}
+
+func principalsEqual(a, b ldrcrypto.Principal) bool {
+	if a.Kind != b.Kind {
+		return false
+	}
+	if a.Kind == ldrcrypto.PrincipalCredential {
+		return a.CredID == b.CredID
+	}
+	return a.Key != nil && b.Key != nil && a.Key.Equal(*b.Key)
+}
+
+// validateAuthReply strictly verifies session/auth responses before accepting
+// authentication OR returning a terminal *AuthError (e.g. unresolved/revoked,
+// which callers persist as a durable Rule 8 stop). Malformed or mismatched
+// echoes always return an ordinary protocol error, never *AuthError.
+func validateAuthReply(authResp map[string]any, lineID []byte, gen uint64, sid, nonce []byte, principal ldrcrypto.Principal) error {
+	if v, err := ldrcrypto.MapUint(authResp, "v"); err != nil || v != 1 {
+		return errors.New("ldrrelay: malformed auth reply version")
+	}
+	cls, err := ldrcrypto.MapString(authResp, "class")
+	if err != nil || cls == "" {
+		return errors.New("ldrrelay: malformed auth reply class")
+	}
+	switch cls {
+	case "authenticated":
+		if err := ldrcrypto.RequireExactKeys(authResp, []string{"class", "generation", "line_id", "session_id", "v"}); err != nil {
+			return fmt.Errorf("ldrrelay: malformed authenticated reply: %w", err)
+		}
+		if gotGen, err := ldrcrypto.MapUint(authResp, "generation"); err != nil || gotGen != gen {
+			return errors.New("ldrrelay: authenticated reply generation mismatch")
+		}
+		if gotLine, err := ldrcrypto.MapBytes(authResp, "line_id"); err != nil || !bytes.Equal(gotLine, lineID) {
+			return errors.New("ldrrelay: authenticated reply line_id mismatch")
+		}
+		if gotSID, err := ldrcrypto.MapBytesLen(authResp, "session_id", 16); err != nil || !bytes.Equal(gotSID, sid) {
+			return errors.New("ldrrelay: authenticated reply session_id mismatch")
+		}
+		return nil
+
+	default:
+		code, err := ldrcrypto.MapString(authResp, "code")
+		if err != nil || code == "" {
+			return errors.New("ldrrelay: malformed auth refusal reply code")
+		}
+		if cls == ldrcore.ClassUnresolved && code == "revoked" {
+			if err := ldrcrypto.RequireExactKeys(authResp, []string{
+				"class", "code", "generation", "line_id", "principal", "server_nonce", "session_id", "v",
+			}); err != nil {
+				return fmt.Errorf("ldrrelay: malformed revoked auth reply: %w", err)
+			}
+			if gotGen, err := ldrcrypto.MapUint(authResp, "generation"); err != nil || gotGen != gen {
+				return errors.New("ldrrelay: revoked auth reply generation mismatch")
+			}
+			if gotLine, err := ldrcrypto.MapBytes(authResp, "line_id"); err != nil || !bytes.Equal(gotLine, lineID) {
+				return errors.New("ldrrelay: revoked auth reply line_id mismatch")
+			}
+			if gotSID, err := ldrcrypto.MapBytesLen(authResp, "session_id", 16); err != nil || !bytes.Equal(gotSID, sid) {
+				return errors.New("ldrrelay: revoked auth reply session_id mismatch")
+			}
+			if gotNonce, err := ldrcrypto.MapBytesLen(authResp, "server_nonce", 32); err != nil || !bytes.Equal(gotNonce, nonce) {
+				return errors.New("ldrrelay: revoked auth reply server_nonce mismatch")
+			}
+			gotPrin, err := ldrcrypto.ParsePrincipal(authResp["principal"])
+			if err != nil || !principalsEqual(gotPrin, principal) {
+				return errors.New("ldrrelay: revoked auth reply principal mismatch")
+			}
+		}
+		return &AuthError{Class: cls, Code: code}
+	}
 }
 
 // AuthError reports a relay authentication refusal (including terminal revoked).
@@ -979,6 +1142,12 @@ func (c *SessionClient) postCBOR(ctx context.Context, endpoint string, body ldrc
 }
 
 func (c *SessionClient) verifyReplyBinding(m map[string]any, reqID uint64, reqDigest [32]byte) error {
+	if v, err := ldrcrypto.MapUint(m, "v"); err != nil || v != 1 {
+		return errors.New("ldrrelay: reply version mismatch")
+	}
+	if sg, err := ldrcrypto.MapUint(m, "session_gen"); err != nil || sg != c.gen {
+		return errors.New("ldrrelay: reply session_gen mismatch")
+	}
 	if sid, err := ldrcrypto.MapBytesLen(m, "session_id", 16); err != nil || !bytes.Equal(sid, c.sessionID) {
 		return errors.New("ldrrelay: reply session_id mismatch")
 	}

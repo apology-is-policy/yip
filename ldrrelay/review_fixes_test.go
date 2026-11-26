@@ -12,12 +12,15 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/apology-is-policy/yip/ldrcore"
 	"github.com/apology-is-policy/yip/ldrcrypto"
@@ -2268,4 +2271,453 @@ func TestAdminSocketSecurityAndClockResume(t *testing.T) {
 	if _, err := os.Lstat(sockPath); !os.IsNotExist(err) {
 		t.Fatalf("expected admin socket removed on Close, stat err=%v", err)
 	}
+}
+
+// TestTransportSessionEchoBindingsAndIdleExpiry verifies Codex Turn 64:
+//  1. DialSession strictly validates the full echo on both "authenticated"
+//     (v, line_id, generation, session_id) and terminal "unresolved"/"revoked"
+//     (also principal and server_nonce), returning an ordinary protocol error
+//     (never *AuthError) on malformed or mismatched echoes.
+//  2. Every authenticated session endpoint (Submit, Query, AnchorRequest
+//     including zero-gen refusals, ControlLog, FetchSidecar including refusals)
+//     echoes v=1 and session_gen uniformly, and verifyReplyBinding rejects
+//     missing or mismatched v, session_gen, session_id, req_id, req_digest, or line_id.
+//  3. validateSession enforces session idle expiry during lookup (evicting expired
+//     sessions without waiting for another client's handshake sweep).
+func TestTransportSessionEchoBindingsAndIdleExpiry(t *testing.T) {
+	ctx := context.Background()
+
+	startTLSHandler := func(t *testing.T, handler http.Handler) ldrcrypto.RelayOrigin {
+		t.Helper()
+		tlsDir := t.TempDir()
+		certPath := filepath.Join(tlsDir, "server.crt")
+		keyPath := filepath.Join(tlsDir, "server.key")
+		pin, err := InitSelfSignedCert(certPath, keyPath, []string{"127.0.0.1", "localhost"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		srvTLS, err := ServerTLSConfig(certPath, keyPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rawLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		tlsLn := tls.NewListener(rawLn, srvTLS)
+		hs := &http.Server{Handler: handler}
+		go func() { _ = hs.Serve(tlsLn) }()
+		t.Cleanup(func() {
+			_ = hs.Close()
+			_ = tlsLn.Close()
+		})
+		return ldrcrypto.RelayOrigin{
+			URL:            "https://" + rawLn.Addr().String(),
+			TLSPolicy:      ldrcrypto.TLSPolicyPinSPKISHA256,
+			TLSPin:         pin[:],
+			SessionBinding: ldrcrypto.SessionBindingTLS13Exporter,
+		}
+	}
+
+	t.Run("dial_session_authenticated_and_revoked_echo_validation", func(t *testing.T) {
+		lineID := bytes.Repeat([]byte{0x44}, 16)
+		otherLineID := bytes.Repeat([]byte{0x45}, 16)
+		profDig, _ := ldrcrypto.ProfileV1().Digest()
+		rootKey, err := ldrcrypto.GenerateEd25519Key()
+		if err != nil {
+			t.Fatal(err)
+		}
+		otherKey, err := ldrcrypto.GenerateEd25519Key()
+		if err != nil {
+			t.Fatal(err)
+		}
+		prin := ldrcrypto.RootPrincipal(rootKey.PublicKey())
+		pCBOR, _ := prin.ToCBOR()
+		otherPCBOR, _ := ldrcrypto.RootPrincipal(otherKey.PublicKey()).ToCBOR()
+
+		sid := bytes.Repeat([]byte{0x11}, 16)
+		otherSID := bytes.Repeat([]byte{0x12}, 16)
+		nonce := bytes.Repeat([]byte{0x22}, 32)
+		otherNonce := bytes.Repeat([]byte{0x23}, 32)
+
+		var mu sync.Mutex
+		var authReply ldrcrypto.Map
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/v1/lines/", func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/session/challenge") {
+				writeCBOR(w, http.StatusOK, ldrcrypto.Map{
+					{Key: "expires_ms", Value: uint64(time.Now().Add(time.Minute).UnixMilli())},
+					{Key: "server_nonce", Value: nonce},
+					{Key: "session_id", Value: sid},
+					{Key: "v", Value: uint64(1)},
+				})
+				return
+			}
+			mu.Lock()
+			rep := authReply
+			mu.Unlock()
+			writeCBOR(w, http.StatusOK, rep)
+		})
+		origin := startTLSHandler(t, mux)
+
+		setReply := func(m ldrcrypto.Map) {
+			mu.Lock()
+			authReply = m
+			mu.Unlock()
+		}
+
+		// Valid authenticated echo succeeds.
+		setReply(ldrcrypto.Map{
+			{Key: "class", Value: "authenticated"},
+			{Key: "generation", Value: uint64(1)},
+			{Key: "line_id", Value: lineID},
+			{Key: "session_id", Value: sid},
+			{Key: "v", Value: uint64(1)},
+		})
+		sc, err := DialSession(ctx, origin, lineID, profDig, 1, prin, rootKey)
+		if err != nil {
+			t.Fatalf("valid authenticated echo failed: %v", err)
+		}
+		sc.Close()
+
+		// Malformed or mismatched authenticated echoes MUST fail with an ordinary error (not *AuthError).
+		badAuthCases := map[string]ldrcrypto.Map{
+			"missing_v":         {{Key: "class", Value: "authenticated"}, {Key: "generation", Value: uint64(1)}, {Key: "line_id", Value: lineID}, {Key: "session_id", Value: sid}},
+			"wrong_v":           {{Key: "class", Value: "authenticated"}, {Key: "generation", Value: uint64(1)}, {Key: "line_id", Value: lineID}, {Key: "session_id", Value: sid}, {Key: "v", Value: uint64(2)}},
+			"missing_gen":       {{Key: "class", Value: "authenticated"}, {Key: "line_id", Value: lineID}, {Key: "session_id", Value: sid}, {Key: "v", Value: uint64(1)}},
+			"wrong_gen":         {{Key: "class", Value: "authenticated"}, {Key: "generation", Value: uint64(2)}, {Key: "line_id", Value: lineID}, {Key: "session_id", Value: sid}, {Key: "v", Value: uint64(1)}},
+			"wrong_line":        {{Key: "class", Value: "authenticated"}, {Key: "generation", Value: uint64(1)}, {Key: "line_id", Value: otherLineID}, {Key: "session_id", Value: sid}, {Key: "v", Value: uint64(1)}},
+			"wrong_session":     {{Key: "class", Value: "authenticated"}, {Key: "generation", Value: uint64(1)}, {Key: "line_id", Value: lineID}, {Key: "session_id", Value: otherSID}, {Key: "v", Value: uint64(1)}},
+			"extra_unknown_key": {{Key: "class", Value: "authenticated"}, {Key: "extra", Value: uint64(1)}, {Key: "generation", Value: uint64(1)}, {Key: "line_id", Value: lineID}, {Key: "session_id", Value: sid}, {Key: "v", Value: uint64(1)}},
+		}
+		for name, rep := range badAuthCases {
+			setReply(rep)
+			_, err := DialSession(ctx, origin, lineID, profDig, 1, prin, rootKey)
+			if err == nil {
+				t.Fatalf("authenticated case %s unexpectedly succeeded", name)
+			}
+			var ae *AuthError
+			if errors.As(err, &ae) {
+				t.Fatalf("authenticated case %s returned *AuthError (%+v), want ordinary protocol error", name, ae)
+			}
+		}
+
+		// Valid full revoked echo MUST return *AuthError(unresolved/revoked).
+		setReply(ldrcrypto.Map{
+			{Key: "class", Value: ldrcore.ClassUnresolved},
+			{Key: "code", Value: "revoked"},
+			{Key: "generation", Value: uint64(1)},
+			{Key: "line_id", Value: lineID},
+			{Key: "principal", Value: pCBOR},
+			{Key: "server_nonce", Value: nonce},
+			{Key: "session_id", Value: sid},
+			{Key: "v", Value: uint64(1)},
+		})
+		_, err = DialSession(ctx, origin, lineID, profDig, 1, prin, rootKey)
+		var ae *AuthError
+		if !errors.As(err, &ae) || ae.Class != ldrcore.ClassUnresolved || ae.Code != "revoked" {
+			t.Fatalf("valid revoked echo: got %v, want *AuthError(unresolved/revoked)", err)
+		}
+
+		// Missing or mismatched revoked echo fields MUST yield an ordinary protocol error
+		// (NEVER *AuthError) so callers do not persist a spurious Rule 8 revocation!
+		badRevokedCases := map[string]ldrcrypto.Map{
+			"bare_class_code_only": {{Key: "class", Value: ldrcore.ClassUnresolved}, {Key: "code", Value: "revoked"}, {Key: "v", Value: uint64(1)}},
+			"wrong_v":              {{Key: "class", Value: ldrcore.ClassUnresolved}, {Key: "code", Value: "revoked"}, {Key: "generation", Value: uint64(1)}, {Key: "line_id", Value: lineID}, {Key: "principal", Value: pCBOR}, {Key: "server_nonce", Value: nonce}, {Key: "session_id", Value: sid}, {Key: "v", Value: uint64(2)}},
+			"wrong_gen":            {{Key: "class", Value: ldrcore.ClassUnresolved}, {Key: "code", Value: "revoked"}, {Key: "generation", Value: uint64(2)}, {Key: "line_id", Value: lineID}, {Key: "principal", Value: pCBOR}, {Key: "server_nonce", Value: nonce}, {Key: "session_id", Value: sid}, {Key: "v", Value: uint64(1)}},
+			"wrong_line":           {{Key: "class", Value: ldrcore.ClassUnresolved}, {Key: "code", Value: "revoked"}, {Key: "generation", Value: uint64(1)}, {Key: "line_id", Value: otherLineID}, {Key: "principal", Value: pCBOR}, {Key: "server_nonce", Value: nonce}, {Key: "session_id", Value: sid}, {Key: "v", Value: uint64(1)}},
+			"wrong_session":        {{Key: "class", Value: ldrcore.ClassUnresolved}, {Key: "code", Value: "revoked"}, {Key: "generation", Value: uint64(1)}, {Key: "line_id", Value: lineID}, {Key: "principal", Value: pCBOR}, {Key: "server_nonce", Value: nonce}, {Key: "session_id", Value: otherSID}, {Key: "v", Value: uint64(1)}},
+			"wrong_nonce":          {{Key: "class", Value: ldrcore.ClassUnresolved}, {Key: "code", Value: "revoked"}, {Key: "generation", Value: uint64(1)}, {Key: "line_id", Value: lineID}, {Key: "principal", Value: pCBOR}, {Key: "server_nonce", Value: otherNonce}, {Key: "session_id", Value: sid}, {Key: "v", Value: uint64(1)}},
+			"wrong_principal":      {{Key: "class", Value: ldrcore.ClassUnresolved}, {Key: "code", Value: "revoked"}, {Key: "generation", Value: uint64(1)}, {Key: "line_id", Value: lineID}, {Key: "principal", Value: otherPCBOR}, {Key: "server_nonce", Value: nonce}, {Key: "session_id", Value: sid}, {Key: "v", Value: uint64(1)}},
+		}
+		for name, rep := range badRevokedCases {
+			setReply(rep)
+			_, err := DialSession(ctx, origin, lineID, profDig, 1, prin, rootKey)
+			if err == nil {
+				t.Fatalf("revoked case %s unexpectedly succeeded", name)
+			}
+			var gotAE *AuthError
+			if errors.As(err, &gotAE) {
+				t.Fatalf("revoked case %s returned *AuthError (%+v), want ordinary protocol error", name, gotAE)
+			}
+		}
+	})
+
+	t.Run("wire_proxy_reply_binding_mutation_across_all_endpoints", func(t *testing.T) {
+		var mu sync.Mutex
+		var mutateResp func(m map[string]any)
+		var rs *RelayServer
+
+		proxy := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			rec := httptest.NewRecorder()
+			rs.ServeHTTP(rec, r)
+			body := rec.Body.Bytes()
+			mu.Lock()
+			mut := mutateResp
+			mu.Unlock()
+			if mut != nil && !strings.HasSuffix(r.URL.Path, "/session/challenge") && !strings.HasSuffix(r.URL.Path, "/session/auth") {
+				dec, err := ldrcrypto.UnmarshalCBOR(body, ldrcrypto.Limits{MaxBytes: maxHTTPBodyBytes, MaxDepth: 16, MaxItems: 16384})
+				if err == nil {
+					if m, ok := dec.(map[string]any); ok {
+						mut(m)
+						if enc, err := ldrcrypto.MarshalCBORWithLimits(m, ldrcrypto.Limits{MaxBytes: maxHTTPBodyBytes, MaxDepth: 16, MaxItems: 16384}); err == nil {
+							body = enc
+						}
+					}
+				}
+			}
+			for k, vals := range rec.Header() {
+				for _, v := range vals {
+					w.Header().Add(k, v)
+				}
+			}
+			w.WriteHeader(rec.Code)
+			_, _ = w.Write(body)
+		})
+
+		origin := startTLSHandler(t, proxy)
+		r1, _ := ldrcrypto.GenerateEd25519Key()
+		r2, _ := ldrcrypto.GenerateEd25519Key()
+		lineID := bytes.Repeat([]byte{0x66}, 16)
+		prof := ldrcrypto.ProfileV1()
+		profDig, _ := prof.Digest()
+		desc := ldrcrypto.CreationDescriptor{
+			Version: 1, LineID: lineID, Generation: 1,
+			RootKeys:    []ldrcrypto.PublicKey{r1.PublicKey(), r2.PublicKey()},
+			RelayOrigin: origin, Profile: prof,
+		}
+		signedDesc, err := ldrcrypto.SignCreationDescriptor(r1, desc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rawDesc, _ := signedDesc.MarshalCanonical()
+		_, cd, genesis, _, err := ldrcrypto.VerifyCreationDescriptor(rawDesc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := ldrstore.OpenFileStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		fc := &fakeClock{wall: 1_700_000_000_000, mono: 0}
+		eng, err := NewRelayEngine(st, DefaultClockConfig(), fc.source())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := eng.Provision(rawDesc); err != nil {
+			t.Fatal(err)
+		}
+		rs = NewRelayServer(eng)
+
+		r1Prin := ldrcrypto.RootPrincipal(r1.PublicKey())
+		sess, err := DialSession(ctx, origin, lineID, profDig, 1, r1Prin, r1)
+		if err != nil {
+			t.Fatalf("DialSession via proxy: %v", err)
+		}
+		defer sess.Close()
+
+		// Commit line_init cleanly first.
+		sortedRoots, _ := ldrcrypto.CanonicalRootKeys(desc.RootKeys)
+		r0c, _ := sortedRoots[0].ToCBOR()
+		r1c, _ := sortedRoots[1].ToCBOR()
+		pMap, _ := prof.ToCBORMap()
+		initBody, err := BuildWireIntentBody(WireIntentInput{
+			ProfileDigest: profDig, LineID: lineID, Generation: 1,
+			Origin: ldrcore.OriginRoot, Principal: r1Prin,
+			OpID: "proxy-init", OpType: "line_init",
+			SeenSeq: 0, SeenHead: genesis, ValidityMS: 600_000,
+			PayloadCommit: ldrcrypto.EmptyPayloadCommit(),
+			Fields: ldrcrypto.Map{
+				{Key: "descriptor_digest", Value: cd[:]},
+				{Key: "profile", Value: pMap},
+				{Key: "root_keys", Value: []any{r0c, r1c}},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		initEnv, err := ldrcrypto.SignIntent(r1, initBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+		initDig, _ := initEnv.Digest()
+		r1Tok, _ := PrincipalToken(r1Prin)
+		initKey := ldrstore.StoredOpKey{Generation: 1, Signer: r1Tok, SeenSeq: 0, OpID: "proxy-init"}
+
+		if rep, err := sess.Submit(ctx, initEnv.RawBytes, nil, nil); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+			t.Fatalf("baseline Submit: rep=%+v err=%v", rep, err)
+		}
+
+		// Mutate session_gen (omit / wrong value) and v (wrong value) on the live wire
+		// across ALL 5 authenticated endpoints (Submit, Query, AnchorRequest, ControlLog, FetchSidecar).
+		wireMuts := map[string]func(map[string]any){
+			"omit_session_gen":  func(m map[string]any) { delete(m, "session_gen") },
+			"wrong_session_gen": func(m map[string]any) { m["session_gen"] = uint64(2) },
+			"wrong_v":           func(m map[string]any) { m["v"] = uint64(2) },
+		}
+		for name, mut := range wireMuts {
+			mu.Lock()
+			mutateResp = mut
+			mu.Unlock()
+			if _, err := sess.Submit(ctx, initEnv.RawBytes, nil, nil); err == nil {
+				t.Fatalf("Submit accepted wire mutation %s", name)
+			}
+			if _, err := sess.Query(ctx, initKey, initDig); err == nil {
+				t.Fatalf("Query accepted wire mutation %s", name)
+			}
+			if _, err := sess.AnchorRequest(ctx); err == nil {
+				t.Fatalf("AnchorRequest accepted wire mutation %s", name)
+			}
+			if _, err := sess.ControlLog(ctx, 1, 16); err == nil {
+				t.Fatalf("ControlLog accepted wire mutation %s", name)
+			}
+			if _, err := sess.FetchSidecar(ctx, ldrstore.SidecarPayload, [32]byte{0x01}); err == nil || strings.Contains(err.Error(), "sidecar refused") {
+				t.Fatalf("FetchSidecar accepted wire mutation %s (err=%v)", name, err)
+			}
+		}
+		mu.Lock()
+		mutateResp = nil
+		mu.Unlock()
+		if rep, err := sess.Query(ctx, initKey, initDig); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+			t.Fatalf("unmutated Query after proxy clear: rep=%+v err=%v", rep, err)
+		}
+	})
+
+	t.Run("live_reply_binding_and_idle_expiry", func(t *testing.T) {
+		fx := startRelayFixture(t)
+		root2Prin := ldrcrypto.RootPrincipal(fx.root2.PublicKey())
+
+		// Install a mutating wrapper around fx.server? Better: reuse fx's TLS cert/key on a
+		// fresh RelayServer backed by fx.engine? Even cleaner: test live RelayServer via a
+		// mutating httptest proxy using the EXACT desc.RelayOrigin from a fixture!
+		// First test validateSession idle expiry directly on fx.server (zero other handshakes!).
+		var clockMu sync.Mutex
+		now := time.Date(2026, 11, 26, 8, 0, 0, 0, time.UTC)
+		fx.server.setTestSessionClock(func() time.Time {
+			clockMu.Lock()
+			defer clockMu.Unlock()
+			return now
+		}, 5*time.Minute)
+		advanceServerTime := func(d time.Duration) {
+			clockMu.Lock()
+			now = now.Add(d)
+			clockMu.Unlock()
+		}
+
+		// Authenticate root2 as the ONLY session on fx.server and commit line_init.
+		sRoot2, err := DialSession(ctx, fx.origin, fx.lineID, fx.profDigest, 1, root2Prin, fx.root2)
+		if err != nil {
+			t.Fatalf("DialSession(root2): %v", err)
+		}
+		defer sRoot2.Close()
+
+		sortedRoots, _ := ldrcrypto.CanonicalRootKeys(fx.desc.RootKeys)
+		r0c, _ := sortedRoots[0].ToCBOR()
+		r1c, _ := sortedRoots[1].ToCBOR()
+		pMap, _ := fx.desc.Profile.ToCBORMap()
+		initBody, err := BuildWireIntentBody(WireIntentInput{
+			ProfileDigest: fx.profDigest, LineID: fx.lineID, Generation: 1,
+			Origin: ldrcore.OriginRoot, Principal: root2Prin,
+			OpID: "live-idle-init", OpType: "line_init",
+			SeenSeq: 0, SeenHead: fx.genesis, ValidityMS: 600_000,
+			PayloadCommit: ldrcrypto.EmptyPayloadCommit(),
+			Fields: ldrcrypto.Map{
+				{Key: "descriptor_digest", Value: fx.cd[:]},
+				{Key: "profile", Value: pMap},
+				{Key: "root_keys", Value: []any{r0c, r1c}},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		initEnv, err := ldrcrypto.SignIntent(fx.root2, initBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rep, err := sRoot2.Submit(ctx, initEnv.RawBytes, nil, nil); err != nil || rep.Outcome.Kind != ldrcore.Committed {
+			t.Fatalf("line_init Submit: rep=%+v err=%v", rep, err)
+		}
+
+		// Baseline request succeeds (session_gen == 1, v == 1).
+		if _, err := sRoot2.ControlLog(ctx, 1, 16); err != nil {
+			t.Fatalf("ControlLog at t=0: %v", err)
+		}
+		// Sidecar refusal (not_found) MUST also carry valid session_gen and pass verifyReplyBinding
+		// (returning the structured sidecar refusal error, not a binding mismatch!).
+		if _, err := sRoot2.FetchSidecar(ctx, ldrstore.SidecarPayload, [32]byte{0x99}); err == nil || !strings.Contains(err.Error(), "sidecar refused") {
+			t.Fatalf("FetchSidecar missing blob: got %v, want sidecar refused (passing reply binding)", err)
+		}
+
+		// Anchor refusal with zero outcome generation (clock_uncertain -> rep.Gen == 0)
+		// MUST still pass verifyReplyBinding because session_gen == 1 is echoed separately!
+		fx.clock.wall -= 10_000
+		fx.clock.mono += 100
+		ancRef, err := sRoot2.AnchorRequest(ctx)
+		if err != nil {
+			t.Fatalf("AnchorRequest clock_uncertain refusal failed reply binding: %v", err)
+		}
+		if ancRef.Class != ldrcore.ClassAdmission || ancRef.Code != "clock_uncertain" || ancRef.Gen != 0 {
+			t.Fatalf("unexpected anchor refusal: %+v", ancRef)
+		}
+		// Restore clock for normal operation.
+		fx.clock.wall += 15_000
+		fx.clock.mono += 1000
+		cg, _ := fx.engine.ClockGuardFor(fx.lineID)
+		if err := cg.ConfirmResume(); err != nil {
+			t.Fatalf("ConfirmResume: %v", err)
+		}
+
+		// Direct verifyReplyBinding checks: missing/wrong v, session_gen, session_id, req_id, req_digest, line_id.
+		reqDig := sha256.Sum256([]byte("req-body"))
+		makeGoodReply := func() map[string]any {
+			return map[string]any{
+				"v":           uint64(1),
+				"session_gen": uint64(1),
+				"session_id":  sRoot2.SessionID(),
+				"req_id":      uint64(42),
+				"req_digest":  reqDig[:],
+				"line_id":     bytes.Clone(fx.lineID),
+			}
+		}
+		if err := sRoot2.verifyReplyBinding(makeGoodReply(), 42, reqDig); err != nil {
+			t.Fatalf("valid verifyReplyBinding failed: %v", err)
+		}
+		mutations := map[string]func(map[string]any){
+			"missing_v":           func(m map[string]any) { delete(m, "v") },
+			"wrong_v":             func(m map[string]any) { m["v"] = uint64(2) },
+			"missing_session_gen": func(m map[string]any) { delete(m, "session_gen") },
+			"zero_session_gen":    func(m map[string]any) { m["session_gen"] = uint64(0) },
+			"wrong_session_gen":   func(m map[string]any) { m["session_gen"] = uint64(2) },
+			"wrong_session_id":    func(m map[string]any) { m["session_id"] = bytes.Repeat([]byte{0xee}, 16) },
+			"wrong_req_id":        func(m map[string]any) { m["req_id"] = uint64(43) },
+			"wrong_req_digest":    func(m map[string]any) { m["req_digest"] = bytes.Repeat([]byte{0xdd}, 32) },
+			"wrong_line_id":       func(m map[string]any) { m["line_id"] = bytes.Repeat([]byte{0xcc}, 16) },
+		}
+		for name, mut := range mutations {
+			m := makeGoodReply()
+			mut(m)
+			if err := sRoot2.verifyReplyBinding(m, 42, reqDig); err == nil {
+				t.Fatalf("verifyReplyBinding accepted mutated reply (%s)", name)
+			}
+		}
+
+		// Idle expiry enforcement on lookup WITHOUT any other handshake/sweep:
+		// 4m59s (< 5m idle limit) succeeds and refreshes lastSeen.
+		advanceServerTime(4*time.Minute + 59*time.Second)
+		if _, err := sRoot2.ControlLog(ctx, 1, 16); err != nil {
+			t.Fatalf("ControlLog just before idle timeout failed: %v", err)
+		}
+		// 5m01s (> 5m idle limit) with ZERO other clients MUST reject immediately and evict the session!
+		advanceServerTime(5*time.Minute + time.Second)
+		if _, err := sRoot2.ControlLog(ctx, 1, 16); err == nil {
+			t.Fatalf("expired idle session unexpectedly accepted ControlLog without sweep!")
+		}
+		// Session was evicted on lookup: even stepping server time back cannot resurrect it!
+		advanceServerTime(-4 * time.Minute)
+		if _, err := sRoot2.AnchorRequest(ctx); err == nil {
+			t.Fatalf("evicted idle session unexpectedly resurrected on AnchorRequest!")
+		}
+	})
 }
