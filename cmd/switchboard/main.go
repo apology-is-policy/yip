@@ -48,8 +48,8 @@ func initBoard() {
 
 func frame(screen tcell.Screen, in input, elapsed time.Duration) bool {
 	width, height := screen.Size()
-	screen.Clear()
 	if width < 40 || height < 10 {
+		screen.Clear()
 		for x, r := range []rune("Resize to at least 40 × 10") {
 			if x < width && height > 0 {
 				screen.SetContent(x, 0, r, nil, tcell.StyleDefault)

@@ -11,6 +11,29 @@ import sys
 import tempfile
 import termios
 import time
+import unicodedata
+
+def terminal_rows(data, width, height):
+    """Apply tcell's cursor-addressed cell updates to a fixed-size screen."""
+    cells = [[' '] * width for _ in range(height)]
+    x = y = 0
+    tokens = r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[ -?]*[@-~]|\x1b\([AB0]|.'
+    for token in re.findall(tokens, data.decode(errors='replace'), re.S):
+        if token.startswith('\x1b'):
+            if token.startswith('\x1b[') and token.endswith('H'):
+                coords = token[2:-1].split(';')
+                y = int(coords[0] or 1) - 1
+                x = int(coords[1] or 1) - 1 if len(coords) > 1 else 0
+        elif token == '\r':
+            x = 0
+        elif token == '\n':
+            y += 1
+        elif token.isprintable():
+            if 0 <= y < height and 0 <= x < width:
+                cells[y][x] = token
+            x += 2 if unicodedata.east_asian_width(token) in ('W', 'F') else 1
+    return [''.join(row) for row in cells]
+
 
 binary = str(Path(sys.argv[1]).resolve())
 evidence = Path(sys.argv[2]).resolve()
@@ -28,7 +51,7 @@ with tempfile.TemporaryDirectory(prefix='yip-pty-') as tmp:
     cli('call', '--as', 'fixture-a', 'fixture-c', 'Second call', body='A second selectable conversation.')
     before_turns = list((root/'line/calls').glob('*/turns/*.md'))
     results = []
-    for mode in ['quit', 'signal']:
+    for mode in ['quit', 'signal', 'native', 'native-signal']:
         master, slave = os.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 44, 160, 0, 0))
         saved = termios.tcgetattr(slave)
@@ -37,15 +60,20 @@ with tempfile.TemporaryDirectory(prefix='yip-pty-') as tmp:
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
         report=root/(mode+'-terminal.json')
         pidfile=root/(mode+'-pid')
-        launcher = """import json,subprocess,sys,termios
+        launcher = """import fcntl,json,subprocess,sys,termios
 +from pathlib import Path
 +before=termios.tcgetattr(0)
 +p=subprocess.Popen([sys.argv[1],'switchboard','--reference','--by','test-operator'])
 +Path(sys.argv[3]).write_text(str(p.pid))
 +rc=p.wait()
++# Darwin resolves its transient PENDIN flag on the next input-queue query.
++# This observes the queue without consuming any of the caller's keystrokes.
++if sys.platform == 'darwin': fcntl.ioctl(0,termios.FIONREAD,bytes(4))
 +Path(sys.argv[2]).write_text(json.dumps(dict(rc=rc,restored=before==termios.tcgetattr(0))))
 +sys.exit(rc)
 +""".replace('\n+','\n')
+        if mode.startswith('native'):
+            launcher = launcher.replace(",'--reference'", "")
         child = subprocess.Popen([sys.executable,'-c',launcher,binary,str(report),str(pidfile)],
                                  stdin=slave, stdout=slave, stderr=slave, env=env,
                                  cwd=root, preexec_fn=setup)
@@ -64,8 +92,9 @@ with tempfile.TemporaryDirectory(prefix='yip-pty-') as tmp:
                     output.extend(chunk)
         try:
             drain(1)
-            assert b'SWITCHBOARD' in output, output[-2000:]
-            assert b'\x1b[?1000h' in output and b'\x1b[?1006h' in output
+            assert b'SWITCHBOARD' in output.upper(), output[-2000:]
+            if not mode.startswith('native'):
+                assert b'\x1b[?1000h' in output and b'\x1b[?1006h' in output
             def screen():
                 rows = {}
                 for row, line in re.findall(rb'\x1b\[(\d+);1H(.*?)\x1b\[K', bytes(output), re.S):
@@ -78,7 +107,7 @@ with tempfile.TemporaryDirectory(prefix='yip-pty-') as tmp:
                 for fragment in [b'\x1b', b'[<0;', b'4;11', b'M']:
                     os.write(master, fragment)
                     drain(.015)
-                assert screen()[3].strip() == expected, (expected, screen()[3])
+                assert screen()[4].strip() == expected, (expected, screen()[4])
                 os.write(master, b'r')
                 for byte in 'UI fixture café界'.encode():
                     os.write(master, bytes([byte]))
@@ -121,13 +150,23 @@ with tempfile.TemporaryDirectory(prefix='yip-pty-') as tmp:
                 os.kill(int(pidfile.read_text()),signal.SIGWINCH)
                 drain(.3)
                 os.write(master,b'2jj1q')
+            elif mode == 'native':
+                for key,label in [(b'\x1bOR',b'Line topology'),(b'\x1bOS',b'Relay health'),(b'\x1b[15~',b'Broadcasts'),(b'\x1b[17~',b'Roadmaps'),(b'\x1b[18~',b'Configuration')]:
+                    os.write(master,key)
+                    drain(.3)
+                    rows = terminal_rows(output, 160, 44)
+                    assert any(label.decode() in row for row in rows), (label, rows[:12])
+                    os.write(master,key)
+                    drain(.15)
+                os.write(master,b'q')
             else:
                 os.kill(int(pidfile.read_text()),signal.SIGTERM)
             drain(.5)
             rc=child.wait(timeout=5)
             assert rc==0, rc
             assert json.loads(report.read_text())['restored'], 'terminal mode not restored'
-            assert b'\x1b[?1006l' in output and b'\x1b[?1000l' in output
+            if not mode.startswith('native'):
+                assert b'\x1b[?1006l' in output and b'\x1b[?1000l' in output
             assert b'\x1b[?1049l' in output and b'\x1b[?25h' in output
             assert len(list((root/'line/calls').glob('*/turns/*.md')))==len(before_turns)
             (evidence/f'pty-{mode}.ansi').write_bytes(output)
@@ -137,6 +176,7 @@ with tempfile.TemporaryDirectory(prefix='yip-pty-') as tmp:
                 if pidfile.exists():
                     try: os.kill(int(pidfile.read_text()),signal.SIGTERM)
                     except ProcessLookupError: pass
+                drain(.6)
                 child.wait(timeout=5)
             os.close(master)
             os.close(slave)

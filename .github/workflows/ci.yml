@@ -26,6 +26,7 @@ jobs:
       - run: YIP_TEST_BIN="$RUNNER_TEMP/yip" bash e2e.sh
       - run: python3 channels_e2e.py "$RUNNER_TEMP/yip"
       - run: YIP_TEST_BIN="$RUNNER_TEMP/yip" python3 delivery_e2e.py
+      - run: python3 scripts/test-switchboard.py "$RUNNER_TEMP/yip" "$RUNNER_TEMP/pty-evidence"
       - run: python3 scripts/package_smoke.py "$RUNNER_TEMP/yip"
       - uses: actions/upload-artifact@v4
         with:
