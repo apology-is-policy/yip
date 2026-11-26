@@ -1114,6 +1114,9 @@ func joinChallengeContext(lineID []byte, gen uint64, reqID []byte, reqDigest [32
 	})
 }
 
+// JoinChallengeSecretSize is the fixed 32-byte length of the P3 challenge secret.
+const JoinChallengeSecretSize = 32
+
 // CreateJoinChallenge verifies req, draws a fresh 32-byte secret and 16-byte challenge ID,
 // and HPKE-encrypts the secret to req.EncryptionKey bound to the complete P3 ceremony context.
 // The raw secret is returned to the operator caller to retain locally and never placed in the challenge.
@@ -1126,7 +1129,7 @@ func CreateJoinChallenge(operatorKey PublicKey, req JoinRequest) (challenge Join
 	if _, err := io.ReadFull(rand.Reader, challengeID); err != nil {
 		return JoinChallenge{}, nil, err
 	}
-	secret = make([]byte, 32)
+	secret = make([]byte, JoinChallengeSecretSize)
 	if _, err := io.ReadFull(rand.Reader, secret); err != nil {
 		return JoinChallenge{}, nil, err
 	}
@@ -1194,9 +1197,15 @@ func RespondJoinChallenge(joinerSig Signer, joinerEncPriv *X25519PrivateKey, exp
 	if err != nil {
 		return JoinProof{}, err
 	}
+	if len(ch.Ciphertext) != JoinChallengeSecretSize+PayloadTagSize {
+		return JoinProof{}, fmt.Errorf("%w: challenge ciphertext length %d != %d", ErrInvalidCeremony, len(ch.Ciphertext), JoinChallengeSecretSize+PayloadTagSize)
+	}
 	secret, err := HPKEOpenBase(joinerEncPriv, ch.Enc, ctxBytes, ctxBytes, ch.Ciphertext)
 	if err != nil {
 		return JoinProof{}, err
+	}
+	if len(secret) != JoinChallengeSecretSize {
+		return JoinProof{}, fmt.Errorf("%w: decrypted challenge secret length %d != %d", ErrInvalidCeremony, len(secret), JoinChallengeSecretSize)
 	}
 	secretCommit, err := DomainDigest(PurposeJoinProofSecret, 1, ctxBytes, secret)
 	if err != nil {
@@ -1221,7 +1230,7 @@ func RespondJoinChallenge(joinerSig Signer, joinerEncPriv *X25519PrivateKey, exp
 // VerifyJoinProof checks all P3 ceremony bindings against the operator's saved
 // request, challenge, and independently generated secret.
 func VerifyJoinProof(operatorKey PublicKey, req JoinRequest, ch JoinChallenge, expectedSecret []byte, proof JoinProof) error {
-	if len(expectedSecret) != 32 {
+	if len(expectedSecret) != JoinChallengeSecretSize {
 		return fmt.Errorf("%w: invalid expected secret length", ErrInvalidCeremony)
 	}
 	reqDigest, err := VerifyJoinRequest(req)

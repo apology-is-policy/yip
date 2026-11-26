@@ -680,3 +680,92 @@ func TestIntentDigestAndChainHeadExactRecordLimit(t *testing.T) {
 		t.Fatalf("UnmarshalSignedIntent(512KiB+1): got %v, want ErrCBORLimitExceeded", err)
 	}
 }
+
+// TestRespondJoinChallengeRejectsNon32ByteSecret verifies Codex Turn 54:
+// RespondJoinChallenge enforces the same 32-byte challenge secret invariant as
+// CreateJoinChallenge and VerifyJoinProof, refusing validly HPKE-encrypted
+// challenges whose plaintext length is not 32 bytes before signing any proof.
+func TestRespondJoinChallengeRejectsNon32ByteSecret(t *testing.T) {
+	op, err := GenerateEd25519Key()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jSig, err := GenerateEd25519Key()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jEnc, err := GenerateX25519Key()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lineID := bytes.Repeat([]byte{0x51}, 16)
+	cd := [32]byte{0x62}
+
+	req, err := SignJoinRequest(jSig, JoinRequest{
+		RequestID:        bytes.Repeat([]byte{0x73}, 16),
+		LineID:           lineID,
+		Generation:       1,
+		DescriptorDigest: cd,
+		EncryptionKey:    jEnc.PublicKey(),
+		Grant: JoinGrant{
+			NamespaceID: "ns-p3",
+			ActorLimit:  2,
+			Reader:      true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqDig, err := VerifyJoinRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	challengeID := bytes.Repeat([]byte{0x84}, 16)
+	ctxBytes, err := joinChallengeContext(req.LineID, req.Generation, req.RequestID, reqDig, op.PublicKey(), req.SigningKey, req.EncryptionKey, challengeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	craftChallenge := func(t *testing.T, secret []byte) JoinChallenge {
+		t.Helper()
+		enc, ct, err := HPKESealBase(req.EncryptionKey, ctxBytes, ctxBytes, secret)
+		if err != nil {
+			t.Fatalf("HPKESealBase(len=%d): %v", len(secret), err)
+		}
+		return JoinChallenge{
+			ChallengeID:   challengeID,
+			LineID:        req.LineID,
+			Generation:    req.Generation,
+			RequestID:     req.RequestID,
+			RequestDigest: reqDig,
+			OperatorKey:   op.PublicKey(),
+			SigningKey:    req.SigningKey,
+			EncryptionKey: req.EncryptionKey,
+			Enc:           enc,
+			Ciphertext:    ct,
+		}
+	}
+
+	for _, badLen := range []int{0, 1, 16, 31, 33, 64} {
+		badSecret := bytes.Repeat([]byte{0x99}, badLen)
+		ch := craftChallenge(t, badSecret)
+		pr, err := RespondJoinChallenge(jSig, jEnc, op.PublicKey(), req, ch)
+		if !errors.Is(err, ErrInvalidCeremony) {
+			t.Fatalf("secret len %d: RespondJoinChallenge got %v, want ErrInvalidCeremony", badLen, err)
+		}
+		if len(pr.Sig) != 0 {
+			t.Fatalf("secret len %d: RespondJoinChallenge returned non-empty signature on refusal", badLen)
+		}
+	}
+
+	// Exact 32-byte secret MUST still succeed and pass VerifyJoinProof.
+	goodSecret := bytes.Repeat([]byte{0xaa}, JoinChallengeSecretSize)
+	goodCh := craftChallenge(t, goodSecret)
+	pr, err := RespondJoinChallenge(jSig, jEnc, op.PublicKey(), req, goodCh)
+	if err != nil {
+		t.Fatalf("valid 32-byte secret RespondJoinChallenge: %v", err)
+	}
+	if err := VerifyJoinProof(op.PublicKey(), req, goodCh, goodSecret, pr); err != nil {
+		t.Fatalf("valid 32-byte secret VerifyJoinProof: %v", err)
+	}
+}
