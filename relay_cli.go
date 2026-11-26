@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -32,7 +33,7 @@ const relayUsage = `yip relay -- operator-hosted Long Distance Relay (TLS 1.3 + 
   yip relay status --dir <data_dir>
       Verify stored WAL/sidecars and print JSON status of provisioned lines.
 
-  yip relay serve --dir <data_dir> [--listen <addr|off>] [--tunnel-listen <loopback|unix:/path>] [--tunnel-path </v1/tunnel>] [--cert <file>] [--key <file>] [--admin-sock <path>]
+  yip relay serve --dir <data_dir> [--listen <addr|off>] [--tunnel-listen <loopback|unix:/path>] [--tunnel-path </v1/tunnel>] [--max-tunnels N] [--max-auth N] [--max-per-line N] [--cert <file>] [--key <file>] [--admin-sock <path>]
       Run the TLS 1.3 LDR relay server (direct and/or WS-tunneled inner TLS 1.3 behind an edge proxy) and local owner-only admin socket until SIGINT/SIGTERM.
 
   yip relay clock status [--dir <data_dir>] [--admin-sock <path>]
@@ -155,16 +156,17 @@ func relayCLIStatus(args []string, out io.Writer) error {
 }
 
 type relayServeOpts struct {
-	Dir          string
-	Listen       string // direct TLS 1.3 listen addr, or "off" when TunnelListen is set
-	TunnelListen string // optional loopback TCP (127.0.0.1:port, [::1]:port, localhost:port) or unix:/path
-	TunnelPath   string // optional WebSocket upgrade path (default /v1/tunnel)
-	CertPath     string
-	KeyPath      string
-	AdminSock    string
-	ClockCfg     ldrrelay.ClockConfig
-	NowFn        ldrrelay.ClockSource
-	ReadyCh      chan<- relayServeReady
+	MaxTunnels, MaxAuth, MaxPerLine int
+	Dir                             string
+	Listen                          string // direct TLS 1.3 listen addr, or "off" when TunnelListen is set
+	TunnelListen                    string // optional loopback TCP (127.0.0.1:port, [::1]:port, localhost:port) or unix:/path
+	TunnelPath                      string // optional WebSocket upgrade path (default /v1/tunnel)
+	CertPath                        string
+	KeyPath                         string
+	AdminSock                       string
+	ClockCfg                        ldrrelay.ClockConfig
+	NowFn                           ldrrelay.ClockSource
+	ReadyCh                         chan<- relayServeReady
 }
 
 type relayServeReady struct {
@@ -205,13 +207,26 @@ func relayCLIServe(args []string, out io.Writer) error {
 	args, certPath = takeFlag(args, "--cert", "")
 	args, keyPath = takeFlag(args, "--key", "")
 	args, adminSock = takeFlag(args, "--admin-sock", "")
+	var limits [3]int
+	for i, flag := range []string{"--max-tunnels", "--max-auth", "--max-per-line"} {
+		var raw string
+		args, raw = takeFlag(args, flag, "")
+		if raw == "" {
+			continue
+		}
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 4096 {
+			return fmt.Errorf("%s requires 1..4096", flag)
+		}
+		limits[i] = n
+	}
 	if len(args) > 0 {
 		return fmt.Errorf("unexpected arguments: %v", args)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return runRelayServe(ctx, relayServeOpts{
-		Dir:          dir,
+		Dir: dir, MaxTunnels: limits[0], MaxAuth: limits[1], MaxPerLine: limits[2],
 		Listen:       listenAddr,
 		TunnelListen: tunnelListen,
 		TunnelPath:   tunnelPath,
@@ -270,12 +285,19 @@ func runRelayServe(ctx context.Context, opts relayServeOpts, out io.Writer) erro
 		_ = st.Close()
 		return err
 	}
-	adminSrv, err := ldrrelay.StartAdminServer(adminSock, eng)
+	relaySrv := ldrrelay.NewRelayServer(eng)
+	if opts.MaxAuth <= 0 {
+		opts.MaxAuth = 64
+	}
+	if opts.MaxPerLine <= 0 {
+		opts.MaxPerLine = 256
+	}
+	relaySrv.ConfigureAdmission(opts.MaxAuth, opts.MaxPerLine)
+	adminSrv, err := ldrrelay.StartAdminServer(adminSock, eng, relaySrv.AdmissionStatus)
 	if err != nil {
 		_ = eng.Shutdown()
 		return err
 	}
-	relaySrv := ldrrelay.NewRelayServer(eng)
 
 	var (
 		directSrv  *http.Server
@@ -310,9 +332,11 @@ func runRelayServe(ctx context.Context, opts relayServeOpts, out io.Writer) erro
 		directAddr = rawLn.Addr().String()
 		directSrv = &http.Server{
 			Addr:              listenAddr,
+			ReadTimeout:       30 * time.Second,
 			Handler:           relaySrv,
 			ReadHeaderTimeout: 10 * time.Second,
 		}
+		relaySrv.TrackConnections(directSrv)
 	}
 
 	if tunnelListen != "" {
@@ -320,7 +344,7 @@ func runRelayServe(ctx context.Context, opts relayServeOpts, out io.Writer) erro
 		if tunnelPath == "" {
 			tunnelPath = "/v1/tunnel"
 		}
-		wsSrv, err := ldrrelay.NewWSTunnelServer(relaySrv, tlsCfg, tunnelPath, 0)
+		wsSrv, err := ldrrelay.NewWSTunnelServer(relaySrv, tlsCfg, tunnelPath, opts.MaxTunnels)
 		if err != nil {
 			cleanupPreStart()
 			return err
@@ -445,6 +469,7 @@ func relayCLIClock(args []string, out io.Writer) error {
 	rest, adminSock = takeFlag(rest, "--admin-sock", "")
 	if sub == "resume" {
 		rest, lineHex = takeFlag(rest, "--line", "")
+		rest, lineHex = takeFlag(rest, "--line-id", lineHex)
 	}
 	if len(rest) > 0 {
 		return fmt.Errorf("unexpected arguments: %v", rest)
@@ -460,13 +485,13 @@ func relayCLIClock(args []string, out io.Writer) error {
 
 	switch sub {
 	case "status":
-		lines, err := ldrrelay.AdminStatus(ctx, adminSock)
+		status, err := ldrrelay.ReadAdminStatus(ctx, adminSock)
 		if err != nil {
 			return err
 		}
 		return json.NewEncoder(out).Encode(map[string]any{
 			"admin_sock": adminSock,
-			"lines":      lines,
+			"lines":      status.Lines, "admission": status.Admission,
 		})
 
 	case "resume":

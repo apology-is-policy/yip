@@ -20,8 +20,12 @@ import (
 // another local process on the same workstation briefly holds the directory lock.
 // Fails immediately on ctx cancellation or any non-lock error.
 func OpenClientWait(ctx context.Context, dir string) (*Client, error) {
+	return openClientWait(ctx, dir, true)
+}
+
+func openClientWait(ctx context.Context, dir string, recoverOutbox bool) (*Client, error) {
 	for {
-		cl, err := OpenClient(dir)
+		cl, err := openClient(dir, nil, nil, recoverOutbox)
 		if err == nil {
 			return cl, nil
 		}

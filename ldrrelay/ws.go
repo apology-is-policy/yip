@@ -651,6 +651,7 @@ func (a wsVirtualAddr) String() string  { return string(a) }
 // terminates inner TLS 1.3 directly inside the origin relay, tags every inner
 // request context with WithWSTunnelCarrier, and serves RelayServer over HTTP/1.1.
 type WSTunnelServer struct {
+	relay      *RelayServer
 	tunnelPath string
 	sem        chan struct{}
 	wsLn       *wsTunnelListener
@@ -683,13 +684,15 @@ func NewWSTunnelServer(relaySrv *RelayServer, innerTLSCfg *tls.Config, tunnelPat
 	innerSrv := &http.Server{
 		Handler:           relaySrv,
 		IdleTimeout:       sessionIdleTimeout,
+		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
 		TLSNextProto:      map[string]func(*http.Server, *tls.Conn, http.Handler){}, // explicit HTTP/1.1 only
 		ConnContext: func(ctx context.Context, _ net.Conn) context.Context {
 			return WithWSTunnelCarrier(ctx)
 		},
 	}
-	ts := &WSTunnelServer{
+	relaySrv.TrackConnections(innerSrv)
+	ts := &WSTunnelServer{relay: relaySrv,
 		tunnelPath: tunnelPath,
 		sem:        make(chan struct{}, maxConns),
 		wsLn:       wsLn,
@@ -737,6 +740,7 @@ func (ts *WSTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	select {
 	case ts.sem <- struct{}{}:
 	default:
+		ts.relay.overload.Add(1)
 		http.Error(w, "too many tunnel connections", http.StatusServiceUnavailable)
 		return
 	}
@@ -773,8 +777,10 @@ func (ts *WSTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = rawConn.SetDeadline(time.Time{})
 
+	ts.relay.tunnels.Add(1)
 	var wc *wsConn
 	wc = newWSConn(rawConn, rw.Reader, false, 0, func() {
+		ts.relay.tunnels.Add(-1)
 		ts.wsLn.remove(wc)
 		<-ts.sem
 	})

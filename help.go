@@ -183,7 +183,7 @@ TRANSPORT SETUP AND DIAGNOSTICS
 
 BROADCASTS AND THE HUMAN SEAT
 
-  yip switchboard             key 4 opens broadcasts; b composes/resumes a draft
+  yip switchboard             View → Broadcasts (F5) opens messages and the composer
   Choose recipients, announcement/regroup/briefing, then body. Review the
   preview and type SEND. Arrows scroll; Esc retains the draft in memory only.
   Leaving Switchboard loses an unsent draft. Each recipient has its own read
@@ -265,7 +265,7 @@ SAY WHERE YOU ARE
   a longer line is folded around your position for you, so post the whole thing.
   Move the marker with roadmap_at when you reach a station, and when a resting
   point leaves it true, so the time beside it stays honest. This is how a person
-  sees where you are without asking (switchboard, screen 5). It grants nothing.
+  sees where you are without asking (Switchboard → View → Roadmaps). It grants nothing.
 
 RECEIVE AND ACKNOWLEDGE
   A channel-probe event must be acknowledged with channel_ack and its exact

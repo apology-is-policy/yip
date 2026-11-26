@@ -38,11 +38,12 @@ func DefaultAdminSocketPath(dataDir string) string {
 // clock resume under LDR-GO-RELAY-DESIGN §4.1) strictly over an owner-only
 // (0600) Unix domain socket — never on any network interface.
 type AdminServer struct {
-	sockPath string
-	sockInfo os.FileInfo
-	ln       net.Listener
-	srv      *http.Server
-	engine   *RelayEngine
+	sockPath  string
+	sockInfo  os.FileInfo
+	ln        net.Listener
+	srv       *http.Server
+	engine    *RelayEngine
+	admission func() AdmissionStatus
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -51,7 +52,7 @@ type AdminServer struct {
 // StartAdminServer binds an owner-only (0600) local Unix domain socket at
 // sockPath and serves local operator control endpoints for engine.
 // It refuses to replace any non-socket file or an already-active socket.
-func StartAdminServer(sockPath string, engine *RelayEngine) (*AdminServer, error) {
+func StartAdminServer(sockPath string, engine *RelayEngine, status ...func() AdmissionStatus) (*AdminServer, error) {
 	if sockPath == "" {
 		return nil, errors.New("ldrrelay: empty admin socket path")
 	}
@@ -101,6 +102,9 @@ func StartAdminServer(sockPath string, engine *RelayEngine) (*AdminServer, error
 		engine:   engine,
 		done:     make(chan struct{}),
 	}
+	if len(status) > 0 {
+		as.admission = status[0]
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/v1/status", as.handleStatus)
 	mux.HandleFunc("/admin/v1/clock/resume", as.handleClockResume)
@@ -146,9 +150,11 @@ func (a *AdminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"lines": a.engine.Status(),
-	})
+	response := map[string]any{"lines": a.engine.Status()}
+	if a.admission != nil {
+		response["admission"] = a.admission()
+	}
+	_ = json.NewEncoder(w).Encode(response)
 }
 
 type adminClockResumeRequest struct {
@@ -251,6 +257,19 @@ func newAdminHTTPClient(sockPath string) *http.Client {
 
 // AdminStatus queries the live status of a running relay via its local admin socket.
 func AdminStatus(ctx context.Context, sockPath string) ([]LineStatus, error) {
+	st, err := ReadAdminStatus(ctx, sockPath)
+	if err != nil {
+		return nil, err
+	}
+	return st.Lines, nil
+}
+
+type RelayAdminStatus struct {
+	Lines     []LineStatus     `json:"lines"`
+	Admission *AdmissionStatus `json:"admission,omitempty"`
+}
+
+func ReadAdminStatus(ctx context.Context, sockPath string) (*RelayAdminStatus, error) {
 	if sockPath == "" {
 		return nil, errors.New("ldrrelay: empty admin socket path")
 	}
@@ -270,13 +289,11 @@ func AdminStatus(ctx context.Context, sockPath string) ([]LineStatus, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("ldrrelay: admin status HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
-	var out struct {
-		Lines []LineStatus `json:"lines"`
-	}
+	var out RelayAdminStatus
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, err
 	}
-	return out.Lines, nil
+	return &out, nil
 }
 
 // AdminClockResume sends an explicit operator clock-resume confirmation to the

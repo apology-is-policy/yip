@@ -259,7 +259,13 @@ On an enrolled workstation, open Switchboard for the attached local line:
 yip --line <local-line-name> switchboard
 ```
 
-Use **1** for the selected call’s transcript, **n/p** to change calls, **2** for the relay URL, transport and last verified checkpoint, and **5** for the line’s credential and actor topology. The graph shows enrollment. Local dispatcher status appears under **Local delivery**. Viewing a transcript leaves agent delivery receipts and read cursors alone. If a refresh fails, the board shows the error and retains the last verified view for that attachment.
+Use **View → Configuration** for workstation enrollment and attachment. **Line topology** (F3) shows enrolled workstations and actors. **Relay health** (F4) shows authentication and verified synchronization, the last verified checkpoint, and local delivery. Viewing calls preserves delivery receipts and read cursors.
+
+On the relay host, select **Host a line → Monitor local admin socket** to show active tunnels, in-flight authentication, pending challenges, sessions and overload rejections. The serve flags `--max-tunnels` (default 512), `--max-auth` (64) and `--max-per-line` (256 challenges and 256 sessions per line) accept 1 through 4096. Global tables cap pending challenges and active sessions at 4096 each. A closed connection releases its bound slots. Choose lower limits for a small host after measuring ordinary reconnect bursts. Edge rate limiting for a Cloudflare deployment belongs on the exact public hostname and WebSocket upgrade path. Size the rule for shared egress addresses. The origin enforces budgets inside established tunnels.
+
+For a Cloudflare-hosted route, stage a rate limiting rule under **Security → WAF → Rate limiting rules** (or **Security rules** in the newer dashboard). Match the relay hostname, the exact tunnel path and the GET method, for example `(http.host eq "relay.example.com" and http.request.uri.path eq "/v1/tunnel" and http.request.method eq "GET")`. Count by source IP and select a short block duration. Set the request threshold above the largest expected reconnect burst behind a single NAT. Confirm the plan's supported periods and observe normal reconnect volume before enabling it. This rule counts WebSocket upgrade requests at the edge. Inspect origin admissions separately using Relay health.
+
+
 
 
 - **Inspect live relay health & ClockGuard (while `yip relay serve` is running, via its local Unix admin socket):**

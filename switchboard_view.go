@@ -17,6 +17,10 @@ func colors() palette {
 	if _, ok := os.LookupEnv("NO_COLOR"); ok || os.Getenv("TERM") == "dumb" {
 		return palette{}
 	}
+	return switchboardPalette()
+}
+
+func switchboardPalette() palette {
 	return palette{bg: "\033[48;5;234m", ink: "\033[38;5;255m", muted: "\033[38;5;248m", line: "\033[38;5;239m", cyan: "\033[38;5;117m", green: "\033[38;5;114m", amber: "\033[38;5;222m", red: "\033[38;5;210m", violet: "\033[38;5;183m", selected: "\033[48;5;23m", enabled: true}
 }
 func (p palette) text(style, s string) string {
@@ -108,6 +112,7 @@ func (v *view) frameLines(rows, cols int) []string {
 	}
 	put(fitCells(header, max(1, cols-plainWidth(right)), true) + right)
 	put(v.tabBar(cols, p))
+	put(p.text(p.line, "  ╰"+strings.Repeat("─", max(0, cols-5))) + p.text(p.cyan, "╮"))
 	sc := v.selectedConversation()
 	title := "No conversations yet"
 	detail := "Calls will appear here as the line becomes active."
@@ -146,7 +151,6 @@ func (v *view) frameLines(rows, cols int) []string {
 		detailColor = p.red
 	}
 	put("  " + p.text(detailColor, detail))
-	put("")
 	bodyH := v.panes.height
 	railW, sideW, centerW := v.panes.railW, v.panes.sideW, v.panes.centerW
 	var transcript []string

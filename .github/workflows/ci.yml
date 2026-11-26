@@ -6,7 +6,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -18,8 +18,16 @@ jobs:
           python-version: '3.12'
       - run: go test -race ./...
       - run: go vet ./...
-      - run: go build -o "$RUNNER_TEMP/yip" .
+      - run: cd cmd/switchboard && go test -race ./...
+      - run: make build
+      - run: ./yip switchboard --check
+      - run: cp yip yip-switchboard "$RUNNER_TEMP/"
+      - run: python3 scripts/release.py --version ci --targets "$(go env GOOS)/$(go env GOARCH)" --out "$RUNNER_TEMP/packages"
       - run: YIP_TEST_BIN="$RUNNER_TEMP/yip" bash e2e.sh
       - run: python3 channels_e2e.py "$RUNNER_TEMP/yip"
       - run: YIP_TEST_BIN="$RUNNER_TEMP/yip" python3 delivery_e2e.py
       - run: python3 scripts/package_smoke.py "$RUNNER_TEMP/yip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yip-${{ matrix.os }}
+          path: ${{ runner.temp }}/packages/

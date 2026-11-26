@@ -18,9 +18,12 @@ import (
 	"github.com/apology-is-policy/yip/ldrclient"
 	"github.com/apology-is-policy/yip/ldrcore"
 	"github.com/apology-is-policy/yip/ldrcrypto"
+	"github.com/apology-is-policy/yip/ldrrelay"
 )
 
 const ldrUsage = `yip ldr -- Long Distance Relay client, equal-roots admin, and P3 enrollment ceremony.
+
+  yip ldr inspect --descriptor <file> [--expect <trusted-digest> --probe]
 
   ROOT & LINE BOOTSTRAP (equal 1-of-2 roots, Ed25519 or ECDSA P-256)
     yip ldr root keygen --out <keyfile> [--pub <pubfile>] [--alg ed25519|ecdsa-p256-sha256]
@@ -63,6 +66,35 @@ func LDRCLI(args []string, out io.Writer) error {
 	}
 	group, rest := args[0], args[1:]
 	switch group {
+	case "inspect":
+		rest, path := takeFlag(rest, "--descriptor", "")
+		rest, expected := takeFlag(rest, "--expect", "")
+		probe := hasFlag(rest, "--probe")
+		if path == "" || (probe && expected == "") {
+			return errors.New("inspect requires --descriptor; --probe also requires --expect from a trusted channel")
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		d, hash, _, _, err := ldrcrypto.VerifyCreationDescriptor(raw)
+		if err != nil {
+			return err
+		}
+		digest := hex.EncodeToString(hash[:])
+		fmt.Fprintf(out, "Line %x\nDescriptor %s\nRelay %s\nCarrier %s\nOrigin TLS %s\n", d.LineID, digest, d.RelayOrigin.URL, d.RelayOrigin.SessionBinding, d.RelayOrigin.TLSPolicy)
+		if expected != "" && !strings.EqualFold(expected, digest) {
+			return errors.New("trusted descriptor fingerprint differs")
+		}
+		if probe {
+			ctx, cancel := ldrTimeoutCtx()
+			defer cancel()
+			if err := ldrrelay.ProbeOrigin(ctx, d.RelayOrigin); err != nil {
+				return err
+			}
+			fmt.Fprintln(out, "Origin verified over TLS 1.3")
+		}
+		return nil
 	case "root":
 		return ldrRootCLI(rest, out)
 	case "join":
@@ -540,7 +572,16 @@ func ldrRootCLI(args []string, out io.Writer) error {
 		if err := ldrclient.SaveJoinRequest(outPath, req); err != nil {
 			return err
 		}
+		sigFP, err := ldrclient.KeyFingerprint(req.SigningKey)
+		if err != nil {
+			return err
+		}
+		encFP, err := ldrclient.KeyFingerprint(req.EncryptionKey)
+		if err != nil {
+			return err
+		}
 		return json.NewEncoder(out).Encode(map[string]any{
+			"sig_fingerprint": sigFP, "enc_fingerprint": encFP,
 			"request":    outPath,
 			"cred_id":    hex.EncodeToString(req.CredID[:]),
 			"request_id": hex.EncodeToString(req.RequestID),
@@ -565,6 +606,7 @@ func ldrJoinCLI(args []string, out io.Writer) error {
 		rest, dir = takeFlag(rest, "--dir", "")
 		rest, descPath = takeFlag(rest, "--descriptor", "")
 		rest, ns = takeFlag(rest, "--namespace", "")
+		rest, expectedDescriptor := takeFlag(rest, "--expect", "")
 		rest, limitStr = takeFlag(rest, "--actor-limit", "4")
 		rest, alg = takeFlag(rest, "--alg", ldrcrypto.AlgEd25519)
 		rest, outPath = takeFlag(rest, "--out", "")
@@ -600,6 +642,9 @@ func ldrJoinCLI(args []string, out io.Writer) error {
 		desc, cd, _, _, err := ldrcrypto.VerifyCreationDescriptor(rawDesc)
 		if err != nil {
 			return err
+		}
+		if expectedDescriptor != "" && !strings.EqualFold(expectedDescriptor, hex.EncodeToString(cd[:])) {
+			return errors.New("trusted descriptor fingerprint differs")
 		}
 		credKeys, err := ldrclient.GenerateCredentialKeys(alg)
 		if err != nil {
@@ -656,6 +701,8 @@ func ldrJoinCLI(args []string, out io.Writer) error {
 
 	case "challenge":
 		var opKeyPath, reqPath, outCh, outSec string
+		rest, expectedSigning := takeFlag(rest, "--expect-signing", "")
+		rest, expectedEncryption := takeFlag(rest, "--expect-encryption", "")
 		rest, opKeyPath = takeFlag(rest, "--operator-key", "")
 		rest, reqPath = takeFlag(rest, "--request", "")
 		rest, outCh = takeFlag(rest, "--out-challenge", "")
@@ -692,6 +739,18 @@ func ldrJoinCLI(args []string, out io.Writer) error {
 		req, reqDig, err := ldrclient.LoadJoinRequest(reqPath)
 		if err != nil {
 			return err
+		}
+		for _, item := range []struct {
+			want string
+			key  ldrcrypto.PublicKey
+		}{{expectedSigning, req.SigningKey}, {expectedEncryption, req.EncryptionKey}} {
+			actual, err := ldrclient.KeyFingerprint(item.key)
+			if err != nil {
+				return err
+			}
+			if item.want != "" && !strings.EqualFold(actual, item.want) {
+				return errors.New("workstation fingerprint differs from trusted value")
+			}
 		}
 		// If --out-secret already exists while --out-challenge does not, allow
 		// safe resume ONLY when --out-secret holds a valid matching ceremony for

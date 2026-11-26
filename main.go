@@ -818,11 +818,23 @@ func main() {
 		me := must(WhoAmI(as, ""))
 		printSetup(me)
 	case "switchboard":
-		// The human's live seat. It can ratify and arbitrate; it deliberately
-		// has no key that speaks as an agent -- see switchboard.go.
-		if err := Switchboard(parseSwitchboardArgs(args)); err != nil {
-			fmt.Fprintln(os.Stderr, "switchboard:", err)
-			os.Exit(1)
+		if hasFlag(args, "--snapshot-stream") {
+			check(serveSwitchboardSnapshots(context.Background(), os.Stdin, os.Stdout))
+			return
+		}
+		if first(args) == "--renderer-name" {
+			fmt.Println(switchboardRenderer)
+			return
+		}
+		switch first(args) {
+		case "--arbitrate", "--reprobe":
+			message, err := switchboardOperator(args[0], args[1:])
+			check(err)
+			fmt.Println(message)
+		case "--reference":
+			check(Switchboard(parseSwitchboardArgs(args)))
+		default:
+			check(launchSwitchboard(args))
 		}
 	case "doctor":
 		if runtime == "claude-channels" {

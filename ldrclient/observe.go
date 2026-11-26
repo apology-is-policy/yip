@@ -2,6 +2,8 @@ package ldrclient
 
 import (
 	"context"
+	"errors"
+	"github.com/apology-is-policy/yip/ldrrelay"
 	"slices"
 	"sort"
 	"time"
@@ -12,13 +14,17 @@ import (
 // CallObservation describes one verified client checkpoint. Viewing a call
 // keeps delivery receipts, scan cursors and pending send recovery independent.
 type CallObservation struct {
-	Origin      ldrcrypto.RelayOrigin
-	Status      ClientStatus
-	VerifiedAt  time.Time
-	Calls       []CallSummary
-	Actors      []ActorSummary
-	Credentials []ObservedCredential
-	Transcript  *CallTranscript
+	Origin                       ldrcrypto.RelayOrigin
+	Status                       ClientStatus
+	VerifiedAt                   time.Time
+	Calls                        []CallSummary
+	Actors                       []ActorSummary
+	Credentials                  []ObservedCredential
+	Transcript                   *CallTranscript
+	Broadcasts                   []BroadcastView
+	Roadmaps                     []VerifiedRegister
+	Stage                        string
+	BroadcastError, RoadmapError string
 }
 
 type ObservedCredential struct {
@@ -31,19 +37,33 @@ type ObservedCredential struct {
 // advance verified.wal and unwrap epoch keys, but the observer cannot submit
 // operations or initiate outbox recovery on behalf of its co-resident agent.
 func ObserveCalls(ctx context.Context, dir, selected string, previous *CallObservation) (CallObservation, error) {
-	var next CallObservation
-	c, err := openClient(dir, nil, nil, false)
+	return ObserveSwitchboard(ctx, dir, selected, previous, ObservationViews{})
+}
+
+type ObservationViews struct{ Broadcasts, Roadmaps bool }
+
+func ObserveSwitchboard(ctx context.Context, dir, selected string, previous *CallObservation, views ObservationViews) (CallObservation, error) {
+	next := CallObservation{Stage: "Opening client directory"}
+	c, err := openClientWait(ctx, dir, false)
 	if err != nil {
 		return next, err
 	}
 	defer c.Close()
 	desc, _, _, _ := c.Descriptor()
 	next.Origin, next.Status = desc.RelayOrigin, c.Status()
+	next.Stage = "Authenticating relay session"
 	sess, err := c.Dial(ctx, ldrcrypto.PrincipalCredential)
 	if err != nil {
+		var refused *ldrrelay.AuthError
+		if errors.As(err, &refused) {
+			next.Stage = "Relay reached · credential refused"
+		} else {
+			next.Stage = "Relay session unavailable"
+		}
 		return next, err
 	}
 	defer sess.Close()
+	next.Stage = "Verifying control log"
 	if _, err = c.Sync(ctx, sess); err != nil {
 		return next, err
 	}
@@ -88,6 +108,19 @@ func ObserveCalls(ctx context.Context, dir, selected string, previous *CallObser
 			}
 		}
 	}
+	next.Stage = "Authenticated and synced · last refresh"
 	next.VerifiedAt = time.Now()
+	if views.Broadcasts {
+		next.Broadcasts, err = c.ListBroadcasts(ctx, sess, "", true)
+		if err != nil {
+			next.BroadcastError = err.Error()
+		}
+	}
+	if views.Roadmaps {
+		next.Roadmaps, err = c.ReadRegisters(ctx, sess, "roadmap")
+		if err != nil {
+			next.RoadmapError = err.Error()
+		}
+	}
 	return next, nil
 }

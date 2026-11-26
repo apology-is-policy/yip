@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apology-is-policy/yip/ldrcore"
@@ -54,6 +55,7 @@ const (
 )
 
 type pendingChallenge struct {
+	conn        net.Conn
 	lineID      []byte
 	principal   ldrcrypto.Principal
 	serverNonce [32]byte
@@ -62,6 +64,7 @@ type pendingChallenge struct {
 }
 
 type activeSession struct {
+	conn      net.Conn
 	sessionID []byte
 	lineID    []byte
 	gen       uint64
@@ -74,7 +77,12 @@ type activeSession struct {
 // RelayServer exposes RelayEngine over TLS 1.3 with RFC 9266 tls-exporter
 // channel-bound authenticated sessions (P7).
 type RelayServer struct {
-	engine *RelayEngine
+	engine    *RelayEngine
+	byConn    map[net.Conn]map[string]struct{}
+	authSlots chan struct{}
+	perLine   int
+	overload  atomic.Uint64
+	tunnels   atomic.Int64
 
 	mu              sync.Mutex
 	pending         map[string]pendingChallenge // hex(session_id)
@@ -89,11 +97,13 @@ type RelayServer struct {
 func NewRelayServer(engine *RelayEngine) *RelayServer {
 	s := &RelayServer{
 		engine:      engine,
+		byConn:      make(map[net.Conn]map[string]struct{}),
 		pending:     make(map[string]pendingChallenge),
 		sessions:    make(map[string]*activeSession),
 		idleTimeout: sessionIdleTimeout,
 		mux:         http.NewServeMux(),
 	}
+	s.ConfigureAdmission(64, 256)
 	s.mux.HandleFunc("/v1/health", s.handleHealth)
 	s.mux.HandleFunc("/v1/lines/", s.handleLine)
 	return s
@@ -246,6 +256,17 @@ func (s *RelayServer) handleLine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if endpoint == "session/challenge" || endpoint == "session/auth" {
+		select {
+		case s.authSlots <- struct{}{}:
+			defer func() { <-s.authSlots }()
+		default:
+			s.overload.Add(1)
+			http.Error(w, "relay authentication busy", http.StatusTooManyRequests)
+			return
+		}
+	}
+	conn, _ := r.Context().Value(connectionKey{}).(net.Conn)
 	body, err := readBoundedBody(w, r, maxHTTPBodyBytes)
 	if err != nil {
 		http.Error(w, "request body too large or unreadable", http.StatusRequestEntityTooLarge)
@@ -255,7 +276,7 @@ func (s *RelayServer) handleLine(w http.ResponseWriter, r *http.Request) {
 
 	switch endpoint {
 	case "session/challenge":
-		s.handleChallenge(w, lineID, cb, body)
+		s.handleChallenge(w, lineID, cb, body, conn)
 	case "session/auth":
 		s.handleAuth(w, lineID, cb, body)
 	case "submit":
@@ -297,17 +318,19 @@ func writeCBOR(w http.ResponseWriter, status int, m ldrcrypto.Map) {
 func (s *RelayServer) sweepLocked(now time.Time) {
 	for k, pc := range s.pending {
 		if now.After(pc.expiresAt) {
+			s.forgetLocked(pc.conn, k)
 			delete(s.pending, k)
 		}
 	}
 	for k, as := range s.sessions {
 		if s.isSessionExpiredLocked(as, now) {
+			s.forgetLocked(as.conn, k)
 			delete(s.sessions, k)
 		}
 	}
 }
 
-func (s *RelayServer) handleChallenge(w http.ResponseWriter, lineID []byte, cb [32]byte, body []byte) {
+func (s *RelayServer) handleChallenge(w http.ResponseWriter, lineID []byte, cb [32]byte, body []byte, conn net.Conn) {
 	dec, err := ldrcrypto.UnmarshalCBORDefault(body)
 	if err != nil {
 		writeCBOR(w, http.StatusBadRequest, ldrcrypto.Map{{Key: "error", Value: "malformed"}, {Key: "v", Value: uint64(1)}})
@@ -366,12 +389,14 @@ func (s *RelayServer) handleChallenge(w http.ResponseWriter, lineID []byte, cb [
 
 	s.mu.Lock()
 	s.sweepLocked(now)
-	if len(s.pending) >= maxPendingChallenges {
+	if s.pendingFullLocked(lineID) {
+		s.overload.Add(1)
 		s.mu.Unlock()
 		writeCBOR(w, http.StatusTooManyRequests, ldrcrypto.Map{{Key: "error", Value: "overloaded"}, {Key: "v", Value: uint64(1)}})
 		return
 	}
-	s.pending[hex.EncodeToString(sid[:])] = pendingChallenge{
+	s.rememberLocked(conn, hex.EncodeToString(sid[:]))
+	s.pending[hex.EncodeToString(sid[:])] = pendingChallenge{conn: conn,
 		lineID:      bytes.Clone(lineID),
 		principal:   prin,
 		serverNonce: nonce,
@@ -428,6 +453,7 @@ func (s *RelayServer) handleAuth(w http.ResponseWriter, lineID []byte, cb [32]by
 	s.mu.Lock()
 	pc, found := s.pending[sidHex]
 	// Burn challenge immediately on first attempt (single-use!).
+	s.forgetLocked(pc.conn, sidHex)
 	delete(s.pending, sidHex)
 	s.mu.Unlock()
 
@@ -478,12 +504,14 @@ func (s *RelayServer) handleAuth(w http.ResponseWriter, lineID []byte, cb [32]by
 
 	s.mu.Lock()
 	s.sweepLocked(now)
-	if len(s.sessions) >= maxActiveSessions {
+	if s.sessionsFullLocked(lineID) {
+		s.overload.Add(1)
 		s.mu.Unlock()
 		writeCBOR(w, http.StatusTooManyRequests, ldrcrypto.Map{{Key: "class", Value: ldrcore.ClassAdmission}, {Key: "code", Value: "overloaded"}, {Key: "v", Value: uint64(1)}})
 		return
 	}
-	s.sessions[sidHex] = &activeSession{
+	s.rememberLocked(pc.conn, sidHex)
+	s.sessions[sidHex] = &activeSession{conn: pc.conn,
 		sessionID: bytes.Clone(sid),
 		lineID:    bytes.Clone(lineID),
 		gen:       curGen,
@@ -512,6 +540,7 @@ func (s *RelayServer) validateSession(sid []byte, lineID []byte, cb [32]byte, re
 		return ldrcrypto.Principal{}, 0, false
 	}
 	if s.isSessionExpiredLocked(sess, now) {
+		s.forgetLocked(sess.conn, sidHex)
 		delete(s.sessions, sidHex)
 		return ldrcrypto.Principal{}, 0, false
 	}
@@ -967,6 +996,60 @@ func resolveOriginDialAddr(originURL string) (string, error) {
 	return net.JoinHostPort(host, port), nil
 }
 
+// ProbeOrigin verifies the descriptor-selected transport without opening a line session.
+func ProbeOrigin(ctx context.Context, origin ldrcrypto.RelayOrigin) error {
+	inner, err := ClientTLSConfig(origin)
+	if err != nil {
+		return err
+	}
+	var outer *tls.Config
+	var addr string
+	switch origin.SessionBinding {
+	case ldrcrypto.SessionBindingWSTLS13Exporter:
+		outer, err = ClientOuterTLSConfig(origin)
+	case ldrcrypto.SessionBindingTLS13Exporter:
+		addr, err = resolveOriginDialAddr(origin.URL)
+	default:
+		return ErrUnsupportedTransport
+	}
+	if err != nil {
+		return err
+	}
+	tc, err := dialOriginTLS(ctx, origin, inner, outer, addr)
+	if err != nil {
+		return err
+	}
+	defer tc.Close()
+	_, err = ExportTLSChannelBinding(tc.ConnectionState())
+	return err
+}
+
+func dialOriginTLS(dialCtx context.Context, origin ldrcrypto.RelayOrigin, innerTLSCfg, outerTLSCfg *tls.Config, dialAddr string) (*tls.Conn, error) {
+	var tc *tls.Conn
+	if origin.SessionBinding == ldrcrypto.SessionBindingWSTLS13Exporter {
+		tunnelCtx, cancel := context.WithTimeout(dialCtx, wsDefaultHandshakeTTL)
+		defer cancel()
+		wsConn, err := DialWSTunnel(tunnelCtx, origin.URL, outerTLSCfg)
+		if err != nil {
+			return nil, err
+		}
+		tc = tls.Client(wsConn, innerTLSCfg)
+		if err := tc.HandshakeContext(tunnelCtx); err != nil {
+			_ = tc.Close()
+			_ = wsConn.Close()
+			return nil, err
+		}
+	} else {
+		dialer := &tls.Dialer{Config: innerTLSCfg}
+		conn, err := dialer.DialContext(dialCtx, "tcp", dialAddr)
+		if err != nil {
+			return nil, err
+		}
+		tc = conn.(*tls.Conn)
+	}
+	return tc, nil
+}
+
 // DialSession opens a pinned TLS 1.3 connection to origin (directly for
 // tls13_exporter, or over an outer HTTPS HTTP/1.1 WebSocket tunnel with pinned
 // inner TLS 1.3 for ws_tls13_exporter), exports RFC 9266 tls-exporter channel
@@ -1031,27 +1114,9 @@ func DialSession(ctx context.Context, origin ldrcrypto.RelayOrigin, lineID []byt
 			stop := context.AfterFunc(handshakeCtx, cancelDial)
 			defer stop()
 			defer cancelDial()
-			var tc *tls.Conn
-			if origin.SessionBinding == ldrcrypto.SessionBindingWSTLS13Exporter {
-				tunnelCtx, cancel := context.WithTimeout(dialCtx, wsDefaultHandshakeTTL)
-				defer cancel()
-				wsConn, err := DialWSTunnel(tunnelCtx, origin.URL, outerTLSCfg)
-				if err != nil {
-					return nil, err
-				}
-				tc = tls.Client(wsConn, innerTLSCfg)
-				if err := tc.HandshakeContext(tunnelCtx); err != nil {
-					_ = tc.Close()
-					_ = wsConn.Close()
-					return nil, err
-				}
-			} else {
-				dialer := &tls.Dialer{Config: innerTLSCfg}
-				conn, err := dialer.DialContext(dialCtx, network, dialAddr)
-				if err != nil {
-					return nil, err
-				}
-				tc = conn.(*tls.Conn)
+			tc, err := dialOriginTLS(dialCtx, origin, innerTLSCfg, outerTLSCfg, dialAddr)
+			if err != nil {
+				return nil, err
 			}
 			cb, err := ExportTLSChannelBinding(tc.ConnectionState())
 			if err != nil {

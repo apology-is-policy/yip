@@ -18,6 +18,23 @@ trap 'rm -f "$stage"' EXIT HUP INT TERM
 cp "$source_bin" "$stage"
 chmod 755 "$stage"
 [ "$("$stage" version)" = "$version" ]
+renderer=$("$stage" switchboard --renderer-name)
+case "$renderer" in
+    yip-switchboard|yip-switchboard-[a-f0-9]*) ;;
+    *) echo "unexpected renderer name: $renderer" >&2; exit 1 ;;
+esac
+case "$renderer" in */*) exit 1 ;; esac
+renderer_src="$(dirname "$source_bin")/$renderer"
+if [ ! -x "$renderer_src" ]; then
+    echo "missing companion: $renderer_src" >&2
+    exit 1
+fi
+ui_stage=$(mktemp "$parent/.yip-switchboard.XXXXXX")
+trap 'rm -f "$stage" "$ui_stage"' EXIT HUP INT TERM
+cp "$renderer_src" "$ui_stage"
+chmod 755 "$ui_stage"
+"$ui_stage" --check >/dev/null
+mv -f "$ui_stage" "$parent/$renderer"
 # Rename a new inode; never overwrite bytes of a running macOS executable.
 if [ -e "$destination" ] || [ -L "$destination" ]; then
     backup="$destination.backup.$(date +%Y%m%dT%H%M%S).$$"

@@ -18,6 +18,9 @@ type sbRelay struct {
 }
 
 func loadRelayBoard(ctx context.Context, att LDRAttachment, selected string, previous sbState) sbState {
+	return loadRelayViews(ctx, att, selected, previous, ldrclient.ObservationViews{})
+}
+func loadRelayViews(ctx context.Context, att LDRAttachment, selected string, previous sbState, views ldrclient.ObservationViews) sbState {
 	// An attachment can be removed or replaced while the terminal is open.
 	current, ok, err := loadLDRAttachment()
 	if err != nil {
@@ -28,12 +31,13 @@ func loadRelayBoard(ctx context.Context, att LDRAttachment, selected string, pre
 	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	snapshot, err := ldrclient.ObserveCalls(ctx, att.ClientDir, selected, &previous.relay.CallObservation)
+	snapshot, err := ldrclient.ObserveSwitchboard(ctx, att.ClientDir, selected, &previous.relay.CallObservation, views)
 	if err != nil {
 		if previous.relay.VerifiedAt.IsZero() || (snapshot.Status.LineID != "" &&
 			(snapshot.Status.LineID != previous.relay.Status.LineID || snapshot.Status.CredID != previous.relay.Status.CredID)) {
 			previous = sbState{relay: &sbRelay{CallObservation: snapshot}}
 		}
+		previous.relay.Stage = snapshot.Stage
 		previous.err = err.Error()
 		return previous
 	}

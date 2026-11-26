@@ -40,7 +40,7 @@ with tempfile.TemporaryDirectory(prefix='yip-pty-') as tmp:
         launcher = """import json,subprocess,sys,termios
 +from pathlib import Path
 +before=termios.tcgetattr(0)
-+p=subprocess.Popen([sys.argv[1],'switchboard','--by','test-operator'])
++p=subprocess.Popen([sys.argv[1],'switchboard','--reference','--by','test-operator'])
 +Path(sys.argv[3]).write_text(str(p.pid))
 +rc=p.wait()
 +Path(sys.argv[2]).write_text(json.dumps(dict(rc=rc,restored=before==termios.tcgetattr(0))))

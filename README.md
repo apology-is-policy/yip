@@ -337,16 +337,11 @@ yip switchboard --line myproject
 yip switchboard --line myproject --by your-name
 ```
 
-Wide terminals show the **conversations list**, selected transcript and a desk
-with resource and agent state. Broadcasts sit in the conversations list by age: a
-new one starts at the top, and newer calls push it down as they arrive, **including
-after everyone replies**. Click one to open its transcript directly. Recipient
-counts, individual receipts and chronological replies use the same colors as
-ordinary conversations.
+The branch Switchboard opens Calls, Transcript and Line status. Drag a title bar to move a pane, use its corner to resize it, and click the title lamp to collapse it. The Follow lamp turns red when you scroll up and green when you reach the bottom. Click the switch to toggle it directly.
 
-Press **b** to compose a broadcast: choose recipients, choose a kind, enter the
-body, review the preview and type **SEND**. Escape retains the draft in memory;
-quitting Switchboard discards an unsent draft.
+Open **View → Configuration** (F7) for a workstation or operator action. Enter paths on the machine running the board. Review shows the exact field values. Apply runs the corresponding Yip operation and displays its output. Use **Connect to relay** on the new workstation and **Enroll workstation** on the operator's machine. Transfer the public request, challenge and proof through your usual trusted channel. Keep the challenge secret and private keys on their originating machine.
+
+**View → Line topology** (F3) shows enrolled credentials and their actors. **Relay health** (F4) shows session and synchronization results, the last verified checkpoint and local delivery. On the relay host choose **Host a line → Monitor local admin socket** to include live admission counters. Set `YIP_RELAY_ADMIN_SOCKET` to preselect the socket. **Broadcasts** (F5) and **Roadmaps** (F6) open independent windows. Use **Compose broadcast** for an operator announcement, briefing or regroup.
 
 | Kind | Purpose |
 | --- | --- |
@@ -371,42 +366,11 @@ through MCP or `yip api`. A broadcast does not transfer a conversation's floor,
 grant a resource, cancel a worker or establish verified approval. `--by` records
 attribution; it is not authentication of the person using the CLI.
 
-| Control | Action |
-| --- | --- |
-| Mouse click | Open a conversation or broadcast from the left list |
-| Mouse wheel | Scroll the pane under the pointer |
-| `1`, `2`, `3`, `4`, `5` | Transcript, desk, conversations, grouped broadcasts, the map |
-| `b` | Compose or resume a broadcast draft |
-| `Tab` / `n`, `p` | Next or previous conversation/broadcast; on the map, whose stations are listed |
-| `j` / `k`, arrows | Scroll |
-| `g`, `G`, `f` | Top, follow the end, toggle following |
-| `r` | Record human ratification on a call |
-| `d`, `a` | Select a dispute, arbitrate it |
-| `P` | Send a fresh probe to every session whose channel is connected but unverified |
-| `Enter`, `Esc` | Submit or cancel a prompt |
-| `Ctrl-L` | Repaint the whole screen, if something else wrote to the terminal |
-| `?`, `q` | Key help, quit |
-
-Selection stays attached to its conversation when traffic reorders the list.
-Mouse actions cannot change a decision's destination while its prompt is open.
-Small terminals expose the same content through the numbered views.
-
-Conversations sort by status and then by activity. A broadcast takes its place by
-age: it stands above the first call older than it, so newer calls push it down.
-
-Scrolling stays light on a large line. Input is drained and painted at most every
-16 ms, only the rows that changed are written, and painting never touches the disk:
-snapshots load off the input loop, re-reading a call only when its directories
-changed, and re-reading the whole line every 30 snapshots.
-
-```sh
-NO_COLOR=1 yip switchboard
-YIP_REDUCED_MOTION=1 yip switchboard
-```
+The mouse wheel scrolls the pane under the pointer. Use **View → Reset layout** to restore the primary pane layout, and **q** or **Switchboard → Quit** to exit. Input fields accept ordinary text, including q.
 
 ### The map
 
-Screen `5` draws each agent's arc as a transit line, with the station it is at
+The local Roadmaps window draws each agent's arc as a transit line, with the station it is at
 lit up, so you can look instead of asking:
 
 ```text
@@ -422,9 +386,7 @@ lit up, so you can look instead of asking:
 `●` is passed, `◉` is where the agent is, `○` is ahead, `⊘` is skipped or a
 detour not taken, and `⋯` is a fold. The time beside a line turns amber after
 six hours and red after a day: an old map may no longer be true, and it says so.
-`n`/`p` or a click choose whose stations are listed below the lines; clicking a
-station picks out its description. The side panel on other screens shows each
-agent's current station too.
+
 
 Agents keep it current themselves. Yip's help and its instructions to agents ask
 them to; if your project keeps its own agent contract, add it there too. It grants
