@@ -698,81 +698,57 @@ Connecting directly to [LDR-RECOVERY.md](LDR-RECOVERY.md) (draft v0):
 
 ## 8. Implementation status and phased build plan
 
-### Current status (2026-11-25)
+### Current status (2026-11-26)
 
-- **Completed on `gemini/ldr` (approved by the operator 2026-11-25; awaiting Codex/Claude cross-review):**
+- **Peer cross-review completed (Codex/Astra, call `0004`, 18 bounded slices / 70 turns / 21 remediation commits through `f87942a`):**
   1. **Draft v9 `ldrcore/` recovery and generation-transition reference model**
      ([LDR-RECOVERY.md](LDR-RECOVERY.md), `ldrcore/recovery.go`,
      `ldrcore/recovery_test.go`): O23-B `seq` reset to 1 with `(gen, seq)`
-     coordinates everywhere, full cross-generation replay from genesis,
-     discarded `call_id` / `broadcast_id` tombstones, 232 active vectors
-     (`A233`–`A234`) and 58 traces / 196 steps (`T53`–`T58`). Verified under
-     held `mac` lease: `gofmt` clean, `go vet ./ldrcore/` clean,
-     `GOMAXPROCS=2 go test -count=1 ./ldrcore/` PASS (`63.976s`),
-     `-race` PASS (`34.947s`).
+     coordinates everywhere, full cross-generation replay from genesis
+     (including retained client genesis profile), discarded `call_id` /
+     `broadcast_id` tombstones, 232 active vectors and 58 traces / 196 steps.
   2. **Phase A (`ldrcrypto/`):** standalone zero-dep Go 1.25 stdlib package
-     (`cbor.go`, `sign.go`, `digest.go`, `hpke.go`, `aead.go`, `envelope.go`,
-     plus RFC/negative/property test suites) implementing strict deterministic
-     CBOR (RFC 8949 §4.2.1), canonical `ed25519` (RFC 8032 §8.4 + all 8
-     small-order point rejections) + strict low-S `ecdsa-p256-sha256`,
-     RFC 9180 HPKE Base mode (byte-verified against Appendix A.1.1 + AES-256-GCM
-     suite), random-salt `HKDF-SHA256 + AES-256-GCM` payload AEAD, and
-     canonical descriptor / P3 ceremony / envelope / P7 session-auth builders.
-     Verified under held `mac` lease: `gofmt` clean, `go vet ./ldrcore/ ./ldrcrypto/`
-     clean, `GOMAXPROCS=2 go test -count=1 ./ldrcrypto/` PASS (`0.557s`),
-     `-race` PASS (`2.118s`).
+     implementing strict deterministic CBOR (exact header widths & zero-alloc
+     map budget preflight), canonical `ed25519` + strict low-S `ecdsa-p256-sha256`,
+     RFC 9180 HPKE Base mode (verified against external CFRG vectors),
+     random-salt `HKDF-SHA256 + AES-256-GCM` payload AEAD with exact package-size
+     preflight, streaming SHA-256 canonical digests, strict single-CA
+     `ParsePinnedCARootPEM`, and signed §9 advisory register envelopes.
   3. **Phase B (`ldrstore/`, `ldrrelay/`, `relay_cli.go`):**
-     - `ldrstore/`: swappable `Store` interface + zero-dep CRC32C-framed
-       append-only WAL (`FileStore`), content-addressed commitment-verified
-       sidecars (`payload-*`, `wrap-*`), macOS `F_FULLFSYNC` / Unix `fsync` /
-       Windows `FlushFileBuffers` + parent-dir sync + exclusive `flock`, clean
-       torn-EOF tail recovery, and hard fail-closed rejection on mid-log/CRC/
-       sidecar corruption.
-     - `ldrrelay/`: `ClockGuard` discontinuity/freeze/sleep/restart detector;
-       canonical wire-intent codec covering all 26 phase-1 record types bridged
-       into `ldrcore.Apply` with real `ldrcrypto` signatures, cryptographic
-       `cred_id` derivation, and real SHA-256 chain heads; serialized per-line
-       `RelayEngine` with full startup WAL/signature/chain replay, P5
-       lookup-before-sidecars, demand-driven `time_anchor`, and `Compact`;
-       TLS 1.3 server/client transport with `InitSelfSignedCert`, strict
-       `pin_spki_sha256` / `pin_ca_root_pem` / `webpki` verification, RFC 9266
-       `tls-exporter` channel-bound single-use challenge sessions (`P7`),
-       and mid-session revocation enforcement.
-     - `yip relay <init|provision|serve|status>` CLI subcommands.
-     - Verified under held `mac` lease (Go 1.25.3, `darwin/arm64`): `gofmt`
-       clean, `go vet ./ldrstore/ ./ldrrelay/ ./ldrcrypto/ ./` clean;
-       `ldrstore/` PASS (`0.537s`, `-race` `1.792s`), `ldrrelay/` PASS
-       (`0.520s`, `-race` `2.140s`), `ldrcrypto/` `-race` PASS (`2.113s`),
-       `TestRelayCLI` PASS (`0.358s`, `-race` `1.464s`), full root `yip`
-       regression suite PASS (`23.912s`).
-  4. **Phase C (`ldrclient/`, `ldr_cli.go`, `main.go`):**
-     - `ldrclient/`: isolated `0600` key custody (`Ed25519`, `ECDSA P-256`,
-       `X25519`, `CredID` re-verification, display fingerprints); exclusive
-       OS-locked local client directory; CRC32C-framed `verified.wal` with full
-       startup replay (chain heads, real signatures, `signedContext`,
-       `ldrcore.Apply`); atomic persist-before-send `outbox.cbor` (`F_FULLFSYNC`)
-       enforcing restart `MustResolve`, `ResolveAll`, slot exclusivity, and
-       persistent Rule 8 per-key stops; O25 full-replay onboarding gate
-       (`VerifyEnrollmentAndActivate`) verifying committed keys & grant against
-       saved P3 request and unwrapping HPKE epoch wraps; P9 reader-enforced
-       `ComposeEpochActivate`; 3-state §10.2 payload reader (`ReadNone`,
-       `ReadNoKey`, `ReadUndecryptable`, `ReadMalformed`, `ReadOK`);
-       rebuildable `projection/` materializer with `VerifiedRead` taint
-       detection and automatic/explicit `Rebuild`; durable `ScannedSeq` local
-       delivery scan cursor with C2 withholding on `actor_move`/removal,
-       leaving host-local resource leases completely untouched.
-     - `yip ldr` CLI (`root`, `join`, `epoch`, `sync`, `actor`, `call`,
-       `status`) + live localhost TLS 1.3 end-to-end CLI test.
-     - Verified under held `mac` lease (Go 1.25.3, `darwin/arm64`): `gofmt`
-       clean, `go vet ./ldrclient/ ./ldrrelay/ ./ldrstore/ ./ldrcrypto/ ./`
-       clean; `ldrclient/` PASS (`2.341s`, `-race` `6.113s`), `TestLDRCLI` +
-       `TestRelayCLI` PASS (`1.462s`, `-race` `5.934s`), `-race` across
-       `ldrrelay/` (`2.340s`), `ldrstore/` (`1.865s`), `ldrcrypto/` (`2.396s`),
-       and full root `yip` regression suite PASS (`27.322s`).
-- **Awaiting peer cross-review (Codex & Claude) and optional future phases:**
-  - **MCP transport/tool wiring & production hardening:** wiring `yip serve`
-    attached-line mode into `ldrclient` once Codex/Claude cross-review
-    Phases A–C.
-  - **Optional future backend:** Cloudflare Worker / Durable Object backend
-    implementing the same `Store` / wire protocol with
-    `session_binding: "app_authenticated_session"`.
+     CRC32C-framed append-only WAL + CAS sidecars with macOS `F_FULLFSYNC` /
+     parent-dir sync barriers, write-quarantine fencing, `ClockGuard` with
+     `uint64` domain validation and local `0600` Unix admin socket
+     (`yip relay clock <status|resume>`), serialized per-line `RelayEngine`
+     with full startup replay + §9 advisory register cache, and TLS 1.3 server/client
+     transport with `pin_spki_sha256` / strict single-CA `pin_ca_root_pem` /
+     `webpki`, IPv6 `net.JoinHostPort` dialing, RFC 9266 `tls-exporter` P7
+     sessions, uniform `v=1`/`session_gen` reply binding, and lookup idle expiry.
+  4. **Phase C (`ldrclient/`, `ldr_cli.go`):**
+     isolated `0600` key custody, OS-locked local client dir (`OpenClient` +
+     multi-process `OpenClientWait`), CRC32C `verified.wal` full replay,
+     persist-before-send `outbox.cbor`, multi-signer `ResolveAll` with monotonic
+     `ResolveEpoch`, O25 full-replay onboarding gate, staged `epochs.cbor` /
+     `cursors.cbor` / `registers.cbor` durability with `ReconcileDurability`,
+     and rebuildable projections with `VerifiedRead` taint detection.
+  5. **Phase D (`ldrcrypto/register.go`, `ldrrelay/register.go`,
+     `ldrclient/registers.go`, `ldrclient/ops.go`, `ldr_cli_ops.go`,
+     `ldr_bridge.go`, [LDR-QUICKSTART.md](LDR-QUICKSTART.md)):**
+     - End-to-end signed & encrypted §9 advisory registers (`presence`, `roadmap`,
+       `resource`) with client-side independent signature, commitment, and
+       `Historical` verification.
+     - Full high-level `ldrclient` coordination API and `yip ldr` CLI parity
+       (calls, turns, byes, notes, ratifications, attachments, disputes,
+       broadcasts, actor addressing/removal, operator/credential revocation,
+       and advisory registers).
+     - Attached-LDR mode (`yip ldr attach` / `yip ldr detach` /
+       `yip install --ldr-dir`) seamlessly routing `yip serve` MCP tools,
+       hooks (`PostToolUse`, `Stop`, `SessionStart`), and live delivery wakeups
+       (`yip delivery listen --runtime agy`, Codex live delivery, Claude
+       Channels) through the verified encrypted LDR client while keeping
+       host-local resource leases strictly local.
+- **Optional future phases:**
+  - **Production `recovery_generation` wire/CLI workflow:** promoting the
+    Draft v9 `ldrcore/` recovery transition model into `ldrrelay`/`ldrclient`
+    wire endpoints once Claude/Codex review recovery wire schemas.
+  - **Cloudflare Worker / Durable Object backend:** implementing the same
+    `Store` / wire protocol with `session_binding: "app_authenticated_session"`.
