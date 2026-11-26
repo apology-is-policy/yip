@@ -2,8 +2,12 @@ package ldrrelay
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
@@ -1705,6 +1709,342 @@ func TestReconcileLineProtectsAcknowledgedPrefixFloorAndOutcomes(t *testing.T) {
 					t.Fatalf("mode %s: live engine MUST quarantine when previously opened WAL path is %s", mode, mode)
 				}
 			})
+		}
+	})
+}
+
+// TestInitSelfSignedCertSyncFailureRecoveryAndPreservation verifies Codex Turn 28:
+//   - Definite pre-link failures wrap ldrstore.ErrPreWrite; uncertain post-link
+//     directory-sync failures wrap ldrstore.ErrUncertainWrite without deleting
+//     published files.
+//   - Both key-dir and cert-dir SyncDir failures (same directory and separate
+//     directories) preserve the matching identity and recover on retry into a
+//     loadable matching TLS 1.3 cert/key pair with the exact SPKI pin.
+//   - Unrelated, sentinel, symlink, mismatched, or different-hosts files are
+//     refused without modification.
+func TestInitSelfSignedCertSyncFailureRecoveryAndPreservation(t *testing.T) {
+	hosts := []string{"127.0.0.1", "localhost"}
+
+	verifyLoadablePair := func(t *testing.T, certPath, keyPath string, wantPin [32]byte) {
+		t.Helper()
+		cfg, err := ServerTLSConfig(certPath, keyPath)
+		if err != nil {
+			t.Fatalf("ServerTLSConfig failed: %v", err)
+		}
+		if cfg.MinVersion != tls.VersionTLS13 || len(cfg.Certificates) != 1 {
+			t.Fatalf("unexpected ServerTLSConfig: min=%x certs=%d", cfg.MinVersion, len(cfg.Certificates))
+		}
+		if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
+			t.Fatalf("tls.LoadX509KeyPair failed: %v", err)
+		}
+		rawCert, err := os.ReadFile(certPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		blk, _ := pem.Decode(rawCert)
+		if blk == nil {
+			t.Fatalf("invalid cert PEM at %s", certPath)
+		}
+		cert, err := x509.ParseCertificate(blk.Bytes)
+		if err != nil {
+			t.Fatalf("ParseCertificate: %v", err)
+		}
+		gotPin := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+		if gotPin != wantPin {
+			t.Fatalf("SPKI pin mismatch: got %x want %x", gotPin, wantPin)
+		}
+		for _, h := range hosts {
+			if err := cert.VerifyHostname(h); err != nil {
+				t.Fatalf("VerifyHostname(%q) failed: %v", h, err)
+			}
+		}
+	}
+
+	layouts := []struct {
+		name     string
+		separate bool
+	}{
+		{name: "same_dir", separate: false},
+		{name: "separate_dirs", separate: true},
+	}
+
+	for _, layout := range layouts {
+		layout := layout
+		makePaths := func(t *testing.T) (certPath, keyPath string) {
+			t.Helper()
+			tmp := t.TempDir()
+			if layout.separate {
+				return filepath.Join(tmp, "certs", "server.crt"), filepath.Join(tmp, "keys", "server.key")
+			}
+			return filepath.Join(tmp, "tls", "server.crt"), filepath.Join(tmp, "tls", "server.key")
+		}
+
+		t.Run("key_dir_sync_failure_"+layout.name, func(t *testing.T) {
+			certPath, keyPath := makePaths(t)
+			keyDir := filepath.Dir(keyPath)
+			failKeyDir := true
+			syncDirHook := func(d string) error {
+				if failKeyDir && filepath.Clean(d) == filepath.Clean(keyDir) {
+					return errors.New("injected key-dir SyncDir EIO")
+				}
+				return ldrstore.SyncDir(d)
+			}
+
+			_, err := initSelfSignedCertWithHooks(certPath, keyPath, hosts, nil, syncDirHook)
+			if !errors.Is(err, ldrstore.ErrUncertainWrite) || errors.Is(err, ldrstore.ErrPreWrite) {
+				t.Fatalf("key-dir SyncDir failure: got %v, want ErrUncertainWrite (not ErrPreWrite)", err)
+			}
+			keyAfterFail, err := os.ReadFile(keyPath)
+			if err != nil {
+				t.Fatalf("expected linked keyPath to remain visible after post-link SyncDir failure: %v", err)
+			}
+			if _, err := os.Lstat(certPath); !os.IsNotExist(err) {
+				t.Fatalf("certPath must not exist after key-dir SyncDir failure, stat err=%v", err)
+			}
+
+			// Retry while key-dir SyncDir STILL fails MUST fail closed without publishing cert or altering key!
+			if _, err := initSelfSignedCertWithHooks(certPath, keyPath, hosts, nil, syncDirHook); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+				t.Fatalf("retry during ongoing key-dir SyncDir fault: got %v, want ErrUncertainWrite", err)
+			}
+			if got, _ := os.ReadFile(keyPath); !bytes.Equal(got, keyAfterFail) {
+				t.Fatalf("retry during fault altered keyPath!")
+			}
+			if _, err := os.Lstat(certPath); !os.IsNotExist(err) {
+				t.Fatalf("retry during key-dir SyncDir fault prematurely published certPath!")
+			}
+
+			// Once key-dir SyncDir recovers, retry MUST preserve the exact key identity and produce a loadable pair.
+			failKeyDir = false
+			pin, err := initSelfSignedCertWithHooks(certPath, keyPath, hosts, nil, syncDirHook)
+			if err != nil {
+				t.Fatalf("recovery retry after key-dir SyncDir fault: %v", err)
+			}
+			if got, _ := os.ReadFile(keyPath); !bytes.Equal(got, keyAfterFail) {
+				t.Fatalf("recovery retry replaced keyPath identity!")
+			}
+			verifyLoadablePair(t, certPath, keyPath, pin)
+		})
+
+		t.Run("cert_dir_sync_failure_"+layout.name, func(t *testing.T) {
+			certPath, keyPath := makePaths(t)
+			certDir := filepath.Dir(certPath)
+			failCertDir := true
+			dirSyncCalls := 0
+			syncDirHook := func(d string) error {
+				dirSyncCalls++
+				if failCertDir && filepath.Clean(d) == filepath.Clean(certDir) {
+					// In same_dir layout, call #1 is keyPath's SyncDir and call #2 is certPath's SyncDir.
+					if layout.separate || dirSyncCalls >= 2 {
+						return errors.New("injected cert-dir SyncDir EIO")
+					}
+				}
+				return ldrstore.SyncDir(d)
+			}
+
+			_, err := initSelfSignedCertWithHooks(certPath, keyPath, hosts, nil, syncDirHook)
+			if !errors.Is(err, ldrstore.ErrUncertainWrite) || errors.Is(err, ldrstore.ErrPreWrite) {
+				t.Fatalf("cert-dir SyncDir failure: got %v, want ErrUncertainWrite (not ErrPreWrite)", err)
+			}
+			keyAfterFail, err := os.ReadFile(keyPath)
+			if err != nil {
+				t.Fatalf("cert-dir SyncDir failure MUST NOT remove matching keyPath: %v", err)
+			}
+			certAfterFail, err := os.ReadFile(certPath)
+			if err != nil {
+				t.Fatalf("expected linked certPath to remain visible after post-link SyncDir failure: %v", err)
+			}
+
+			// Retry while cert-dir SyncDir STILL fails MUST fail closed while preserving both files.
+			if _, err := initSelfSignedCertWithHooks(certPath, keyPath, hosts, nil, syncDirHook); !errors.Is(err, ldrstore.ErrUncertainWrite) {
+				t.Fatalf("retry during ongoing cert-dir SyncDir fault: got %v, want ErrUncertainWrite", err)
+			}
+			if got, _ := os.ReadFile(keyPath); !bytes.Equal(got, keyAfterFail) {
+				t.Fatalf("retry during cert-dir fault altered keyPath!")
+			}
+			if got, _ := os.ReadFile(certPath); !bytes.Equal(got, certAfterFail) {
+				t.Fatalf("retry during cert-dir fault altered certPath!")
+			}
+
+			// Once cert-dir SyncDir recovers, retry MUST pass barriers, keep BOTH files byte-identical,
+			// and return the exact SPKI pin for the loadable matching pair.
+			failCertDir = false
+			pin, err := initSelfSignedCertWithHooks(certPath, keyPath, hosts, nil, syncDirHook)
+			if err != nil {
+				t.Fatalf("recovery retry after cert-dir SyncDir fault: %v", err)
+			}
+			if got, _ := os.ReadFile(keyPath); !bytes.Equal(got, keyAfterFail) {
+				t.Fatalf("recovery retry altered keyPath!")
+			}
+			if got, _ := os.ReadFile(certPath); !bytes.Equal(got, certAfterFail) {
+				t.Fatalf("recovery retry altered certPath!")
+			}
+			verifyLoadablePair(t, certPath, keyPath, pin)
+		})
+	}
+
+	t.Run("definite_pre_link_failures_and_recovery", func(t *testing.T) {
+		// 1. Key temp SyncFile fails before os.Link -> ErrPreWrite, nothing published, retry succeeds cleanly.
+		tmp := t.TempDir()
+		cert1 := filepath.Join(tmp, "kpre", "server.crt")
+		key1 := filepath.Join(tmp, "kpre", "server.key")
+		failSyncFile := true
+		_, err := initSelfSignedCertWithHooks(cert1, key1, hosts, func(f *os.File) error {
+			if failSyncFile {
+				return errors.New("injected key SyncFile pre-link EIO")
+			}
+			return ldrstore.SyncFile(f)
+		}, nil)
+		if !errors.Is(err, ldrstore.ErrPreWrite) || errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("key pre-link SyncFile failure: got %v, want ErrPreWrite (not ErrUncertainWrite)", err)
+		}
+		if _, err := os.Lstat(key1); !os.IsNotExist(err) {
+			t.Fatalf("pre-link key failure published key1")
+		}
+		if _, err := os.Lstat(cert1); !os.IsNotExist(err) {
+			t.Fatalf("pre-link key failure published cert1")
+		}
+		failSyncFile = false
+		pin1, err := InitSelfSignedCert(cert1, key1, hosts)
+		if err != nil {
+			t.Fatalf("retry after pre-link key failure: %v", err)
+		}
+		verifyLoadablePair(t, cert1, key1, pin1)
+
+		// 2. Key succeeds; cert temp SyncFile fails before os.Link -> ErrPreWrite, key preserved,
+		//    retry keeps exact key identity and publishes matching cert!
+		cert2 := filepath.Join(tmp, "cpre", "server.crt")
+		key2 := filepath.Join(tmp, "cpre", "server.key")
+		syncCalls := 0
+		_, err = initSelfSignedCertWithHooks(cert2, key2, hosts, func(f *os.File) error {
+			syncCalls++
+			if syncCalls == 2 {
+				return errors.New("injected cert SyncFile pre-link EIO")
+			}
+			return ldrstore.SyncFile(f)
+		}, nil)
+		if !errors.Is(err, ldrstore.ErrPreWrite) || errors.Is(err, ldrstore.ErrUncertainWrite) {
+			t.Fatalf("cert pre-link SyncFile failure: got %v, want ErrPreWrite (not ErrUncertainWrite)", err)
+		}
+		key2Bytes, err := os.ReadFile(key2)
+		if err != nil {
+			t.Fatalf("expected key2 preserved after cert pre-link failure: %v", err)
+		}
+		if _, err := os.Lstat(cert2); !os.IsNotExist(err) {
+			t.Fatalf("pre-link cert failure published cert2")
+		}
+		pin2, err := InitSelfSignedCert(cert2, key2, hosts)
+		if err != nil {
+			t.Fatalf("retry after cert pre-link failure: %v", err)
+		}
+		if got, _ := os.ReadFile(key2); !bytes.Equal(got, key2Bytes) {
+			t.Fatalf("retry after cert pre-link failure replaced key2 identity!")
+		}
+		verifyLoadablePair(t, cert2, key2, pin2)
+	})
+
+	t.Run("unrelated_aliasing_and_mismatched_files_preserved", func(t *testing.T) {
+		tmp := t.TempDir()
+		realDir := filepath.Join(tmp, "real")
+		if err := os.MkdirAll(realDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		linkDir := filepath.Join(tmp, "link")
+		if err := os.Symlink(realDir, linkDir); err != nil {
+			t.Fatal(err)
+		}
+
+		// Direct & symlink aliasing refused before creating either file.
+		aliasTarget := filepath.Join(realDir, "same.pem")
+		if _, err := InitSelfSignedCert(aliasTarget, aliasTarget, hosts); !errors.Is(err, ErrTLSOutputCollision) {
+			t.Fatalf("direct alias: got %v, want ErrTLSOutputCollision", err)
+		}
+		if _, err := InitSelfSignedCert(aliasTarget, filepath.Join(linkDir, "same.pem"), hosts); !errors.Is(err, ErrTLSOutputCollision) {
+			t.Fatalf("symlink alias: got %v, want ErrTLSOutputCollision", err)
+		}
+		if _, err := os.Lstat(aliasTarget); !os.IsNotExist(err) {
+			t.Fatalf("aliasing InitSelfSignedCert created %s", aliasTarget)
+		}
+
+		// Unrelated sentinel at keyPath -> refused, sentinel untouched, cert not created.
+		sentinel := []byte("UNRELATED-SENTINEL-DO-NOT-CLOBBER\n")
+		sentKey := filepath.Join(tmp, "sent-key.pem")
+		if err := os.WriteFile(sentKey, sentinel, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		unusedCert := filepath.Join(tmp, "unused.crt")
+		if _, err := InitSelfSignedCert(unusedCert, sentKey, hosts); !errors.Is(err, ErrTLSOutputExists) {
+			t.Fatalf("sentinel at keyPath: got %v, want ErrTLSOutputExists", err)
+		}
+		if got, _ := os.ReadFile(sentKey); !bytes.Equal(got, sentinel) {
+			t.Fatalf("sentinel at keyPath was altered!")
+		}
+		if _, err := os.Lstat(unusedCert); !os.IsNotExist(err) {
+			t.Fatalf("created cert despite sentinel at keyPath!")
+		}
+
+		// Unrelated sentinel at certPath -> refused, sentinel untouched, key not created.
+		sentCert := filepath.Join(tmp, "sent-cert.pem")
+		if err := os.WriteFile(sentCert, sentinel, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		unusedKey := filepath.Join(tmp, "unused.key")
+		if _, err := InitSelfSignedCert(sentCert, unusedKey, hosts); !errors.Is(err, ErrTLSOutputExists) {
+			t.Fatalf("sentinel at certPath: got %v, want ErrTLSOutputExists", err)
+		}
+		if got, _ := os.ReadFile(sentCert); !bytes.Equal(got, sentinel) {
+			t.Fatalf("sentinel at certPath was altered!")
+		}
+		if _, err := os.Lstat(unusedKey); !os.IsNotExist(err) {
+			t.Fatalf("created key despite sentinel at certPath!")
+		}
+
+		// Generate two distinct valid throwaway pairs to test symlink-to-valid-key,
+		// mismatched valid key/cert, and differing hosts refusal.
+		pairACert, pairAKey := filepath.Join(tmp, "a", "s.crt"), filepath.Join(tmp, "a", "s.key")
+		pairBCert, pairBKey := filepath.Join(tmp, "b", "s.crt"), filepath.Join(tmp, "b", "s.key")
+		if _, err := InitSelfSignedCert(pairACert, pairAKey, hosts); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := InitSelfSignedCert(pairBCert, pairBKey, hosts); err != nil {
+			t.Fatal(err)
+		}
+
+		// Symlink at keyPath pointing to valid P-256 key MUST be refused (not regular).
+		symKey := filepath.Join(tmp, "sym.key")
+		if err := os.Symlink(pairAKey, symKey); err != nil {
+			t.Fatal(err)
+		}
+		symCert := filepath.Join(tmp, "sym.crt")
+		if _, err := InitSelfSignedCert(symCert, symKey, hosts); !errors.Is(err, ErrTLSOutputExists) {
+			t.Fatalf("symlink keyPath: got %v, want ErrTLSOutputExists", err)
+		}
+		if _, err := os.Lstat(symCert); !os.IsNotExist(err) {
+			t.Fatalf("created cert for symlink keyPath!")
+		}
+
+		// Mismatched valid key A + valid cert B MUST be refused with both files untouched.
+		origKeyA, _ := os.ReadFile(pairAKey)
+		origCertB, _ := os.ReadFile(pairBCert)
+		if _, err := InitSelfSignedCert(pairBCert, pairAKey, hosts); !errors.Is(err, ErrTLSOutputExists) {
+			t.Fatalf("mismatched valid pair: got %v, want ErrTLSOutputExists", err)
+		}
+		if got, _ := os.ReadFile(pairAKey); !bytes.Equal(got, origKeyA) {
+			t.Fatalf("mismatched refusal altered key A!")
+		}
+		if got, _ := os.ReadFile(pairBCert); !bytes.Equal(got, origCertB) {
+			t.Fatalf("mismatched refusal altered cert B!")
+		}
+
+		// Existing valid pair A with different hosts MUST be refused with both files untouched.
+		origCertA, _ := os.ReadFile(pairACert)
+		if _, err := InitSelfSignedCert(pairACert, pairAKey, []string{"127.0.0.1", "other.example"}); !errors.Is(err, ErrTLSOutputExists) {
+			t.Fatalf("different hosts over valid pair: got %v, want ErrTLSOutputExists", err)
+		}
+		if got, _ := os.ReadFile(pairACert); !bytes.Equal(got, origCertA) {
+			t.Fatalf("different-hosts refusal altered cert A!")
+		}
+		if got, _ := os.ReadFile(pairAKey); !bytes.Equal(got, origKeyA) {
+			t.Fatalf("different-hosts refusal altered key A!")
 		}
 	})
 }

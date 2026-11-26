@@ -583,21 +583,45 @@ func TestLDRCLIOutputPreservationAliasingAndRetry(t *testing.T) {
 		}
 	}
 
-	// 4. `yip relay init`: rerun MUST NOT clobber existing TLS cert/key!
+	// 4. `yip relay init`: reruns MUST NEVER clobber existing TLS cert/key:
+	//    - exact matching hosts recovers idempotently with identical SPKI pin and untouched files,
+	//    - differing hosts refuses while leaving both files untouched.
 	relayDir := filepath.Join(tmp, "relay-nocl")
 	var rBuf bytes.Buffer
 	if err := RelayCLI([]string{"init", "--dir", relayDir, "--hosts", "127.0.0.1,localhost"}, &rBuf); err != nil {
 		t.Fatalf("first relay init: %v", err)
 	}
+	var firstInit map[string]any
+	if err := json.Unmarshal(rBuf.Bytes(), &firstInit); err != nil {
+		t.Fatalf("decode first relay init JSON: %v", err)
+	}
 	certBytes, _ := os.ReadFile(filepath.Join(relayDir, "tls", "server.crt"))
 	keyBytes, _ := os.ReadFile(filepath.Join(relayDir, "tls", "server.key"))
-	if err := RelayCLI([]string{"init", "--dir", relayDir, "--hosts", "127.0.0.1,localhost"}, &rBuf); err == nil {
-		t.Fatalf("expected repeated relay init over existing TLS cert/key to fail")
+	rBuf.Reset()
+	if err := RelayCLI([]string{"init", "--dir", relayDir, "--hosts", "127.0.0.1,localhost"}, &rBuf); err != nil {
+		t.Fatalf("idempotent exact relay init retry: %v", err)
+	}
+	var secondInit map[string]any
+	if err := json.Unmarshal(rBuf.Bytes(), &secondInit); err != nil {
+		t.Fatalf("decode second relay init JSON: %v", err)
+	}
+	if secondInit["pin_spki_sha256"] != firstInit["pin_spki_sha256"] {
+		t.Fatalf("idempotent relay init changed pin: %v vs %v", secondInit["pin_spki_sha256"], firstInit["pin_spki_sha256"])
 	}
 	if got, _ := os.ReadFile(filepath.Join(relayDir, "tls", "server.crt")); !bytes.Equal(certBytes, got) {
-		t.Fatalf("repeated relay init clobbered server.crt!")
+		t.Fatalf("idempotent relay init altered server.crt!")
 	}
 	if got, _ := os.ReadFile(filepath.Join(relayDir, "tls", "server.key")); !bytes.Equal(keyBytes, got) {
-		t.Fatalf("repeated relay init clobbered server.key!")
+		t.Fatalf("idempotent relay init altered server.key!")
+	}
+	rBuf.Reset()
+	if err := RelayCLI([]string{"init", "--dir", relayDir, "--hosts", "127.0.0.1,other.local"}, &rBuf); err == nil {
+		t.Fatalf("expected relay init with differing hosts over existing TLS cert/key to fail")
+	}
+	if got, _ := os.ReadFile(filepath.Join(relayDir, "tls", "server.crt")); !bytes.Equal(certBytes, got) {
+		t.Fatalf("conflicting relay init clobbered server.crt!")
+	}
+	if got, _ := os.ReadFile(filepath.Join(relayDir, "tls", "server.key")); !bytes.Equal(keyBytes, got) {
+		t.Fatalf("conflicting relay init clobbered server.key!")
 	}
 }
