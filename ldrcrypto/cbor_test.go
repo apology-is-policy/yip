@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"reflect"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -270,5 +273,168 @@ func TestCBORAbsentVsExplicitZero(t *testing.T) {
 	}
 	if val, exists := parsed["key_epoch"]; !exists || val != 0 {
 		t.Fatalf("explicit zero key_epoch lost: exists=%v val=%d", exists, val)
+	}
+}
+
+// TestCBORExactWidthByteLimitsAndEncodeDecodeParity verifies Codex Turn 34:
+//   - Encoder charges exact canonical CBOR header widths (1/2/3/5/9 bytes) rather
+//     than overestimating 9 bytes, so MarshalCBORWithLimits and UnmarshalCBOR agree
+//     at exact-fit and one-byte-over budgets across integers, bstr, tstr, arrays,
+//     maps (both Map and map[string]any), and near DefaultMaxBytes.
+func TestCBORExactWidthByteLimitsAndEncodeDecodeParity(t *testing.T) {
+	cases := []struct {
+		name      string
+		val       any
+		wantBytes int
+	}{
+		{"uint_0_1B", uint64(0), 1},
+		{"uint_23_1B", uint64(23), 1},
+		{"uint_24_2B", uint64(24), 2},
+		{"uint_255_2B", uint64(255), 2},
+		{"uint_256_3B", uint64(256), 3},
+		{"uint_65535_3B", uint64(65535), 3},
+		{"uint_65536_5B", uint64(65536), 5},
+		{"uint_maxu32_5B", uint64(0xffffffff), 5},
+		{"uint_u32_plus_1_9B", uint64(0x100000000), 9},
+		{"uint_max_counter_9B", MaxCounter, 9},
+		{"bool_true_1B", true, 1},
+		{"bstr_empty_1B", []byte{}, 1},
+		{"bstr_23_24B", bytes.Repeat([]byte{0xab}, 23), 24},
+		{"bstr_24_26B", bytes.Repeat([]byte{0xab}, 24), 26},
+		{"bstr_256_259B", bytes.Repeat([]byte{0xab}, 256), 259},
+		{"tstr_empty_1B", "", 1},
+		{"tstr_23_24B", strings.Repeat("a", 23), 24},
+		{"tstr_24_26B", strings.Repeat("a", 24), 26},
+		{"tstr_256_259B", strings.Repeat("a", 256), 259},
+		{"arr_empty_1B", []any{}, 1},
+		{"arr_one_zero_2B", []any{uint64(0)}, 2},
+		{"str_arr_one_3B", []string{"a"}, 3},
+		{"map_empty_1B", Map{}, 1},
+		{"gomap_empty_1B", map[string]any{}, 1},
+		{"map_single_4B", Map{{Key: "a", Value: uint64(0)}}, 4},
+		{"gomap_single_4B", map[string]any{"a": uint64(0)}, 4},
+		// Near DefaultMaxBytes (524288): 5-byte length header + 524283 payload = 524288 exact fit.
+		{"bstr_exact_default_max", make([]byte, DefaultMaxBytes-5), DefaultMaxBytes},
+		{"tstr_exact_default_max", strings.Repeat("x", DefaultMaxBytes-5), DefaultMaxBytes},
+		// Container near DefaultMaxBytes: a1 (1B) + 61 64 (2B) + 5a <4B> (5B) + 524280B = 524288 exact fit.
+		{"map_container_exact_default_max", Map{{Key: "d", Value: make([]byte, DefaultMaxBytes-8)}}, DefaultMaxBytes},
+		{"gomap_container_exact_default_max", map[string]any{"d": make([]byte, DefaultMaxBytes-8)}, DefaultMaxBytes},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			exactLim := Limits{MaxBytes: tc.wantBytes, MaxDepth: DefaultMaxDepth, MaxItems: DefaultMaxItems}
+			enc, err := MarshalCBORWithLimits(tc.val, exactLim)
+			if err != nil {
+				t.Fatalf("MarshalCBORWithLimits(exact %dB) failed: %v", tc.wantBytes, err)
+			}
+			if len(enc) != tc.wantBytes {
+				t.Fatalf("encoded len = %d, want %d", len(enc), tc.wantBytes)
+			}
+			dec, err := UnmarshalCBOR(enc, exactLim)
+			if err != nil {
+				t.Fatalf("UnmarshalCBOR(exact %dB) failed: %v", tc.wantBytes, err)
+			}
+			reenc, err := MarshalCBORWithLimits(dec, exactLim)
+			if err != nil {
+				t.Fatalf("re-encode(exact %dB) failed: %v", tc.wantBytes, err)
+			}
+			if !bytes.Equal(reenc, enc) {
+				t.Fatalf("round-trip byte mismatch at exact limit %dB", tc.wantBytes)
+			}
+
+			// One byte over the limit MUST fail identically on both encode and decode!
+			if tc.wantBytes > 1 {
+				tightLim := Limits{MaxBytes: tc.wantBytes - 1, MaxDepth: DefaultMaxDepth, MaxItems: DefaultMaxItems}
+				if _, err := MarshalCBORWithLimits(tc.val, tightLim); !errors.Is(err, ErrCBORLimitExceeded) {
+					t.Fatalf("MarshalCBORWithLimits(1B under=%d): got %v, want ErrCBORLimitExceeded", tightLim.MaxBytes, err)
+				}
+				if _, err := UnmarshalCBOR(enc, tightLim); !errors.Is(err, ErrCBORLimitExceeded) {
+					t.Fatalf("UnmarshalCBOR(1B under=%d): got %v, want ErrCBORLimitExceeded", tightLim.MaxBytes, err)
+				}
+			}
+		})
+	}
+
+	// Default-limit (+1 byte over DefaultMaxBytes) checks for bstr, tstr, and map container.
+	overCases := []struct {
+		name string
+		val  any
+	}{
+		{"bstr_default_plus_1", make([]byte, DefaultMaxBytes-4)},
+		{"tstr_default_plus_1", strings.Repeat("x", DefaultMaxBytes-4)},
+		{"map_container_default_plus_1", Map{{Key: "d", Value: make([]byte, DefaultMaxBytes-7)}}},
+		{"gomap_container_default_plus_1", map[string]any{"d": make([]byte, DefaultMaxBytes-7)}},
+	}
+	for _, tc := range overCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := MarshalCBOR(tc.val); !errors.Is(err, ErrCBORLimitExceeded) {
+				t.Fatalf("MarshalCBOR(%s): got %v, want ErrCBORLimitExceeded", tc.name, err)
+			}
+			// Encode with +1 larger cap, then verify UnmarshalCBORDefault also rejects!
+			enc, err := MarshalCBORWithLimits(tc.val, Limits{MaxBytes: DefaultMaxBytes + 1, MaxDepth: DefaultMaxDepth, MaxItems: DefaultMaxItems})
+			if err != nil {
+				t.Fatalf("MarshalCBORWithLimits(+1 cap): %v", err)
+			}
+			if len(enc) != DefaultMaxBytes+1 {
+				t.Fatalf("len = %d, want %d", len(enc), DefaultMaxBytes+1)
+			}
+			if _, err := UnmarshalCBORDefault(enc); !errors.Is(err, ErrCBORLimitExceeded) {
+				t.Fatalf("UnmarshalCBORDefault(%s): got %v, want ErrCBORLimitExceeded", tc.name, err)
+			}
+		})
+	}
+}
+
+// TestCBORMapBudgetPreflightBeforeAllocation verifies Codex Turn 34:
+// Both Map and map[string]any reject item-budget, byte-budget, depth-budget,
+// and oversized-key violations BEFORE allocating sorting/staging buffers.
+func TestCBORMapBudgetPreflightBeforeAllocation(t *testing.T) {
+	const bigN = 20000
+	bigMap := make(Map, bigN)
+	bigGoMap := make(map[string]any, bigN)
+	for i := 0; i < bigN; i++ {
+		k := fmt.Sprintf("k%06d", i)
+		bigMap[i] = MapEntry{Key: k, Value: uint64(0)}
+		bigGoMap[k] = uint64(0)
+	}
+	bigKey := strings.Repeat("k", 256*1024)
+	bigKeyMap := Map{{Key: bigKey, Value: uint64(0)}}
+	bigKeyGoMap := map[string]any{bigKey: uint64(0)}
+
+	cases := []struct {
+		name string
+		val  any
+		lim  Limits
+	}{
+		{"Map_exceeds_max_items", bigMap, Limits{MaxBytes: 10 << 20, MaxDepth: 8, MaxItems: 100}},
+		{"GoMap_exceeds_max_items", bigGoMap, Limits{MaxBytes: 10 << 20, MaxDepth: 8, MaxItems: 100}},
+		{"Map_exceeds_max_bytes", bigMap, Limits{MaxBytes: 1024, MaxDepth: 8, MaxItems: 100000}},
+		{"GoMap_exceeds_max_bytes", bigGoMap, Limits{MaxBytes: 1024, MaxDepth: 8, MaxItems: 100000}},
+		{"Map_exceeds_max_depth", []any{bigMap}, Limits{MaxBytes: 10 << 20, MaxDepth: 1, MaxItems: 100000}},
+		{"GoMap_exceeds_max_depth", []any{bigGoMap}, Limits{MaxBytes: 10 << 20, MaxDepth: 1, MaxItems: 100000}},
+		{"Map_oversized_key_exceeds_max_bytes", bigKeyMap, Limits{MaxBytes: 1024, MaxDepth: 8, MaxItems: 100}},
+		{"GoMap_oversized_key_exceeds_max_bytes", bigKeyGoMap, Limits{MaxBytes: 1024, MaxDepth: 8, MaxItems: 100}},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			_, err := MarshalCBORWithLimits(tc.val, tc.lim)
+			runtime.ReadMemStats(&after)
+			if !errors.Is(err, ErrCBORLimitExceeded) {
+				t.Fatalf("%s: got %v, want ErrCBORLimitExceeded", tc.name, err)
+			}
+			// Staging 20,000 entries or a 256 KiB encoded key would allocate >> 256 KiB;
+			// preflight rejection should allocate only the small error string (< 64 KiB even under -race).
+			delta := after.TotalAlloc - before.TotalAlloc
+			if delta > 64*1024 {
+				t.Fatalf("%s allocated %d bytes before failing budget check (want <= 65536)", tc.name, delta)
+			}
+		})
 	}
 }

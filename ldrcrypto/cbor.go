@@ -105,10 +105,25 @@ func (e *cborEncoder) countItem() error {
 }
 
 func (e *cborEncoder) checkSize(extra int) error {
-	if extra < 0 || len(e.buf)+extra > e.lim.MaxBytes {
+	if extra < 0 || extra > e.lim.MaxBytes-len(e.buf) {
 		return fmt.Errorf("%w: encoded size > %d", ErrCBORLimitExceeded, e.lim.MaxBytes)
 	}
 	return nil
+}
+
+func typeArgLen(n uint64) int {
+	switch {
+	case n < 24:
+		return 1
+	case n <= 0xff:
+		return 2
+	case n <= 0xffff:
+		return 3
+	case n <= 0xffffffff:
+		return 5
+	default:
+		return 9
+	}
 }
 
 func appendTypeArg(dst []byte, major byte, n uint64) []byte {
@@ -152,7 +167,7 @@ func encodeASCIIKey(k string) ([]byte, error) {
 	if uint64(len(k)) > MaxCounter {
 		return nil, ErrCBOROutOfDomain
 	}
-	out := make([]byte, 0, 9+len(k))
+	out := make([]byte, 0, typeArgLen(uint64(len(k)))+len(k))
 	out = appendTypeArg(out, 3, uint64(len(k)))
 	out = append(out, k...)
 	return out, nil
@@ -162,10 +177,42 @@ func (e *cborEncoder) encodeUint(n uint64) error {
 	if n > MaxCounter {
 		return fmt.Errorf("%w: %d", ErrCBOROutOfDomain, n)
 	}
-	if err := e.checkSize(9); err != nil {
+	if err := e.checkSize(typeArgLen(n)); err != nil {
 		return err
 	}
 	e.buf = appendTypeArg(e.buf, 0, n)
+	return nil
+}
+
+func (e *cborEncoder) checkHeaderAndPayload(payloadLen int) error {
+	if payloadLen < 0 || uint64(payloadLen) > MaxCounter {
+		return ErrCBOROutOfDomain
+	}
+	hdr := typeArgLen(uint64(payloadLen))
+	rem := e.lim.MaxBytes - len(e.buf)
+	if hdr > rem || payloadLen > rem-hdr {
+		return fmt.Errorf("%w: encoded size > %d", ErrCBORLimitExceeded, e.lim.MaxBytes)
+	}
+	return nil
+}
+
+func (e *cborEncoder) preflightArray(n int, depth int) error {
+	if depth >= e.lim.MaxDepth {
+		return fmt.Errorf("%w: depth > %d", ErrCBORLimitExceeded, e.lim.MaxDepth)
+	}
+	if n < 0 || uint64(n) > MaxCounter {
+		return ErrCBOROutOfDomain
+	}
+	hdr := typeArgLen(uint64(n))
+	if err := e.checkSize(hdr); err != nil {
+		return err
+	}
+	remItems := e.lim.MaxItems - e.items
+	remBytes := e.lim.MaxBytes - len(e.buf) - hdr
+	// Every array element requires at least 1 item and at least 1 encoded byte.
+	if n > remItems || n > remBytes {
+		return fmt.Errorf("%w: array length %d exceeds remaining budget", ErrCBORLimitExceeded, n)
+	}
 	return nil
 }
 
@@ -205,27 +252,24 @@ func (e *cborEncoder) encodeValue(v any, depth int) error {
 		}
 		return nil
 	case []byte:
-		if err := e.checkSize(9 + len(x)); err != nil {
+		if err := e.checkHeaderAndPayload(len(x)); err != nil {
 			return err
 		}
 		e.buf = appendTypeArg(e.buf, 2, uint64(len(x)))
 		e.buf = append(e.buf, x...)
 		return nil
 	case string:
+		if err := e.checkHeaderAndPayload(len(x)); err != nil {
+			return err
+		}
 		if !utf8.ValidString(x) {
 			return fmt.Errorf("%w: invalid UTF-8 string", ErrCBORInvalid)
-		}
-		if err := e.checkSize(9 + len(x)); err != nil {
-			return err
 		}
 		e.buf = appendTypeArg(e.buf, 3, uint64(len(x)))
 		e.buf = append(e.buf, x...)
 		return nil
 	case []any:
-		if depth >= e.lim.MaxDepth {
-			return fmt.Errorf("%w: depth > %d", ErrCBORLimitExceeded, e.lim.MaxDepth)
-		}
-		if err := e.checkSize(9); err != nil {
+		if err := e.preflightArray(len(x), depth); err != nil {
 			return err
 		}
 		e.buf = appendTypeArg(e.buf, 4, uint64(len(x)))
@@ -236,10 +280,7 @@ func (e *cborEncoder) encodeValue(v any, depth int) error {
 		}
 		return nil
 	case []string:
-		if depth >= e.lim.MaxDepth {
-			return fmt.Errorf("%w: depth > %d", ErrCBORLimitExceeded, e.lim.MaxDepth)
-		}
-		if err := e.checkSize(9); err != nil {
+		if err := e.preflightArray(len(x), depth); err != nil {
 			return err
 		}
 		e.buf = appendTypeArg(e.buf, 4, uint64(len(x)))
@@ -250,13 +291,9 @@ func (e *cborEncoder) encodeValue(v any, depth int) error {
 		}
 		return nil
 	case Map:
-		return e.encodeMapEntries(x, depth)
+		return e.encodeMapSlice(x, depth)
 	case map[string]any:
-		entries := make([]MapEntry, 0, len(x))
-		for k, val := range x {
-			entries = append(entries, MapEntry{Key: k, Value: val})
-		}
-		return e.encodeMapEntries(entries, depth)
+		return e.encodeGoMap(x, depth)
 	case nil:
 		return fmt.Errorf("%w: null is disallowed", ErrCBORUnsupported)
 	default:
@@ -264,22 +301,100 @@ func (e *cborEncoder) encodeValue(v any, depth int) error {
 	}
 }
 
-func (e *cborEncoder) encodeMapEntries(entries []MapEntry, depth int) error {
+type encodedMapEntry struct {
+	keyBytes []byte
+	entry    MapEntry
+}
+
+// preflightMapHeader validates depth, header byte width, remaining item budget,
+// and minimum byte budget for a map of n entries BEFORE allocating any staging
+// or sorting buffers. Returns the remaining byte budget available for all keys
+// combined (reserving at least 1 byte for each of the n values).
+func (e *cborEncoder) preflightMapHeader(n int, depth int) (int, error) {
 	if depth >= e.lim.MaxDepth {
-		return fmt.Errorf("%w: depth > %d", ErrCBORLimitExceeded, e.lim.MaxDepth)
+		return 0, fmt.Errorf("%w: depth > %d", ErrCBORLimitExceeded, e.lim.MaxDepth)
 	}
-	type encodedEntry struct {
-		keyBytes []byte
-		entry    MapEntry
+	if n < 0 || uint64(n) > MaxCounter {
+		return 0, ErrCBOROutOfDomain
 	}
-	sorted := make([]encodedEntry, len(entries))
+	hdr := typeArgLen(uint64(n))
+	if err := e.checkSize(hdr); err != nil {
+		return 0, err
+	}
+	remItems := e.lim.MaxItems - e.items
+	remBytes := e.lim.MaxBytes - len(e.buf) - hdr
+	// Each map entry consumes at least 2 items (key + value) and at least 2 bytes.
+	if n > remItems/2 || n > remBytes/2 {
+		return 0, fmt.Errorf("%w: map length %d exceeds remaining budget", ErrCBORLimitExceeded, n)
+	}
+	return remBytes - n, nil
+}
+
+func preflightMapKey(k string, remForKeys *int, maxBytes int) error {
+	if uint64(len(k)) > MaxCounter {
+		return ErrCBOROutOfDomain
+	}
+	if len(k) > *remForKeys {
+		return fmt.Errorf("%w: encoded size > %d", ErrCBORLimitExceeded, maxBytes)
+	}
+	keyLen := typeArgLen(uint64(len(k))) + len(k)
+	if keyLen > *remForKeys {
+		return fmt.Errorf("%w: encoded size > %d", ErrCBORLimitExceeded, maxBytes)
+	}
+	if !isStrictASCIIKey(k) {
+		return fmt.Errorf("%w: map key must be printable ASCII", ErrCBORUnsupported)
+	}
+	*remForKeys -= keyLen
+	return nil
+}
+
+func (e *cborEncoder) encodeMapSlice(entries []MapEntry, depth int) error {
+	remForKeys, err := e.preflightMapHeader(len(entries), depth)
+	if err != nil {
+		return err
+	}
+	// Preflight every key's encoded width and ASCII constraint with zero allocation
+	// before allocating the sorting buffer.
+	for _, ent := range entries {
+		if err := preflightMapKey(ent.Key, &remForKeys, e.lim.MaxBytes); err != nil {
+			return err
+		}
+	}
+	sorted := make([]encodedMapEntry, len(entries))
 	for i, ent := range entries {
 		kb, err := encodeASCIIKey(ent.Key)
 		if err != nil {
 			return err
 		}
-		sorted[i] = encodedEntry{keyBytes: kb, entry: ent}
+		sorted[i] = encodedMapEntry{keyBytes: kb, entry: ent}
 	}
+	return e.finishEncodedMap(sorted, depth)
+}
+
+func (e *cborEncoder) encodeGoMap(m map[string]any, depth int) error {
+	remForKeys, err := e.preflightMapHeader(len(m), depth)
+	if err != nil {
+		return err
+	}
+	// Preflight every key's encoded width and ASCII constraint with zero allocation
+	// before allocating the sorting buffer.
+	for k := range m {
+		if err := preflightMapKey(k, &remForKeys, e.lim.MaxBytes); err != nil {
+			return err
+		}
+	}
+	sorted := make([]encodedMapEntry, 0, len(m))
+	for k, val := range m {
+		kb, err := encodeASCIIKey(k)
+		if err != nil {
+			return err
+		}
+		sorted = append(sorted, encodedMapEntry{keyBytes: kb, entry: MapEntry{Key: k, Value: val}})
+	}
+	return e.finishEncodedMap(sorted, depth)
+}
+
+func (e *cborEncoder) finishEncodedMap(sorted []encodedMapEntry, depth int) error {
 	// RFC 8949 §4.2.1: deterministic map key sorting is bytewise lexicographic
 	// order on the canonical encoded key bytes (shorter key length first for tstr).
 	sort.Slice(sorted, func(i, j int) bool {
@@ -290,7 +405,7 @@ func (e *cborEncoder) encodeMapEntries(entries []MapEntry, depth int) error {
 			return fmt.Errorf("%w: duplicate map key %q", ErrCBORNonCanonical, sorted[i].entry.Key)
 		}
 	}
-	if err := e.checkSize(9); err != nil {
+	if err := e.checkSize(typeArgLen(uint64(len(sorted)))); err != nil {
 		return err
 	}
 	e.buf = appendTypeArg(e.buf, 5, uint64(len(sorted)))
