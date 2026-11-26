@@ -14,15 +14,19 @@ package main
 // initialize carries no thread identity -- but every tools/call carries
 // params._meta.threadId, equal to the thread UUID. So the server answering a
 // session's tool calls can bind delivery to exactly that session, and dispatch
-// for as long as the session keeps it running.
+// for as long as the server runs. A resumed chat can replace its MCP server
+// without making another tool call. The replacement therefore also dispatches
+// to an existing session binding before learning its own thread ID. It never
+// infers that ID from the endpoint or claims to own the recorded session.
 //
 // Binding rules:
 //   - A binding names one thread. The NEWEST session wins: a server binds when
 //     the current binding predates its own start, or when the bound session is
 //     no longer live. A superseded server is passive until that is true again.
 //   - Liveness is a kernel lock held by the bound session's own server for the
-//     life of its process (one lock file per thread, never unlinked). A manual
-//     registration counts as live only while a dispatch watch runs.
+//     life of its process (one lock file per thread, never unlinked). A recovery
+//     or manual dispatcher holds a separate watch lock; neither lock proves
+//     that the chat itself has closed when its holder exits.
 //   - Rebinding never resends or rewrites earlier attempts. A notice accepted
 //     by an earlier session stays "accepted" until somebody acknowledges it.
 //   - Binding happens at the session's first Yip tool call. Until then nothing
@@ -101,7 +105,7 @@ func codexBindingAlive(ep Endpoint) bool {
 	if codexSessionAlive(ep.Agent, ep.Thread) {
 		return true
 	}
-	return ep.Binding != "session" && dispatchWatchAlive(ep.Agent)
+	return dispatchWatchAlive(ep.Agent)
 }
 
 // A binding with no recorded time predates every live server (legacy/manual).
@@ -253,9 +257,6 @@ func (s *server) observeCodexThread(thread string) string {
 		return "\n\n[yip] Delivery to this chat is unavailable: " + err.Error()
 	}
 	s.codexThread, s.codexRelease = thread, unlock
-	if s.startCodex != nil {
-		s.startCodex()
-	}
 	if !res.Bound {
 		return "\n\n[yip] A newer Codex session holds delivery for " + s.me + "; this chat will not be notified unless that session ends."
 	}
@@ -269,6 +270,7 @@ func (s *server) observeCodexThread(thread string) string {
 func (s *server) codexLoop(ctx context.Context) {
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
+	defer s.stopCodexRecovery()
 	last := ""
 	for {
 		msg := ""
@@ -292,8 +294,9 @@ func (s *server) codexTick() error {
 	thread := s.codexThread
 	s.codexMu.Unlock()
 	if thread == "" {
-		return nil
+		return s.codexRecoveryTick()
 	}
+	s.stopCodexRecovery()
 	ep, err := readEndpoint(s.me)
 	if err != nil {
 		return err
@@ -324,6 +327,47 @@ func (s *server) codexTick() error {
 	return err
 }
 
+// Until this server receives a thread ID, it may act only as a dispatcher for
+// an already explicit session binding. This closes the resume/reload gap:
+// waiting for a tools/call here would require waking the agent to enable wake.
+// Manual registrations still require their explicitly started watch. The
+// watcher lock elects one recovery dispatcher, and dispatchEndpoint rechecks
+// the destination under its transaction lock so a concurrent rebind is safe.
+func (s *server) codexRecoveryTick() error {
+	ep, err := readEndpoint(s.me)
+	if err != nil || ep.Runtime != "codex" || ep.Binding != "session" || ep.Thread == "" || ep.Paused || Retired(s.me) || codexSessionAlive(s.me, ep.Thread) {
+		s.stopCodexRecovery()
+		return nil
+	}
+	if s.codexRecoveryRelease == nil {
+		release, err := beginDispatchWatch(s.me)
+		if err != nil {
+			if dispatchWatchAlive(s.me) {
+				return nil // another recovery server or external watch owns it
+			}
+			return err
+		}
+		s.codexRecoveryRelease = release
+	}
+	send := s.codexSend
+	if send == nil {
+		send = codexSender
+	}
+	_, err = dispatchEndpoint(s.me, "codex", ep.Thread, send)
+	if errors.Is(err, errNotOwner) {
+		return nil // binding changed; next tick follows the recorded destination
+	}
+	return err
+}
+
+// Used only by the dispatch loop, including its shutdown, never by tool calls.
+func (s *server) stopCodexRecovery() {
+	if s.codexRecoveryRelease != nil {
+		s.codexRecoveryRelease()
+		s.codexRecoveryRelease = nil
+	}
+}
+
 func codexEndpointStatus(ep Endpoint) string {
 	switch {
 	case ep.Thread == "":
@@ -331,9 +375,9 @@ func codexEndpointStatus(ep Endpoint) string {
 	case codexSessionAlive(ep.Agent, ep.Thread):
 		return "Codex session live; delivering to its chat"
 	case dispatchWatchAlive(ep.Agent):
-		return "Codex dispatcher running"
+		return "Codex dispatcher running; using recorded chat binding"
 	case ep.Binding == "session":
-		return "Codex session closed; dispatcher stopped (rebinds at the next session's first Yip tool call)"
+		return "Codex MCP disconnected; dispatcher stopped (chat may still be open; reconnect MCP or run delivery dispatch --watch 1h)"
 	}
 	return "Codex registered; dispatcher stopped (no automatic wake)"
 }

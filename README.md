@@ -207,14 +207,18 @@ Codex has no Channels equivalent: an MCP server cannot push text into a
 conversation. It does have `codex queue --thread UUID`, and it tells each MCP
 server which thread is calling (`_meta.threadId` on every tool call). So the
 Yip server inside a Codex session **binds delivery to that exact chat at its
-first Yip tool call** and runs `codex queue` itself for as long as the session
-lives. No UUID, registration or separate dispatcher is needed. The agent is
+first Yip tool call** and runs `codex queue` while its MCP server runs.
+After a resume/reload replaces that server, the replacement can dispatch to
+the previously recorded chat before another tool call. It does not guess its
+own thread identity or change the binding. No UUID, registration or separate
+dispatcher is needed. The agent is
 told to call `ring` early; the tool result confirms "Delivery connected".
 
-- Before that first Yip call nothing can name the chat; notices wait as pending
+- Before the first binding nothing can name the chat; notices wait as pending
   and inbox/hooks still show them.
 - The newest session to bind wins. An older one goes passive and takes over
-  again only if the newer one ends. Nothing is resent on a rebind.
+  again only if the newer binding has no live MCP server or dispatcher.
+  Nothing is resent on a rebind.
 - Idle chats start a turn; busy ones get the notice on their next turn. It
   does not interrupt tools or open a closed session.
 - `codex queue` success means `accepted`, not read: the agent records `read`
@@ -223,6 +227,8 @@ told to call `ring` early; the tool result confirms "Delivery connected".
 The previous manual route still works as a fallback:
 `yip delivery register EXACT-CHAT-UUID` plus
 `yip delivery dispatch --watch 1h` in a supervised terminal.
+An existing session binding needs only the dispatch command if no MCP server
+is running. A stopped MCP dispatcher does not prove the chat is closed.
 
 ### Antigravity TUI (`agy`): live delivery via `agentapi`
 

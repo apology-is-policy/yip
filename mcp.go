@@ -278,13 +278,13 @@ type server struct {
 	startChannel func() error
 
 	// Codex live delivery (serve --codex); see codex_live.go.
-	codexMode    bool
-	codexMu      sync.Mutex
-	codexThread  string // fixed by the first tools/call _meta.threadId
-	codexFailed  bool
-	codexRelease func()
-	codexSend    deliverySender // nil = codex queue; injectable for tests
-	startCodex   func()
+	codexMode            bool
+	codexMu              sync.Mutex
+	codexThread          string // fixed by the first tools/call _meta.threadId
+	codexFailed          bool
+	codexRelease         func()
+	codexSend            deliverySender // nil = codex queue; injectable for tests
+	codexRecoveryRelease func()         // dispatch-loop-owned fallback watch
 	// Antigravity (serve --agy); see agy.go / agy_live.go.
 	agyMode  bool
 	agyConv  string // per tools/call: root conversation UUID from _meta
@@ -328,7 +328,7 @@ func serveIO(me, mode string, input io.Reader, output io.Writer) error {
 			endChannel(me, s.channel)
 			release()
 		}
-		// The thread lock is liveness; dropping it marks the session gone.
+		// The thread lock is MCP liveness, not proof that the chat is closed.
 		// The binding itself stays, so a later session or watch can take over.
 		s.codexMu.Lock()
 		if s.codexRelease != nil {
@@ -338,11 +338,10 @@ func serveIO(me, mode string, input io.Reader, output io.Writer) error {
 		s.codexMu.Unlock()
 	}()
 	if s.codexMode {
-		// Started once, by the first tools/call that names this thread.
-		s.startCodex = func() {
-			wg.Add(1)
-			go func() { defer wg.Done(); s.codexLoop(ctx) }()
-		}
+		// Recover an existing binding even before the first tools/call. Codex
+		// can replace this process while the chat is idle during a resume.
+		wg.Add(1)
+		go func() { defer wg.Done(); s.codexLoop(ctx) }()
 	}
 	if channels {
 		unlock, err := channelOwner(me)

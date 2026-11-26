@@ -130,14 +130,17 @@ TRANSPORT SETUP AND DIAGNOSTICS
     their own worktree; the listener follows the binding automatically.
   The session's own Yip MCP server binds delivery to that exact chat at its
   first Yip tool call (Codex sends _meta.threadId) and runs codex queue while
-  the session lives: no UUID, registration or dispatcher. Before that call the
-  chat cannot be named and notices stay pending. The newest session to bind
-  wins; an older one goes passive. Rebinding never resends.
+  its MCP server runs: no UUID, registration or separate dispatcher. A restarted
+  server recovers the existing session binding before another tool call; it
+  never guesses its own chat identity. Before the first binding, notices stay
+  pending. The newest session to bind wins; an older one goes passive.
+  Rebinding never resends. A stopped MCP server does not prove a closed chat.
   Manual fallback (one exact chat, external dispatcher):
     yip delivery register EXACT-CHAT-UUID [--replay]
     yip delivery dispatch --watch 1h
   Without --watch, dispatch runs once. Watch is bounded to 24h. Registration
-  cannot move a binding that is live.
+  cannot move a binding that is live. For an existing session binding, use just
+  dispatch --watch if no MCP server is running; no re-registration is needed.
   Installation binds absolute Yip state paths for the shared Codex daemon and
   forwards CODEX_HOME. Reinstall/review hooks if those paths change. No remote
   routing, sandbox bypass, approval or automatic runtime trust is configured.

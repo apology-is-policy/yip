@@ -415,7 +415,7 @@ func TestCodexBindingNewestSessionWinsAndSupersededIsPassive(t *testing.T) {
 		t.Fatal(ep)
 	}
 	unlockA()
-	if !strings.Contains(EndpointStatus("b"), "session closed") || !strings.Contains(EndpointStatus("b"), "dispatcher stopped") {
+	if strings.Contains(EndpointStatus("b"), "session closed") || !strings.Contains(EndpointStatus("b"), "MCP disconnected; dispatcher stopped") {
 		t.Fatal(EndpointStatus("b"))
 	}
 }
