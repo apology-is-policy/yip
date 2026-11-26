@@ -563,10 +563,12 @@ func ClientTLSConfig(origin ldrcrypto.RelayOrigin) (*tls.Config, error) {
 		}, nil
 
 	case ldrcrypto.TLSPolicyPinCARootPEM:
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(origin.TLSPin) {
-			return nil, errors.New("ldrrelay: pin_ca_root_pem contained no valid PEM certificates")
+		caCert, err := ldrcrypto.ParsePinnedCARootPEM(origin.TLSPin)
+		if err != nil {
+			return nil, err
 		}
+		pool := x509.NewCertPool()
+		pool.AddCert(caCert)
 		return &tls.Config{
 			MinVersion: tls.VersionTLS13,
 			ServerName: host,

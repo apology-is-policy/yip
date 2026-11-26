@@ -860,6 +860,22 @@ type SessionClient struct {
 	mu         sync.Mutex
 }
 
+func resolveOriginDialAddr(originURL string) (string, error) {
+	u, err := url.Parse(originURL)
+	if err != nil {
+		return "", err
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "", errors.New("ldrrelay: relay origin URL missing host")
+	}
+	port := u.Port()
+	if port == "" {
+		port = "443"
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
 // DialSession opens a pinned TLS 1.3 connection to origin, exports RFC 9266
 // tls-exporter channel binding, runs the single-use challenge/auth handshake,
 // and returns an authenticated SessionClient.
@@ -869,13 +885,9 @@ func DialSession(ctx context.Context, origin ldrcrypto.RelayOrigin, lineID []byt
 		return nil, err
 	}
 	tlsCfg.NextProtos = []string{"h2", "http/1.1"}
-	u, err := url.Parse(origin.URL)
+	addr, err := resolveOriginDialAddr(origin.URL)
 	if err != nil {
 		return nil, err
-	}
-	addr := u.Host
-	if !strings.Contains(addr, ":") {
-		addr += ":443"
 	}
 
 	var dialMu sync.Mutex

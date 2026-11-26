@@ -3,6 +3,8 @@ package ldrcrypto
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -173,13 +175,49 @@ type RelayOrigin struct {
 	SessionBinding string
 }
 
+// ParsePinnedCARootPEM strictly parses a pin_ca_root_pem blob, requiring
+// exactly one standalone valid CA X.509 certificate PEM block with no leading
+// or trailing non-whitespace bytes, no PEM headers, BasicConstraintsValid+IsCA,
+// and KeyUsageCertSign (when KeyUsage is specified).
+func ParsePinnedCARootPEM(pemBytes []byte) (*x509.Certificate, error) {
+	trimmed := bytes.TrimSpace(pemBytes)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("%w: pin_ca_root_pem requires a single CA certificate PEM", ErrInvalidDescriptor)
+	}
+	firstLine, _, hasNL := bytes.Cut(trimmed, []byte("\n"))
+	if !hasNL || !bytes.Equal(bytes.TrimSuffix(firstLine, []byte("\r")), []byte("-----BEGIN CERTIFICATE-----")) {
+		return nil, fmt.Errorf("%w: pin_ca_root_pem must contain only a single CERTIFICATE PEM block", ErrInvalidDescriptor)
+	}
+	if bytes.Count(trimmed, []byte("-----BEGIN ")) != 1 || bytes.Count(trimmed, []byte("-----END ")) != 1 {
+		return nil, fmt.Errorf("%w: pin_ca_root_pem must contain exactly one CERTIFICATE PEM block", ErrInvalidDescriptor)
+	}
+	blk, rest := pem.Decode(trimmed)
+	if blk == nil || blk.Type != "CERTIFICATE" || len(blk.Headers) != 0 {
+		return nil, fmt.Errorf("%w: pin_ca_root_pem must contain a single standalone CERTIFICATE PEM block", ErrInvalidDescriptor)
+	}
+	if len(bytes.TrimSpace(rest)) != 0 {
+		return nil, fmt.Errorf("%w: pin_ca_root_pem must not contain multiple certificates or trailing data", ErrInvalidDescriptor)
+	}
+	cert, err := x509.ParseCertificate(blk.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("%w: pin_ca_root_pem invalid X.509 certificate: %v", ErrInvalidDescriptor, err)
+	}
+	if !cert.BasicConstraintsValid || !cert.IsCA {
+		return nil, fmt.Errorf("%w: pin_ca_root_pem certificate must be a CA (BasicConstraintsValid && IsCA)", ErrInvalidDescriptor)
+	}
+	if cert.KeyUsage != 0 && cert.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return nil, fmt.Errorf("%w: pin_ca_root_pem CA certificate missing KeyUsageCertSign", ErrInvalidDescriptor)
+	}
+	return cert, nil
+}
+
 // Validate checks relay_origin syntax and policy consistency.
 func (r RelayOrigin) Validate() error {
 	if !strings.HasPrefix(r.URL, "https://") {
 		return fmt.Errorf("%w: relay URL must use https://", ErrInvalidDescriptor)
 	}
 	u, err := url.Parse(r.URL)
-	if err != nil || u.Host == "" {
+	if err != nil || u.Host == "" || u.Hostname() == "" {
 		return fmt.Errorf("%w: invalid relay URL", ErrInvalidDescriptor)
 	}
 	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
@@ -191,8 +229,8 @@ func (r RelayOrigin) Validate() error {
 			return fmt.Errorf("%w: pin_spki_sha256 requires 32-byte pin", ErrInvalidDescriptor)
 		}
 	case TLSPolicyPinCARootPEM:
-		if len(r.TLSPin) == 0 {
-			return fmt.Errorf("%w: pin_ca_root_pem requires non-empty pin bytes", ErrInvalidDescriptor)
+		if _, err := ParsePinnedCARootPEM(r.TLSPin); err != nil {
+			return err
 		}
 	case TLSPolicyWebPKI:
 		if len(r.TLSPin) != 0 {

@@ -2,10 +2,18 @@ package ldrcrypto
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"sort"
 	"testing"
+	"time"
 )
 
 func TestEndToEndProfileV1Workflow(t *testing.T) {
@@ -307,12 +315,42 @@ func TestEndToEndProfileV1Workflow(t *testing.T) {
 	}
 }
 
+func makeTestCertPEM(t *testing.T, cn string, isCA bool) []byte {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		BasicConstraintsValid: true,
+		IsCA:                  isCA,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+	}
+	if isCA {
+		tmpl.KeyUsage = x509.KeyUsageCertSign | x509.KeyUsageCRLSign
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
 func TestRelayOriginPoliciesAndSessionAuth(t *testing.T) {
+	ca1PEM := makeTestCertPEM(t, "test-ca-1", true)
+	ca2PEM := makeTestCertPEM(t, "test-ca-2", true)
+	leafPEM := makeTestCertPEM(t, "test-leaf", false)
+
 	// Verify all three TLS policies (LAN/closed-net SPKI pin, Enterprise CA pin, Public VM / Workers WebPKI)
 	// and both session binding modes (tls13_exporter and app_authenticated_session).
 	validOrigins := []RelayOrigin{
 		{URL: "https://10.0.0.5:8443", TLSPolicy: TLSPolicyPinSPKISHA256, TLSPin: bytes.Repeat([]byte{0x01}, 32), SessionBinding: SessionBindingTLS13Exporter},
-		{URL: "https://yip.corp.internal:8443", TLSPolicy: TLSPolicyPinCARootPEM, TLSPin: []byte("-----BEGIN CERTIFICATE-----..."), SessionBinding: SessionBindingTLS13Exporter},
+		{URL: "https://[::1]", TLSPolicy: TLSPolicyPinSPKISHA256, TLSPin: bytes.Repeat([]byte{0x02}, 32), SessionBinding: SessionBindingTLS13Exporter},
+		{URL: "https://yip.corp.internal:8443", TLSPolicy: TLSPolicyPinCARootPEM, TLSPin: ca1PEM, SessionBinding: SessionBindingTLS13Exporter},
 		{URL: "https://relay.example.com", TLSPolicy: TLSPolicyWebPKI, TLSPin: nil, SessionBinding: SessionBindingTLS13Exporter},
 		{URL: "https://yip-ldr.example.workers.dev", TLSPolicy: TLSPolicyWebPKI, TLSPin: nil, SessionBinding: SessionBindingAppAuth},
 	}
@@ -341,6 +379,12 @@ func TestRelayOriginPoliciesAndSessionAuth(t *testing.T) {
 		{URL: "https://relay.local:8443", TLSPolicy: TLSPolicyPinSPKISHA256, TLSPin: []byte("short"), SessionBinding: SessionBindingTLS13Exporter},
 		{URL: "https://relay.local:8443", TLSPolicy: TLSPolicyWebPKI, TLSPin: []byte("must-be-empty"), SessionBinding: SessionBindingTLS13Exporter},
 		{URL: "https://relay.local:8443", TLSPolicy: TLSPolicyPinCARootPEM, TLSPin: nil, SessionBinding: SessionBindingTLS13Exporter},
+		{URL: "https://relay.local:8443", TLSPolicy: TLSPolicyPinCARootPEM, TLSPin: []byte("-----BEGIN CERTIFICATE-----..."), SessionBinding: SessionBindingTLS13Exporter},
+		{URL: "https://relay.local:8443", TLSPolicy: TLSPolicyPinCARootPEM, TLSPin: append(bytes.Clone(ca1PEM), ca2PEM...), SessionBinding: SessionBindingTLS13Exporter},
+		{URL: "https://relay.local:8443", TLSPolicy: TLSPolicyPinCARootPEM, TLSPin: append([]byte("leading-comment\n"), ca1PEM...), SessionBinding: SessionBindingTLS13Exporter},
+		{URL: "https://relay.local:8443", TLSPolicy: TLSPolicyPinCARootPEM, TLSPin: append([]byte("-----BEGIN CERTIFICATE-----\nNOT_BASE64\n"), ca1PEM...), SessionBinding: SessionBindingTLS13Exporter},
+		{URL: "https://relay.local:8443", TLSPolicy: TLSPolicyPinCARootPEM, TLSPin: append(bytes.Clone(ca1PEM), []byte("trailing-junk\n")...), SessionBinding: SessionBindingTLS13Exporter},
+		{URL: "https://relay.local:8443", TLSPolicy: TLSPolicyPinCARootPEM, TLSPin: leafPEM, SessionBinding: SessionBindingTLS13Exporter},
 		{URL: "https://relay.local:8443", TLSPolicy: TLSPolicyWebPKI, SessionBinding: "bearer_token"},
 	}
 	for i, ro := range invalidOrigins {

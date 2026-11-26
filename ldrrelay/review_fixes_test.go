@@ -3,15 +3,20 @@ package ldrrelay
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -2719,5 +2724,267 @@ func TestTransportSessionEchoBindingsAndIdleExpiry(t *testing.T) {
 		if _, err := sRoot2.AnchorRequest(ctx); err == nil {
 			t.Fatalf("evicted idle session unexpectedly resurrected on AnchorRequest!")
 		}
+	})
+}
+
+// TestTLSOriginSingleCAPinningAndIPv6DialAddr verifies Codex Turn 68:
+//  1. pin_ca_root_pem enforces a single valid CA certificate with no extra PEM
+//     material (rejecting multi-cert bundles, trailing/leading junk, and non-CA
+//     leaf certs in both RelayOrigin.Validate and ClientTLSConfig) and verifies
+//     live TLS 1.3 trust exclusively against that one pinned CA.
+//  2. DialSession resolves default port 443 and explicit ports cleanly for
+//     bracketed IPv6, IPv4, and DNS origins via net.JoinHostPort, including a
+//     live TLS 1.3 handshake over IPv6 loopback ([::1]) when available.
+func TestTLSOriginSingleCAPinningAndIPv6DialAddr(t *testing.T) {
+	ctx := context.Background()
+
+	mintCA := func(t *testing.T, cn string) (*x509.Certificate, *ecdsa.PrivateKey, []byte) {
+		t.Helper()
+		priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmpl := &x509.Certificate{
+			SerialNumber:          big.NewInt(1),
+			Subject:               pkix.Name{CommonName: cn},
+			NotBefore:             time.Now().Add(-time.Hour),
+			NotAfter:              time.Now().Add(24 * time.Hour),
+			BasicConstraintsValid: true,
+			IsCA:                  true,
+			KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cert, priv, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	}
+
+	mintServerCert := func(t *testing.T, ca *x509.Certificate, caKey *ecdsa.PrivateKey, ips []net.IP, dns []string) (tls.Certificate, []byte) {
+		t.Helper()
+		priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmpl := &x509.Certificate{
+			SerialNumber:          big.NewInt(2),
+			Subject:               pkix.Name{CommonName: "relay-leaf"},
+			NotBefore:             time.Now().Add(-time.Hour),
+			NotAfter:              time.Now().Add(24 * time.Hour),
+			BasicConstraintsValid: true,
+			IsCA:                  false,
+			KeyUsage:              x509.KeyUsageDigitalSignature,
+			ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+			IPAddresses:           ips,
+			DNSNames:              dns,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &priv.PublicKey, caKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keyDER, err := x509.MarshalECPrivateKey(priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+		keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+		pair, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pair, certPEM
+	}
+
+	t.Run("single_ca_pinning_validation_and_live_tls13", func(t *testing.T) {
+		caA, caAKey, caAPEM := mintCA(t, "internal-ca-A")
+		caB, caBKey, caBPEM := mintCA(t, "internal-ca-B")
+		leafA, leafAPEM := mintServerCert(t, caA, caAKey, []net.IP{net.ParseIP("127.0.0.1")}, []string{"localhost"})
+		leafB, _ := mintServerCert(t, caB, caBKey, []net.IP{net.ParseIP("127.0.0.1")}, []string{"localhost"})
+
+		// Reject multi-CA bundle, leading text, trailing junk, non-CA leaf cert, and empty bytes.
+		badPins := map[string][]byte{
+			"empty":         nil,
+			"multi_ca":      append(bytes.Clone(caAPEM), caBPEM...),
+			"leading_text":  append([]byte("comment\n"), caAPEM...),
+			"trailing_junk": append(bytes.Clone(caAPEM), []byte("extra\n")...),
+			"non_ca_leaf":   leafAPEM,
+		}
+		for name, pin := range badPins {
+			ro := ldrcrypto.RelayOrigin{
+				URL:            "https://127.0.0.1:8443",
+				TLSPolicy:      ldrcrypto.TLSPolicyPinCARootPEM,
+				TLSPin:         pin,
+				SessionBinding: ldrcrypto.SessionBindingTLS13Exporter,
+			}
+			if err := ro.Validate(); err == nil {
+				t.Fatalf("RelayOrigin.Validate accepted %s pin_ca_root_pem", name)
+			}
+			if _, err := ClientTLSConfig(ro); err == nil {
+				t.Fatalf("ClientTLSConfig accepted %s pin_ca_root_pem", name)
+			}
+		}
+
+		// Live TLS 1.3 handshake: pinning caA trusts server presenting leafA and rejects server presenting leafB.
+		serveLeaf := func(t *testing.T, leaf tls.Certificate) string {
+			t.Helper()
+			rawLn, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			tlsLn := tls.NewListener(rawLn, &tls.Config{
+				MinVersion:   tls.VersionTLS13,
+				Certificates: []tls.Certificate{leaf},
+			})
+			hs := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})}
+			go func() { _ = hs.Serve(tlsLn) }()
+			t.Cleanup(func() {
+				_ = hs.Close()
+				_ = tlsLn.Close()
+			})
+			return "https://" + rawLn.Addr().String()
+		}
+
+		urlA := serveLeaf(t, leafA)
+		urlB := serveLeaf(t, leafB)
+
+		originA := ldrcrypto.RelayOrigin{
+			URL:            urlA,
+			TLSPolicy:      ldrcrypto.TLSPolicyPinCARootPEM,
+			TLSPin:         caAPEM,
+			SessionBinding: ldrcrypto.SessionBindingTLS13Exporter,
+		}
+		cfgA, err := ClientTLSConfig(originA)
+		if err != nil {
+			t.Fatalf("ClientTLSConfig(valid single CA): %v", err)
+		}
+		hcA := &http.Client{Transport: &http.Transport{TLSClientConfig: cfgA}}
+		defer hcA.CloseIdleConnections()
+		resp, err := hcA.Get(urlA)
+		if err != nil {
+			t.Fatalf("TLS 1.3 GET with pinned CA A failed: %v", err)
+		}
+		_ = resp.Body.Close()
+
+		// Server signed by unpinned CA B MUST be rejected when pinned to CA A.
+		originB := originA
+		originB.URL = urlB
+		cfgB, err := ClientTLSConfig(originB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hcB := &http.Client{Transport: &http.Transport{TLSClientConfig: cfgB}}
+		defer hcB.CloseIdleConnections()
+		if _, err := hcB.Get(urlB); err == nil {
+			t.Fatalf("pinned CA A unexpectedly accepted certificate signed by unpinned CA B!")
+		}
+	})
+
+	t.Run("ipv6_default_and_explicit_port_resolution_and_dial", func(t *testing.T) {
+		cases := []struct {
+			rawURL string
+			want   string
+		}{
+			{"https://[::1]", "[::1]:443"},
+			{"https://[::1]:8443", "[::1]:8443"},
+			{"https://[2001:db8::1]", "[2001:db8::1]:443"},
+			{"https://[2001:db8::1]:9443", "[2001:db8::1]:9443"},
+			{"https://127.0.0.1", "127.0.0.1:443"},
+			{"https://127.0.0.1:8443", "127.0.0.1:8443"},
+			{"https://relay.example.com", "relay.example.com:443"},
+			{"https://relay.example.com:8443", "relay.example.com:8443"},
+		}
+		for _, tc := range cases {
+			got, err := resolveOriginDialAddr(tc.rawURL)
+			if err != nil {
+				t.Fatalf("resolveOriginDialAddr(%q): %v", tc.rawURL, err)
+			}
+			if got != tc.want {
+				t.Fatalf("resolveOriginDialAddr(%q) = %q, want %q", tc.rawURL, got, tc.want)
+			}
+		}
+
+		// Verify DialSession with a bracketed IPv6 origin omitting port attempts "[::1]:443"
+		// rather than failing with "missing port in address".
+		r1, _ := ldrcrypto.GenerateEd25519Key()
+		r2, _ := ldrcrypto.GenerateEd25519Key()
+		prof := ldrcrypto.ProfileV1()
+		profDig, _ := prof.Digest()
+		lineID := bytes.Repeat([]byte{0x77}, 16)
+		r1Prin := ldrcrypto.RootPrincipal(r1.PublicKey())
+
+		defaultPortOrigin := ldrcrypto.RelayOrigin{
+			URL:            "https://[::1]",
+			TLSPolicy:      ldrcrypto.TLSPolicyPinSPKISHA256,
+			TLSPin:         bytes.Repeat([]byte{0x11}, 32),
+			SessionBinding: ldrcrypto.SessionBindingTLS13Exporter,
+		}
+		dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		_, dialErr := DialSession(dialCtx, defaultPortOrigin, lineID, profDig, 1, r1Prin, r1)
+		if dialErr != nil && strings.Contains(dialErr.Error(), "missing port in address") {
+			t.Fatalf("DialSession on default-port IPv6 origin failed with missing port: %v", dialErr)
+		}
+
+		// Live end-to-end TLS 1.3 DialSession over explicit IPv6 loopback ([::1]:<port>)
+		// combined with single-CA pin_ca_root_pem!
+		rawLn, err := net.Listen("tcp6", "[::1]:0")
+		if err != nil {
+			t.Skipf("IPv6 loopback unavailable in this environment: %v", err)
+		}
+		ca, caKey, caPEM := mintCA(t, "ipv6-ca")
+		leaf, _ := mintServerCert(t, ca, caKey, []net.IP{net.ParseIP("::1")}, nil)
+		tlsLn := tls.NewListener(rawLn, &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{leaf},
+			NextProtos:   []string{"h2", "http/1.1"},
+		})
+
+		ipv6Origin := ldrcrypto.RelayOrigin{
+			URL:            "https://" + rawLn.Addr().String(),
+			TLSPolicy:      ldrcrypto.TLSPolicyPinCARootPEM,
+			TLSPin:         caPEM,
+			SessionBinding: ldrcrypto.SessionBindingTLS13Exporter,
+		}
+		desc := ldrcrypto.CreationDescriptor{
+			Version: 1, LineID: lineID, Generation: 1,
+			RootKeys:    []ldrcrypto.PublicKey{r1.PublicKey(), r2.PublicKey()},
+			RelayOrigin: ipv6Origin, Profile: prof,
+		}
+		signedDesc, err := ldrcrypto.SignCreationDescriptor(r1, desc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rawDesc, _ := signedDesc.MarshalCanonical()
+		st, err := ldrstore.OpenFileStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		fc := &fakeClock{wall: 1_700_000_000_000, mono: 0}
+		eng, err := NewRelayEngine(st, DefaultClockConfig(), fc.source())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := eng.Provision(rawDesc); err != nil {
+			t.Fatal(err)
+		}
+		hs := &http.Server{Handler: NewRelayServer(eng)}
+		go func() { _ = hs.Serve(tlsLn) }()
+		t.Cleanup(func() {
+			_ = hs.Close()
+			_ = tlsLn.Close()
+		})
+
+		sess, err := DialSession(ctx, ipv6Origin, lineID, profDig, 1, r1Prin, r1)
+		if err != nil {
+			t.Fatalf("live IPv6 explicit-port DialSession with single-CA pin failed: %v", err)
+		}
+		sess.Close()
 	})
 }
