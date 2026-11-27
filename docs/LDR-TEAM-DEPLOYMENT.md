@@ -37,7 +37,7 @@ The companion guide includes the CLI equivalents and alternative configurations 
 
 **The operator key authorizes enrollment. Activating a fresh encryption epoch also requires an enrolled reader credential in the admin client directory.** Complete this step before enrolling your team.
 
-Choose **Line administration → Create operator reader request**, using the same admin directory. Issue a challenge for that request using its signing and encryption fingerprints. Prove possession in the admin directory, then enroll the verified workstation with the operator key. These are the same **Issue challenge**, **Prove workstation keys**, and **Enroll verified workstation** actions described below. The challenge secret stays in the admin account.
+Choose **Line administration → Create operator reader request**, using the same admin directory. Choose **Inspect signed request**, check the admin reader grant, then issue a challenge using its reviewed request digest and both device fingerprints. Prove possession in the admin directory, then enroll the verified workstation with the operator key. These are the same **Issue challenge**, **Prove workstation keys**, and **Enroll verified workstation** actions described below. The challenge secret stays in the admin account.
 
 If you also want your own coding session on the line, enroll it as an ordinary member. Keep administrative keys and the admin client directory outside the agent’s accessible workspace.
 
@@ -52,7 +52,7 @@ yip ldr inspect --descriptor line.desc.cbor
 | Who | Switchboard action | Handoff |
 | --- | --- | --- |
 | Colleague | Under **Actions → Connect to a Relay**, choose **Verify relay connection** and enter the trusted descriptor fingerprint. Then choose **Create workstation request**. Use a private client directory such as `~/.yip-ldr/project`, a unique namespace such as `alice-laptop`, an actor limit of `1` for one agent, and **Receive encrypted content**. | Send the request file to the operator. Confirm both printed workstation fingerprints, signing and encryption, through the independent channel. |
-| Operator | Under **Relays → Relay operator → Enroll workstation**, choose **Issue challenge**. Supply the request and both confirmed fingerprints. | Send the challenge file to the colleague. Keep the separate secret file in the operator account. |
+| Operator | Under **Relays → Relay operator → Enroll workstation**, choose **Inspect signed request**. Check line, namespace, actor limit and reader access. Choose **Issue challenge** using the reviewed request digest and both independently confirmed fingerprints. | Send the challenge file to the colleague. Keep the separate secret file in the operator account. |
 | Colleague | Choose **Prove workstation keys** with the original client directory, request, challenge, and verified operator public key. | Return the proof file. The private workstation keys stay in the colleague’s account. |
 | Operator | Choose **Enroll verified workstation** with the request, challenge, secret, and proof. After enrolling the intended readers, choose **Activate reader epoch** from the enrolled admin directory. | Tell the colleagues they can activate their workstations. Several readers can be enrolled before this epoch change. |
 | Colleague | Choose **Activate workstation**, then **Declare actor**. Use distinct names, for example `alice-codex` and `bob-claude`. | The workstation can now reconnect using its enrolled credential. |

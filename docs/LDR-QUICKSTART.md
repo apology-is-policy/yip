@@ -141,7 +141,15 @@ yip ldr root reader-request \
   --namespace admin-device \
   --out ~/ldr-setup/admin.req.cbor
 
+yip ldr join inspect --request ~/ldr-setup/admin.req.cbor
+# Verify the signed line and grant, then enter request_digest.
+read -r request_digest
+# Enter the signing and encryption fingerprints confirmed with the workstation owner.
+read -r signing_fp
+read -r encryption_fp
 yip ldr join challenge \
+  --expect-request "$request_digest" \
+  --expect-signing "$signing_fp" --expect-encryption "$encryption_fp" \
   --operator-key ~/ldr-setup/operator.key \
   --request ~/ldr-setup/admin.req.cbor \
   --out-challenge ~/ldr-setup/admin.ch.cbor \
@@ -187,7 +195,15 @@ Colleague sends `bob.req.cbor` to the operator and **verifies the printed signin
 
 ```sh
 # Operator
+yip ldr join inspect --request ~/bob.req.cbor
+# Verify the signed line and grant, then enter request_digest.
+read -r request_digest
+# Enter the signing and encryption fingerprints confirmed with the workstation owner.
+read -r signing_fp
+read -r encryption_fp
 yip ldr join challenge \
+  --expect-request "$request_digest" \
+  --expect-signing "$signing_fp" --expect-encryption "$encryption_fp" \
   --operator-key ~/ldr-setup/operator.key \
   --request ~/bob.req.cbor \
   --out-challenge ~/bob.ch.cbor \

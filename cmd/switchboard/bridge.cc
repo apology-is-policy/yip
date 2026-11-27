@@ -482,6 +482,9 @@ void config_form(View v) {
     if (action.label == "Create workstation request")
         ImGui::TextWrapped("Compare the descriptor fingerprint through a trusted channel. Send the request "
                            "file and verify both workstation fingerprints with the operator.");
+    if (action.label == "Inspect signed request")
+        ImGui::TextWrapped("Check the signed line, namespace, actor limit and reader grant. "
+                           "Use the resulting request digest when issuing the challenge.");
     if (action.label == "Issue challenge")
         ImGui::TextWrapped("Compare both fingerprints with the workstation owner. Return the challenge file. "
                            "Keep the secret file on this workstation.");

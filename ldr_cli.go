@@ -39,8 +39,10 @@ const ldrUsage = `yip ldr -- Long Distance Relay client, equal-roots admin, and 
     yip ldr root reader-request --dir <admin-dir> --namespace <ns> [--alg ed25519|ecdsa-p256-sha256] --out <req.cbor>
 
   P3 KEY-FIRST ENROLLMENT, REVOCATION & O25 FULL-REPLAY ONBOARDING
-    yip ldr join request --dir <client-dir> --descriptor <desc.cbor> --namespace <ns> [--actor-limit 4] [--reader] --out <req.cbor>
-    yip ldr join challenge --operator-key <file> --request <req.cbor> --out-challenge <ch.cbor> --out-secret <sec.cbor>
+    yip ldr join inspect --request <req.cbor>
+    yip ldr join request --dir <client-dir> --descriptor <desc.cbor> [--expect <descriptor-digest>] --namespace <ns> [--actor-limit 4] [--reader] --out <req.cbor>
+    yip ldr join challenge --operator-key <file> --request <req.cbor> [--expect-request <reviewed-digest>]
+        [--expect-signing <fingerprint>] [--expect-encryption <fingerprint>] --out-challenge <ch.cbor> --out-secret <sec.cbor>
     yip ldr join prove --dir <client-dir> --operator-pub <file> --request <req.cbor> --challenge <ch.cbor> --out <proof.cbor>
     yip ldr join enroll --dir <client-dir> --operator-key <file> --request <req.cbor> --challenge <ch.cbor> --secret <sec.cbor> --proof <proof.cbor>
     yip ldr join revoke --dir <admin-dir> --operator-key <file> --cred-id <hex>
@@ -597,10 +599,38 @@ func ldrRootCLI(args []string, out io.Writer) error {
 
 func ldrJoinCLI(args []string, out io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: yip ldr join <request|challenge|prove|enroll|activate>")
+		return errors.New("usage: yip ldr join <inspect|request|challenge|prove|enroll|activate|revoke>")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
+	case "inspect":
+		rest, path := takeFlag(rest, "--request", "")
+		if path == "" || len(rest) != 0 {
+			return errors.New("usage: yip ldr join inspect --request <file>")
+		}
+		req, digest, err := ldrclient.LoadJoinRequest(path)
+		if err != nil {
+			return err
+		}
+		signing, err := ldrclient.KeyFingerprint(req.SigningKey)
+		if err != nil {
+			return err
+		}
+		encryption, err := ldrclient.KeyFingerprint(req.EncryptionKey)
+		if err != nil {
+			return err
+		}
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]any{
+			"request_digest": hex.EncodeToString(digest[:]), "request_id": hex.EncodeToString(req.RequestID),
+			"line_id": hex.EncodeToString(req.LineID), "generation": req.Generation,
+			"descriptor_digest": hex.EncodeToString(req.DescriptorDigest[:]), "cred_id": hex.EncodeToString(req.CredID[:]),
+			"sig_fingerprint": signing, "enc_fingerprint": encryption,
+			"namespace": req.Grant.NamespaceID, "actor_limit": req.Grant.ActorLimit,
+			"reader": req.Grant.Reader, "capabilities": append([]string{}, req.Grant.Capabilities...),
+		})
+
 	case "request":
 		var dir, descPath, ns, limitStr, alg, outPath string
 		rest, dir = takeFlag(rest, "--dir", "")
@@ -739,6 +769,14 @@ func ldrJoinCLI(args []string, out io.Writer) error {
 		req, reqDig, err := ldrclient.LoadJoinRequest(reqPath)
 		if err != nil {
 			return err
+		}
+		actualDigest := hex.EncodeToString(reqDig[:])
+		rest, expectedDigest := takeFlag(rest, "--expect-request", actualDigest)
+		if len(rest) != 0 {
+			return fmt.Errorf("unexpected challenge arguments: %v", rest)
+		}
+		if !strings.EqualFold(expectedDigest, actualDigest) {
+			return errors.New("join request differs from the inspected request digest")
 		}
 		for _, item := range []struct {
 			want string
@@ -885,6 +923,10 @@ func ldrJoinCLI(args []string, out io.Writer) error {
 			return err
 		}
 		defer cl.Close()
+		desc, digest, _, _ := cl.Descriptor()
+		if req.DescriptorDigest != digest || !bytes.Equal(req.LineID, desc.LineID) {
+			return errors.New("join request belongs to a different line or descriptor")
+		}
 		cl.AttachOperatorKey(opKM)
 
 		ctx, cancel := ldrTimeoutCtx()

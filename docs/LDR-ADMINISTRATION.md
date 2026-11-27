@@ -262,12 +262,14 @@ yip ldr root reader-request --dir "$ADMIN" --namespace project-admin \
   --out "$KIT/admin.req.cbor"
 ~~~
 
-Read `sig_fingerprint` and `enc_fingerprint` from the request output and enter them in that order below. Record the `cred_id` as the admin reader. Use `operator.pub` authenticated at bootstrap. The challenge and the private challenge secret must have **different** output paths.
+Inspect the request and verify the admin reader grant. Enter its `request_digest` first, then the signing and encryption fingerprints from the request you created. Record the `cred_id` as the admin reader. Use `operator.pub` authenticated at bootstrap. The challenge and the private challenge secret must have **different** output paths.
 
 ~~~sh
+yip ldr join inspect --request "$KIT/admin.req.cbor"
+read -r REQUEST_DIGEST
 read -r SIG_FP
 read -r ENC_FP
-yip ldr join challenge --operator-key "$OP" --request "$KIT/admin.req.cbor" \
+yip ldr join challenge --operator-key "$OP" --request "$KIT/admin.req.cbor" --expect-request "$REQUEST_DIGEST" \
   --expect-signing "$SIG_FP" --expect-encryption "$ENC_FP" \
   --out-challenge "$KIT/admin.ch.cbor" --out-secret "$KIT/admin.sec.cbor"
 yip ldr join prove --dir "$ADMIN" --operator-pub "$KIT/operator.pub" \
@@ -287,16 +289,19 @@ Verify that the enrollment committed the expected credential ID, the epoch activ
 Opening a transport connection or inspecting a descriptor requires no pre-approved source IP in Yip. A useful member session requires an operator-enrolled credential bound to the signed line. Network allowlists, VPNs or an edge firewall can impose separate reachability requirements. The authorization decision is on the project line. There is no public registration endpoint where knowing a line name earns admission.
 
 1. Agree with the colleague on the device/account, namespace, number of agent identities and reader entitlement. Use a distinct namespace such as `alice-laptop` and start with the actor count they need. Give them the signed descriptor and authenticated operator public key. Confirm the descriptor digest and the authenticity of the operator public key through a previously established channel. For example, compare `shasum -a 256 operator.pub` or `sha256sum operator.pub` on both hosts.
-2. Have them create their request following the client manual. Ask for the signed request file and the output identifying the device, grant, credential ID and both fingerprints. Confirm the grant with the person and verify both fingerprints independently of the exchange used to send the file. For a remote ceremony also compare the SHA-256 of the actual request file independently. Check the actual signed grant or supervise request creation and compare its file digest. A fingerprint match alone leaves the grant unchecked. The enrollment uses the grant inside the request. [Inspect the grant in a received request](#inspect-the-grant-in-a-received-request). Have them make a corrected request if its grant is unsuitable.
+2. Have them create their request following the client manual. Ask for the signed request file and the output identifying the device, grant, credential ID and both fingerprints. Confirm the grant with the person and verify both fingerprints independently of the exchange used to send the file. For a remote ceremony also compare the SHA-256 of the actual request file independently. Inspect the actual signed grant in the received file and keep its `request_digest`. A fingerprint match alone leaves the grant unchecked. The enrollment uses the grant inside the request. [Inspect the grant in a received request](#inspect-the-grant-in-a-received-request). Have them make a corrected request if its grant is unsuitable.
 3. On the operator's workstation, create a private exchange directory for **this one request**, save the incoming file as `request.cbor`, and enter the independently checked fingerprints. Use the challenge it produces. Keep `secret.cbor` on the operator's machine.
 
 ~~~sh
 X="$KIT/alice-laptop-01"
 mkdir -m 0700 "$X"
 # Receive the colleague's request into "$X/request.cbor" before continuing.
+yip ldr join inspect --request "$X/request.cbor"
+# Compare the line and grant, then enter the reviewed request digest and the verified fingerprints.
+read -r REQUEST_DIGEST
 read -r SIG_FP
 read -r ENC_FP
-yip ldr join challenge --operator-key "$OP" --request "$X/request.cbor" \
+yip ldr join challenge --operator-key "$OP" --request "$X/request.cbor" --expect-request "$REQUEST_DIGEST" \
   --expect-signing "$SIG_FP" --expect-encryption "$ENC_FP" \
   --out-challenge "$X/challenge.cbor" --out-secret "$X/secret.cbor"
 ~~~
@@ -426,39 +431,12 @@ For an escalation collect versions, OS/architecture, redacted endpoint/policy, l
 
 ## Inspect the grant in a received request
 
-Use this when you are the approving operator and want to verify exactly what you would be signing. The release CLI's `join challenge` can compare the two device fingerprints. Those values identify keys. They do not say how many actors or which reader entitlement the request asks you to authorize. The member’s terminal output is helpful for comparison, but the signed request file is the authoritative grant.
-
-With a trusted **source checkout matching the deployed release** and Go available, the following read-only helper uses Yip's own decoder and signature verifier. Run it from the checkout root containing `go.mod`. Set `X` to the private exchange directory containing the received `request.cbor`. Only the request file needs to be present on this inspection machine. The helper neither needs signing keys nor contacts the relay. With only a binary installation, an operator can instead supervise request creation on the intended workstation, witness the flags and generated output, and compare a digest of those exact file bytes back on the approving workstation.
+On the operator's workstation use **Enroll workstation → Inspect signed request**, or run the following command from the installed release. It verifies the workstation signature and displays the signed request offline. It requires only the received file.
 
 ~~~sh
-INSPECT_DIR=$(mktemp -d)
-cat > "$INSPECT_DIR/inspect.go" <<'EOF'
-package main
-
-import (
-    "fmt"
-    "log"
-    "os"
-
-    "github.com/apology-is-policy/yip/ldrclient"
-)
-
-func main() {
-    if len(os.Args) != 2 {
-        log.Fatal("supply one request file")
-    }
-    request, _, err := ldrclient.LoadJoinRequest(os.Args[1])
-    if err != nil {
-        log.Fatal(err)
-    }
-    fmt.Printf("line %x\ndescriptor %x\ncredential %x\n",
-        request.LineID, request.DescriptorDigest, request.CredID)
-    fmt.Printf("namespace %q\nactor limit %d\nreader %t\ncapabilities %q\n",
-        request.Grant.NamespaceID, request.Grant.ActorLimit,
-        request.Grant.Reader, request.Grant.Capabilities)
-}
-EOF
-go run "$INSPECT_DIR/inspect.go" "$X/request.cbor"
+yip ldr join inspect --request "$X/request.cbor"
 ~~~
 
-Compare the line and descriptor with your custody record, the credential with the requesting device, and every grant field with the intended authorization. In the Alice example you expect `alice-laptop`, one actor and `reader true`. If any value differs, decline the request and have the member submit a fresh, correctly scoped one. Complete the independent key fingerprint checks when issuing the challenge.
+Compare `line_id` and `descriptor_digest` with the project record, and `cred_id`, `sig_fingerprint` and `enc_fingerprint` with the intended workstation. Read the signed `namespace`, `actor_limit` and `reader` values before approving. For the Alice example expect `alice-laptop`, one actor and reader access. The output also shows the request's capabilities list. The current enrollment operation grants the namespace, actor limit and reader setting.
+
+After reviewing the values, record `request_digest` and supply it in **Issue challenge → Reviewed request digest** or the CLI's `--expect-request` flag. This digest covers the signed request. It differs from a file checksum and from the line's descriptor digest. If the file changes before the challenge, the comparison fails. Keep the checked device fingerprints from your independent channel. If the grant differs from what you agreed, ask the workstation owner for a corrected request.

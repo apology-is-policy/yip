@@ -210,8 +210,48 @@ func TestLDRCLIEndToEndOverTLS13(t *testing.T) {
 		chF := filepath.Join(tmp, name+".ch.cbor")
 		secF := filepath.Join(tmp, name+".sec.cbor")
 		prF := filepath.Join(tmp, name+".proof.cbor")
-		runLDR("join", "request", "--dir", clientDir, "--descriptor", descFile, "--namespace", ns, "--actor-limit", "2", "--reader", "--out", reqF)
-		runLDR("join", "challenge", "--operator-key", opKey, "--request", reqF, "--out-challenge", chF, "--out-secret", secF)
+		made := runLDR("join", "request", "--dir", clientDir, "--descriptor", descFile, "--namespace", ns, "--actor-limit", "2", "--reader", "--out", reqF)
+		inspected := runLDR("join", "inspect", "--request", reqF)
+		for _, k := range []string{"namespace", "actor_limit", "reader", "cred_id", "sig_fingerprint", "enc_fingerprint"} {
+			if inspected[k] != made[k] {
+				t.Fatalf("inspect %s = %v, request returned %v", k, inspected[k], made[k])
+			}
+		}
+		challenge := []string{"join", "challenge", "--operator-key", opKey, "--request", reqF, "--out-challenge", chF, "--out-secret", secF, "--expect-request"}
+		if err := LDRCLI(append(challenge, "different digest"), &bytes.Buffer{}); err == nil {
+			t.Fatal("challenge accepted a different reviewed request")
+		}
+		for _, path := range []string{chF, secF} {
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("unexpected challenge output %s: %v", path, err)
+			}
+		}
+		req, digest, err := ldrclient.LoadJoinRequest(reqF)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if inspected["request_digest"] != hex.EncodeToString(digest[:]) || inspected["line_id"] != hex.EncodeToString(req.LineID) ||
+			inspected["descriptor_digest"] != hex.EncodeToString(req.DescriptorDigest[:]) {
+			t.Fatal("inspect reported the wrong request or line identity")
+		}
+		runLDR(append(challenge, inspected["request_digest"].(string))...)
+		raw, err := os.ReadFile(reqF)
+		if err != nil {
+			t.Fatal(err)
+		}
+		at := bytes.Index(raw, req.Sig)
+		if at < 0 {
+			t.Fatal("signature missing from request fixture")
+		}
+		raw[at] ^= 1
+		bad := filepath.Join(tmp, name+".bad.cbor")
+		if err := os.WriteFile(bad, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var result bytes.Buffer
+		if err := LDRCLI([]string{"join", "inspect", "--request", bad}, &result); err == nil || result.Len() != 0 {
+			t.Fatalf("inspect disclosed an unverified grant: %q %v", result.String(), err)
+		}
 		runLDR("join", "prove", "--dir", clientDir, "--operator-pub", opPub, "--request", reqF, "--challenge", chF, "--out", prF)
 		runLDR("join", "enroll", "--dir", rootDir, "--operator-key", opKey, "--request", reqF, "--challenge", chF, "--secret", secF, "--proof", prF)
 	}

@@ -20,11 +20,18 @@ import (
 type formField struct {
 	label, flag      string
 	optional, toggle bool
+	path             bool
 }
 
 func field(label, flag string) formField { return formField{label: label, flag: flag} }
 func optional(label, flag string) formField {
 	return formField{label: label, flag: flag, optional: true}
+}
+func pathField(label, flag string) formField {
+	return formField{label: label, flag: flag, path: true}
+}
+func optionalPath(label, flag string) formField {
+	return formField{label: label, flag: flag, optional: true, path: true}
 }
 func toggle(label, flag string) formField {
 	return formField{label: label, flag: flag, optional: true, toggle: true}
@@ -39,21 +46,21 @@ func form(group, label, command string, fields ...formField) boardAction {
 	return boardAction{group, label, command, fields}
 }
 
-var clientDir = field("Client directory", "--dir")
-var adminDir = field("Operator client directory", "--dir")
-var relayDir = field("Relay data directory", "--dir")
-var descriptor = field("Signed descriptor file", "--descriptor")
+var clientDir = pathField("Client directory", "--dir")
+var adminDir = pathField("Operator client directory", "--dir")
+var relayDir = pathField("Relay data directory", "--dir")
+var descriptor = pathField("Signed descriptor file", "--descriptor")
 var digest = field("Trusted descriptor fingerprint", "--expect")
-var operatorKey = field("Operator key file", "--operator-key")
-var requestFile = field("Join request file", "--request")
-var challengeFile = field("Challenge file", "--challenge")
+var operatorKey = pathField("Operator key file", "--operator-key")
+var requestFile = pathField("Join request file", "--request")
+var challengeFile = pathField("Challenge file", "--challenge")
 var runtimeField = field("Runtime", "--runtime")
 var lineField = field("Local line", "--line")
 var profileField = optional("Profile", "--profile")
 var seatField = optional("Seat name", "--as")
 var actorField = field("Actor", "--actor")
 var byField = optional("Attribution", "--by")
-var rootKey = field("Root key file", "--root-key")
+var rootKey = pathField("Root key file", "--root-key")
 var callID = field("Call ID", "--call")
 var fromActor = field("Sending actor", "--from")
 var message = field("Message", "--body")
@@ -61,21 +68,22 @@ var dispute = field("Dispute ID", "--dispute")
 var actions = []boardAction{
 	form("Connect to relay", "Inspect signed descriptor", "ldr inspect", descriptor),
 	form("Connect to relay", "Verify relay connection", "ldr inspect --probe", descriptor, digest),
-	form("Connect to relay", "Create workstation request", "ldr join request", descriptor, digest, clientDir, field("Workstation namespace", "--namespace"), optional("Actor limit", "--actor-limit"), toggle("Receive encrypted content", "--reader"), field("Save request to", "--out")),
-	form("Connect to relay", "Prove workstation keys", "ldr join prove", clientDir, field("Trusted operator public key", "--operator-pub"), requestFile, challengeFile, field("Save proof to", "--out")),
+	form("Connect to relay", "Create workstation request", "ldr join request", descriptor, digest, clientDir, field("Workstation namespace", "--namespace"), optional("Actor limit", "--actor-limit"), toggle("Receive encrypted content", "--reader"), pathField("Save request to", "--out")),
+	form("Connect to relay", "Prove workstation keys", "ldr join prove", clientDir, pathField("Trusted operator public key", "--operator-pub"), requestFile, challengeFile, pathField("Save proof to", "--out")),
 	form("Connect to relay", "Activate workstation", "ldr join activate", clientDir),
 	form("Connect to relay", "Declare actor", "ldr actor declare", clientDir, actorField),
 	form("Connect to relay", "Remove actor", "ldr actor remove", clientDir, actorField),
 	form("Connect to relay", "Attach local line", "ldr attach", clientDir, lineField, seatField, optional("Relay actor", "--actor")),
 	form("Connect to relay", "Detach local line", "ldr detach", lineField),
-	form("Enroll workstation", "Issue challenge", "ldr join challenge", operatorKey, requestFile, field("Verified signing fingerprint", "--expect-signing"), field("Verified encryption fingerprint", "--expect-encryption"), field("Save challenge to", "--out-challenge"), field("Keep secret in local file", "--out-secret")),
-	form("Enroll workstation", "Enroll verified workstation", "ldr join enroll", adminDir, operatorKey, requestFile, challengeFile, field("Local challenge secret file", "--secret"), field("Workstation proof file", "--proof")),
+	form("Enroll workstation", "Inspect signed request", "ldr join inspect", requestFile),
+	form("Enroll workstation", "Issue challenge", "ldr join challenge", operatorKey, requestFile, field("Reviewed request digest", "--expect-request"), field("Verified signing fingerprint", "--expect-signing"), field("Verified encryption fingerprint", "--expect-encryption"), pathField("Save challenge to", "--out-challenge"), pathField("Keep secret in local file", "--out-secret")),
+	form("Enroll workstation", "Enroll verified workstation", "ldr join enroll", adminDir, operatorKey, requestFile, challengeFile, pathField("Local challenge secret file", "--secret"), pathField("Workstation proof file", "--proof")),
 	form("Enroll workstation", "Activate reader epoch", "ldr epoch activate", adminDir, operatorKey),
 	form("Enroll workstation", "Revoke credential", "ldr join revoke", adminDir, operatorKey, field("Credential ID", "--cred-id")),
 	form("Create a Line", "Create a Line", "switchboard --create-line", field("Line name", "")),
 	form("Add Agent", "Add Agent", "@agent", lineField, field("Provider", ""), field("Agent name", ""), field("Attachment", ""), optional("Worktree path", ""), optional("Profile name", ""), toggle("Checkout-local Claude settings", "--local")),
 	form("Manage Lines", "View another line", "@line", lineField),
-	form("Manage Agents", "Remove agent", "uninstall", lineField, field("Agent name", "--as"), runtimeField, profileField),
+	form("Manage Agents", "Remove agent", "uninstall", lineField, field("Agent name", "--as"), profileField),
 	form("Diagnostics", "Run Doctor", "doctor", runtimeField, profileField, optional("Line", "--line")),
 	form("Diagnostics", "Re-probe overdue local endpoints", "switchboard --reprobe", lineField, byField),
 	form("Client tools", "Client status", "ldr status", clientDir),
@@ -91,7 +99,7 @@ var actions = []boardAction{
 	form("Relay calls", "Say bye", "ldr call bye", clientDir, fromActor, callID),
 	form("Relay calls", "Add actor note", "ldr call note", clientDir, fromActor, callID, message),
 	form("Relay calls", "Set call status", "ldr call status", clientDir, fromActor, callID, field("State", "--state"), optional("Reason", "--reason"), optional("Related call", "--related")),
-	form("Relay calls", "Attach file", "ldr call attach", clientDir, fromActor, callID, field("Attachment file", "--path")),
+	form("Relay calls", "Attach file", "ldr call attach", clientDir, fromActor, callID, pathField("Attachment file", "--path")),
 	form("Relay calls", "Ratify as operator", "ldr call ratify", adminDir, operatorKey, callID, message),
 	form("Relay calls", "Record dispute", "ldr call dispute", clientDir, fromActor, callID, field("Claim", "--claim")),
 	form("Relay calls", "Record measurement", "ldr call measure", clientDir, fromActor, callID, dispute, field("Command", "--cmd")),
@@ -102,22 +110,22 @@ var actions = []boardAction{
 	form("Resources", "Inspect resource configuration", "config show"),
 	form("Resources", "Initialize resource configuration", "config init", toggle("All line clients have restarted", "--clients-restarted")),
 	form("Resources", "Migrate resource configuration", "config migrate", toggle("All line clients have restarted", "--clients-restarted")),
-	form("Resources", "Validate configuration", "config validate", field("Configuration file", "")),
-	form("Resources", "Apply configuration", "config apply", field("Configuration file", ""), toggle("All line clients have restarted", "--clients-restarted")),
+	form("Resources", "Validate configuration", "config validate", pathField("Configuration file", "")),
+	form("Resources", "Apply configuration", "config apply", pathField("Configuration file", ""), toggle("All line clients have restarted", "--clients-restarted")),
 	form("Host a line", "Generate relay certificate", "relay init", relayDir, field("Certificate hostnames", "--hosts")),
 	form("Host a line", "Provision signed line", "relay provision", relayDir, descriptor),
-	form("Host a line", "Serve in this terminal", "@serve", relayDir, optional("Direct listen address or off", "--listen"), optional("Tunnel loopback address or Unix socket", "--tunnel-listen"), optional("Tunnel path", "--tunnel-path"), optional("TLS certificate file", "--cert"), optional("TLS private key file", "--key"), optional("Tunnel capacity", "--max-tunnels"), optional("Authentication concurrency", "--max-auth"), optional("Per-line admission limit", "--max-per-line")),
+	form("Host a line", "Serve in this terminal", "@serve", relayDir, optional("Direct listen address or off", "--listen"), optional("Tunnel loopback address or Unix socket", "--tunnel-listen"), optional("Tunnel path", "--tunnel-path"), optionalPath("TLS certificate file", "--cert"), optionalPath("TLS private key file", "--key"), optional("Tunnel capacity", "--max-tunnels"), optional("Authentication concurrency", "--max-auth"), optional("Per-line admission limit", "--max-per-line")),
 	form("Host a line", "Inspect live relay", "relay clock status", relayDir),
 	form("Host a line", "Inspect offline store", "relay status", relayDir),
 	form("Host a line", "Resume relay clock", "relay clock resume", relayDir, field("Hosted line ID", "--line-id")),
-	form("Host a line", "Monitor local admin socket", "@monitor", field("Relay admin socket path", "--admin-sock")),
-	form("Line administration", "Generate signing key", "ldr root keygen", field("Private key output file", "--out"), field("Public key output file", "--pub"), optional("Algorithm", "--alg")),
-	form("Line administration", "Sign line descriptor", "ldr root descriptor", field("First root public key file", "--root1"), field("Second root public key file", "--root2"), field("Root signing key file", "--signer"), field("Relay HTTPS URL", "--url"), field("TLS policy", "--tls-policy"), optional("SPKI pin or CA file", "--tls-pin"), optional("Session binding", "--session-binding"), optional("Inner server name", "--inner-server-name"), optional("Outer TLS policy", "--outer-tls-policy"), optional("Outer pin or CA file", "--outer-tls-pin"), field("Save descriptor to", "--out")),
-	form("Line administration", "Create operator reader request", "ldr root reader-request", adminDir, field("Namespace", "--namespace"), field("Save request to", "--out")),
-	form("Line administration", "Replace root key", "ldr root replace-root", adminDir, rootKey, field("Old root public key file", "--old-root-pub"), field("New root public key file", "--new-root-pub")),
+	form("Host a line", "Monitor local admin socket", "@monitor", pathField("Relay admin socket path", "--admin-sock")),
+	form("Line administration", "Generate signing key", "ldr root keygen", pathField("Private key output file", "--out"), pathField("Public key output file", "--pub"), optional("Algorithm", "--alg")),
+	form("Line administration", "Sign line descriptor", "ldr root descriptor", pathField("First root public key file", "--root1"), pathField("Second root public key file", "--root2"), pathField("Root signing key file", "--signer"), field("Relay HTTPS URL", "--url"), field("TLS policy", "--tls-policy"), optionalPath("SPKI pin or CA file", "--tls-pin"), optional("Session binding", "--session-binding"), optional("Inner server name", "--inner-server-name"), optional("Outer TLS policy", "--outer-tls-policy"), optionalPath("Outer pin or CA file", "--outer-tls-pin"), pathField("Save descriptor to", "--out")),
+	form("Line administration", "Create operator reader request", "ldr root reader-request", adminDir, field("Namespace", "--namespace"), pathField("Save request to", "--out")),
+	form("Line administration", "Replace root key", "ldr root replace-root", adminDir, rootKey, pathField("Old root public key file", "--old-root-pub"), pathField("New root public key file", "--new-root-pub")),
 	form("Line administration", "Initialize provisioned line", "ldr root init-line", adminDir, descriptor, rootKey),
-	form("Line administration", "Authorize operator", "ldr root authorize-operator", adminDir, rootKey, field("Operator public key", "--operator-pub")),
-	form("Line administration", "Revoke operator", "ldr root revoke-operator", adminDir, rootKey, field("Operator public key", "--operator-pub")),
+	form("Line administration", "Authorize operator", "ldr root authorize-operator", adminDir, rootKey, pathField("Operator public key", "--operator-pub")),
+	form("Line administration", "Revoke operator", "ldr root revoke-operator", adminDir, rootKey, pathField("Operator public key", "--operator-pub")),
 	form("Broadcasts", "Send local briefing", "broadcast briefing", lineField, byField, field("Recipients (comma-separated)", "--to"), field("Message", "@stdin")),
 	form("Broadcasts", "Send local announcement", "broadcast announcement", lineField, byField, field("Recipients (comma-separated)", "--to"), field("Message", "@stdin")),
 	form("Broadcasts", "Send local regroup", "broadcast regroup", lineField, byField, field("Recipients (comma-separated)", "--to"), field("Message", "@stdin")),
@@ -163,20 +171,29 @@ func agentArguments(values []string) ([]string, string, error) {
 	return args, "", nil
 }
 
+func expandHomePath(path string) (string, error) {
+	if !strings.HasPrefix(path, "~/") {
+		return path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, path[2:]), nil
+}
+
 func installBoardAgent(ctx context.Context, yip, dir string, args, values []string) (string, error) {
 	path := strings.TrimSpace(values[4])
 	if path != "" && values[3] != "Codex profile" {
-		if strings.HasPrefix(path, "~/") {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return "", err
-			}
-			path = filepath.Join(home, path[2:])
+		var err error
+		path, err = expandHomePath(path)
+		if err != nil {
+			return "", err
 		}
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(dir, path)
 		}
-		path, err := filepath.Abs(path)
+		path, err = filepath.Abs(path)
 		if err != nil {
 			return "", err
 		}
@@ -260,11 +277,15 @@ func (a boardAction) arguments(values []string) (args []string, body string, err
 		if strings.HasPrefix(v, "--") {
 			return nil, "", fmt.Errorf("%s cannot begin with --", f.label)
 		}
-		if strings.HasPrefix(v, "~/") {
-			home, e := os.UserHomeDir()
-			if e == nil && (f.flag == "--dir" || strings.Contains(strings.ToLower(f.label), "file") || strings.Contains(f.label, "Save ") || f.flag == "--out") {
-				v = filepath.Join(home, v[2:])
-			}
+		if f.path {
+			v, err = expandHomePath(v)
+		} else if f.flag == "--tunnel-listen" && strings.HasPrefix(v, "unix:~/") {
+			var path string
+			path, err = expandHomePath(strings.TrimPrefix(v, "unix:"))
+			v = "unix:" + path
+		}
+		if err != nil {
+			return nil, "", fmt.Errorf("%s: %w", f.label, err)
 		}
 		if f.flag != "" {
 			args = append(args, f.flag)

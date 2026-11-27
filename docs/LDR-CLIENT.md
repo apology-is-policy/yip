@@ -165,7 +165,7 @@ agy
 
 ~~~sh
 # In the running agent conversation. Substitute the chosen local line and name.
-yip delivery listen --runtime agy --line project-relay --as alice-agy
+"$HOME/.local/bin/yip" delivery listen --runtime agy --line project-relay --as alice-agy
 ~~~
 
 **Already installed.** Keep the existing integration and explicitly map its local name. An existing local `reviewer` seat can act as `alice-codex` on the relay. In this case peer calls go to `alice-codex` and local delivery commands select `reviewer`.
