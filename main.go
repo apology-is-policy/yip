@@ -330,16 +330,14 @@ func main() {
 		check(Retire(me, first(args) != "--undo"))
 		fmt.Println("retirement updated")
 	case "install":
-		if ldrActor != "" && ldrDir == "" {
-			check(fmt.Errorf("--ldr-actor requires --ldr-dir <client-dir>"))
-		}
-		res, err := InstallWith("", line, as, local, runtime, InstallOptions{Seat: seat, Profile: profile, WakeWindow: wakeWindow})
+		res, err := InstallWith("", line, as, local, runtime, InstallOptions{
+			Seat:       seat,
+			Profile:    profile,
+			WakeWindow: wakeWindow,
+			LDRDir:     ldrDir,
+			LDRActor:   ldrActor,
+		})
 		check(err)
-		if ldrDir != "" {
-			activeLine = res.Line
-			_, err = AttachLDRLine(ldrDir, res.Agent, ldrActor)
-			check(err)
-		}
 		verb := "joined"
 		if res.Reinstall {
 			verb = "rejoined"

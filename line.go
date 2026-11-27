@@ -193,6 +193,8 @@ type InstallOptions struct {
 	// WakeWindow (claude-rewake): how long after starting or ending a turn an
 	// idle session stays wakeable. It becomes the hook's timeout. 0 = default.
 	WakeWindow time.Duration
+	LDRDir     string // optional LDR client directory to validate before install side effects and attach atomically
+	LDRActor   string // optional LDR actor mapping for the installed seat
 }
 
 func Install(cwd, lineOverride, asOverride string, local bool) (*installResult, error) {
@@ -230,6 +232,9 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 	}
 	if opts.Profile != "" && asOverride == "" {
 		return nil, fmt.Errorf("--profile needs an explicit --as NAME: a profile seat has no checkout to name it after")
+	}
+	if strings.TrimSpace(opts.LDRActor) != "" && strings.TrimSpace(opts.LDRDir) == "" {
+		return nil, fmt.Errorf("--ldr-actor requires --ldr-dir <client-dir>")
 	}
 	root := checkoutRoot(cwd)
 
@@ -349,6 +354,14 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 	}
 	if bound {
 		res.Notes = append(res.Notes, fmt.Sprintf("%s is bound by a live Claude session (pid %d): a session started here is refused that name until the binding ends.", agent, bd.Session.PID))
+	}
+	var pendingLDR *preparedLDRAttach
+	if strings.TrimSpace(opts.LDRDir) != "" {
+		var err error
+		pendingLDR, err = preflightLDRAttachLocked(opts.LDRDir, agent, opts.LDRActor)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if runtime == "agy" {
@@ -484,6 +497,11 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 	}
 	if err := SaveMembers(m); err != nil {
 		return nil, err
+	}
+	if pendingLDR != nil {
+		if _, err := commitLDRAttachLocked(pendingLDR); err != nil {
+			return nil, err
+		}
 	}
 	for _, n := range LineNames() {
 		if n != agent {

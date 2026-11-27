@@ -1707,6 +1707,30 @@ func TestAttachLDRLineValidationAndActorMappingLifecycle(t *testing.T) {
 	if got := att2.actorFor("bob-seat"); got != "bob-claude" {
 		t.Fatalf("actorFor(bob-seat) = %q, want bob-claude", got)
 	}
+
+	// 6. InstallWith rejects invalid --ldr-dir / --ldr-actor BEFORE creating checkout or line side effects!
+	cleanCheckout := filepath.Join(t.TempDir(), "clean-checkout")
+	if err := os.MkdirAll(cleanCheckout, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InstallWith(cleanCheckout, "no-side-effects", "alice-seat", false, "claude-rewake", InstallOptions{
+		LDRDir:   aliceClientDir,
+		LDRActor: "undeclared-actor",
+	}); err == nil || !strings.Contains(err.Error(), "not declared") {
+		t.Fatalf("expected InstallWith with invalid --ldr-actor to fail, got: %v", err)
+	}
+	for _, untouched := range []string{
+		filepath.Join(cleanCheckout, ".mcp.json"),
+		filepath.Join(cleanCheckout, ".claude"),
+		filepath.Join(lineDirFor("no-side-effects"), "members.json"),
+		filepath.Join(lineDirFor("no-side-effects"), "seats.json"),
+		filepath.Join(lineDirFor("no-side-effects"), "ldr.json"),
+		filepath.Join(lineDirFor("no-side-effects"), "delivery", "alice-seat.json"),
+	} {
+		if _, err := os.Stat(untouched); !os.IsNotExist(err) {
+			t.Fatalf("failed InstallWith left side effect %s (err=%v)", untouched, err)
+		}
+	}
 }
 
 func TestLDRBindPreservesAndGuardsActorAndUninstallPrunesMapping(t *testing.T) {
@@ -1845,6 +1869,23 @@ func TestLDRBindPreservesAndGuardsActorAndUninstallPrunesMapping(t *testing.T) {
 		"body": "reply from bound worktree",
 	}); err != nil {
 		t.Fatalf("feature-wt failed to reply as alice-relay: %v", err)
+	}
+
+	// 4b. Reattaching the local line to a DIFFERENT client directory (bobClientDir) MUST NOT
+	//     inherit feature-wt's saved live binding from aliceClientDir!
+	reattached, err := AttachLDRLine(bobClientDir, "bob-local", "bob-relay")
+	if err != nil {
+		t.Fatalf("reattach to bobClientDir: %v", err)
+	}
+	if got := reattached.actorFor("feature-wt"); got == "alice-relay" {
+		t.Fatalf("reattached client directory inherited previous credential's bound actor: %q", got)
+	}
+	if _, err := (&server{me: "feature-wt"}).call("ring", nil); err == nil || !strings.Contains(err.Error(), "previous LDR client") {
+		t.Fatalf("expected stale-route bound worktree to require re-binding, got: %v", err)
+	}
+	// Restore aliceClientDir before testing uninstall pruning.
+	if _, err := AttachLDRLine(aliceClientDir, "alice-agy", "alice-relay"); err != nil {
+		t.Fatal(err)
 	}
 
 	// 5. Uninstall removes uninstalled seat's actor mapping from ldr.json while keeping others intact.
