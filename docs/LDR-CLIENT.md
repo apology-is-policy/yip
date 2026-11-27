@@ -253,7 +253,11 @@ yip ldr sync --dir "$CLIENT" --project --scan
 yip --line "$LOCAL_LINE" --as "$ACTOR" delivery status
 ~~~
 
-The last command takes the **local seat name**. Substitute it if you mapped a different remote actor. `ldr status` inspects local state. `sync` establishes a credential session, fetches and verifies changes, `--project` updates local readable records, and `--scan` discovers deliverable notices. A successful sync can return `applied: 0` when already current.
+The last command takes the **local seat name**. Substitute it if you mapped a different remote actor. On an attached line, its `ldr` object reports the local seat, resolved relay actor, credential, activation and locally verified health. If `healthy` is false, read `error`. A green local report can still appear while the origin is offline.
+
+For a live check, run the installed runtime's `doctor` command from the configured checkout or with the matching Codex profile. It reads the installed line selection, authenticates to the relay, syncs verified state, and reports the seat, actor and checkpoint. An explicit `--line` must agree with the installed configuration. To confirm delivery into a particular chat, send and acknowledge a fresh call there.
+
+`ldr status` inspects local state. `sync` establishes a credential session, fetches and verifies changes, `--project` updates local readable records, and `--scan` discovers deliverable notices. A successful sync can return `applied: 0` when already current.
 
 | Field | What to look for |
 |---|---|
