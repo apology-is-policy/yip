@@ -330,13 +330,14 @@ func main() {
 		check(Retire(me, first(args) != "--undo"))
 		fmt.Println("retirement updated")
 	case "install":
-		res, err := InstallWith("", line, as, local, runtime, InstallOptions{Seat: seat, Profile: profile, WakeWindow: wakeWindow})
+		res, err := InstallWith("", line, as, local, runtime, InstallOptions{
+			Seat:       seat,
+			Profile:    profile,
+			WakeWindow: wakeWindow,
+			LDRDir:     ldrDir,
+			LDRActor:   ldrActor,
+		})
 		check(err)
-		if ldrDir != "" {
-			activeLine = res.Line
-			_, err = AttachLDRLine(ldrDir, res.Agent, ldrActor)
-			check(err)
-		}
 		verb := "joined"
 		if res.Reinstall {
 			verb = "rejoined"
@@ -357,10 +358,14 @@ func main() {
 		for _, note := range res.Notes {
 			fmt.Printf("  note:     %s\n", note)
 		}
+		lineHint := ""
+		if line != "" {
+			lineHint = " --line " + res.Line
+		}
 		switch {
 		case runtime == "claude-channels":
 			fmt.Println("\nStart Claude here with: claude --dangerously-load-development-channels server:yip")
-			fmt.Println("Accept the preview warning yourself; organization policy still applies. After Claude acknowledges the probe, run yip doctor --runtime claude-channels.")
+			fmt.Printf("Accept the preview warning yourself; organization policy still applies. After Claude acknowledges the probe, run yip doctor --runtime claude-channels%s.\n", lineHint)
 		case runtime == "claude-rewake":
 			window := wakeWindow
 			if window == 0 {
@@ -368,12 +373,13 @@ func main() {
 			}
 			fmt.Printf("\nRestart Claude here. Each time a turn starts or ends, a background hook stays armed for %s:\n", window)
 			fmt.Println("a Yip notice then wakes the idle session (no Channels or tmux). Review new hooks in /hooks if asked.")
-			fmt.Println("Then: yip doctor --runtime claude-rewake")
+			fmt.Printf("Then: yip doctor --runtime claude-rewake%s\n", lineHint)
 		case runtime == "codex":
 			start, doc := "codex", "yip doctor --runtime codex"
 			if profile != "" {
 				start, doc = "codex -p "+profile+" -C /path/to/the/code", doc+" --profile "+profile
 			}
+			doc += lineHint
 			fmt.Printf("\nStart Codex with: %s   (restart an already-open session)\n", start)
 			fmt.Println("Review and trust the Yip hooks in /hooks. Delivery binds to the chat at its first Yip tool call;")
 			fmt.Printf("no UUID or separate dispatcher is needed. Then: %s\n", doc)
@@ -382,9 +388,9 @@ func main() {
 			fmt.Println("Live idle wakeups connect when the session runs its daemon listener via run_command (IsDaemon=true):")
 			fmt.Printf("  %s\n", agyListenCommand(res.Bin, res.Line, res.Agent))
 			fmt.Println("Multiple sessions from one launch folder can each call the Yip `bind` MCP tool with their own worktree;")
-			fmt.Println("the running listener follows the binding automatically. Then: yip doctor --runtime agy")
+			fmt.Printf("the running listener follows the binding automatically. Then: yip doctor --runtime agy%s\n", lineHint)
 		default:
-			fmt.Printf("\nRestart %s here, then yip doctor --runtime %s. Review and trust new hooks in the runtime.\n", runtime, runtime)
+			fmt.Printf("\nRestart %s here, then yip doctor --runtime %s%s. Review and trust new hooks in the runtime.\n", runtime, runtime, lineHint)
 		}
 	case "uninstall":
 		// Without an explicit line, leave the lines this checkout actually
@@ -844,14 +850,8 @@ func main() {
 			check(launchSwitchboard(args))
 		}
 	case "doctor":
-		if runtime == "claude-channels" {
-			me := must(WhoAmI(as, ""))
-			fmt.Println(EndpointStatus(me))
-			if !channelPreferred(me) {
-				os.Exit(1)
-			}
-			return
-		}
+		doctorExplicitLine = line
+		defer func() { doctorExplicitLine = "" }()
 		if runtime == "codex" {
 			check(CodexDoctor("", profile))
 			return
@@ -860,13 +860,32 @@ func main() {
 			check(AgyDoctor(""))
 			return
 		}
+		check(resolveDoctorLine(mcpConfiguredLine(checkoutRoot("")), filepath.Join(checkoutRoot(""), ".mcp.json")))
+		if runtime == "claude-channels" {
+			me := must(WhoAmI(as, ""))
+			ldrSummary, ldrErr := checkLDRDoctor(me)
+			fmt.Println(EndpointStatus(me))
+			if ldrSummary != "" {
+				fmt.Printf("ldr: %s\n", ldrSummary)
+			}
+			check(ldrErr)
+			if !channelPreferred(me) {
+				os.Exit(1)
+			}
+			return
+		}
 		if runtime == "claude-rewake" {
 			me := must(WhoAmI(as, ""))
 			_, hooksIn := hookInstalled(checkoutRoot(""))
 			if !strings.Contains(strings.Join(hooksIn, " "), "rewake (2/2)") {
 				check(fmt.Errorf("claude-rewake hooks missing for %s (found: %s); re-run yip install --runtime claude-rewake", me, orDash(strings.Join(hooksIn, ", "))))
 			}
+			ldrSummary, ldrErr := checkLDRDoctor(me)
+			check(ldrErr)
 			fmt.Printf("hooks: %s\ndelivery: %s\n", strings.Join(hooksIn, ", "), EndpointStatus(me))
+			if ldrSummary != "" {
+				fmt.Printf("ldr: %s\n", ldrSummary)
+			}
 			fmt.Println("Armed means a background waiter is running; it re-arms each time a turn starts or ends. This does not prove Claude woke: verify a notice is received and acknowledged.")
 			return
 		}
@@ -1077,13 +1096,58 @@ func doctor(as string) {
 		say(true, "peers: none yet -- run `yip install` in another checkout")
 	}
 	if err == nil {
-		if rings, err := RingFor(me); err == nil {
+		ldrSummary, ldrErr := checkLDRDoctor(me)
+		if ldrErr != nil {
+			say(false, "ldr: %v", ldrErr)
+		} else if ldrSummary != "" {
+			say(true, "ldr: %s", ldrSummary)
+		} else if rings, rerr := RingFor(me); rerr == nil {
 			say(true, "ringing: %d", len(rings))
 		}
 	}
 	if !ok {
 		os.Exit(1)
 	}
+}
+
+var doctorExplicitLine string
+
+func resolveDoctorLine(configuredLine, source string) error {
+	configuredLine = strings.TrimSpace(configuredLine)
+	if configuredLine == "" {
+		return nil
+	}
+	want := slugify(configuredLine)
+	if doctorExplicitLine != "" && slugify(doctorExplicitLine) != want {
+		return fmt.Errorf("%s is configured for line %q, not --line %q", source, want, slugify(doctorExplicitLine))
+	}
+	if doctorExplicitLine == "" && os.Getenv("YIP_ROOT") == "" && os.Getenv("YIP_LINE") == "" {
+		activeLine = want
+	}
+	return nil
+}
+
+func mcpConfiguredLine(root string) string {
+	if m, err := readJSON(filepath.Join(root, ".mcp.json")); err == nil {
+		if servers, ok := m["mcpServers"].(map[string]any); ok {
+			if yipSrv, ok := servers["yip"].(map[string]any); ok {
+				rawArgs, _ := yipSrv["args"].([]any)
+				for i := 0; i+1 < len(rawArgs); i++ {
+					flag, _ := rawArgs[i].(string)
+					val, _ := rawArgs[i+1].(string)
+					if flag == "--line" && val != "" {
+						return val
+					}
+				}
+			}
+		}
+	}
+	if doctorExplicitLine == "" && os.Getenv("YIP_ROOT") == "" && os.Getenv("YIP_LINE") == "" {
+		if hosts := linesHosting(root); len(hosts) == 1 {
+			return hosts[0]
+		}
+	}
+	return ""
 }
 
 func orDash(s string) string {

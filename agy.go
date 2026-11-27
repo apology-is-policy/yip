@@ -295,8 +295,8 @@ func AgyDoctor(root string) error {
 	if !hasAgyFlag || agent == "" {
 		return fmt.Errorf("Antigravity MCP args incomplete (expected `serve --agy ... --as NAME`); re-run yip install --runtime agy")
 	}
-	if pluginLine != "" && os.Getenv("YIP_ROOT") == "" {
-		activeLine = slugify(pluginLine)
+	if err := resolveDoctorLine(pluginLine, filepath.Join(pluginDir, "mcp_config.json")); err != nil {
+		return err
 	}
 
 	hookMap, err := readJSON(filepath.Join(pluginDir, "hooks.json"))
@@ -342,8 +342,15 @@ func AgyDoctor(root string) error {
 	if err != nil {
 		return fmt.Errorf("agentapi unavailable: %w", err)
 	}
+	ldrSummary, err := checkLDRDoctor(agent)
+	if err != nil {
+		return err
+	}
 	fmt.Printf("Antigravity plugin valid for %s in %s; agentapi found at %s.\n", agent, pluginDir, agentapiBin)
 	fmt.Printf("delivery: %s\n", EndpointStatus(agent))
+	if ldrSummary != "" {
+		fmt.Printf("ldr: %s\n", ldrSummary)
+	}
 	if b, ok, _ := liveBinding(agent); ok {
 		fmt.Printf("bound: %s is currently answered by session pid %d (launched as %s)\n", agent, b.Session.PID, b.Launch)
 	}

@@ -56,8 +56,7 @@ func codexManagedBlock(content string) (block, rest string, err error) {
 	return block, rest, nil
 }
 
-// codexBlockAgent reads back the identity a managed block serves ("" if none).
-func codexBlockAgent(block string) string {
+func codexBlockArgs(block string) []string {
 	for _, line := range strings.Split(block, "\n") {
 		list, ok := strings.CutPrefix(line, "args = [")
 		if !ok {
@@ -67,16 +66,34 @@ func codexBlockAgent(block string) string {
 		for list = strings.TrimSpace(list); strings.HasPrefix(list, `"`); {
 			q, err := strconv.QuotedPrefix(list)
 			if err != nil {
-				return ""
+				return nil
 			}
 			v, _ := strconv.Unquote(q)
 			args = append(args, v)
 			list = strings.TrimLeft(list[len(q):], ", ")
 		}
-		for i := 0; i+1 < len(args); i++ {
-			if args[i] == "--as" {
-				return args[i+1]
-			}
+		return args
+	}
+	return nil
+}
+
+// codexBlockAgent reads back the identity a managed block serves ("" if none).
+func codexBlockAgent(block string) string {
+	args := codexBlockArgs(block)
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--as" {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// codexBlockLine reads back the --line a managed block serves ("" if none).
+func codexBlockLine(block string) string {
+	args := codexBlockArgs(block)
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--line" {
+			return args[i+1]
 		}
 	}
 	return ""
@@ -285,10 +302,20 @@ var codexMCPList = func(dir, profile string) ([]byte, error) {
 	return cmd.Output()
 }
 
+var codexQueueCheck = func() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, "codex", "queue", "--help").Run()
+}
+
 // codexLoadsYip reports whether Codex, started in dir, would run Yip as
 // agent. ok=false with a nil error is a definite "no", and why says what to
 // do; an error means Codex could not be asked (not installed, too old).
 func codexLoadsYip(dir, profile, agent string) (ok bool, why string, err error) {
+	return codexLoadsYipOnLine(dir, profile, agent, "")
+}
+
+func codexLoadsYipOnLine(dir, profile, agent, wantLine string) (ok bool, why string, err error) {
 	out, err := codexMCPList(dir, profile)
 	if err != nil {
 		return false, "", err
@@ -318,6 +345,9 @@ func codexLoadsYip(dir, profile, agent string) (ok bool, why string, err error) 
 		for i := 0; i+1 < len(s.Transport.Args); i++ {
 			if s.Transport.Args[i] == "--as" && s.Transport.Args[i+1] != agent {
 				return false, fmt.Sprintf("Codex here loads a Yip server for %q, not %q (another config layer wins)", s.Transport.Args[i+1], agent), nil
+			}
+			if wantLine != "" && s.Transport.Args[i] == "--line" && slugify(s.Transport.Args[i+1]) != slugify(wantLine) {
+				return false, fmt.Sprintf("Codex here loads a Yip server for line %q, not %q (another config layer wins)", s.Transport.Args[i+1], wantLine), nil
 			}
 		}
 		return true, "", nil
@@ -395,26 +425,35 @@ func CodexDoctor(root, profile string) error {
 			return fmt.Errorf("%s has %d Yip registrations, expected 1", ev, n)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err = exec.CommandContext(ctx, "codex", "queue", "--help").Run(); err != nil {
+	if err = codexQueueCheck(); err != nil {
 		return fmt.Errorf("Codex queue unavailable: %w", err)
 	}
 	agent := codexBlockAgent(block)
+	blockLine := codexBlockLine(block)
+	if err := resolveDoctorLine(blockLine, configPath); err != nil {
+		return err
+	}
 	// The files being right is not the same as Codex loading them.
 	startDir := root // where Codex will be started; "" = here
 	if startDir == "" {
 		startDir, _ = os.Getwd()
 	}
-	loaded, why, err := codexLoadsYip(startDir, profile, agent)
+	loaded, why, err := codexLoadsYipOnLine(startDir, profile, agent, blockLine)
 	if err != nil {
 		return fmt.Errorf("could not ask Codex what it loads here (codex mcp list --json): %w", err)
 	}
 	if !loaded {
 		return fmt.Errorf("%s", why)
 	}
+	ldrSummary, err := checkLDRDoctor(agent)
+	if err != nil {
+		return err
+	}
 	fmt.Printf("Codex MCP and hook registrations present for %s in %s, and Codex loads them here; queue command available.\n", agent, configPath)
 	fmt.Printf("delivery: %s\n", EndpointStatus(agent))
+	if ldrSummary != "" {
+		fmt.Printf("ldr: %s\n", ldrSummary)
+	}
 	fmt.Println("Review hook trust in /hooks. This does not prove runtime delivery or receipt: verify that the intended chat receives and acknowledges a notice.")
 	return nil
 }

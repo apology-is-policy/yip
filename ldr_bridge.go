@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -27,7 +28,34 @@ import (
 type LDRAttachment struct {
 	Version   int               `json:"version"`
 	ClientDir string            `json:"client_dir"`
+	CredID    string            `json:"cred_id,omitempty"`
 	Actors    map[string]string `json:"actors,omitempty"` // local agent name -> LDR actor_id
+}
+
+func bdMatchesLDRRoute(bd Binding, att LDRAttachment) bool {
+	if strings.TrimSpace(bd.LDRActor) == "" {
+		return false
+	}
+	if strings.TrimSpace(bd.LDRClientDir) == "" || strings.TrimSpace(att.ClientDir) == "" {
+		return false
+	}
+	if !sameDir(bd.LDRClientDir, att.ClientDir) {
+		return false
+	}
+	if strings.TrimSpace(att.CredID) != "" && strings.TrimSpace(bd.LDRCredID) != "" &&
+		strings.TrimSpace(att.CredID) != strings.TrimSpace(bd.LDRCredID) {
+		return false
+	}
+	return true
+}
+
+func (a LDRAttachment) rawActorFor(localName string) string {
+	if a.Actors != nil {
+		if mapped := strings.TrimSpace(a.Actors[localName]); mapped != "" {
+			return mapped
+		}
+	}
+	return localName
 }
 
 func (a LDRAttachment) actorFor(localName string) string {
@@ -35,6 +63,9 @@ func (a LDRAttachment) actorFor(localName string) string {
 		if mapped := strings.TrimSpace(a.Actors[localName]); mapped != "" {
 			return mapped
 		}
+	}
+	if bd, ok, _ := liveBinding(localName); ok && bdMatchesLDRRoute(bd, a) {
+		return strings.TrimSpace(bd.LDRActor)
 	}
 	return localName
 }
@@ -86,51 +117,174 @@ func readLDRAttachment(p, envDir string) (LDRAttachment, bool, error) {
 	return LDRAttachment{}, false, nil
 }
 
-// AttachLDRLine validates clientDir and records the attachment in the active local line.
-func AttachLDRLine(clientDir, localAs, actorID string) (LDRAttachment, error) {
-	if strings.TrimSpace(clientDir) == "" {
-		return LDRAttachment{}, errors.New("ldr attach requires --dir <client-dir>")
+func validateLDRClientAndActor(cl *ldrclient.Client, dir, localAs, effActor string) (ldrclient.ClientStatus, map[string]bool, error) {
+	st := cl.Status()
+	if st.CredID == "" {
+		return st, nil, fmt.Errorf("cannot attach LDR directory %s: no credential keys loaded (enroll a workstation or reader credential first)", dir)
+	}
+	if !st.Activated {
+		return st, nil, fmt.Errorf("cannot attach LDR directory %s: credential %s is not activated (complete enrollment and run `yip ldr join activate` first)", dir, st.CredID)
+	}
+	if st.Suspect || st.Halted != "" {
+		return st, nil, fmt.Errorf("cannot attach halted or suspect LDR directory %s", dir)
+	}
+	if st.OutboxUncertain || st.EpochsUncertain || st.CursorsUncertain {
+		return st, nil, fmt.Errorf("cannot attach LDR directory %s with uncertain local durability state", dir)
+	}
+	if slices.Contains(st.StoppedKeys, "cred:"+st.CredID) {
+		return st, nil, fmt.Errorf("cannot attach LDR directory %s: credential %s is revoked or stopped", dir, st.CredID)
+	}
+	liveCredActors := map[string]bool{}
+	foreignActors := map[string]string{}
+	for _, a := range cl.ListActors() {
+		if !a.Live {
+			continue
+		}
+		if a.Cred == st.CredID {
+			liveCredActors[a.ID] = true
+		} else {
+			foreignActors[a.ID] = a.Cred
+		}
+	}
+	if localAs != "" && !liveCredActors[effActor] {
+		if ownerCred, foreign := foreignActors[effActor]; foreign {
+			return st, nil, fmt.Errorf("cannot map local seat %q to LDR actor %q: actor belongs to credential %s, not %s in %s", localAs, effActor, ownerCred, st.CredID, dir)
+		}
+		return st, nil, fmt.Errorf("cannot map local seat %q to LDR actor %q: actor is not declared as a live actor for credential %s in %s (run `yip ldr sync` and `yip ldr actor declare` first)", localAs, effActor, st.CredID, dir)
+	}
+	return st, liveCredActors, nil
+}
+
+type preparedLDRAttach struct {
+	att LDRAttachment
+}
+
+func openAndValidateLDRAttach(clientDir, localAs, actorID string) (string, string, string, string, map[string]bool, error) {
+	clientDir = strings.TrimSpace(clientDir)
+	localAs = strings.TrimSpace(localAs)
+	actorID = strings.TrimSpace(actorID)
+	if clientDir == "" {
+		return "", "", "", "", nil, errors.New("ldr attach requires --dir <client-dir>")
+	}
+	if actorID != "" && localAs == "" {
+		return "", "", "", "", nil, fmt.Errorf("ldr attach --actor %q requires --as <local-agent> to identify the local seat", actorID)
+	}
+	if localAs != "" && !validComponent(localAs) {
+		return "", "", "", "", nil, fmt.Errorf("invalid local agent name %q", localAs)
 	}
 	absDir, err := filepath.Abs(clientDir)
 	if err != nil {
-		return LDRAttachment{}, err
+		return "", "", "", "", nil, err
+	}
+	effActor := actorID
+	if effActor == "" {
+		effActor = localAs
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cl, err := ldrclient.OpenClientWait(ctx, absDir)
 	if err != nil {
-		return LDRAttachment{}, fmt.Errorf("cannot open LDR client dir %s: %w", absDir, err)
+		return "", "", "", "", nil, fmt.Errorf("cannot open LDR client dir %s: %w", absDir, err)
 	}
+	st, liveCredActors, verr := validateLDRClientAndActor(cl, absDir, localAs, effActor)
 	_ = cl.Close()
+	if verr != nil {
+		return "", "", "", "", nil, verr
+	}
+	return absDir, st.CredID, localAs, actorID, liveCredActors, nil
+}
 
+// preflightLDRAttachLocked validates clientDir, actor ownership, and existing
+// ldr.json state while fileGuard(membersPath()) is already held, before install
+// writes any checkout or line files.
+func preflightLDRAttachLocked(clientDir, localAs, actorID string) (*preparedLDRAttach, error) {
+	absDir, credID, localAs, actorID, liveCredActors, err := openAndValidateLDRAttach(clientDir, localAs, actorID)
+	if err != nil {
+		return nil, err
+	}
+	return buildLDRAttachLocked(absDir, credID, localAs, actorID, liveCredActors)
+}
+
+func buildLDRAttachLocked(absDir, credID, localAs, actorID string, liveCredActors map[string]bool) (*preparedLDRAttach, error) {
+	effActor := actorID
+	if effActor == "" {
+		effActor = localAs
+	}
+	prev, prevOk, err := readLDRAttachment(ldrAttachmentPath(), "")
+	if err != nil {
+		return nil, fmt.Errorf("existing LDR attachment is invalid (fix or run `yip ldr detach` first): %w", err)
+	}
+	actors := map[string]string{}
+	if prevOk && sameDir(prev.ClientDir, absDir) && (strings.TrimSpace(prev.CredID) == "" || strings.TrimSpace(prev.CredID) == credID) {
+		for seat, mapped := range prev.Actors {
+			if liveCredActors[mapped] {
+				actors[seat] = mapped
+			}
+		}
+	}
+	if localAs != "" {
+		for otherSeat, otherActor := range actors {
+			if otherSeat != localAs && otherActor == effActor {
+				return nil, fmt.Errorf("cannot map local seat %q to LDR actor %q: local seat %q on line %s already maps to %q", localAs, effActor, otherSeat, activeLine, effActor)
+			}
+		}
+		if actorID != "" {
+			actors[localAs] = actorID
+		} else {
+			delete(actors, localAs)
+		}
+	}
+	return &preparedLDRAttach{
+		att: LDRAttachment{
+			Version:   1,
+			ClientDir: absDir,
+			CredID:    credID,
+			Actors:    actors,
+		},
+	}, nil
+}
+
+func commitLDRAttachLocked(p *preparedLDRAttach) (LDRAttachment, error) {
+	if err := writeState(ldrAttachmentPath(), p.att); err != nil {
+		return LDRAttachment{}, err
+	}
+	return p.att, nil
+}
+
+// AttachLDRLine validates clientDir and records the attachment in the active local line,
+// serialized under the line's membership transaction lock.
+func AttachLDRLine(clientDir, localAs, actorID string) (LDRAttachment, error) {
+	absDir, credID, localAs, actorID, liveCredActors, err := openAndValidateLDRAttach(clientDir, localAs, actorID)
+	if err != nil {
+		return LDRAttachment{}, err
+	}
 	if err := EnsureRoot(); err != nil {
 		return LDRAttachment{}, err
 	}
-	att, _, err := loadLDRAttachment()
-	if err != nil {
-		return LDRAttachment{}, fmt.Errorf("existing LDR attachment is invalid (fix or run `yip ldr detach` first): %w", err)
-	}
-	att.Version = 1
-	att.ClientDir = absDir
-	if att.Actors == nil {
-		att.Actors = map[string]string{}
-	}
-	if localAs != "" && actorID != "" {
-		att.Actors[localAs] = actorID
-	}
-	b, err := json.MarshalIndent(att, "", "  ")
+	unlock, err := fileGuard(membersPath())
 	if err != nil {
 		return LDRAttachment{}, err
 	}
-	if err := atomicReplace(ldrAttachmentPath(), append(b, '\n')); err != nil {
+	defer unlock()
+	prep, err := buildLDRAttachLocked(absDir, credID, localAs, actorID, liveCredActors)
+	if err != nil {
 		return LDRAttachment{}, err
 	}
-	return att, nil
+	return commitLDRAttachLocked(prep)
 }
 
-// DetachLDRLine removes ldr.json from the active local line without touching the LDR client directory.
+// DetachLDRLine removes ldr.json from the active local line without touching the LDR client directory,
+// serialized under the line's membership transaction lock.
 func DetachLDRLine() error {
-	err := os.Remove(ldrAttachmentPath())
+	if _, err := os.Stat(Root()); os.IsNotExist(err) {
+		return nil
+	}
+	unlock, err := fileGuard(membersPath())
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	err = os.Remove(ldrAttachmentPath())
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -142,7 +296,7 @@ func ldrAttachCLI(rest []string, out io.Writer) error {
 	rest, dir = takeFlag(rest, "--dir", "")
 	rest, localAs = takeFlag(rest, "--as", "")
 	rest, actorID = takeFlag(rest, "--actor", "")
-	if dir == "" {
+	if strings.TrimSpace(dir) == "" || len(rest) != 0 {
 		return errors.New("usage: yip ldr attach --dir <client-dir> [--line <line>] [--as <local-agent>] [--actor <ldr-actor>]")
 	}
 	att, err := AttachLDRLine(dir, localAs, actorID)
@@ -157,6 +311,9 @@ func ldrAttachCLI(rest []string, out io.Writer) error {
 }
 
 func ldrDetachCLI(rest []string, out io.Writer) error {
+	if len(rest) != 0 {
+		return errors.New("usage: yip [--line <line>] ldr detach")
+	}
 	if err := DetachLDRLine(); err != nil {
 		return err
 	}
@@ -164,6 +321,198 @@ func ldrDetachCLI(rest []string, out io.Writer) error {
 		"line":     activeLine,
 		"detached": true,
 	})
+}
+
+// pruneLDRActors is called from uninstallLocked while fileGuard(membersPath()) is held.
+func pruneLDRActors(names ...string) {
+	if len(names) == 0 {
+		return
+	}
+	att, ok, err := readLDRAttachment(ldrAttachmentPath(), "")
+	if !ok || err != nil || len(att.Actors) == 0 {
+		return
+	}
+	changed := false
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		if _, exists := att.Actors[n]; exists {
+			delete(att.Actors, n)
+			changed = true
+		}
+	}
+	if !changed {
+		return
+	}
+	_ = writeState(ldrAttachmentPath(), att)
+}
+
+func prepareLDRBind(launch, name, as string, session procID, convID string, b Bindings) (string, string, string, string, error) {
+	att, ok, err := loadLDRAttachment()
+	if err != nil {
+		return "", "", "", "", err
+	}
+	if !ok {
+		return "", "", "", "", nil
+	}
+	absDir, err := filepath.Abs(att.ClientDir)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cl, err := ldrclient.OpenClientWait(ctx, absDir)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("cannot open LDR client dir %s for bind: %w", absDir, err)
+	}
+	st, liveCredActors, verr := validateLDRClientAndActor(cl, absDir, "", "")
+	_ = cl.Close()
+	if verr != nil {
+		return "", "", "", "", verr
+	}
+
+	var targetActor, note string
+	if name == launch {
+		targetActor = att.rawActorFor(launch)
+		if !liveCredActors[targetActor] {
+			return "", "", "", "", fmt.Errorf("launch seat %q maps to LDR actor %q, which is not a live actor of credential %s in %s", launch, targetActor, st.CredID, absDir)
+		}
+	} else {
+		if mapped := strings.TrimSpace(att.Actors[name]); mapped != "" {
+			if !liveCredActors[mapped] {
+				return "", "", "", "", fmt.Errorf("mapped LDR actor %q for %q is not a live actor of credential %s in %s", mapped, name, st.CredID, absDir)
+			}
+			targetActor = mapped
+		} else if liveCredActors[name] {
+			targetActor = name
+		} else if strings.TrimSpace(as) != "" {
+			return "", "", "", "", fmt.Errorf("cannot bind worktree as %q on LDR line %s: %q is not a live actor of credential %s in %s (declare it with `yip ldr actor declare` or map it with `yip ldr attach` first)", name, activeLine, name, st.CredID, absDir)
+		} else {
+			launchActor := att.rawActorFor(launch)
+			if !liveCredActors[launchActor] {
+				return "", "", "", "", fmt.Errorf("cannot bind worktree %q on LDR line %s: neither %q nor launch seat %q maps to a live actor of credential %s in %s", name, activeLine, name, launch, st.CredID, absDir)
+			}
+			if other, inUse, aerr := answeringTo(launch, session, b); aerr != nil {
+				return "", "", "", "", fmt.Errorf("cannot tell who answers to %s: %w", launch, aerr)
+			} else if inUse {
+				return "", "", "", "", fmt.Errorf("cannot bind worktree %q on LDR line %s: launch actor %q (%s) is already in use by live session pid %d; declare a separate actor with `yip ldr actor declare` and pass as", name, activeLine, launchActor, launch, other.PID)
+			}
+			targetActor = launchActor
+			note = fmt.Sprintf("LDR relay actor remains %q (from %s).", targetActor, launch)
+		}
+	}
+
+	for otherName, bd := range b.Bindings {
+		if sameBindingOwner(bd, session, convID) || !procAlive(bd.Session) {
+			continue
+		}
+		var bdActor string
+		if mapped := strings.TrimSpace(att.Actors[otherName]); mapped != "" {
+			bdActor = mapped
+		} else if bdMatchesLDRRoute(bd, att) && bd.LDRCredID == st.CredID {
+			bdActor = strings.TrimSpace(bd.LDRActor)
+		} else if strings.TrimSpace(bd.LDRClientDir) == "" && strings.TrimSpace(bd.LDRActor) != "" {
+			bdActor = strings.TrimSpace(bd.LDRActor)
+		} else {
+			continue
+		}
+		if bdActor == targetActor {
+			return "", "", "", "", fmt.Errorf("cannot bind %q on LDR line %s: relay actor %q is already bound to %q by live session pid %d; two sessions cannot share one relay actor", name, activeLine, targetActor, otherName, bd.Session.PID)
+		}
+	}
+	if name == launch {
+		return "", "", "", "", nil
+	}
+	return absDir, st.CredID, targetActor, note, nil
+}
+
+func resolveSessionLDRRoute(att LDRAttachment, me string) (LDRAttachment, string, error) {
+	bd, bound, err := liveBinding(me)
+	if err != nil {
+		return att, "", err
+	}
+	var actor string
+	switch {
+	case strings.TrimSpace(att.Actors[me]) != "":
+		actor = strings.TrimSpace(att.Actors[me])
+	case bound && bdMatchesLDRRoute(bd, att):
+		actor = strings.TrimSpace(bd.LDRActor)
+		if strings.TrimSpace(att.CredID) == "" && strings.TrimSpace(bd.LDRCredID) != "" {
+			att.CredID = strings.TrimSpace(bd.LDRCredID)
+		}
+	case bound && strings.TrimSpace(bd.LDRClientDir) != "" && !bdMatchesLDRRoute(bd, att):
+		return att, "", fmt.Errorf("worktree %q was bound under a previous LDR client or credential; call bind again for current LDR client %s", me, att.ClientDir)
+	default:
+		actor = att.rawActorFor(me)
+	}
+	if !bound {
+		if _, serr := os.Stat(bindingsPath()); serr == nil {
+			b, lerr := loadBindingsStrict()
+			if lerr != nil {
+				return att, "", lerr
+			}
+			curConv := envConvID()
+			curSess, inSess := nearestSession()
+			for otherName, otherBD := range b.Bindings {
+				if otherName == me || !procAlive(otherBD.Session) {
+					continue
+				}
+				var otherActor string
+				if mapped := strings.TrimSpace(att.Actors[otherName]); mapped != "" {
+					otherActor = mapped
+				} else if bdMatchesLDRRoute(otherBD, att) {
+					otherActor = strings.TrimSpace(otherBD.LDRActor)
+				} else {
+					continue
+				}
+				if otherActor != actor {
+					continue
+				}
+				if (curConv != "" && curConv != otherBD.ConvID) || (inSess && curSess != otherBD.Session) {
+					return att, "", fmt.Errorf("LDR relay actor %q (from %s) is currently bound to worktree %s (%s) by live session pid %d; declare and bind a distinct relay actor", actor, me, otherBD.Worktree, otherName, otherBD.Session.PID)
+				}
+			}
+		}
+	}
+	return att, actor, nil
+}
+
+func resolveSessionLDRActor(att LDRAttachment, me string) (string, error) {
+	_, actor, err := resolveSessionLDRRoute(att, me)
+	return actor, err
+}
+
+func actorMovedToBoundWorktree(att LDRAttachment, localAgent string) bool {
+	if _, bound, err := liveBinding(localAgent); err != nil || bound {
+		return false
+	}
+	if _, err := os.Stat(bindingsPath()); os.IsNotExist(err) {
+		return false
+	}
+	b, err := loadBindingsStrict()
+	if err != nil {
+		return false
+	}
+	myActor := att.rawActorFor(localAgent)
+	for otherName, bd := range b.Bindings {
+		if otherName == localAgent || !procAlive(bd.Session) {
+			continue
+		}
+		var otherActor string
+		if mapped := strings.TrimSpace(att.Actors[otherName]); mapped != "" {
+			otherActor = mapped
+		} else if bdMatchesLDRRoute(bd, att) {
+			otherActor = strings.TrimSpace(bd.LDRActor)
+		} else {
+			continue
+		}
+		if otherActor == myActor {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Local seen/hook cursor bookkeeping (outside authoritative LDR verified state) ---
@@ -206,12 +555,27 @@ func updateLDRCursor(agent, callID string, fn func(*ldrCallCursor)) error {
 
 // --- LDR Client Session Helpers ---
 
+func verifyOpenedLDRClient(cl *ldrclient.Client, att LDRAttachment) error {
+	want := strings.TrimSpace(att.CredID)
+	if want == "" {
+		return nil
+	}
+	got := cl.Status().CredID
+	if got != want {
+		return fmt.Errorf("LDR client directory %s holds credential %s, not attached credential %s; run `yip ldr attach` or `bind` again to confirm the replacement", att.ClientDir, got, want)
+	}
+	return nil
+}
+
 func withLDRSession(ctx context.Context, att LDRAttachment, fn func(*ldrclient.Client, *ldrrelay.SessionClient) error) error {
 	cl, err := ldrclient.OpenClientWait(ctx, att.ClientDir)
 	if err != nil {
 		return err
 	}
 	defer cl.Close()
+	if err := verifyOpenedLDRClient(cl, att); err != nil {
+		return err
+	}
 	sess, err := cl.Dial(ctx, ldrcrypto.PrincipalCredential)
 	if err != nil {
 		return err
@@ -282,7 +646,11 @@ func ldrToolCall(me, name string, a map[string]any) (string, bool, error) {
 		return "", false, nil
 	}
 
-	actor := att.actorFor(me)
+	var actor string
+	att, actor, err = resolveSessionLDRRoute(att, me)
+	if err != nil {
+		return "", true, err
+	}
 	ctx, cancel := ldrTimeoutCtx()
 	defer cancel()
 
@@ -418,6 +786,9 @@ func ldrToolCall(me, name string, a map[string]any) (string, bool, error) {
 				return nil, err
 			}
 			defer cl.Close()
+			if err := verifyOpenedLDRClient(cl, att); err != nil {
+				return nil, err
+			}
 			return cl.Dial(waitCtx, ldrcrypto.PrincipalCredential)
 		}
 		sess, err := dialSess()
@@ -436,6 +807,9 @@ func ldrToolCall(me, name string, a map[string]any) (string, bool, error) {
 				return "", "", "", "", 0, err
 			}
 			defer cl.Close()
+			if err := verifyOpenedLDRClient(cl, att); err != nil {
+				return "", "", "", "", 0, err
+			}
 			if _, serr := cl.Sync(waitCtx, sess); serr != nil {
 				// If the long-lived TLS session dropped, re-dial once and retry sync.
 				if !errors.Is(serr, ldrclient.ErrKeyRevoked) && !errors.Is(serr, ldrclient.ErrViolation) &&
@@ -939,12 +1313,18 @@ func ldrHostLocalResourceSnapshot(localAgent string) map[string]string {
 // host-local resource lease events (resources stay strictly host-local).
 func ldrDeliverySnapshot(att LDRAttachment, localAgent string) map[string]string {
 	out := ldrHostLocalResourceSnapshot(localAgent)
+	if actorMovedToBoundWorktree(att, localAgent) {
+		return out
+	}
 
 	// 2. Remote verified LDR notices (sync + ScanDelivery + DeliverableNotices).
-	actor := att.actorFor(localAgent)
+	effAtt, actor, rerr := resolveSessionLDRRoute(att, localAgent)
+	if rerr != nil {
+		return out
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	_ = withLDRSession(ctx, att, func(cl *ldrclient.Client, sess *ldrrelay.SessionClient) error {
+	_ = withLDRSession(ctx, effAtt, func(cl *ldrclient.Client, sess *ldrrelay.SessionClient) error {
 		_, _ = cl.Sync(ctx, sess)
 		_, _ = cl.ScanDelivery()
 		desc, cd, _, _ := cl.Descriptor()
@@ -1025,6 +1405,9 @@ func ldrAckNotice(source string) error {
 		return fmt.Errorf("cannot open LDR client for delivery ack: %w", err)
 	}
 	defer cl.Close()
+	if err := verifyOpenedLDRClient(cl, att); err != nil {
+		return err
+	}
 	desc, cd, _, _ := cl.Descriptor()
 	curLineHex := hex.EncodeToString(desc.LineID)
 	curDescHex := hex.EncodeToString(cd[:8])
@@ -1039,11 +1422,14 @@ func ldrAckNotice(source string) error {
 }
 
 func ldrCallsListText(att LDRAttachment, me string) (string, error) {
-	actor := att.actorFor(me)
+	effAtt, actor, err := resolveSessionLDRRoute(att, me)
+	if err != nil {
+		return "", err
+	}
 	ctx, cancel := ldrTimeoutCtx()
 	defer cancel()
 	var sums []ldrclient.CallSummary
-	err := withLDRSession(ctx, att, func(cl *ldrclient.Client, sess *ldrrelay.SessionClient) error {
+	err = withLDRSession(ctx, effAtt, func(cl *ldrclient.Client, sess *ldrrelay.SessionClient) error {
 		if _, err := cl.Sync(ctx, sess); err != nil {
 			return err
 		}
@@ -1068,18 +1454,163 @@ func ldrCallsListText(att LDRAttachment, me string) (string, error) {
 	return strings.TrimRight(b.String(), "\n"), nil
 }
 
-func ldrHookRings(att LDRAttachment, me string) ([]ldrclient.CallSummary, []ldrclient.BroadcastView) {
-	actor := att.actorFor(me)
+// LDRDeliveryStatus reports LDR attachment, credential, and seat-to-actor
+// health inside `yip delivery status` / `deliveries` JSON when LDR is attached.
+type LDRDeliveryStatus struct {
+	Attached  bool   `json:"attached"`
+	ClientDir string `json:"client_dir,omitempty"`
+	LocalSeat string `json:"local_seat"`
+	Actor     string `json:"actor,omitempty"`
+	LineID    string `json:"line_id,omitempty"`
+	CredID    string `json:"cred_id,omitempty"`
+	Activated bool   `json:"activated,omitempty"`
+	ActorLive bool   `json:"actor_live,omitempty"`
+	Healthy   bool   `json:"healthy"`
+	Error     string `json:"error,omitempty"`
+}
+
+func inspectLDRDeliveryStatus(agent string) *LDRDeliveryStatus {
+	att, ok, err := loadLDRAttachment()
+	if err != nil {
+		return &LDRDeliveryStatus{
+			Attached:  true,
+			LocalSeat: agent,
+			Healthy:   false,
+			Error:     err.Error(),
+		}
+	}
+	if !ok {
+		return nil
+	}
+	effAtt, actor, aerr := resolveSessionLDRRoute(att, agent)
+	res := &LDRDeliveryStatus{
+		Attached:  true,
+		ClientDir: att.ClientDir,
+		LocalSeat: agent,
+		Actor:     actor,
+	}
+	if aerr != nil {
+		res.Error = aerr.Error()
+		return res
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cl, err := ldrclient.OpenClientWait(ctx, effAtt.ClientDir)
+	if err != nil {
+		res.Error = fmt.Sprintf("cannot open LDR client dir %s: %v", effAtt.ClientDir, err)
+		return res
+	}
+	cerr := verifyOpenedLDRClient(cl, effAtt)
+	st, liveCredActors, verr := validateLDRClientAndActor(cl, effAtt.ClientDir, agent, actor)
+	_ = cl.Close()
+	res.LineID = st.LineID
+	res.CredID = st.CredID
+	res.Activated = st.Activated
+	res.ActorLive = liveCredActors != nil && liveCredActors[actor]
+	if cerr != nil {
+		res.Error = cerr.Error()
+		return res
+	}
+	if verr != nil {
+		res.Error = verr.Error()
+		return res
+	}
+	if st.MustResolve {
+		res.Error = fmt.Sprintf("LDR client %s has unsettled outbox operation(s) requiring reconciliation (must_resolve=true)", effAtt.ClientDir)
+		return res
+	}
+	res.Healthy = true
+	return res
+}
+
+func checkLDRDoctor(agent string) (string, error) {
+	att, ok, err := loadLDRAttachment()
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", nil
+	}
+	actor := ""
+	if agent != "" {
+		var aerr error
+		att, actor, aerr = resolveSessionLDRRoute(att, agent)
+		if aerr != nil {
+			return "", aerr
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cl, err := ldrclient.OpenClientWait(ctx, att.ClientDir)
+	if err != nil {
+		return "", fmt.Errorf("cannot open LDR client dir %s: %w", att.ClientDir, err)
+	}
+	defer cl.Close()
+	if err := verifyOpenedLDRClient(cl, att); err != nil {
+		return "", err
+	}
+
+	st, _, verr := validateLDRClientAndActor(cl, att.ClientDir, "", "")
+	if verr != nil {
+		return "", verr
+	}
+	sess, err := cl.Dial(ctx, ldrcrypto.PrincipalCredential)
+	if err != nil {
+		return "", fmt.Errorf("LDR relay session failed for %s: %w", att.ClientDir, err)
+	}
+	defer sess.Close()
+	if _, err := cl.Sync(ctx, sess); err != nil {
+		return "", fmt.Errorf("LDR relay sync failed for %s: %w", att.ClientDir, err)
+	}
+	_, _ = cl.ScanDelivery()
+	st, _, verr = validateLDRClientAndActor(cl, att.ClientDir, agent, actor)
+	if verr != nil {
+		return "", verr
+	}
+	if st.MustResolve {
+		return "", fmt.Errorf("LDR client %s has unsettled outbox operation(s) requiring reconciliation (must_resolve=true)", att.ClientDir)
+	}
+	deliverable := 0
+	for _, n := range cl.DeliverableNotices() {
+		if actor == "" || n.Actor == actor {
+			deliverable++
+		}
+	}
+	if agent != "" {
+		return fmt.Sprintf("line %s (%s), seat %s -> actor %s (seq %d, deliverable %d)", st.LineID, att.ClientDir, agent, actor, st.CheckpointSeq, deliverable), nil
+	}
+	return fmt.Sprintf("line %s (%s), seq %d", st.LineID, att.ClientDir, st.CheckpointSeq), nil
+}
+
+func ldrHookRingsChecked(att LDRAttachment, me string) ([]ldrclient.CallSummary, []ldrclient.BroadcastView, string, error) {
+	effAtt, actor, err := resolveSessionLDRRoute(att, me)
+	if err != nil {
+		return nil, nil, att.actorFor(me), err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var sums []ldrclient.CallSummary
 	var bvs []ldrclient.BroadcastView
-	_ = withLDRSession(ctx, att, func(cl *ldrclient.Client, sess *ldrrelay.SessionClient) error {
-		_, _ = cl.Sync(ctx, sess)
-		sums, _ = cl.ListCallSummaries(ctx, sess, actor, false)
-		bvs, _ = cl.ListBroadcasts(ctx, sess, actor, false)
-		return nil
+	err = withLDRSession(ctx, effAtt, func(cl *ldrclient.Client, sess *ldrrelay.SessionClient) error {
+		if _, serr := cl.Sync(ctx, sess); serr != nil {
+			return serr
+		}
+		if _, _, verr := validateLDRClientAndActor(cl, effAtt.ClientDir, me, actor); verr != nil {
+			return verr
+		}
+		var lerr error
+		sums, lerr = cl.ListCallSummaries(ctx, sess, actor, false)
+		if lerr != nil {
+			return lerr
+		}
+		bvs, lerr = cl.ListBroadcasts(ctx, sess, actor, false)
+		return lerr
 	})
+	return sums, bvs, actor, err
+}
+
+func ldrHookRings(att LDRAttachment, me string) ([]ldrclient.CallSummary, []ldrclient.BroadcastView) {
+	sums, bvs, _, _ := ldrHookRingsChecked(att, me)
 	return sums, bvs
 }
 
@@ -1155,9 +1686,11 @@ func ldrHookStop(att LDRAttachment, me string) any {
 
 func ldrHookSessionStart(att LDRAttachment, me string) any {
 	_ = Beat(me, "")
-	actor := att.actorFor(me)
-	sums, bvs := ldrHookRings(att, me)
+	sums, bvs, actor, err := ldrHookRingsChecked(att, me)
 	var parts []string
+	if err != nil {
+		parts = append(parts, fmt.Sprintf("[yip ldr] delivery/relay warning for %s (actor %s): %v", me, actor, err))
+	}
 	if txt := formatLDRRing(sums, me, actor); txt != "nothing ringing." {
 		parts = append(parts, "[yip] "+txt)
 	}

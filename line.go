@@ -193,6 +193,8 @@ type InstallOptions struct {
 	// WakeWindow (claude-rewake): how long after starting or ending a turn an
 	// idle session stays wakeable. It becomes the hook's timeout. 0 = default.
 	WakeWindow time.Duration
+	LDRDir     string // optional LDR client directory to validate before install side effects and attach atomically
+	LDRActor   string // optional LDR actor mapping for the installed seat
 }
 
 func Install(cwd, lineOverride, asOverride string, local bool) (*installResult, error) {
@@ -230,6 +232,9 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 	}
 	if opts.Profile != "" && asOverride == "" {
 		return nil, fmt.Errorf("--profile needs an explicit --as NAME: a profile seat has no checkout to name it after")
+	}
+	if strings.TrimSpace(opts.LDRActor) != "" && strings.TrimSpace(opts.LDRDir) == "" {
+		return nil, fmt.Errorf("--ldr-actor requires --ldr-dir <client-dir>")
 	}
 	root := checkoutRoot(cwd)
 
@@ -349,6 +354,14 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 	}
 	if bound {
 		res.Notes = append(res.Notes, fmt.Sprintf("%s is bound by a live Claude session (pid %d): a session started here is refused that name until the binding ends.", agent, bd.Session.PID))
+	}
+	var pendingLDR *preparedLDRAttach
+	if strings.TrimSpace(opts.LDRDir) != "" {
+		var err error
+		pendingLDR, err = preflightLDRAttachLocked(opts.LDRDir, agent, opts.LDRActor)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if runtime == "agy" {
@@ -485,6 +498,11 @@ func InstallWith(cwd, lineOverride, asOverride string, local bool, runtime strin
 	if err := SaveMembers(m); err != nil {
 		return nil, err
 	}
+	if pendingLDR != nil {
+		if _, err := commitLDRAttachLocked(pendingLDR); err != nil {
+			return nil, err
+		}
+	}
 	for _, n := range LineNames() {
 		if n != agent {
 			res.Peers = append(res.Peers, n)
@@ -617,6 +635,7 @@ func UninstallFrom(cwd, agent, profile string) (string, error) {
 }
 
 func uninstallLocked(root, agent, profile string, m Members, seats Seats) error {
+	var removed []string
 	if profile != "" {
 		if err := codexProfileFiles(profile, "", "", agent, true); err != nil {
 			return err
@@ -624,9 +643,14 @@ func uninstallLocked(root, agent, profile string, m Members, seats Seats) error 
 		for name, s := range seats.Seats {
 			if s.Profile == profile && (agent == "" || agent == name) {
 				delete(seats.Seats, name)
+				removed = append(removed, name)
 			}
 		}
-		return saveSeats(seats)
+		if err := saveSeats(seats); err != nil {
+			return err
+		}
+		pruneLDRActors(removed...)
+		return nil
 	}
 	owner := m.AgentAt(root)
 	here := seats.At(root)
@@ -663,15 +687,23 @@ func uninstallLocked(root, agent, profile string, m Members, seats Seats) error 
 	for _, name := range here {
 		if agent == "" || agent == name {
 			delete(seats.Seats, name)
+			removed = append(removed, name)
 		}
 	}
 	if err := saveSeats(seats); err != nil {
 		return err
 	}
 	if agent == "" || agent == owner {
+		if owner != "" {
+			removed = append(removed, owner)
+		}
 		delete(m.Members, root)
 	}
-	return SaveMembers(m)
+	if err := SaveMembers(m); err != nil {
+		return err
+	}
+	pruneLDRActors(removed...)
+	return nil
 }
 
 func contains(list []string, s string) bool {

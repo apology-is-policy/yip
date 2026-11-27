@@ -1584,3 +1584,511 @@ func TestLDRBridgeCLIRoutingAndRefusalThroughActualBinary(t *testing.T) {
 		t.Fatalf("cli release failed under malformed ldr.json: err=%v out=%q", err, out)
 	}
 }
+
+func TestAttachLDRLineValidationAndActorMappingLifecycle(t *testing.T) {
+	fx := newLDRBridgeFixture(t)
+	aliceCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	bobCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	unactCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	ag, arid, ardig := fx.enroll(t, "ns-alice", aliceCK, 4, 0x71)
+	bg, brid, brdig := fx.enroll(t, "ns-bob", bobCK, 4, 0x72)
+	ug, urid, urdig := fx.enroll(t, "ns-unact", unactCK, 2, 0x73)
+	fx.activateEpoch(t, "ep-attach-1")
+
+	aliceClientDir := filepath.Join(t.TempDir(), "alice-ldr")
+	bobClientDir := filepath.Join(t.TempDir(), "bob-ldr")
+	fx.setupWorkstation(t, bobClientDir, bobCK, bg, brid, brdig, "bob-claude")
+	fx.setupWorkstation(t, aliceClientDir, aliceCK, ag, arid, ardig, "alice-codex", "reviewer")
+
+	// Pre-activation member directory (Activated == false).
+	unactDir := filepath.Join(t.TempDir(), "unactivated-ldr")
+	unactCl, err := ldrclient.InitClientDir(ldrclient.InitDirOptions{
+		Dir: unactDir, SignedDescriptor: fx.rawDesc, CredKeys: unactCK,
+		ExpectedGrant: &ug, ExpectedJoinReq: urid, ExpectedJoinReqDigest: &urdig,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unactCl.Close()
+
+	// Admin directory without reader credential keys (CredID == "").
+	bareAdminDir := filepath.Join(t.TempDir(), "bare-admin")
+	bareAdminCl, err := ldrclient.InitClientDir(ldrclient.InitDirOptions{
+		Dir: bareAdminDir, SignedDescriptor: fx.rawDesc, DirKind: ldrclient.DirKindAdmin, Activated: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = bareAdminCl.Close()
+
+	// Enrolled & activated admin reader directory (DirKind == "admin", CredID != "", Activated == true).
+	adminReaderCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	fx.enroll(t, "ns-admin-reader", adminReaderCK, 0, 0x74)
+	fx.activateEpoch(t, "ep-attach-admin")
+	enrolledAdminDir := filepath.Join(t.TempDir(), "enrolled-admin")
+	enrolledAdminCl, err := ldrclient.InitClientDir(ldrclient.InitDirOptions{
+		Dir: enrolledAdminDir, SignedDescriptor: fx.rawDesc, CredKeys: adminReaderCK, DirKind: ldrclient.DirKindAdmin, Activated: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = enrolledAdminCl.Close()
+
+	home := filepath.Join(t.TempDir(), "attach-home")
+	_ = os.Setenv("YIP_HOME", home)
+	activeLine = "attach-hygiene"
+
+	// 1. --actor without --as MUST fail rather than silently discarding the actor mapping.
+	if _, err := AttachLDRLine(aliceClientDir, "", "alice-codex"); err == nil || !strings.Contains(err.Error(), "requires --as") {
+		t.Fatalf("expected --actor without --as to fail, got: %v", err)
+	}
+	if err := ldrAttachCLI([]string{"--dir", aliceClientDir, "--actor", "alice-codex"}, &bytes.Buffer{}); err == nil {
+		t.Fatal("expected ldrAttachCLI without --as to fail when --actor is given")
+	}
+
+	// 2. Unactivated member directory and uncredentialed admin directory MUST fail,
+	// whereas an enrolled & activated admin reader directory succeeds for line observation
+	// and still refuses undeclared actor mappings.
+	if _, err := AttachLDRLine(unactDir, "", ""); err == nil || !strings.Contains(err.Error(), "not activated") {
+		t.Fatalf("expected unactivated directory attach to fail, got: %v", err)
+	}
+	if _, err := AttachLDRLine(bareAdminDir, "", ""); err == nil || !strings.Contains(err.Error(), "no credential keys") {
+		t.Fatalf("expected bare admin directory attach to fail, got: %v", err)
+	}
+	if _, err := AttachLDRLine(enrolledAdminDir, "", ""); err != nil {
+		t.Fatalf("expected activated admin reader directory to attach for line observation: %v", err)
+	}
+	if _, err := AttachLDRLine(enrolledAdminDir, "reviewer", "alice-codex"); err == nil {
+		t.Fatal("expected mapping undeclared actor onto admin reader directory to fail")
+	}
+	if err := DetachLDRLine(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Mapping a seat to an undeclared actor or another workstation's credential actor MUST fail.
+	if _, err := AttachLDRLine(aliceClientDir, "reviewer", "undeclared-actor"); err == nil || !strings.Contains(err.Error(), "not declared") {
+		t.Fatalf("expected undeclared actor mapping to fail, got: %v", err)
+	}
+	if _, err := AttachLDRLine(aliceClientDir, "reviewer", "bob-claude"); err == nil || !strings.Contains(err.Error(), "belongs to credential") {
+		t.Fatalf("expected foreign-credential actor mapping to fail, got: %v", err)
+	}
+
+	// 4. Explicit seat mapping succeeds, duplicate seat-to-same-actor fails, and re-attaching
+	// the same seat without --actor clears the prior explicit mapping when seat name is a live actor.
+	att, err := AttachLDRLine(aliceClientDir, "reviewer", "alice-codex")
+	if err != nil {
+		t.Fatalf("AttachLDRLine(reviewer -> alice-codex): %v", err)
+	}
+	if got := att.actorFor("reviewer"); got != "alice-codex" {
+		t.Fatalf("actorFor(reviewer) = %q, want alice-codex", got)
+	}
+	if _, err := AttachLDRLine(aliceClientDir, "second-seat", "alice-codex"); err == nil || !strings.Contains(err.Error(), "already maps") {
+		t.Fatalf("expected duplicate seat mapping to same actor to fail, got: %v", err)
+	}
+	att, err = AttachLDRLine(aliceClientDir, "reviewer", "")
+	if err != nil {
+		t.Fatalf("re-attach reviewer -> reviewer (actorID empty): %v", err)
+	}
+	if _, exists := att.Actors["reviewer"]; exists || att.actorFor("reviewer") != "reviewer" {
+		t.Fatalf("expected stale reviewer mapping to be cleared, got Actors=%v actorFor=%q", att.Actors, att.actorFor("reviewer"))
+	}
+
+	// 5. Switching the local line to a second client directory (Credential 2) drops Credential 1's mappings!
+	if _, err := AttachLDRLine(aliceClientDir, "seat-one", "alice-codex"); err != nil {
+		t.Fatal(err)
+	}
+	att2, err := AttachLDRLine(bobClientDir, "bob-seat", "bob-claude")
+	if err != nil {
+		t.Fatalf("switch to bobClientDir: %v", err)
+	}
+	if _, leaked := att2.Actors["seat-one"]; leaked {
+		t.Fatalf("switching client directories leaked previous credential's actor map: %+v", att2.Actors)
+	}
+	if got := att2.actorFor("bob-seat"); got != "bob-claude" {
+		t.Fatalf("actorFor(bob-seat) = %q, want bob-claude", got)
+	}
+
+	// 6. InstallWith rejects invalid --ldr-dir / --ldr-actor BEFORE creating checkout or line side effects!
+	cleanCheckout := filepath.Join(t.TempDir(), "clean-checkout")
+	if err := os.MkdirAll(cleanCheckout, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InstallWith(cleanCheckout, "no-side-effects", "alice-seat", false, "claude-rewake", InstallOptions{
+		LDRDir:   aliceClientDir,
+		LDRActor: "undeclared-actor",
+	}); err == nil || !strings.Contains(err.Error(), "not declared") {
+		t.Fatalf("expected InstallWith with invalid --ldr-actor to fail, got: %v", err)
+	}
+	for _, untouched := range []string{
+		filepath.Join(cleanCheckout, ".mcp.json"),
+		filepath.Join(cleanCheckout, ".claude"),
+		filepath.Join(lineDirFor("no-side-effects"), "members.json"),
+		filepath.Join(lineDirFor("no-side-effects"), "seats.json"),
+		filepath.Join(lineDirFor("no-side-effects"), "ldr.json"),
+		filepath.Join(lineDirFor("no-side-effects"), "delivery", "alice-seat.json"),
+	} {
+		if _, err := os.Stat(untouched); !os.IsNotExist(err) {
+			t.Fatalf("failed InstallWith left side effect %s (err=%v)", untouched, err)
+		}
+	}
+}
+
+func TestLDRBindPreservesAndGuardsActorAndUninstallPrunesMapping(t *testing.T) {
+	fx := newLDRBridgeFixture(t)
+	aliceCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	bobCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	ag, arid, ardig := fx.enroll(t, "ns-alice-bind", aliceCK, 4, 0x81)
+	bg, brid, brdig := fx.enroll(t, "ns-bob-bind", bobCK, 4, 0x82)
+	fx.activateEpoch(t, "ep-bind-1")
+
+	aliceClientDir := filepath.Join(t.TempDir(), "alice-bind-ldr")
+	bobClientDir := filepath.Join(t.TempDir(), "bob-bind-ldr")
+	fx.setupWorkstation(t, aliceClientDir, aliceCK, ag, arid, ardig, "alice-relay", "alice-wt2")
+	fx.setupWorkstation(t, bobClientDir, bobCK, bg, brid, brdig, "bob-relay")
+
+	aliceHome := filepath.Join(t.TempDir(), "alice-bind-home")
+	bobHome := filepath.Join(t.TempDir(), "bob-bind-home")
+	launchDir := filepath.Join(t.TempDir(), "alice-launch")
+	wt1Dir := filepath.Join(t.TempDir(), "feature-wt")
+	wt2Dir := filepath.Join(t.TempDir(), "second-wt")
+	for _, d := range []string{launchDir, wt1Dir, wt2Dir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	origProcAlive := procAlive
+	origAncestors := processAncestors
+	t.Cleanup(func() {
+		procAlive = origProcAlive
+		processAncestors = origAncestors
+	})
+	sess1 := procID{PID: 41001, Start: "boot-s1"}
+	sess2 := procID{PID: 41002, Start: "boot-s2"}
+	liveProcs := map[procID]bool{sess1: true, sess2: true}
+	procAlive = func(p procID) bool { return liveProcs[p] }
+	activeSess := sess1
+	processAncestors = func() []procID { return []procID{activeSess} }
+
+	useAlice := func() { _ = os.Setenv("YIP_HOME", aliceHome); activeLine = "bind-alice" }
+	useBob := func() { _ = os.Setenv("YIP_HOME", bobHome); activeLine = "bind-bob" }
+
+	useAlice()
+	if _, err := InstallWith(launchDir, "bind-alice", "alice-agy", false, "agy", InstallOptions{}); err != nil {
+		t.Fatalf("InstallWith(alice-agy): %v", err)
+	}
+	if _, err := AttachLDRLine(aliceClientDir, "alice-agy", "alice-relay"); err != nil {
+		t.Fatalf("AttachLDRLine(alice-agy -> alice-relay): %v", err)
+	}
+	if err := registerSession(sess1, "alice-agy"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Explicit bind to an undeclared actor MUST fail without mutating members or bindings.
+	conv1 := "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	if _, err := BindWithConv("alice-agy", sess1, conv1, wt1Dir, "undeclared-actor"); err == nil || !strings.Contains(err.Error(), "not a live actor") {
+		t.Fatalf("expected bind with undeclared explicit as to fail, got: %v", err)
+	}
+
+	// 2. Default worktree bind (as == "") inherits launch seat's mapped relay actor ("alice-relay").
+	res, err := BindWithConv("alice-agy", sess1, conv1, wt1Dir, "")
+	if err != nil {
+		t.Fatalf("BindWithConv(wt1Dir): %v", err)
+	}
+	if res.Name != "feature-wt" {
+		t.Fatalf("bound Name = %q, want feature-wt", res.Name)
+	}
+	att, ok, err := loadLDRAttachment()
+	if err != nil || !ok {
+		t.Fatalf("loadLDRAttachment: ok=%v err=%v", ok, err)
+	}
+	if got := att.actorFor("feature-wt"); got != "alice-relay" {
+		t.Fatalf("actorFor(feature-wt) = %q, want alice-relay", got)
+	}
+
+	// 3. A second live session cannot share "alice-relay" via default bind,
+	//    and is fenced from acting as "alice-agy" while sess1 holds "alice-relay",
+	//    but CAN bind wt2Dir using its own declared actor "alice-wt2"!
+	if err := registerSession(sess2, "alice-agy"); err != nil {
+		t.Fatal(err)
+	}
+	activeSess = sess2
+	conv2 := "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+	if _, err := BindWithConv("alice-agy", sess2, conv2, wt2Dir, ""); err == nil || !strings.Contains(err.Error(), "already bound") {
+		t.Fatalf("expected second session sharing alice-relay to fail, got: %v", err)
+	}
+	if _, err := (&server{me: "alice-agy"}).call("ring", nil); err == nil || !strings.Contains(err.Error(), "currently bound to worktree") {
+		t.Fatalf("expected unbound second session to be fenced from alice-relay, got: %v", err)
+	}
+	res2, err := BindWithConv("alice-agy", sess2, conv2, wt2Dir, "alice-wt2")
+	if err != nil {
+		t.Fatalf("BindWithConv(wt2Dir, as=alice-wt2): %v", err)
+	}
+	if res2.Name != "alice-wt2" || att.actorFor("alice-wt2") != "alice-wt2" {
+		t.Fatalf("unexpected second bind result: %+v actor=%q", res2, att.actorFor("alice-wt2"))
+	}
+
+	// 4. Bob opens a call to "alice-relay": delivery routes to "feature-wt" (not stolen by "alice-agy")
+	//    and "feature-wt" can read & reply as "alice-relay"!
+	useBob()
+	if _, err := AttachLDRLine(bobClientDir, "bob-seat", "bob-relay"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&server{me: "bob-seat"}).call("call", map[string]any{
+		"peer":    "alice-relay",
+		"subject": "Worktree bind check",
+		"body":    "silver-worktree-phrase",
+	}); err != nil {
+		t.Fatalf("bob call to alice-relay: %v", err)
+	}
+
+	useAlice()
+	activeSess = sess1
+	launchSnap := ldrDeliverySnapshot(att, "alice-agy")
+	wtSnap := ldrDeliverySnapshot(att, "feature-wt")
+	for k := range launchSnap {
+		if strings.HasPrefix(k, "ldr:") {
+			t.Fatalf("launch seat alice-agy stole LDR notice %q while bound to feature-wt", k)
+		}
+	}
+	foundWTNotice := false
+	for k := range wtSnap {
+		if strings.HasPrefix(k, "ldr:") {
+			foundWTNotice = true
+		}
+	}
+	if !foundWTNotice {
+		t.Fatalf("bound worktree feature-wt did not receive LDR notice for alice-relay: %+v", wtSnap)
+	}
+	trOut, err := (&server{me: "feature-wt"}).call("read", map[string]any{"call": "0001-worktree-bind-check"})
+	if err != nil || !strings.Contains(trOut, "silver-worktree-phrase") {
+		t.Fatalf("feature-wt failed to read call for alice-relay: err=%v out=%q", err, trOut)
+	}
+	if _, err := (&server{me: "feature-wt"}).call("say", map[string]any{
+		"call": "0001-worktree-bind-check",
+		"body": "reply from bound worktree",
+	}); err != nil {
+		t.Fatalf("feature-wt failed to reply as alice-relay: %v", err)
+	}
+
+	// 4b. Reattaching the local line to a DIFFERENT client directory (bobClientDir) MUST NOT
+	//     inherit feature-wt's saved live binding from aliceClientDir!
+	reattached, err := AttachLDRLine(bobClientDir, "bob-local", "bob-relay")
+	if err != nil {
+		t.Fatalf("reattach to bobClientDir: %v", err)
+	}
+	if got := reattached.actorFor("feature-wt"); got == "alice-relay" {
+		t.Fatalf("reattached client directory inherited previous credential's bound actor: %q", got)
+	}
+	if _, err := (&server{me: "feature-wt"}).call("ring", nil); err == nil || !strings.Contains(err.Error(), "previous LDR client") {
+		t.Fatalf("expected stale-route bound worktree to require re-binding, got: %v", err)
+	}
+	// Restore aliceClientDir before testing in-place replacement & uninstall pruning.
+	if _, err := AttachLDRLine(aliceClientDir, "alice-agy", "alice-relay"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4c. Replacing an enrolled directory IN PLACE at the same path with a fresh credential
+	//     is caught both at actor use (before re-attach) and on re-attach (invalidating prior bindings & actors)!
+	inPlaceDir := filepath.Join(t.TempDir(), "inplace-ldr")
+	ipCK1, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	ipCK2, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	ipg1, iprid1, iprdig1 := fx.enroll(t, "ns-inplace-1", ipCK1, 2, 0x83)
+	ipg2, iprid2, iprdig2 := fx.enroll(t, "ns-inplace-2", ipCK2, 2, 0x84)
+	fx.activateEpoch(t, "ep-bind-inplace")
+	fx.setupWorkstation(t, inPlaceDir, ipCK1, ipg1, iprid1, iprdig1, "inplace-a")
+
+	activeLine = "bind-inplace"
+	if _, err := InstallWith(launchDir, "bind-inplace", "alice-agy", false, "agy", InstallOptions{
+		LDRDir:   inPlaceDir,
+		LDRActor: "inplace-a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := registerSession(sess1, "alice-agy"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BindWithConv("alice-agy", sess1, conv1, wt1Dir, ""); err != nil {
+		t.Fatal(err)
+	}
+	// Replace inPlaceDir in place with credential 2!
+	if err := os.RemoveAll(inPlaceDir); err != nil {
+		t.Fatal(err)
+	}
+	fx.setupWorkstation(t, inPlaceDir, ipCK2, ipg2, iprid2, iprdig2, "inplace-b")
+	if _, err := (&server{me: "feature-wt"}).call("ring", nil); err == nil || !strings.Contains(err.Error(), "holds credential") {
+		t.Fatalf("expected in-place replaced directory to be refused before re-attach, got: %v", err)
+	}
+	reattachedInPlace, err := AttachLDRLine(inPlaceDir, "new-seat", "inplace-b")
+	if err != nil {
+		t.Fatalf("re-attach replaced inPlaceDir: %v", err)
+	}
+	if _, leaked := reattachedInPlace.Actors["alice-agy"]; leaked {
+		t.Fatalf("in-place credential replacement leaked old credential's actor mapping: %+v", reattachedInPlace.Actors)
+	}
+	if _, err := (&server{me: "feature-wt"}).call("ring", nil); err == nil || !strings.Contains(err.Error(), "previous LDR client or credential") {
+		t.Fatalf("expected bound worktree from old credential at same path to require re-binding, got: %v", err)
+	}
+	activeLine = "bind-alice"
+
+	// 5. Uninstall removes uninstalled seat's actor mapping from ldr.json while keeping others intact.
+	liveProcs[sess1] = false
+	liveProcs[sess2] = false
+	if _, err := AttachLDRLine(aliceClientDir, "keep-seat", "alice-wt2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UninstallFrom(launchDir, "alice-agy", ""); err != nil {
+		t.Fatalf("UninstallFrom(alice-agy): %v", err)
+	}
+	afterUninstall, ok, err := loadLDRAttachment()
+	if err != nil || !ok {
+		t.Fatalf("loadLDRAttachment after uninstall: ok=%v err=%v", ok, err)
+	}
+	if _, stale := afterUninstall.Actors["alice-agy"]; stale {
+		t.Fatalf("UninstallFrom left stale alice-agy mapping in ldr.json: %+v", afterUninstall.Actors)
+	}
+	if afterUninstall.Actors["keep-seat"] != "alice-wt2" {
+		t.Fatalf("UninstallFrom clobbered unrelated seat mapping: %+v", afterUninstall.Actors)
+	}
+}
+
+func TestDoctorAndDeliveryDiagnosticsWithLDRAttachment(t *testing.T) {
+	fx := newLDRBridgeFixture(t)
+	aliceCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	unactCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	ag, arid, ardig := fx.enroll(t, "ns-alice-doc", aliceCK, 4, 0x91)
+	ug, urid, urdig := fx.enroll(t, "ns-unact-doc", unactCK, 2, 0x92)
+	fx.activateEpoch(t, "ep-doc-1")
+
+	aliceClientDir := filepath.Join(t.TempDir(), "alice-doc-ldr")
+	fx.setupWorkstation(t, aliceClientDir, aliceCK, ag, arid, ardig, "alice-codex")
+
+	unactDir := filepath.Join(t.TempDir(), "unact-doc-ldr")
+	unactCl, err := ldrclient.InitClientDir(ldrclient.InitDirOptions{
+		Dir: unactDir, SignedDescriptor: fx.rawDesc, CredKeys: unactCK,
+		ExpectedGrant: &ug, ExpectedJoinReq: urid, ExpectedJoinReqDigest: &urdig,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unactCl.Close()
+
+	home := filepath.Join(t.TempDir(), "doc-home")
+	codexHomeDir := filepath.Join(t.TempDir(), "codex-home")
+	checkout := filepath.Join(t.TempDir(), "project-checkout")
+	if err := os.MkdirAll(checkout, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	origCodexHome := os.Getenv("CODEX_HOME")
+	origMCPList := codexMCPList
+	origQueueCheck := codexQueueCheck
+	origExplicitLine := doctorExplicitLine
+	t.Cleanup(func() {
+		_ = os.Setenv("CODEX_HOME", origCodexHome)
+		codexMCPList = origMCPList
+		codexQueueCheck = origQueueCheck
+		doctorExplicitLine = origExplicitLine
+	})
+	_ = os.Setenv("YIP_HOME", home)
+	_ = os.Setenv("CODEX_HOME", codexHomeDir)
+
+	fakeYip := filepath.Join(t.TempDir(), "yip")
+	script := "#!/bin/sh\nif [ \"$1\" = version ]; then echo '" + serverVersion + "'; exit 0; fi\nexit 0\n"
+	if err := os.WriteFile(fakeYip, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	codexQueueCheck = func() error { return nil }
+	codexMCPList = func(dir, profile string) ([]byte, error) {
+		return json.Marshal([]map[string]any{{
+			"name":    "yip",
+			"enabled": true,
+			"transport": map[string]any{
+				"args": []string{"serve", "--codex", "--line", "project-relay", "--as", "reviewer"},
+			},
+		}})
+	}
+
+	// Install Codex profile "project-alice" on named line "project-relay" mapped to "alice-codex".
+	if _, err := InstallWith(checkout, "project-relay", "reviewer", false, "codex", InstallOptions{
+		Profile:  "project-alice",
+		LDRDir:   aliceClientDir,
+		LDRActor: "alice-codex",
+	}); err != nil {
+		t.Fatalf("InstallWith(codex profile): %v", err)
+	}
+	// Replace wired binary path in profile config with fakeYip matching serverVersion.
+	if err := codexProfileFiles("project-alice", fakeYip, "project-relay", "reviewer", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Simulate running `yip doctor --runtime codex --profile project-alice` WITHOUT `--line`:
+	//    activeLine starts on an unrelated directory-derived line, and CodexDoctor MUST switch
+	//    activeLine to "project-relay", locate reviewer's endpoint, and verify LDR health!
+	activeLine = "wrong-derived-line"
+	if err := CodexDoctor(checkout, "project-alice"); err != nil {
+		t.Fatalf("CodexDoctor without --line failed: %v", err)
+	}
+	if activeLine != "project-relay" {
+		t.Fatalf("CodexDoctor resolved activeLine = %q, want project-relay", activeLine)
+	}
+
+	// 2. Passing an explicit mismatched `--line` MUST fail clearly.
+	doctorExplicitLine = "other-line"
+	if err := CodexDoctor(checkout, "project-alice"); err == nil || !strings.Contains(err.Error(), "configured for line") {
+		t.Fatalf("expected CodexDoctor with mismatched --line to fail, got: %v", err)
+	}
+	doctorExplicitLine = ""
+
+	// 3. DeliveryInbox (`yip delivery status`) preserves Endpoint JSON and embeds healthy `"ldr"` metadata.
+	activeLine = "project-relay"
+	rawInbox, err := DeliveryInbox("reviewer")
+	if err != nil {
+		t.Fatalf("DeliveryInbox(reviewer): %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(rawInbox), &parsed); err != nil {
+		t.Fatalf("DeliveryInbox invalid JSON: %v\n%s", err, rawInbox)
+	}
+	ldrObj, _ := parsed["ldr"].(map[string]any)
+	if ldrObj == nil || ldrObj["healthy"] != true || ldrObj["actor"] != "alice-codex" || ldrObj["actor_live"] != true {
+		t.Fatalf("unexpected DeliveryInbox ldr payload: %+v", ldrObj)
+	}
+
+	// 4. Unactivated client directory or undeclared actor (via YIP_LDR_DIR after detach) MUST surface in
+	//    CodexDoctor, DeliveryInbox, and SessionStart instead of looking like a quiet healthy line!
+	if err := DetachLDRLine(); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Setenv("YIP_LDR_DIR", unactDir)
+	if err := CodexDoctor(checkout, "project-alice"); err == nil || !strings.Contains(err.Error(), "not activated") {
+		t.Fatalf("expected CodexDoctor to fail on unactivated YIP_LDR_DIR, got: %v", err)
+	}
+	rawBroken, err := DeliveryInbox("reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsedBroken map[string]any
+	if err := json.Unmarshal([]byte(rawBroken), &parsedBroken); err != nil {
+		t.Fatal(err)
+	}
+	brokenLDR, _ := parsedBroken["ldr"].(map[string]any)
+	if brokenLDR == nil || brokenLDR["healthy"] != false || !strings.Contains(brokenLDR["error"].(string), "not activated") {
+		t.Fatalf("expected DeliveryInbox to surface unactivated LDR error, got: %+v", brokenLDR)
+	}
+
+	// Undeclared actor ("reviewer" on aliceClientDir when ldr.json was detached so YIP_LDR_DIR has empty Actors map):
+	_ = os.Setenv("YIP_LDR_DIR", aliceClientDir)
+	if err := CodexDoctor(checkout, "project-alice"); err == nil || !strings.Contains(err.Error(), "not declared") {
+		t.Fatalf("expected CodexDoctor to catch unmapped local seat name on YIP_LDR_DIR, got: %v", err)
+	}
+	attEnv, ok, err := loadLDRAttachment()
+	if err != nil || !ok {
+		t.Fatalf("loadLDRAttachment(env): ok=%v err=%v", ok, err)
+	}
+	ssOut := ldrHookSessionStart(attEnv, "reviewer")
+	ssJSON, _ := json.Marshal(ssOut)
+	if !strings.Contains(string(ssJSON), "[yip ldr]") || !strings.Contains(string(ssJSON), "not declared") {
+		t.Fatalf("expected ldrHookSessionStart to surface undeclared actor warning, got: %s", string(ssJSON))
+	}
+	_ = os.Unsetenv("YIP_LDR_DIR")
+}
