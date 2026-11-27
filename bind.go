@@ -51,6 +51,7 @@ type Binding struct {
 	Launch   string `json:"launch"`
 	Worktree string `json:"worktree"`
 	Bound    string `json:"bound"`
+	LDRActor string `json:"ldr_actor,omitempty"`
 }
 
 func sameBindingOwner(bd Binding, session procID, convID string) bool {
@@ -559,6 +560,13 @@ func BindWithConv(launch string, session procID, convID, worktree, as string) (*
 	if tep, terr := readEndpoint(name); name != launch && terr == nil && tep.Runtime != "claude-rewake" && tep.Runtime != "agy" {
 		return nil, fmt.Errorf("%s is delivered through %s; bind needs a worktree on the claude-rewake runtime, agy runtime, or plain hooks", name, tep.Runtime)
 	}
+	ldrActor, ldrNote, err := prepareLDRBind(launch, name, as, session, convID, b)
+	if err != nil {
+		return nil, err
+	}
+	if ldrNote != "" {
+		res.Notes = append(res.Notes, ldrNote)
+	}
 	// Prepare before committing, so a failure leaves the identity unchanged.
 	if name != launch && epErr == nil {
 		warning, err := ensureEndpoint(name, ep.Runtime)
@@ -600,7 +608,7 @@ func BindWithConv(launch string, session procID, convID, worktree, as string) (*
 		}
 	}
 	if name != launch {
-		b.Bindings[name] = Binding{Session: session, ConvID: convID, Launch: launch, Worktree: root, Bound: now()}
+		b.Bindings[name] = Binding{Session: session, ConvID: convID, Launch: launch, Worktree: root, Bound: now(), LDRActor: ldrActor}
 	}
 	b.Version, b.Boot = 1, bootID()
 	// The commit, the last step. A rewake waiter checks its identity and

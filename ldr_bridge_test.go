@@ -1709,3 +1709,163 @@ func TestAttachLDRLineValidationAndActorMappingLifecycle(t *testing.T) {
 	}
 }
 
+func TestLDRBindPreservesAndGuardsActorAndUninstallPrunesMapping(t *testing.T) {
+	fx := newLDRBridgeFixture(t)
+	aliceCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	bobCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	ag, arid, ardig := fx.enroll(t, "ns-alice-bind", aliceCK, 4, 0x81)
+	bg, brid, brdig := fx.enroll(t, "ns-bob-bind", bobCK, 4, 0x82)
+	fx.activateEpoch(t, "ep-bind-1")
+
+	aliceClientDir := filepath.Join(t.TempDir(), "alice-bind-ldr")
+	bobClientDir := filepath.Join(t.TempDir(), "bob-bind-ldr")
+	fx.setupWorkstation(t, aliceClientDir, aliceCK, ag, arid, ardig, "alice-relay", "alice-wt2")
+	fx.setupWorkstation(t, bobClientDir, bobCK, bg, brid, brdig, "bob-relay")
+
+	aliceHome := filepath.Join(t.TempDir(), "alice-bind-home")
+	bobHome := filepath.Join(t.TempDir(), "bob-bind-home")
+	launchDir := filepath.Join(t.TempDir(), "alice-launch")
+	wt1Dir := filepath.Join(t.TempDir(), "feature-wt")
+	wt2Dir := filepath.Join(t.TempDir(), "second-wt")
+	for _, d := range []string{launchDir, wt1Dir, wt2Dir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	origProcAlive := procAlive
+	origAncestors := processAncestors
+	t.Cleanup(func() {
+		procAlive = origProcAlive
+		processAncestors = origAncestors
+	})
+	sess1 := procID{PID: 41001, Start: "boot-s1"}
+	sess2 := procID{PID: 41002, Start: "boot-s2"}
+	liveProcs := map[procID]bool{sess1: true, sess2: true}
+	procAlive = func(p procID) bool { return liveProcs[p] }
+	activeSess := sess1
+	processAncestors = func() []procID { return []procID{activeSess} }
+
+	useAlice := func() { _ = os.Setenv("YIP_HOME", aliceHome); activeLine = "bind-alice" }
+	useBob := func() { _ = os.Setenv("YIP_HOME", bobHome); activeLine = "bind-bob" }
+
+	useAlice()
+	if _, err := InstallWith(launchDir, "bind-alice", "alice-agy", false, "agy", InstallOptions{}); err != nil {
+		t.Fatalf("InstallWith(alice-agy): %v", err)
+	}
+	if _, err := AttachLDRLine(aliceClientDir, "alice-agy", "alice-relay"); err != nil {
+		t.Fatalf("AttachLDRLine(alice-agy -> alice-relay): %v", err)
+	}
+	if err := registerSession(sess1, "alice-agy"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Explicit bind to an undeclared actor MUST fail without mutating members or bindings.
+	conv1 := "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	if _, err := BindWithConv("alice-agy", sess1, conv1, wt1Dir, "undeclared-actor"); err == nil || !strings.Contains(err.Error(), "not a live actor") {
+		t.Fatalf("expected bind with undeclared explicit as to fail, got: %v", err)
+	}
+
+	// 2. Default worktree bind (as == "") inherits launch seat's mapped relay actor ("alice-relay").
+	res, err := BindWithConv("alice-agy", sess1, conv1, wt1Dir, "")
+	if err != nil {
+		t.Fatalf("BindWithConv(wt1Dir): %v", err)
+	}
+	if res.Name != "feature-wt" {
+		t.Fatalf("bound Name = %q, want feature-wt", res.Name)
+	}
+	att, ok, err := loadLDRAttachment()
+	if err != nil || !ok {
+		t.Fatalf("loadLDRAttachment: ok=%v err=%v", ok, err)
+	}
+	if got := att.actorFor("feature-wt"); got != "alice-relay" {
+		t.Fatalf("actorFor(feature-wt) = %q, want alice-relay", got)
+	}
+
+	// 3. A second live session cannot share "alice-relay" via default bind,
+	//    and is fenced from acting as "alice-agy" while sess1 holds "alice-relay",
+	//    but CAN bind wt2Dir using its own declared actor "alice-wt2"!
+	if err := registerSession(sess2, "alice-agy"); err != nil {
+		t.Fatal(err)
+	}
+	activeSess = sess2
+	conv2 := "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+	if _, err := BindWithConv("alice-agy", sess2, conv2, wt2Dir, ""); err == nil || !strings.Contains(err.Error(), "already bound") {
+		t.Fatalf("expected second session sharing alice-relay to fail, got: %v", err)
+	}
+	if _, err := (&server{me: "alice-agy"}).call("ring", nil); err == nil || !strings.Contains(err.Error(), "currently bound to worktree") {
+		t.Fatalf("expected unbound second session to be fenced from alice-relay, got: %v", err)
+	}
+	res2, err := BindWithConv("alice-agy", sess2, conv2, wt2Dir, "alice-wt2")
+	if err != nil {
+		t.Fatalf("BindWithConv(wt2Dir, as=alice-wt2): %v", err)
+	}
+	if res2.Name != "alice-wt2" || att.actorFor("alice-wt2") != "alice-wt2" {
+		t.Fatalf("unexpected second bind result: %+v actor=%q", res2, att.actorFor("alice-wt2"))
+	}
+
+	// 4. Bob opens a call to "alice-relay": delivery routes to "feature-wt" (not stolen by "alice-agy")
+	//    and "feature-wt" can read & reply as "alice-relay"!
+	useBob()
+	if _, err := AttachLDRLine(bobClientDir, "bob-seat", "bob-relay"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&server{me: "bob-seat"}).call("call", map[string]any{
+		"peer":    "alice-relay",
+		"subject": "Worktree bind check",
+		"body":    "silver-worktree-phrase",
+	}); err != nil {
+		t.Fatalf("bob call to alice-relay: %v", err)
+	}
+
+	useAlice()
+	activeSess = sess1
+	launchSnap := ldrDeliverySnapshot(att, "alice-agy")
+	wtSnap := ldrDeliverySnapshot(att, "feature-wt")
+	for k := range launchSnap {
+		if strings.HasPrefix(k, "ldr:") {
+			t.Fatalf("launch seat alice-agy stole LDR notice %q while bound to feature-wt", k)
+		}
+	}
+	foundWTNotice := false
+	for k := range wtSnap {
+		if strings.HasPrefix(k, "ldr:") {
+			foundWTNotice = true
+		}
+	}
+	if !foundWTNotice {
+		t.Fatalf("bound worktree feature-wt did not receive LDR notice for alice-relay: %+v", wtSnap)
+	}
+	trOut, err := (&server{me: "feature-wt"}).call("read", map[string]any{"call": "0001-worktree-bind-check"})
+	if err != nil || !strings.Contains(trOut, "silver-worktree-phrase") {
+		t.Fatalf("feature-wt failed to read call for alice-relay: err=%v out=%q", err, trOut)
+	}
+	if _, err := (&server{me: "feature-wt"}).call("say", map[string]any{
+		"call": "0001-worktree-bind-check",
+		"body": "reply from bound worktree",
+	}); err != nil {
+		t.Fatalf("feature-wt failed to reply as alice-relay: %v", err)
+	}
+
+	// 5. Uninstall removes uninstalled seat's actor mapping from ldr.json while keeping others intact.
+	liveProcs[sess1] = false
+	liveProcs[sess2] = false
+	if _, err := AttachLDRLine(aliceClientDir, "keep-seat", "alice-wt2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UninstallFrom(launchDir, "alice-agy", ""); err != nil {
+		t.Fatalf("UninstallFrom(alice-agy): %v", err)
+	}
+	afterUninstall, ok, err := loadLDRAttachment()
+	if err != nil || !ok {
+		t.Fatalf("loadLDRAttachment after uninstall: ok=%v err=%v", ok, err)
+	}
+	if _, stale := afterUninstall.Actors["alice-agy"]; stale {
+		t.Fatalf("UninstallFrom left stale alice-agy mapping in ldr.json: %+v", afterUninstall.Actors)
+	}
+	if afterUninstall.Actors["keep-seat"] != "alice-wt2" {
+		t.Fatalf("UninstallFrom clobbered unrelated seat mapping: %+v", afterUninstall.Actors)
+	}
+}
+
+

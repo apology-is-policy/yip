@@ -617,6 +617,7 @@ func UninstallFrom(cwd, agent, profile string) (string, error) {
 }
 
 func uninstallLocked(root, agent, profile string, m Members, seats Seats) error {
+	var removed []string
 	if profile != "" {
 		if err := codexProfileFiles(profile, "", "", agent, true); err != nil {
 			return err
@@ -624,9 +625,14 @@ func uninstallLocked(root, agent, profile string, m Members, seats Seats) error 
 		for name, s := range seats.Seats {
 			if s.Profile == profile && (agent == "" || agent == name) {
 				delete(seats.Seats, name)
+				removed = append(removed, name)
 			}
 		}
-		return saveSeats(seats)
+		if err := saveSeats(seats); err != nil {
+			return err
+		}
+		pruneLDRActors(removed...)
+		return nil
 	}
 	owner := m.AgentAt(root)
 	here := seats.At(root)
@@ -663,15 +669,23 @@ func uninstallLocked(root, agent, profile string, m Members, seats Seats) error 
 	for _, name := range here {
 		if agent == "" || agent == name {
 			delete(seats.Seats, name)
+			removed = append(removed, name)
 		}
 	}
 	if err := saveSeats(seats); err != nil {
 		return err
 	}
 	if agent == "" || agent == owner {
+		if owner != "" {
+			removed = append(removed, owner)
+		}
 		delete(m.Members, root)
 	}
-	return SaveMembers(m)
+	if err := SaveMembers(m); err != nil {
+		return err
+	}
+	pruneLDRActors(removed...)
+	return nil
 }
 
 func contains(list []string, s string) bool {
