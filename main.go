@@ -330,6 +330,9 @@ func main() {
 		check(Retire(me, first(args) != "--undo"))
 		fmt.Println("retirement updated")
 	case "install":
+		if ldrActor != "" && ldrDir == "" {
+			check(fmt.Errorf("--ldr-actor requires --ldr-dir <client-dir>"))
+		}
 		res, err := InstallWith("", line, as, local, runtime, InstallOptions{Seat: seat, Profile: profile, WakeWindow: wakeWindow})
 		check(err)
 		if ldrDir != "" {

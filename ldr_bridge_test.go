@@ -1584,3 +1584,128 @@ func TestLDRBridgeCLIRoutingAndRefusalThroughActualBinary(t *testing.T) {
 		t.Fatalf("cli release failed under malformed ldr.json: err=%v out=%q", err, out)
 	}
 }
+
+func TestAttachLDRLineValidationAndActorMappingLifecycle(t *testing.T) {
+	fx := newLDRBridgeFixture(t)
+	aliceCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	bobCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	unactCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	ag, arid, ardig := fx.enroll(t, "ns-alice", aliceCK, 4, 0x71)
+	bg, brid, brdig := fx.enroll(t, "ns-bob", bobCK, 4, 0x72)
+	ug, urid, urdig := fx.enroll(t, "ns-unact", unactCK, 2, 0x73)
+	fx.activateEpoch(t, "ep-attach-1")
+
+	aliceClientDir := filepath.Join(t.TempDir(), "alice-ldr")
+	bobClientDir := filepath.Join(t.TempDir(), "bob-ldr")
+	fx.setupWorkstation(t, aliceClientDir, aliceCK, ag, arid, ardig, "alice-codex", "reviewer")
+	fx.setupWorkstation(t, bobClientDir, bobCK, bg, brid, brdig, "bob-claude")
+
+	// Pre-activation member directory (Activated == false).
+	unactDir := filepath.Join(t.TempDir(), "unactivated-ldr")
+	unactCl, err := ldrclient.InitClientDir(ldrclient.InitDirOptions{
+		Dir: unactDir, SignedDescriptor: fx.rawDesc, CredKeys: unactCK,
+		ExpectedGrant: &ug, ExpectedJoinReq: urid, ExpectedJoinReqDigest: &urdig,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unactCl.Close()
+
+	// Admin directory without reader credential keys (CredID == "").
+	bareAdminDir := filepath.Join(t.TempDir(), "bare-admin")
+	bareAdminCl, err := ldrclient.InitClientDir(ldrclient.InitDirOptions{
+		Dir: bareAdminDir, SignedDescriptor: fx.rawDesc, DirKind: ldrclient.DirKindAdmin, Activated: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = bareAdminCl.Close()
+
+	// Enrolled & activated admin reader directory (DirKind == "admin", CredID != "", Activated == true).
+	adminReaderCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	fx.enroll(t, "ns-admin-reader", adminReaderCK, 0, 0x74)
+	fx.activateEpoch(t, "ep-attach-admin")
+	enrolledAdminDir := filepath.Join(t.TempDir(), "enrolled-admin")
+	enrolledAdminCl, err := ldrclient.InitClientDir(ldrclient.InitDirOptions{
+		Dir: enrolledAdminDir, SignedDescriptor: fx.rawDesc, CredKeys: adminReaderCK, DirKind: ldrclient.DirKindAdmin, Activated: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = enrolledAdminCl.Close()
+
+	home := filepath.Join(t.TempDir(), "attach-home")
+	_ = os.Setenv("YIP_HOME", home)
+	activeLine = "attach-hygiene"
+
+	// 1. --actor without --as MUST fail rather than silently discarding the actor mapping.
+	if _, err := AttachLDRLine(aliceClientDir, "", "alice-codex"); err == nil || !strings.Contains(err.Error(), "requires --as") {
+		t.Fatalf("expected --actor without --as to fail, got: %v", err)
+	}
+	if err := ldrAttachCLI([]string{"--dir", aliceClientDir, "--actor", "alice-codex"}, &bytes.Buffer{}); err == nil {
+		t.Fatal("expected ldrAttachCLI without --as to fail when --actor is given")
+	}
+
+	// 2. Unactivated member directory and uncredentialed admin directory MUST fail,
+	// whereas an enrolled & activated admin reader directory succeeds for line observation
+	// and still refuses undeclared actor mappings.
+	if _, err := AttachLDRLine(unactDir, "", ""); err == nil || !strings.Contains(err.Error(), "not activated") {
+		t.Fatalf("expected unactivated directory attach to fail, got: %v", err)
+	}
+	if _, err := AttachLDRLine(bareAdminDir, "", ""); err == nil || !strings.Contains(err.Error(), "no credential keys") {
+		t.Fatalf("expected bare admin directory attach to fail, got: %v", err)
+	}
+	if _, err := AttachLDRLine(enrolledAdminDir, "", ""); err != nil {
+		t.Fatalf("expected activated admin reader directory to attach for line observation: %v", err)
+	}
+	if _, err := AttachLDRLine(enrolledAdminDir, "reviewer", "alice-codex"); err == nil {
+		t.Fatal("expected mapping undeclared actor onto admin reader directory to fail")
+	}
+	if err := DetachLDRLine(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Mapping a seat to an undeclared actor or another workstation's credential actor MUST fail.
+	if _, err := AttachLDRLine(aliceClientDir, "reviewer", "undeclared-actor"); err == nil || !strings.Contains(err.Error(), "not declared") {
+		t.Fatalf("expected undeclared actor mapping to fail, got: %v", err)
+	}
+	if _, err := AttachLDRLine(aliceClientDir, "reviewer", "bob-claude"); err == nil || !strings.Contains(err.Error(), "belongs to credential") {
+		t.Fatalf("expected foreign-credential actor mapping to fail, got: %v", err)
+	}
+
+	// 4. Explicit seat mapping succeeds, duplicate seat-to-same-actor fails, and re-attaching
+	// the same seat without --actor clears the prior explicit mapping when seat name is a live actor.
+	att, err := AttachLDRLine(aliceClientDir, "reviewer", "alice-codex")
+	if err != nil {
+		t.Fatalf("AttachLDRLine(reviewer -> alice-codex): %v", err)
+	}
+	if got := att.actorFor("reviewer"); got != "alice-codex" {
+		t.Fatalf("actorFor(reviewer) = %q, want alice-codex", got)
+	}
+	if _, err := AttachLDRLine(aliceClientDir, "second-seat", "alice-codex"); err == nil || !strings.Contains(err.Error(), "already maps") {
+		t.Fatalf("expected duplicate seat mapping to same actor to fail, got: %v", err)
+	}
+	att, err = AttachLDRLine(aliceClientDir, "reviewer", "")
+	if err != nil {
+		t.Fatalf("re-attach reviewer -> reviewer (actorID empty): %v", err)
+	}
+	if _, exists := att.Actors["reviewer"]; exists || att.actorFor("reviewer") != "reviewer" {
+		t.Fatalf("expected stale reviewer mapping to be cleared, got Actors=%v actorFor=%q", att.Actors, att.actorFor("reviewer"))
+	}
+
+	// 5. Switching the local line to a second client directory (Credential 2) drops Credential 1's mappings!
+	if _, err := AttachLDRLine(aliceClientDir, "seat-one", "alice-codex"); err != nil {
+		t.Fatal(err)
+	}
+	att2, err := AttachLDRLine(bobClientDir, "bob-seat", "bob-claude")
+	if err != nil {
+		t.Fatalf("switch to bobClientDir: %v", err)
+	}
+	if _, leaked := att2.Actors["seat-one"]; leaked {
+		t.Fatalf("switching client directories leaked previous credential's actor map: %+v", att2.Actors)
+	}
+	if got := att2.actorFor("bob-seat"); got != "bob-claude" {
+		t.Fatalf("actorFor(bob-seat) = %q, want bob-claude", got)
+	}
+}
+

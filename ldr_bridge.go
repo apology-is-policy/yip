@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -86,14 +87,65 @@ func readLDRAttachment(p, envDir string) (LDRAttachment, bool, error) {
 	return LDRAttachment{}, false, nil
 }
 
+func validateLDRClientAndActor(cl *ldrclient.Client, dir, localAs, effActor string) (ldrclient.ClientStatus, map[string]bool, error) {
+	st := cl.Status()
+	if st.CredID == "" {
+		return st, nil, fmt.Errorf("cannot attach LDR directory %s: no credential keys loaded (enroll a workstation or reader credential first)", dir)
+	}
+	if !st.Activated {
+		return st, nil, fmt.Errorf("cannot attach LDR directory %s: credential %s is not activated (complete enrollment and run `yip ldr join activate` first)", dir, st.CredID)
+	}
+	if st.Suspect || st.Halted != "" {
+		return st, nil, fmt.Errorf("cannot attach halted or suspect LDR directory %s", dir)
+	}
+	if st.OutboxUncertain || st.EpochsUncertain || st.CursorsUncertain {
+		return st, nil, fmt.Errorf("cannot attach LDR directory %s with uncertain local durability state", dir)
+	}
+	if slices.Contains(st.StoppedKeys, "cred:"+st.CredID) {
+		return st, nil, fmt.Errorf("cannot attach LDR directory %s: credential %s is revoked or stopped", dir, st.CredID)
+	}
+	liveCredActors := map[string]bool{}
+	foreignActors := map[string]string{}
+	for _, a := range cl.ListActors() {
+		if !a.Live {
+			continue
+		}
+		if a.Cred == st.CredID {
+			liveCredActors[a.ID] = true
+		} else {
+			foreignActors[a.ID] = a.Cred
+		}
+	}
+	if localAs != "" && !liveCredActors[effActor] {
+		if ownerCred, foreign := foreignActors[effActor]; foreign {
+			return st, nil, fmt.Errorf("cannot map local seat %q to LDR actor %q: actor belongs to credential %s, not %s in %s", localAs, effActor, ownerCred, st.CredID, dir)
+		}
+		return st, nil, fmt.Errorf("cannot map local seat %q to LDR actor %q: actor is not declared as a live actor for credential %s in %s (run `yip ldr sync` and `yip ldr actor declare` first)", localAs, effActor, st.CredID, dir)
+	}
+	return st, liveCredActors, nil
+}
+
 // AttachLDRLine validates clientDir and records the attachment in the active local line.
 func AttachLDRLine(clientDir, localAs, actorID string) (LDRAttachment, error) {
-	if strings.TrimSpace(clientDir) == "" {
+	clientDir = strings.TrimSpace(clientDir)
+	localAs = strings.TrimSpace(localAs)
+	actorID = strings.TrimSpace(actorID)
+	if clientDir == "" {
 		return LDRAttachment{}, errors.New("ldr attach requires --dir <client-dir>")
+	}
+	if actorID != "" && localAs == "" {
+		return LDRAttachment{}, fmt.Errorf("ldr attach --actor %q requires --as <local-agent> to identify the local seat", actorID)
+	}
+	if localAs != "" && !validComponent(localAs) {
+		return LDRAttachment{}, fmt.Errorf("invalid local agent name %q", localAs)
 	}
 	absDir, err := filepath.Abs(clientDir)
 	if err != nil {
 		return LDRAttachment{}, err
+	}
+	effActor := actorID
+	if effActor == "" {
+		effActor = localAs
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -101,22 +153,43 @@ func AttachLDRLine(clientDir, localAs, actorID string) (LDRAttachment, error) {
 	if err != nil {
 		return LDRAttachment{}, fmt.Errorf("cannot open LDR client dir %s: %w", absDir, err)
 	}
+	_, liveCredActors, verr := validateLDRClientAndActor(cl, absDir, localAs, effActor)
 	_ = cl.Close()
+	if verr != nil {
+		return LDRAttachment{}, verr
+	}
 
 	if err := EnsureRoot(); err != nil {
 		return LDRAttachment{}, err
 	}
-	att, _, err := loadLDRAttachment()
+	prev, prevOk, err := readLDRAttachment(ldrAttachmentPath(), "")
 	if err != nil {
 		return LDRAttachment{}, fmt.Errorf("existing LDR attachment is invalid (fix or run `yip ldr detach` first): %w", err)
 	}
-	att.Version = 1
-	att.ClientDir = absDir
-	if att.Actors == nil {
-		att.Actors = map[string]string{}
+	actors := map[string]string{}
+	if prevOk && sameDir(prev.ClientDir, absDir) {
+		for seat, mapped := range prev.Actors {
+			if liveCredActors[mapped] {
+				actors[seat] = mapped
+			}
+		}
 	}
-	if localAs != "" && actorID != "" {
-		att.Actors[localAs] = actorID
+	if localAs != "" {
+		for otherSeat, otherActor := range actors {
+			if otherSeat != localAs && otherActor == effActor {
+				return LDRAttachment{}, fmt.Errorf("cannot map local seat %q to LDR actor %q: local seat %q on line %s already maps to %q", localAs, effActor, otherSeat, activeLine, effActor)
+			}
+		}
+		if actorID != "" {
+			actors[localAs] = actorID
+		} else {
+			delete(actors, localAs)
+		}
+	}
+	att := LDRAttachment{
+		Version:   1,
+		ClientDir: absDir,
+		Actors:    actors,
 	}
 	b, err := json.MarshalIndent(att, "", "  ")
 	if err != nil {
@@ -142,7 +215,7 @@ func ldrAttachCLI(rest []string, out io.Writer) error {
 	rest, dir = takeFlag(rest, "--dir", "")
 	rest, localAs = takeFlag(rest, "--as", "")
 	rest, actorID = takeFlag(rest, "--actor", "")
-	if dir == "" {
+	if strings.TrimSpace(dir) == "" || len(rest) != 0 {
 		return errors.New("usage: yip ldr attach --dir <client-dir> [--line <line>] [--as <local-agent>] [--actor <ldr-actor>]")
 	}
 	att, err := AttachLDRLine(dir, localAs, actorID)
@@ -157,6 +230,9 @@ func ldrAttachCLI(rest []string, out io.Writer) error {
 }
 
 func ldrDetachCLI(rest []string, out io.Writer) error {
+	if len(rest) != 0 {
+		return errors.New("usage: yip [--line <line>] ldr detach")
+	}
 	if err := DetachLDRLine(); err != nil {
 		return err
 	}
