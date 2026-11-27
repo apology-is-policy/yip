@@ -342,12 +342,14 @@ func codexLoadsYipOnLine(dir, profile, agent, wantLine string) (ok bool, why str
 			}
 			return false, "Codex sees the Yip server but it is disabled (" + reason + "); a managed policy may restrict MCP servers", nil
 		}
-		for i := 0; i+1 < len(s.Transport.Args); i++ {
-			if s.Transport.Args[i] == "--as" && s.Transport.Args[i+1] != agent {
-				return false, fmt.Sprintf("Codex here loads a Yip server for %q, not %q (another config layer wins)", s.Transport.Args[i+1], agent), nil
-			}
-			if wantLine != "" && s.Transport.Args[i] == "--line" && slugify(s.Transport.Args[i+1]) != slugify(wantLine) {
-				return false, fmt.Sprintf("Codex here loads a Yip server for line %q, not %q (another config layer wins)", s.Transport.Args[i+1], wantLine), nil
+		_, actualAgent := takeFlag(s.Transport.Args, "--as", "")
+		if actualAgent != agent {
+			return false, fmt.Sprintf("Codex here loads a Yip server for %q, not %q (another config layer wins)", actualAgent, agent), nil
+		}
+		if wantLine != "" {
+			_, actualLine := takeFlag(s.Transport.Args, "--line", "")
+			if actualLine == "" || slugify(actualLine) != slugify(wantLine) {
+				return false, fmt.Sprintf("Codex here loads a Yip server for line %q, not %q (another config layer wins)", actualLine, wantLine), nil
 			}
 		}
 		return true, "", nil

@@ -1562,7 +1562,9 @@ func checkLDRDoctor(agent string) (string, error) {
 	if _, err := cl.Sync(ctx, sess); err != nil {
 		return "", fmt.Errorf("LDR relay sync failed for %s: %w", att.ClientDir, err)
 	}
-	_, _ = cl.ScanDelivery()
+	if _, err := cl.ScanDelivery(); err != nil {
+		return "", fmt.Errorf("LDR delivery scan failed for %s: %w", att.ClientDir, err)
+	}
 	st, _, verr = validateLDRClientAndActor(cl, att.ClientDir, agent, actor)
 	if verr != nil {
 		return "", verr

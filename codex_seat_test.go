@@ -670,6 +670,12 @@ func TestCodexLoadCheckExplainsUntrustedAndDisabled(t *testing.T) {
 	if ok, why, _ := codexLoadsYip(dir, "", "other"); ok || !strings.Contains(why, `"codex", not "other"`) {
 		t.Fatal(why)
 	}
+	for _, args := range []string{`["serve","--codex","--as","codex"]`, `["serve","--codex","--line","t"]`} {
+		answer = `[{"name":"yip","enabled":true,"transport":{"args":` + args + `}}]`
+		if ok, why, err := codexLoadsYipOnLine(dir, "", "codex", "t"); ok || why == "" || err != nil {
+			t.Errorf("incomplete runtime registration %s: ok=%v why=%q err=%v", args, ok, why, err)
+		}
+	}
 	answer = `[{"name":"yip","enabled":false,"disabled_reason":"not allowed by requirements","transport":{"args":[]}}]`
 	if ok, why, _ := codexLoadsYip(dir, "", "codex"); ok || !strings.Contains(why, "not allowed by requirements") {
 		t.Fatal("policy-disabled server not explained:", why)
