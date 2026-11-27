@@ -347,6 +347,14 @@ func DeliveryInbox(agent string) (string, error) {
 		ep.ChannelConnected = ep.ChannelConnected && channelOwnerAlive(agent)
 		ep.ChannelReady = ep.ChannelReady && ep.ChannelConnected
 	}
+	if ldrSt := inspectLDRDeliveryStatus(agent); ldrSt != nil {
+		type endpointWithLDR struct {
+			Endpoint
+			LDR *LDRDeliveryStatus `json:"ldr,omitempty"`
+		}
+		b, err := json.MarshalIndent(endpointWithLDR{Endpoint: ep, LDR: ldrSt}, "", "  ")
+		return string(b), err
+	}
 	b, err := json.MarshalIndent(ep, "", "  ")
 	return string(b), err
 }

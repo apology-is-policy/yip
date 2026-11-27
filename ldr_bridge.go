@@ -1409,18 +1409,155 @@ func ldrCallsListText(att LDRAttachment, me string) (string, error) {
 	return strings.TrimRight(b.String(), "\n"), nil
 }
 
-func ldrHookRings(att LDRAttachment, me string) ([]ldrclient.CallSummary, []ldrclient.BroadcastView) {
-	actor := att.actorFor(me)
+// LDRDeliveryStatus reports LDR attachment, credential, and seat-to-actor
+// health inside `yip delivery status` / `deliveries` JSON when LDR is attached.
+type LDRDeliveryStatus struct {
+	Attached  bool   `json:"attached"`
+	ClientDir string `json:"client_dir,omitempty"`
+	LocalSeat string `json:"local_seat"`
+	Actor     string `json:"actor,omitempty"`
+	LineID    string `json:"line_id,omitempty"`
+	CredID    string `json:"cred_id,omitempty"`
+	Activated bool   `json:"activated,omitempty"`
+	ActorLive bool   `json:"actor_live,omitempty"`
+	Healthy   bool   `json:"healthy"`
+	Error     string `json:"error,omitempty"`
+}
+
+func inspectLDRDeliveryStatus(agent string) *LDRDeliveryStatus {
+	att, ok, err := loadLDRAttachment()
+	if err != nil {
+		return &LDRDeliveryStatus{
+			Attached:  true,
+			LocalSeat: agent,
+			Healthy:   false,
+			Error:     err.Error(),
+		}
+	}
+	if !ok {
+		return nil
+	}
+	actor, aerr := resolveSessionLDRActor(att, agent)
+	res := &LDRDeliveryStatus{
+		Attached:  true,
+		ClientDir: att.ClientDir,
+		LocalSeat: agent,
+		Actor:     actor,
+	}
+	if aerr != nil {
+		res.Error = aerr.Error()
+		return res
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cl, err := ldrclient.OpenClientWait(ctx, att.ClientDir)
+	if err != nil {
+		res.Error = fmt.Sprintf("cannot open LDR client dir %s: %v", att.ClientDir, err)
+		return res
+	}
+	st, liveCredActors, verr := validateLDRClientAndActor(cl, att.ClientDir, agent, actor)
+	_ = cl.Close()
+	res.LineID = st.LineID
+	res.CredID = st.CredID
+	res.Activated = st.Activated
+	res.ActorLive = liveCredActors != nil && liveCredActors[actor]
+	if verr != nil {
+		res.Error = verr.Error()
+		return res
+	}
+	if st.MustResolve {
+		res.Error = fmt.Sprintf("LDR client %s has unsettled outbox operation(s) requiring reconciliation (must_resolve=true)", att.ClientDir)
+		return res
+	}
+	res.Healthy = true
+	return res
+}
+
+func checkLDRDoctor(agent string) (string, error) {
+	att, ok, err := loadLDRAttachment()
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", nil
+	}
+	actor := ""
+	if agent != "" {
+		var aerr error
+		actor, aerr = resolveSessionLDRActor(att, agent)
+		if aerr != nil {
+			return "", aerr
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cl, err := ldrclient.OpenClientWait(ctx, att.ClientDir)
+	if err != nil {
+		return "", fmt.Errorf("cannot open LDR client dir %s: %w", att.ClientDir, err)
+	}
+	defer cl.Close()
+
+	st, _, verr := validateLDRClientAndActor(cl, att.ClientDir, "", "")
+	if verr != nil {
+		return "", verr
+	}
+	sess, err := cl.Dial(ctx, ldrcrypto.PrincipalCredential)
+	if err != nil {
+		return "", fmt.Errorf("LDR relay session failed for %s: %w", att.ClientDir, err)
+	}
+	defer sess.Close()
+	if _, err := cl.Sync(ctx, sess); err != nil {
+		return "", fmt.Errorf("LDR relay sync failed for %s: %w", att.ClientDir, err)
+	}
+	_, _ = cl.ScanDelivery()
+	st, _, verr = validateLDRClientAndActor(cl, att.ClientDir, agent, actor)
+	if verr != nil {
+		return "", verr
+	}
+	if st.MustResolve {
+		return "", fmt.Errorf("LDR client %s has unsettled outbox operation(s) requiring reconciliation (must_resolve=true)", att.ClientDir)
+	}
+	deliverable := 0
+	for _, n := range cl.DeliverableNotices() {
+		if actor == "" || n.Actor == actor {
+			deliverable++
+		}
+	}
+	if agent != "" {
+		return fmt.Sprintf("line %s (%s), seat %s -> actor %s (seq %d, deliverable %d)", st.LineID, att.ClientDir, agent, actor, st.CheckpointSeq, deliverable), nil
+	}
+	return fmt.Sprintf("line %s (%s), seq %d", st.LineID, att.ClientDir, st.CheckpointSeq), nil
+}
+
+func ldrHookRingsChecked(att LDRAttachment, me string) ([]ldrclient.CallSummary, []ldrclient.BroadcastView, string, error) {
+	actor, err := resolveSessionLDRActor(att, me)
+	if err != nil {
+		return nil, nil, att.actorFor(me), err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var sums []ldrclient.CallSummary
 	var bvs []ldrclient.BroadcastView
-	_ = withLDRSession(ctx, att, func(cl *ldrclient.Client, sess *ldrrelay.SessionClient) error {
-		_, _ = cl.Sync(ctx, sess)
-		sums, _ = cl.ListCallSummaries(ctx, sess, actor, false)
-		bvs, _ = cl.ListBroadcasts(ctx, sess, actor, false)
-		return nil
+	err = withLDRSession(ctx, att, func(cl *ldrclient.Client, sess *ldrrelay.SessionClient) error {
+		if _, serr := cl.Sync(ctx, sess); serr != nil {
+			return serr
+		}
+		if _, _, verr := validateLDRClientAndActor(cl, att.ClientDir, me, actor); verr != nil {
+			return verr
+		}
+		var lerr error
+		sums, lerr = cl.ListCallSummaries(ctx, sess, actor, false)
+		if lerr != nil {
+			return lerr
+		}
+		bvs, lerr = cl.ListBroadcasts(ctx, sess, actor, false)
+		return lerr
 	})
+	return sums, bvs, actor, err
+}
+
+func ldrHookRings(att LDRAttachment, me string) ([]ldrclient.CallSummary, []ldrclient.BroadcastView) {
+	sums, bvs, _, _ := ldrHookRingsChecked(att, me)
 	return sums, bvs
 }
 
@@ -1496,9 +1633,11 @@ func ldrHookStop(att LDRAttachment, me string) any {
 
 func ldrHookSessionStart(att LDRAttachment, me string) any {
 	_ = Beat(me, "")
-	actor := att.actorFor(me)
-	sums, bvs := ldrHookRings(att, me)
+	sums, bvs, actor, err := ldrHookRingsChecked(att, me)
 	var parts []string
+	if err != nil {
+		parts = append(parts, fmt.Sprintf("[yip ldr] delivery/relay warning for %s (actor %s): %v", me, actor, err))
+	}
 	if txt := formatLDRRing(sums, me, actor); txt != "nothing ringing." {
 		parts = append(parts, "[yip] "+txt)
 	}

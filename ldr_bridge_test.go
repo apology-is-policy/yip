@@ -1909,4 +1909,146 @@ func TestLDRBindPreservesAndGuardsActorAndUninstallPrunesMapping(t *testing.T) {
 	}
 }
 
+func TestDoctorAndDeliveryDiagnosticsWithLDRAttachment(t *testing.T) {
+	fx := newLDRBridgeFixture(t)
+	aliceCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	unactCK, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	ag, arid, ardig := fx.enroll(t, "ns-alice-doc", aliceCK, 4, 0x91)
+	ug, urid, urdig := fx.enroll(t, "ns-unact-doc", unactCK, 2, 0x92)
+	fx.activateEpoch(t, "ep-doc-1")
+
+	aliceClientDir := filepath.Join(t.TempDir(), "alice-doc-ldr")
+	fx.setupWorkstation(t, aliceClientDir, aliceCK, ag, arid, ardig, "alice-codex")
+
+	unactDir := filepath.Join(t.TempDir(), "unact-doc-ldr")
+	unactCl, err := ldrclient.InitClientDir(ldrclient.InitDirOptions{
+		Dir: unactDir, SignedDescriptor: fx.rawDesc, CredKeys: unactCK,
+		ExpectedGrant: &ug, ExpectedJoinReq: urid, ExpectedJoinReqDigest: &urdig,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unactCl.Close()
+
+	home := filepath.Join(t.TempDir(), "doc-home")
+	codexHomeDir := filepath.Join(t.TempDir(), "codex-home")
+	checkout := filepath.Join(t.TempDir(), "project-checkout")
+	if err := os.MkdirAll(checkout, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	origCodexHome := os.Getenv("CODEX_HOME")
+	origMCPList := codexMCPList
+	origQueueCheck := codexQueueCheck
+	origExplicitLine := doctorExplicitLine
+	t.Cleanup(func() {
+		_ = os.Setenv("CODEX_HOME", origCodexHome)
+		codexMCPList = origMCPList
+		codexQueueCheck = origQueueCheck
+		doctorExplicitLine = origExplicitLine
+	})
+	_ = os.Setenv("YIP_HOME", home)
+	_ = os.Setenv("CODEX_HOME", codexHomeDir)
+
+	fakeYip := filepath.Join(t.TempDir(), "yip")
+	script := "#!/bin/sh\nif [ \"$1\" = version ]; then echo '" + serverVersion + "'; exit 0; fi\nexit 0\n"
+	if err := os.WriteFile(fakeYip, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	codexQueueCheck = func() error { return nil }
+	codexMCPList = func(dir, profile string) ([]byte, error) {
+		return json.Marshal([]map[string]any{{
+			"name":    "yip",
+			"enabled": true,
+			"transport": map[string]any{
+				"args": []string{"serve", "--codex", "--line", "project-relay", "--as", "reviewer"},
+			},
+		}})
+	}
+
+	// Install Codex profile "project-alice" on named line "project-relay" mapped to "alice-codex".
+	if _, err := InstallWith(checkout, "project-relay", "reviewer", false, "codex", InstallOptions{
+		Profile:  "project-alice",
+		LDRDir:   aliceClientDir,
+		LDRActor: "alice-codex",
+	}); err != nil {
+		t.Fatalf("InstallWith(codex profile): %v", err)
+	}
+	// Replace wired binary path in profile config with fakeYip matching serverVersion.
+	if err := codexProfileFiles("project-alice", fakeYip, "project-relay", "reviewer", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Simulate running `yip doctor --runtime codex --profile project-alice` WITHOUT `--line`:
+	//    activeLine starts on an unrelated directory-derived line, and CodexDoctor MUST switch
+	//    activeLine to "project-relay", locate reviewer's endpoint, and verify LDR health!
+	activeLine = "wrong-derived-line"
+	if err := CodexDoctor(checkout, "project-alice"); err != nil {
+		t.Fatalf("CodexDoctor without --line failed: %v", err)
+	}
+	if activeLine != "project-relay" {
+		t.Fatalf("CodexDoctor resolved activeLine = %q, want project-relay", activeLine)
+	}
+
+	// 2. Passing an explicit mismatched `--line` MUST fail clearly.
+	doctorExplicitLine = "other-line"
+	if err := CodexDoctor(checkout, "project-alice"); err == nil || !strings.Contains(err.Error(), "configured for line") {
+		t.Fatalf("expected CodexDoctor with mismatched --line to fail, got: %v", err)
+	}
+	doctorExplicitLine = ""
+
+	// 3. DeliveryInbox (`yip delivery status`) preserves Endpoint JSON and embeds healthy `"ldr"` metadata.
+	activeLine = "project-relay"
+	rawInbox, err := DeliveryInbox("reviewer")
+	if err != nil {
+		t.Fatalf("DeliveryInbox(reviewer): %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(rawInbox), &parsed); err != nil {
+		t.Fatalf("DeliveryInbox invalid JSON: %v\n%s", err, rawInbox)
+	}
+	ldrObj, _ := parsed["ldr"].(map[string]any)
+	if ldrObj == nil || ldrObj["healthy"] != true || ldrObj["actor"] != "alice-codex" || ldrObj["actor_live"] != true {
+		t.Fatalf("unexpected DeliveryInbox ldr payload: %+v", ldrObj)
+	}
+
+	// 4. Unactivated client directory or undeclared actor (via YIP_LDR_DIR after detach) MUST surface in
+	//    CodexDoctor, DeliveryInbox, and SessionStart instead of looking like a quiet healthy line!
+	if err := DetachLDRLine(); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Setenv("YIP_LDR_DIR", unactDir)
+	if err := CodexDoctor(checkout, "project-alice"); err == nil || !strings.Contains(err.Error(), "not activated") {
+		t.Fatalf("expected CodexDoctor to fail on unactivated YIP_LDR_DIR, got: %v", err)
+	}
+	rawBroken, err := DeliveryInbox("reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsedBroken map[string]any
+	if err := json.Unmarshal([]byte(rawBroken), &parsedBroken); err != nil {
+		t.Fatal(err)
+	}
+	brokenLDR, _ := parsedBroken["ldr"].(map[string]any)
+	if brokenLDR == nil || brokenLDR["healthy"] != false || !strings.Contains(brokenLDR["error"].(string), "not activated") {
+		t.Fatalf("expected DeliveryInbox to surface unactivated LDR error, got: %+v", brokenLDR)
+	}
+
+	// Undeclared actor ("reviewer" on aliceClientDir when ldr.json was detached so YIP_LDR_DIR has empty Actors map):
+	_ = os.Setenv("YIP_LDR_DIR", aliceClientDir)
+	if err := CodexDoctor(checkout, "project-alice"); err == nil || !strings.Contains(err.Error(), "not declared") {
+		t.Fatalf("expected CodexDoctor to catch unmapped local seat name on YIP_LDR_DIR, got: %v", err)
+	}
+	attEnv, ok, err := loadLDRAttachment()
+	if err != nil || !ok {
+		t.Fatalf("loadLDRAttachment(env): ok=%v err=%v", ok, err)
+	}
+	ssOut := ldrHookSessionStart(attEnv, "reviewer")
+	ssJSON, _ := json.Marshal(ssOut)
+	if !strings.Contains(string(ssJSON), "[yip ldr]") || !strings.Contains(string(ssJSON), "not declared") {
+		t.Fatalf("expected ldrHookSessionStart to surface undeclared actor warning, got: %s", string(ssJSON))
+	}
+	_ = os.Unsetenv("YIP_LDR_DIR")
+}
+
+
 
