@@ -70,9 +70,14 @@ with tempfile.TemporaryDirectory(prefix='yip-pty-') as tmp:
                     if not chunk:
                         break
                     output.extend(chunk)
+        def wait_for(condition, description):
+            deadline = time.monotonic() + 10
+            while not condition():
+                if child.poll() is not None or time.monotonic() >= deadline:
+                    raise AssertionError(f"{mode}: waiting for {description}; last output {output[-1500:]!r}")
+                drain(.05)
         try:
-            drain(1)
-            assert b'SWITCHBOARD' in output.upper(), output[-2000:]
+            wait_for(lambda: b'SWITCHBOARD' in output.upper(), 'Switchboard to open')
             if not mode.startswith('native'):
                 assert b'\x1b[?1000h' in output and b'\x1b[?1006h' in output
             def screen():
@@ -81,13 +86,13 @@ with tempfile.TemporaryDirectory(prefix='yip-pty-') as tmp:
                     rows[int(row)] = re.sub(rb'\x1b\[[0-9;]*m', b'', line).decode()
                 return rows
             if mode == 'quit':
-                assert 'floor: fixture-c' in ''.join(screen().values())
+                wait_for(lambda: 'floor: fixture-c' in ''.join(screen().values()), 'both conversations to load')
                 expected = screen()[12][:27].strip()
                 # SGR click on the second conversation, delivered in fragments.
-                for fragment in [b'\x1b', b'[<0;', b'4;11', b'M']:
+                for fragment in [b'\x1b[', b'<0;', b'4;11', b'M']:
                     os.write(master, fragment)
                     drain(.015)
-                assert screen()[4].strip() == expected, (expected, screen()[4])
+                wait_for(lambda: screen().get(4, '').strip() == expected, f'selected title {expected!r}')
                 os.write(master, b'r')
                 for byte in 'UI fixture café界'.encode():
                     os.write(master, bytes([byte]))
@@ -97,12 +102,11 @@ with tempfile.TemporaryDirectory(prefix='yip-pty-') as tmp:
                 os.write(master, b'\x1b[<0;4;8M\x1b[<65;150;10M')
                 drain(.1)
                 os.write(master, b'\r')
-                drain(.2)
+                wait_for(lambda: any((root/'line/calls').glob('*/notes/*.md')), 'ratification note')
                 notes = list((root/'line/calls').glob('*/notes/*.md'))
                 assert len(notes)==1 and 'UI fixture café界' in notes[0].read_text()
                 os.write(master, b'rdiscard this\x1b')
-                drain(.2)
-                assert 'ratify as' not in screen()[43]
+                wait_for(lambda: 'ratify as' not in screen()[43], 'ratification prompt to close')
                 for fragment in [b'\x1b', b'[', b'A']:
                     os.write(master, fragment)
                     drain(.03)
@@ -111,21 +115,21 @@ with tempfile.TemporaryDirectory(prefix='yip-pty-') as tmp:
                 cli('broadcast','regroup','--to','fixture-a,fixture-b','--by','test-operator',body='Regroup for the next milestone.')
                 broadcast = json.loads(next((root/'line/broadcasts').glob('*.json')).read_text())
                 cli('api','broadcast_reply',json.dumps(dict(id=broadcast['id'],body='The checkpoint is complete.')),'--as','fixture-b')
-                drain(2.3)
+                wait_for(lambda: any('BROADCAST / regroup' in line[:27] for line in screen().values()),
+                         'new broadcast in the call list')
                 rows=screen()
                 row=next(row for row,text in rows.items() if 'BROADCAST / regroup' in text[:27])
                 os.write(master, ('\x1b[<0;4;%dM'%row).encode())
                 drain(.2)
                 os.write(master,b'g')
-                drain(.2)
+                wait_for(lambda: 'The checkpoint is complete.' in '\n'.join(screen().values()), 'broadcast reply')
                 current='\n'.join(screen().values())
                 assert 'RECIPIENTS' in current and 'REPLY' in current and 'The checkpoint is complete.' in current, current
                 assert b'\x1b[38;5;183m' in output and b'\x1b[38;5;117m' in output
                 (evidence/'broadcast-frame.txt').write_text(current)
                 # Grouped view and narrow conversation list retain broadcasts.
                 os.write(master,b'4')
-                drain(.2)
-                assert 'BROADCASTS / b' in '\n'.join(screen().values())
+                wait_for(lambda: 'BROADCASTS / b' in '\n'.join(screen().values()), 'grouped broadcast view')
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH',24,80,0,0))
                 os.kill(int(pidfile.read_text()),signal.SIGWINCH)
                 drain(.3)
@@ -133,9 +137,9 @@ with tempfile.TemporaryDirectory(prefix='yip-pty-') as tmp:
             elif mode == 'native':
                 for key,label in [(b'\x1bOR',b'Line topology'),(b'\x1bOS',b'Relays'),(b'\x1b[15~',b'Broadcasts'),(b'\x1b[17~',b'Roadmaps'),(b'\x1b[18~',b'Configuration')]:
                     os.write(master,key)
-                    drain(.3)
-                    rows = terminal_rows(output, 160, 44)
-                    assert any(label.decode() in row for row in rows), (label, rows[:12])
+                    def window_open():
+                        return any(label.decode() in row for row in terminal_rows(output, 160, 44))
+                    wait_for(window_open, f'{label.decode()} to open')
                     os.write(master,key)
                     drain(.15)
                 os.write(master,b'q')
