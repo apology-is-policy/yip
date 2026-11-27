@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Isolated CLI/MCP/configuration and real-PTY broadcast checks; no live wakes."""
 import fcntl
-import glob
 import json
 import os
 import pathlib
 import pty
-import re
 import select
 import struct
 import subprocess
@@ -14,6 +12,8 @@ import tempfile
 import termios
 import time
 import tomllib
+
+from scripts.terminal_screen import terminal_rows
 
 # install records the resolved path, and on macOS /tmp is a symlink.
 binary = os.path.realpath(os.environ.get("YIP_TEST_BIN", "/tmp/yiptest"))
@@ -73,41 +73,71 @@ with tempfile.TemporaryDirectory(prefix="yip-delivery-e2e-") as temp:
     assert "reply requested" not in run("api", "broadcasts", "--as", "b")
     print("PASS isolated Codex install, generated hook, literal queue argv, restart deduplication, acknowledgment, MCP read and per-recipient replies")
 
-    # Start a real terminal with an isolated line, then use only operator keys.
+    # Drive the default Switchboard through its native Compose and Review windows.
+    width, height = 128, 40
+    broadcasts = root / "line/broadcasts"
+    existing = set(broadcasts.glob("*.json"))
     pid, fd = pty.fork()
     if pid == 0:
         os.chdir(root)
-        os.execve(binary, [binary, "switchboard", "--by", "test operator"], env)
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 110, 0, 0))
+        os.execve(binary, [binary, "--line", "fixture", "switchboard", "--by", "test operator"],
+                  dict(env, TERM="xterm-256color"))
+    def resize():
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+    resize()
     capture = bytearray()
-    def until(needle, timeout=8):
-        end = time.monotonic() + timeout
-        segment = bytearray()
-        while time.monotonic() < end:
-            ready, _, _ = select.select([fd], [], [], 0.2)
-            if ready:
-                block = os.read(fd, 65536)
-                capture.extend(block)
-                segment.extend(block)
-                if needle in segment:
-                    return
-        raise AssertionError("PTY did not show " + repr(needle) + "; captured tail: " + repr(bytes(capture[-2000:])))
+    frame_start = 0
+
+    def locate(label, *, resized=False):
+        deadline = time.monotonic() + 8
+        while True:
+            rows = terminal_rows(capture[frame_start:], width, height)
+            for y, row in enumerate(rows):
+                if label in row and (not resized or rows[-2][-2] == "╝"):
+                    return row.index(label) + 1, y + 1
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f"{label!r} missing from screen:\n" + "\n".join(rows))
+            if select.select([fd], [], [], min(.2, remaining))[0]:
+                capture.extend(os.read(fd, 65536))
+
+    def click(label, dy=0, *, resized=False):
+        x, y = locate(label, resized=resized)
+        # SGR reports use one-based cell coordinates, M for press and m for release.
+        pos = f"\x1b[<0;{x+1};{y+dy}"
+        os.write(fd, (pos + "M" + pos + "m").encode())
+
     try:
-        until(b"SWITCHBOARD")
-        os.write(fd, b"b")
-        until(b"recipients")
-        # Defaults already contain a,b. Accept them, then replace announcement.
-        os.write(fd, b"\r")
-        until(b"kind:")
-        os.write(fd, b"\x7f" * len("announcement") + b"briefing\r")
-        until(b"broadcast text")
-        os.write(fd, b"PTY status request\r")
-        until(b"type SEND")
-        assert len(glob.glob(str(root / "line/broadcasts/*.json"))) == 1
-        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-        os.write(fd, b"SEND\r")
-        until(b"recorded broadcast")
-        assert len(glob.glob(str(root / "line/broadcasts/*.json"))) == 2
+        locate("Switchboard")
+        os.write(fd, b"\x1b[15~")  # F5, Broadcasts
+        click("Compose broadcast")
+        locate("Send local briefing")
+        click("Recipients (comma-separated)", dy=1)
+        os.write(fd, b"a,b")
+        locate("a,b")
+        click("Message", dy=1)
+        os.write(fd, b"PTY status request")
+        locate("PTY status request")
+        click("Review")
+        locate("Recipients (comma-separated): a,b")
+        locate("Message: PTY status request")
+        assert set(broadcasts.glob("*.json")) == existing
+        # The reviewed draft survives a resize before the operator confirms.
+        width, height = 116, 36
+        frame_start = len(capture)
+        resize()
+        click("Apply", resized=True)
+        deadline = time.monotonic() + 8
+        while not (created := set(broadcasts.glob("*.json")) - existing):
+            if time.monotonic() >= deadline:
+                raise AssertionError("reviewed broadcast was not recorded:\n" +
+                                     "\n".join(terminal_rows(capture[frame_start:], width, height)))
+            if select.select([fd], [], [], .05)[0]:
+                capture.extend(os.read(fd, 65536))
+        assert len(created) == 1, created
+        sent = json.loads(created.pop().read_text())
+        assert (sent["kind"], sent["by"], sent["recipients"], sent["body"]) == (
+            "briefing", "test operator", ["a", "b"], "PTY status request"), sent
         os.write(fd, b"q")
         # Drain the terminal while the UI restores its mode, with a deadline.
         deadline = time.monotonic() + 8
@@ -126,11 +156,14 @@ with tempfile.TemporaryDirectory(prefix="yip-delivery-e2e-") as temp:
         pid = 0
         assert os.waitstatus_to_exitcode(code) == 0
     finally:
-        if pid:
-            # Only the test-owned child, never another Yip/session process.
-            os.kill(pid, 9)
-            os.waitpid(pid, 0)
         os.close(fd)
+        if pid:
+            # Closing the master also releases pending PTY output on Darwin.
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+            os.waitpid(pid, 0)
     artifact = os.environ.get("YIP_PTY_CAPTURE")
     if artifact:
         pathlib.Path(artifact).write_bytes(capture)
@@ -188,7 +221,8 @@ with tempfile.TemporaryDirectory(prefix="yip-delivery-e2e-") as temp:
         proc.stdin.close()
         proc.wait(10)
     status = run("line", "--line", "fixture")
-    assert "session closed" in status, status
+    reviewer = next(row for row in status.splitlines() if row.lstrip().startswith("reviewer "))
+    assert "Codex MCP disconnected; dispatcher stopped" in reviewer, reviewer
     print("PASS live Codex binding from _meta.threadId, in-server queue to that exact thread, thread-bound CLI identity, release on exit")
 
     # claude-rewake in a launch folder shared with a Codex seat, on a NAMED line.
@@ -208,10 +242,11 @@ with tempfile.TemporaryDirectory(prefix="yip-delivery-e2e-") as temp:
     session_start = hooks["SessionStart"][0]["hooks"][0]["command"]
     hook_env = {k: v for k, v in env2.items() if k not in ("YIP_LINE",)}
     stdin = json.dumps({"session_id": "e2e-session", "cwd": str(work), "hook_event_name": "Stop"})
-    waiter = subprocess.Popen(["sh", "-c", rewake[0]["command"]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True, cwd=work, env=hook_env)
-    waiter.stdin.write(stdin)
-    waiter.stdin.close()
+    with tempfile.TemporaryFile(mode="w+") as hook_input:
+        hook_input.write(stdin)
+        hook_input.seek(0)
+        waiter = subprocess.Popen(["sh", "-c", rewake[0]["command"]], stdin=hook_input, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True, cwd=work, env=hook_env)
     deadline = time.monotonic() + 10
     while "rewake armed" not in run2("line", "--line", "strategies"):
         assert time.monotonic() < deadline and waiter.poll() is None, "waiter never armed"
