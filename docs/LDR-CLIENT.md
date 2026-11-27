@@ -175,7 +175,11 @@ yip --line "$LOCAL_LINE" --as reviewer ldr attach --dir "$CLIENT" --actor "$ACTO
 yip --line "$LOCAL_LINE" --as reviewer delivery status
 ~~~
 
-The route is recorded in `ldr.json` under the selected local line's state root. `YIP_LDR_DIR` can supply a route when that file is absent. Check for inherited environment overrides when two shells disagree. Use the supported attach/detach commands to change routes. Keep a list of all local actor mappings when switching an entire line.
+Attach checks the credential and actors in the client directory's locally verified state. Complete activation first. If a recently declared actor is missing, run `yip ldr sync --dir "$CLIENT"` and check `yip ldr actor list --dir "$CLIENT"`. Supply the local seat with `--as` whenever you specify a relay actor with `--actor`. Omitting `--actor` when you name a seat selects the actor with the same name. For line observation alone, you can attach an activated credential without naming a seat.
+
+The route is recorded in `ldr.json` under the selected local line's state root. `YIP_LDR_DIR` can supply a route when that file is absent. Switching the line to a different client directory drops the old directory's explicit seat mappings. Record the seats first, then map each one to an actor belonging to the new credential and check delivery from the intended session. Use a separate local line if the two routes need to stay available at the same time.
+
+**Moving a session to a worktree.** When a supported runtime uses the Yip **bind** tool, read the confirmation for the effective local name and relay actor. A worktree with its own mapped or declared actor can use that actor. A worktree without one can retain the launch seat's actor while the session is bound there. To run two conversations simultaneously, declare and map a distinct actor for each. A worktree directory name by itself does not create a relay identity.
 
 ## Verify a two-workstation call
 
