@@ -1597,8 +1597,8 @@ func TestAttachLDRLineValidationAndActorMappingLifecycle(t *testing.T) {
 
 	aliceClientDir := filepath.Join(t.TempDir(), "alice-ldr")
 	bobClientDir := filepath.Join(t.TempDir(), "bob-ldr")
-	fx.setupWorkstation(t, aliceClientDir, aliceCK, ag, arid, ardig, "alice-codex", "reviewer")
 	fx.setupWorkstation(t, bobClientDir, bobCK, bg, brid, brdig, "bob-claude")
+	fx.setupWorkstation(t, aliceClientDir, aliceCK, ag, arid, ardig, "alice-codex", "reviewer")
 
 	// Pre-activation member directory (Activated == false).
 	unactDir := filepath.Join(t.TempDir(), "unactivated-ldr")
@@ -1883,10 +1883,53 @@ func TestLDRBindPreservesAndGuardsActorAndUninstallPrunesMapping(t *testing.T) {
 	if _, err := (&server{me: "feature-wt"}).call("ring", nil); err == nil || !strings.Contains(err.Error(), "previous LDR client") {
 		t.Fatalf("expected stale-route bound worktree to require re-binding, got: %v", err)
 	}
-	// Restore aliceClientDir before testing uninstall pruning.
+	// Restore aliceClientDir before testing in-place replacement & uninstall pruning.
 	if _, err := AttachLDRLine(aliceClientDir, "alice-agy", "alice-relay"); err != nil {
 		t.Fatal(err)
 	}
+
+	// 4c. Replacing an enrolled directory IN PLACE at the same path with a fresh credential
+	//     is caught both at actor use (before re-attach) and on re-attach (invalidating prior bindings & actors)!
+	inPlaceDir := filepath.Join(t.TempDir(), "inplace-ldr")
+	ipCK1, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	ipCK2, _ := ldrclient.GenerateCredentialKeys(ldrcrypto.AlgEd25519)
+	ipg1, iprid1, iprdig1 := fx.enroll(t, "ns-inplace-1", ipCK1, 2, 0x83)
+	ipg2, iprid2, iprdig2 := fx.enroll(t, "ns-inplace-2", ipCK2, 2, 0x84)
+	fx.activateEpoch(t, "ep-bind-inplace")
+	fx.setupWorkstation(t, inPlaceDir, ipCK1, ipg1, iprid1, iprdig1, "inplace-a")
+
+	activeLine = "bind-inplace"
+	if _, err := InstallWith(launchDir, "bind-inplace", "alice-agy", false, "agy", InstallOptions{
+		LDRDir:   inPlaceDir,
+		LDRActor: "inplace-a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := registerSession(sess1, "alice-agy"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BindWithConv("alice-agy", sess1, conv1, wt1Dir, ""); err != nil {
+		t.Fatal(err)
+	}
+	// Replace inPlaceDir in place with credential 2!
+	if err := os.RemoveAll(inPlaceDir); err != nil {
+		t.Fatal(err)
+	}
+	fx.setupWorkstation(t, inPlaceDir, ipCK2, ipg2, iprid2, iprdig2, "inplace-b")
+	if _, err := (&server{me: "feature-wt"}).call("ring", nil); err == nil || !strings.Contains(err.Error(), "holds credential") {
+		t.Fatalf("expected in-place replaced directory to be refused before re-attach, got: %v", err)
+	}
+	reattachedInPlace, err := AttachLDRLine(inPlaceDir, "new-seat", "inplace-b")
+	if err != nil {
+		t.Fatalf("re-attach replaced inPlaceDir: %v", err)
+	}
+	if _, leaked := reattachedInPlace.Actors["alice-agy"]; leaked {
+		t.Fatalf("in-place credential replacement leaked old credential's actor mapping: %+v", reattachedInPlace.Actors)
+	}
+	if _, err := (&server{me: "feature-wt"}).call("ring", nil); err == nil || !strings.Contains(err.Error(), "previous LDR client or credential") {
+		t.Fatalf("expected bound worktree from old credential at same path to require re-binding, got: %v", err)
+	}
+	activeLine = "bind-alice"
 
 	// 5. Uninstall removes uninstalled seat's actor mapping from ldr.json while keeping others intact.
 	liveProcs[sess1] = false
@@ -2049,6 +2092,3 @@ func TestDoctorAndDeliveryDiagnosticsWithLDRAttachment(t *testing.T) {
 	}
 	_ = os.Unsetenv("YIP_LDR_DIR")
 }
-
-
-
