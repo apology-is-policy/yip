@@ -29,6 +29,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -163,6 +164,7 @@ type sbWaiting struct {
 }
 
 type sbState struct {
+	relay     *sbRelay
 	resources []sbResource
 	disk      string
 	calls     []*sbCall
@@ -581,6 +583,16 @@ func (v *view) key(k rune) {
 		return
 	}
 	v.flash = ""
+	if v.st.relay != nil {
+		switch k {
+		case 'a', 'r', 'b', 'P', '4':
+			v.flash = "Read-only relay view"
+			return
+		case '?':
+			v.flash = sbRelayKeys
+			return
+		}
+	}
 	switch k {
 	case '?':
 		v.flash = "click a call · wheel over a pane · tab/n next · p prev · j/k scroll · g top G end · f follow · r ratify a arbitrate · 4 broadcasts · b compose · 5 map · P re-probe a stuck channel · ^L repaint"
@@ -594,7 +606,7 @@ func (v *view) key(k rune) {
 	case 12: // Ctrl-L: anything else that wrote to the terminal is ours to paint over
 		v.lastFrame = nil
 	case 'p':
-		if v.tab == 4 {
+		if v.tab == 4 && v.st.relay == nil {
 			v.mapCycle(-1)
 			return
 		}
@@ -633,7 +645,7 @@ func (v *view) key(k rune) {
 	case 'f':
 		v.follow = !v.follow
 	case '\t', 'n':
-		if v.tab == 4 {
+		if v.tab == 4 && v.st.relay == nil {
 			v.mapCycle(1)
 			return
 		}
@@ -672,6 +684,10 @@ func Switchboard(by string) error {
 	if by == "" {
 		by = "human"
 	}
+	att, remote, err := loadLDRAttachment()
+	if err != nil {
+		return err
+	}
 	if err := EnsureRoot(); err != nil {
 		return err
 	}
@@ -689,7 +705,12 @@ func Switchboard(by string) error {
 	fmt.Fprint(t.f, escAltOn+escHideCursor+escMouseOn)
 
 	loader := &sbLoader{}
-	v := &view{t: t, by: by, follow: true, st: loader.load()}
+	v := &view{t: t, by: by, follow: true}
+	if remote {
+		v.st.relay = &sbRelay{}
+	} else {
+		v.st = loader.load()
+	}
 	v.render()
 
 	keys := make(chan rune, 64)
@@ -709,14 +730,30 @@ func Switchboard(by string) error {
 	// packet every few milliseconds; run them in one thread and each makes the other wait.
 	states := make(chan sbState, 1)
 	loading := false
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var lastLoad time.Time
 	startLoad := func() {
 		if loading {
 			return
 		}
 		loading = true
-		go func() { states <- loader.load() }()
+		lastLoad = time.Now()
+		if remote {
+			id := ""
+			if sc := v.selectedCall(); sc != nil {
+				id = sc.call.ID
+			}
+			previous := v.st
+			go func() { states <- loadRelayBoard(ctx, att, id, previous) }()
+		} else {
+			go func() { states <- loader.load() }()
+		}
 	}
 
+	if remote {
+		startLoad()
+	}
 	tick := time.NewTicker(time.Second)
 	var decoder sbInputDecoder
 	escapeTimer := time.NewTimer(time.Hour)
@@ -755,6 +792,7 @@ func Switchboard(by string) error {
 			if !ok {
 				return nil
 			}
+			oldSelection := v.sel
 			changed := false
 			feed := func(k rune) {
 				for _, event := range decoder.feed(k) {
@@ -784,7 +822,7 @@ func Switchboard(by string) error {
 			if decoder.loneEscape() {
 				escapeTimer.Reset(100 * time.Millisecond)
 			}
-			if v.wantLoad {
+			if v.wantLoad || (remote && oldSelection != v.sel) {
 				v.wantLoad = false
 				startLoad()
 			}
@@ -801,12 +839,20 @@ func Switchboard(by string) error {
 				paint()
 			}
 		case <-tick.C:
-			startLoad()
+			if !remote || time.Since(lastLoad) >= 5*time.Second {
+				startLoad()
+			}
 			v.frame++
 			paint()
 		case next := <-states:
 			loading = false
 			v.refresh(next)
+			if remote && next.err == "" {
+				sc := v.selectedCall()
+				if sc != nil && (next.relay.Transcript == nil || sc.call.ID != next.relay.Transcript.ID) {
+					startLoad()
+				}
+			}
 			paint()
 		case s := <-sigs:
 			if s == syscall.SIGWINCH {

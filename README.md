@@ -212,14 +212,18 @@ Codex has no Channels equivalent: an MCP server cannot push text into a
 conversation. It does have `codex queue --thread UUID`, and it tells each MCP
 server which thread is calling (`_meta.threadId` on every tool call). So the
 Yip server inside a Codex session **binds delivery to that exact chat at its
-first Yip tool call** and runs `codex queue` itself for as long as the session
-lives. No UUID, registration or separate dispatcher is needed. The agent is
+first Yip tool call** and runs `codex queue` while its MCP server runs.
+After a resume/reload replaces that server, the replacement can dispatch to
+the previously recorded chat before another tool call. It does not guess its
+own thread identity or change the binding. No UUID, registration or separate
+dispatcher is needed. The agent is
 told to call `ring` early; the tool result confirms "Delivery connected".
 
-- Before that first Yip call nothing can name the chat; notices wait as pending
+- Before the first binding nothing can name the chat; notices wait as pending
   and inbox/hooks still show them.
 - The newest session to bind wins. An older one goes passive and takes over
-  again only if the newer one ends. Nothing is resent on a rebind.
+  again only if the newer binding has no live MCP server or dispatcher.
+  Nothing is resent on a rebind.
 - Idle chats start a turn; busy ones get the notice on their next turn. It
   does not interrupt tools or open a closed session.
 - `codex queue` success means `accepted`, not read: the agent records `read`
@@ -228,6 +232,8 @@ told to call `ring` early; the tool result confirms "Delivery connected".
 The previous manual route still works as a fallback:
 `yip delivery register EXACT-CHAT-UUID` plus
 `yip delivery dispatch --watch 1h` in a supervised terminal.
+An existing session binding needs only the dispatch command if no MCP server
+is running. A stopped MCP dispatcher does not prove the chat is closed.
 
 ### Antigravity TUI (`agy`): live delivery via `agentapi`
 
@@ -331,21 +337,20 @@ Use a distinct identity when changing transports or replacing a registered targe
 
 ## Switchboard and broadcasts
 
+To put colleagues on a project line across machines, follow the [team relay deployment guide](docs/LDR-TEAM-DEPLOYMENT.md). The [relay administration manual](docs/LDR-ADMINISTRATION.md) covers service setup, enrollment and recovery. The [relay client manual](docs/LDR-CLIENT.md) covers workstation setup, runtime attachment and the handoff to a configured agent.
+
 ```sh
 yip switchboard --line myproject
 yip switchboard --line myproject --by your-name
 ```
 
-Wide terminals show the **conversations list**, selected transcript and a desk
-with resource and agent state. Broadcasts sit in the conversations list by age: a
-new one starts at the top, and newer calls push it down as they arrive, **including
-after everyone replies**. Click one to open its transcript directly. Recipient
-counts, individual receipts and chronological replies use the same colors as
-ordinary conversations.
+The branch Switchboard opens Calls, Transcript and Line status. Drag a title bar to move a pane, use its corner to resize it, and click the title lamp to collapse it. The Follow lamp turns red when you scroll up and green when you reach the bottom. Click the switch to toggle it directly.
 
-Press **b** to compose a broadcast: choose recipients, choose a kind, enter the
-body, review the preview and type **SEND**. Escape retains the draft in memory;
-quitting Switchboard discards an unsent draft.
+From a new checkout choose **Actions → Create a Line**, name it, then choose **Add Agent**. Pick the provider and a worktree, shared seat or Codex profile. The install result includes the launch command. **Manage Lines** selects the line to observe. **Manage Agents** shows its registrations and delivery state. The framed **?** button or **F1** opens help for the active window.
+
+**Line topology** (F3) shows local attachments, enrolled workstations and relay actors. **Relays** (F4) lists attached local lines and their configured origins. Select one to observe its verified checkpoint, open client operations or detach. Choose **Connect** on a joining workstation and **Operator → Enroll workstation** on the operator's machine. Verify the descriptor and workstation fingerprints through a trusted channel. Keep private keys and the challenge secret on their originating machine. On the relay host, **Operator → Host a line → Monitor local admin socket** adds live admission counters.
+
+**Broadcasts** (F5) has its own composer. **Roadmaps** (F6) opens a wide station map. **Configuration** (F7) provides Doctor and resource settings. Forms show their inputs for review before applying them.
 
 | Kind | Purpose |
 | --- | --- |
@@ -370,42 +375,11 @@ through MCP or `yip api`. A broadcast does not transfer a conversation's floor,
 grant a resource, cancel a worker or establish verified approval. `--by` records
 attribution; it is not authentication of the person using the CLI.
 
-| Control | Action |
-| --- | --- |
-| Mouse click | Open a conversation or broadcast from the left list |
-| Mouse wheel | Scroll the pane under the pointer |
-| `1`, `2`, `3`, `4`, `5` | Transcript, desk, conversations, grouped broadcasts, the map |
-| `b` | Compose or resume a broadcast draft |
-| `Tab` / `n`, `p` | Next or previous conversation/broadcast; on the map, whose stations are listed |
-| `j` / `k`, arrows | Scroll |
-| `g`, `G`, `f` | Top, follow the end, toggle following |
-| `r` | Record human ratification on a call |
-| `d`, `a` | Select a dispute, arbitrate it |
-| `P` | Send a fresh probe to every session whose channel is connected but unverified |
-| `Enter`, `Esc` | Submit or cancel a prompt |
-| `Ctrl-L` | Repaint the whole screen, if something else wrote to the terminal |
-| `?`, `q` | Key help, quit |
-
-Selection stays attached to its conversation when traffic reorders the list.
-Mouse actions cannot change a decision's destination while its prompt is open.
-Small terminals expose the same content through the numbered views.
-
-Conversations sort by status and then by activity. A broadcast takes its place by
-age: it stands above the first call older than it, so newer calls push it down.
-
-Scrolling stays light on a large line. Input is drained and painted at most every
-16 ms, only the rows that changed are written, and painting never touches the disk:
-snapshots load off the input loop, re-reading a call only when its directories
-changed, and re-reading the whole line every 30 snapshots.
-
-```sh
-NO_COLOR=1 yip switchboard
-YIP_REDUCED_MOTION=1 yip switchboard
-```
+The mouse wheel scrolls the pane under the pointer. Use **View → Reset layout** to restore the primary pane layout, and **q** or **Switchboard → Quit** to exit. Input fields accept ordinary text, including q.
 
 ### The map
 
-Screen `5` draws each agent's arc as a transit line, with the station it is at
+The local Roadmaps window draws each agent's arc as a transit line, with the station it is at
 lit up, so you can look instead of asking:
 
 ```text
@@ -421,9 +395,7 @@ lit up, so you can look instead of asking:
 `●` is passed, `◉` is where the agent is, `○` is ahead, `⊘` is skipped or a
 detour not taken, and `⋯` is a fold. The time beside a line turns amber after
 six hours and red after a day: an old map may no longer be true, and it says so.
-`n`/`p` or a click choose whose stations are listed below the lines; clicking a
-station picks out its description. The side panel on other screens shows each
-agent's current station too.
+
 
 Agents keep it current themselves. Yip's help and its instructions to agents ask
 them to; if your project keeps its own agent contract, add it there too. It grants

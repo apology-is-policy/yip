@@ -42,24 +42,14 @@ release:
 all: build
 
 build:
+	cd cmd/switchboard && CGO_ENABLED=1 $(GO) build -o ../../yip-switchboard .
 	$(GO) build $(LDFLAGS) -o yip .
 
 install: build
-	@mkdir -p "$(dir $(BIN))"
-	rm -f "$(BIN)"
-	cp yip "$(BIN)"
-	@# Verify the INSTALLED path, not the build output. An exit >= 128 means a
-	@# signal killed it -- the exact failure this target exists to prevent --
-	@# and it must fail loudly rather than leave a dead hook behind. Any other
-	@# exit code means the binary RAN, which is all that is being asked here.
-	@"$(BIN)" version >/dev/null 2>&1; rc=$$?; \
-	 if [ $$rc -ge 128 ]; then \
-	   echo "FAIL: $(BIN) died with signal $$(($$rc - 128)) -- the install did not take"; \
-	   exit 1; \
-	 fi
-	@echo "installed $(BIN) ($$("$(BIN)" version))"
+	sh scripts/install-binary.sh ./yip "$(abspath $(BIN))"
 
 test:
+	cd cmd/switchboard && CGO_ENABLED=1 $(GO) test ./... && CGO_ENABLED=1 $(GO) run . --check
 	$(GO) test ./...
 	@# e2e.sh runs /tmp/yiptest. Building it HERE is not a convenience: without
 	@# it the suite silently exercises whatever stale binary was left there,
@@ -68,8 +58,8 @@ test:
 	./e2e.sh
 
 clean:
-	rm -f yip
+	rm -f yip yip-switchboard
 
 uninstall:
-	rm -f "$(BIN)"
+	rm -f "$(BIN)" "$(dir $(BIN))yip-switchboard"
 	@echo "removed executable only; line state and runtime config retained"

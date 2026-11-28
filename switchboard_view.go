@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,7 +17,11 @@ func colors() palette {
 	if _, ok := os.LookupEnv("NO_COLOR"); ok || os.Getenv("TERM") == "dumb" {
 		return palette{}
 	}
-	return palette{bg: "\033[48;5;234m", ink: "\033[38;5;255m", muted: "\033[38;5;248m", line: "\033[38;5;239m", cyan: "\033[38;5;117m", green: "\033[38;5;114m", amber: "\033[38;5;222m", red: "\033[38;5;210m", violet: "\033[38;5;183m", selected: "\033[48;5;237m", enabled: true}
+	return switchboardPalette()
+}
+
+func switchboardPalette() palette {
+	return palette{bg: "\033[48;5;234m", ink: "\033[38;5;255m", muted: "\033[38;5;248m", line: "\033[38;5;239m", cyan: "\033[38;5;117m", green: "\033[38;5;114m", amber: "\033[38;5;222m", red: "\033[38;5;210m", violet: "\033[38;5;183m", selected: "\033[48;5;23m", enabled: true}
 }
 func (p palette) text(style, s string) string {
 	s = strings.ReplaceAll(terminalText(s), "\n", " ")
@@ -33,6 +38,36 @@ func (v *view) activityGlyph() string {
 	}
 	return []string{"●", "◉", "●", "·"}[v.frame%4]
 }
+
+// Keep the view shortcuts in the same row at every terminal size.
+func (v *view) tabBar(cols int, p palette) string {
+	names := []string{"Chat", "Desk", "Calls", "Broadcasts", "Map"}
+	if v.st.relay != nil {
+		names = []string{"Chat", "Relay", "Calls", "", "Topology"}
+	}
+	gap := "  "
+	if cols < 56 {
+		gap = " "
+		if names[3] != "" {
+			names[3] = "Bcast"
+		}
+	}
+	var tabs []string
+	for i, name := range names {
+		if name == "" {
+			continue
+		}
+		key := strconv.Itoa(i + 1)
+		label := key + " " + name
+		if i == v.tab {
+			tabs = append(tabs, p.tag(p.selected+p.ink, "▸"+label))
+		} else {
+			tabs = append(tabs, p.text(p.muted, label))
+		}
+	}
+	return "  " + strings.Join(tabs, gap)
+}
+
 func (v *view) frameLines(rows, cols int) []string {
 	if rows < 1 || cols < 1 {
 		return nil
@@ -71,8 +106,12 @@ func (v *view) frameLines(rows, cols int) []string {
 		name = "local line"
 	}
 	header := p.text(p.cyan, "  ╭─ YIP ") + p.text(p.ink, "/ SWITCHBOARD")
-	right := fmt.Sprintf("%s  %d active · %d stale  ", name, open, stale)
-	put(fitCells(header, max(1, cols-plainWidth(right)), true) + p.text(p.muted, right))
+	right := p.text(p.cyan, "○ "+name) + p.text(p.muted, fmt.Sprintf("  %d active · %d stale  ", open, stale))
+	if v.st.relay != nil {
+		right = p.text(p.violet, "⇄ LDR · "+name+"  ")
+	}
+	put(fitCells(header, max(1, cols-plainWidth(right)), true) + right)
+	put(v.tabBar(cols, p))
 	put(p.text(p.line, "  ╰"+strings.Repeat("─", max(0, cols-5))) + p.text(p.cyan, "╮"))
 	sc := v.selectedConversation()
 	title := "No conversations yet"
@@ -92,9 +131,26 @@ func (v *view) frameLines(rows, cols int) []string {
 	if v.tab == 4 {
 		title, detail = "Where everyone is", "n/p or click: whose stations are listed · click a station: its description"
 	}
+	if v.st.relay != nil {
+		if sc == nil && v.st.relay.VerifiedAt.IsZero() {
+			title, detail = "Relay calls", "Connecting to the enrolled line…"
+		}
+		if v.tab == 4 {
+			title, detail = "Relay topology", "Enrolled credentials and their declared actors"
+		}
+		if v.tab == 1 {
+			title, detail = "Relay status", v.st.relay.Origin.URL
+		}
+		if v.st.err != "" {
+			detail = "Refresh failed · " + v.st.err
+		}
+	}
 	put("  " + p.text(p.ink, title))
-	put("  " + p.text(p.muted, detail))
-	put("")
+	detailColor := p.muted
+	if v.st.relay != nil && v.st.err != "" {
+		detailColor = p.red
+	}
+	put("  " + p.text(detailColor, detail))
 	bodyH := v.panes.height
 	railW, sideW, centerW := v.panes.railW, v.panes.sideW, v.panes.centerW
 	var transcript []string
@@ -106,7 +162,11 @@ func (v *view) frameLines(rows, cols int) []string {
 	case 3:
 		transcript = v.memoBroadcasts(centerW-4, p)
 	case 4:
-		transcript = v.mapLines(centerW-4, p)
+		if v.st.relay != nil {
+			transcript = v.relayTopology(p)
+		} else {
+			transcript = v.mapLines(centerW-4, p)
+		}
 	default:
 		transcript = v.memoTranscript(max(8, centerW-4), p)
 	}
@@ -153,9 +213,12 @@ func (v *view) frameLines(rows, cols int) []string {
 		typed := tailCells(terminalText(string(v.input)), max(1, cols-plainWidth(prompt)-5))
 		put("  " + p.text(p.violet, prompt) + " " + typed + p.text(p.cyan, "▏"))
 	} else {
-		help := "  click call · wheel over pane · tab/n next · p prev · j/k scroll · f follow · 1 chat 2 desk 3 calls 4 broadcasts 5 map · b compose · r ratify · a arbitrate · q quit"
-		if cols < 125 {
-			help = "  1 chat 2 desk 3 calls 4 broadcasts 5 map · b compose · r ratify · a arbitrate · ? help · q quit"
+		help := "  n/p select · j/k scroll · r ratify · a arbitrate · b compose · ? help · q quit"
+		if v.st.relay != nil {
+			help = "  n/p select · j/k scroll · f follow · ? help · q quit"
+		}
+		if cols < 56 {
+			help = "  n/p select · j/k scroll · ? help · q quit"
 		}
 		if v.flash != "" {
 			help = "  " + v.flash
@@ -213,6 +276,15 @@ func (v *view) memoTranscript(w int, p palette) []string {
 }
 func (v *view) styledTranscript(w int, p palette) []string {
 	sc := v.selectedConversation()
+	if v.st.relay != nil && sc != nil && (v.st.relay.Transcript == nil || v.st.relay.Transcript.ID != sc.call.ID) {
+		return []string{"Fetching transcript…"}
+	}
+	if sc == nil && v.st.relay != nil {
+		if v.st.relay.VerifiedAt.IsZero() {
+			return []string{"Awaiting verified line state"}
+		}
+		return []string{"No calls on this line."}
+	}
 	if sc == nil {
 		return []string{"", p.text(p.cyan, "A quiet line."), "", p.text(p.muted, "Open a call to begin a conversation.")}
 	}
@@ -221,18 +293,24 @@ func (v *view) styledTranscript(w int, p palette) []string {
 	}
 	var out []string
 	for _, e := range sc.entries {
-		color := p.cyan
+		color, glyph := p.cyan, "●"
 		switch e.kind {
+		case "TURN":
+			if e.from == sc.call.To {
+				color, glyph = p.violet, "◆"
+			}
 		case "NOTE":
-			color = p.muted
+			color, glyph = p.muted, "◇"
 		case "HUMAN":
-			color = p.violet
+			color, glyph = p.amber, "★"
 		case "BARGE":
-			color = p.red
+			color, glyph = p.red, "!"
 		case "STATE":
-			color = p.amber
+			color, glyph = p.amber, "↳"
+		case "ATTACHMENT":
+			color, glyph = p.muted, "+"
 		}
-		out = append(out, p.text(color, "● "+e.from)+p.text(p.muted, fmt.Sprintf("   %s  %s #%d", shortTime(e.at), e.kind, e.n)))
+		out = append(out, p.text(color, glyph+" "+e.from)+p.text(p.muted, fmt.Sprintf("   %s  %s #%d", shortTime(e.at), e.kind, e.n)))
 		for _, l := range wrap(terminalText(e.body), max(8, w-2)) {
 			out = append(out, p.text(p.line, "│ ")+l)
 		}
@@ -247,7 +325,7 @@ func (v *view) callRail(w int, p palette) []string {
 	if w < 1 {
 		return nil
 	}
-	out := []string{p.text(p.muted, "CONVERSATIONS"), ""}
+	out := []string{p.text(p.cyan, "CONVERSATIONS"), ""}
 	for i := range v.st.calls {
 		c := v.st.calls[i]
 		marker := "○"
@@ -285,13 +363,16 @@ func (v *view) dashboard(w int, p palette) []string {
 	if w < 8 {
 		return nil
 	}
+	if v.st.relay != nil {
+		return v.relayDashboard(w, p)
+	}
 	out := []string{}
 	if sc := v.selectedCall(); sc != nil && len(sc.disputes) > 0 {
 		out = append(out, p.text(p.violet, "DECISIONS · a arbitrate"))
 		out = append(out, v.disputeLines(w)...)
 		out = append(out, "")
 	}
-	out = append(out, p.text(p.muted, "SHARED MACHINES"), "")
+	out = append(out, p.text(p.cyan, "SHARED MACHINES"), "")
 	for _, r := range v.st.resources {
 		l := r.lease
 		color, label := p.green, "AVAILABLE"
@@ -334,7 +415,7 @@ func (v *view) dashboard(w int, p palette) []string {
 		}
 		out = append(out, "")
 	}
-	out = append(out, p.text(p.muted, "ON THE LINE"), "")
+	out = append(out, p.text(p.violet, "ON THE LINE"), "")
 	for _, a := range v.st.members {
 		if v.st.retired[a] {
 			continue

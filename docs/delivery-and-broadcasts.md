@@ -330,7 +330,25 @@ pending, and inbox/hooks still show them. The newest session to bind wins. A
 superseded session's server goes passive and takes over again only if the
 newer session ends. Rebinding never resends: notices accepted by an earlier
 chat stay `accepted` until acknowledged, and the new chat is told how many.
-Stopping the session releases the lock; status reports the binding as closed.
+Stopping the MCP server releases its thread lock; that does not prove the chat
+is closed. In Codex 0.171.0, a same-thread `thread/resume` was observed replacing
+the server while the TUI stayed open. Previously the replacement waited for a
+tool call before starting its dispatch loop, leaving an idle resumed chat
+unreachable until the operator spoke again.
+
+The dispatch loop now starts with the MCP server. Before receiving its own
+`_meta.threadId`, it may recover only an existing `session` binding with a
+recorded destination and no live thread-lock holder. A separate dispatcher
+lock elects one recovery watcher; normal endpoint transactions recheck the
+destination and preserve attempts. Recovery neither claims the recorded thread
+as its own nor changes the binding. A live bound server takes precedence, and
+paused/retired, unbound, invalid and other-runtime endpoints are not recovered.
+Manual registrations still require an explicitly started external dispatcher.
+`wait` sees recovery as a running dispatcher. Status distinguishes MCP loss
+from chat closure. If all MCP servers have stopped, run
+`yip delivery dispatch --watch 1h` against the existing binding, or reconnect
+the MCP server. Recovery does not add `codex queue --resume` or reopen chats.
+
 An identity whose retained endpoint belongs to Channels or tmux keeps it, and
 Codex push stays off under that name (install says so).
 

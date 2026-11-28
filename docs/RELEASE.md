@@ -1,8 +1,8 @@
 # Building, installing and qualifying a release
 
-Yip is MIT-licensed and uses Go's standard library. The module path is
+The Yip core uses Go's standard library. The Switchboard companion uses tcell and the vendored Korre ImTUI and Dear ImGui sources. Their notices ship with each archive. The module path is
 `github.com/apology-is-policy/yip`. Source builds need Go 1.25+, Git and a Unix
-host; Switchboard additionally uses a terminal and `stty`. Python 3.11+ is used
+host; building the Switchboard also requires native C and C++ compilers. Installed binaries require a terminal and the system C++ runtime. Python 3.11+ is used
 by packaging/integration tests, not by the installed Yip binary.
 
 Supported build targets are macOS and Linux on arm64/amd64. Native Windows is
@@ -17,13 +17,13 @@ python3 scripts/release.py --version YOUR_VERSION --out /absolute/output
 `GO=/path/to/go` selects the compiler. `--targets darwin/arm64` can build a subset.
 The release builder does not publish, tag or push anything. It refuses existing
 archive/checksum names, uses fixed archive timestamps, and emits `BUILD.json`
-with compiler/version and per-file Go source hashes plus `SHA256SUMS`. Use the
+with compiler/version and Go and C++ source hashes plus `SHA256SUMS`. Use the
 same toolchain and source to reproduce binaries. The builder checks free space
 before each target, preserving this deployment's 8 GiB floor. A completed target
 can remain if a later target fails; do not call a partial set a complete release.
 
-Each archive includes the binary, license, README, operating/resource guides,
-example config and an installer. Verify SHA256SUMS against your trusted release
+Each archive includes the core, its content-addressed Switchboard companion, license, README, operating/resource guides,
+example config and an installer. The [relay administration manual](LDR-ADMINISTRATION.md) and [relay client manual](LDR-CLIENT.md) are included under `docs/` in every target archive. Verify SHA256SUMS against your trusted release
 source before extracting/running it. The checksums are integrity evidence, not
 a signature or proof of publisher identity. No signed release is claimed.
 
@@ -33,6 +33,8 @@ yip version
 yip --help
 yip --help-agents
 ```
+
+Keep the extracted companion next to the core when installing. The installer exercises its headless rendering check and places it beside the installed core. Retain matching companions when rolling back. Native CI builds each supported target separately. For a cross build, supply matching compilers via `CC_linux_amd64` and `CXX_linux_amd64` (use the corresponding OS and architecture for other targets).
 
 The installer stages and executes a new inode before renaming it into place,
 backing up an existing executable. This avoids in-place writes to a running

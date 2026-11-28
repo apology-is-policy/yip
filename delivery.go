@@ -81,6 +81,13 @@ func deliveryID(agent, source string) string {
 // Source and outbox need no dual-write transaction: a crash before this write
 // leaves the source discoverable; a crash after it finds the same source ID.
 func deliverySnapshot(agent string) map[string]string {
+	if att, ok, err := loadLDRAttachment(); err != nil {
+		out := ldrHostLocalResourceSnapshot(agent)
+		out["ldr-config-error:"+err.Error()] = "LDR CONFIGURATION ERROR: " + err.Error()
+		return out
+	} else if ok {
+		return ldrDeliverySnapshot(att, agent)
+	}
 	out := map[string]string{}
 	for key, value := range watchSnapshot(agent) {
 		switch strings.SplitN(key, ":", 2)[0] {
@@ -189,6 +196,11 @@ func AckDelivery(agent, id string) error {
 			if ep.Events[i].ID == id {
 				if ep.Runtime == "claude-channels" && (ep.Events[i].ID == ep.ChannelProbe || strings.HasPrefix(ep.Events[i].Source, probePrefix(ep.Thread))) {
 					return fmt.Errorf("use channel_ack through the receiving MCP session for the probe")
+				}
+				if strings.HasPrefix(ep.Events[i].Source, "ldr:") {
+					if err := ldrAckNotice(ep.Events[i].Source); err != nil {
+						return err
+					}
 				}
 				ep.Events[i].Status = "read"
 				return nil
@@ -334,6 +346,14 @@ func DeliveryInbox(agent string) (string, error) {
 	if ep.Runtime == "claude-channels" {
 		ep.ChannelConnected = ep.ChannelConnected && channelOwnerAlive(agent)
 		ep.ChannelReady = ep.ChannelReady && ep.ChannelConnected
+	}
+	if ldrSt := inspectLDRDeliveryStatus(agent); ldrSt != nil {
+		type endpointWithLDR struct {
+			Endpoint
+			LDR *LDRDeliveryStatus `json:"ldr,omitempty"`
+		}
+		b, err := json.MarshalIndent(endpointWithLDR{Endpoint: ep, LDR: ldrSt}, "", "  ")
+		return string(b), err
 	}
 	b, err := json.MarshalIndent(ep, "", "  ")
 	return string(b), err

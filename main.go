@@ -50,6 +50,8 @@ DELIVERY AND BROADCASTS
   yip broadcast briefing --to a,b    body on stdin; CLI/operator attribution
   yip broadcast announcement|regroup --to a,b    same recipient snapshot
   yip api broadcasts             addressed broadcasts, including reply requests
+  yip relay init|provision|serve|status   operator-hosted LDR TLS 1.3 relay
+  yip ldr root|join|epoch|sync|actor|call|status   LDR client & ceremonies
 
 COMMANDS
 
@@ -185,9 +187,12 @@ func main() {
 	args, runtime = takeFlag(args, "--runtime", "claude")
 	var seat bool
 	var wakeWindow time.Duration
+	var ldrDir, ldrActor string
 	if cmd == "install" || cmd == "uninstall" || cmd == "doctor" {
 		args, profile = takeFlag(args, "--profile", "")
 		seat = hasFlag(args, "--seat")
+		args, ldrDir = takeFlag(args, "--ldr-dir", "")
+		args, ldrActor = takeFlag(args, "--ldr-actor", "")
 		var ww string
 		args, ww = takeFlag(args, "--wake-window", "")
 		if ww != "" {
@@ -197,8 +202,15 @@ func main() {
 		}
 	}
 
-	// Every command but install needs to know which line it is on before it
-	// can find anything; install resolves its own.
+	// Every command but install, relay, and standalone ldr needs to know which local line it is on.
+	if cmd == "relay" {
+		check(RelayCLI(args, os.Stdout))
+		return
+	}
+	if cmd == "ldr" && first(args) != "attach" && first(args) != "detach" {
+		check(LDRCLI(args, os.Stdout))
+		return
+	}
 	if cmd != "install" {
 		switch {
 		case line != "":
@@ -212,6 +224,13 @@ func main() {
 			}
 		}
 	}
+	if cmd == "ldr" {
+		if as != "" && first(args) == "attach" {
+			args = append(args, "--as", as)
+		}
+		check(LDRCLI(args, os.Stdout))
+		return
+	}
 
 	// A human observer does not beat as the agent registered at this checkout.
 	if cmd != "config" && cmd != "doctor" && cmd != "version" && cmd != "serve" && cmd != "hook" && cmd != "switchboard" && cmd != "ratify" && cmd != "settled" && cmd != "install" && cmd != "retire" && cmd != "broadcast" && cmd != "delivery" {
@@ -223,6 +242,11 @@ func main() {
 	case "config":
 		check(ResourceConfigCLI(args))
 	case "broadcast":
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			check(fmt.Errorf("local `yip broadcast` is not supported on LDR-attached lines; operator broadcasts require the operator key via `yip ldr broadcast create --dir <client-dir> --operator-key <key> ...`"))
+		}
 		check(BroadcastCLI(args))
 	case "delivery":
 		if first(args) == "listen" {
@@ -282,15 +306,37 @@ func main() {
 		fmt.Println(out)
 	case "inbox":
 		me := must(WhoAmI(as, ""))
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			out, err := (&server{me: me}).call("inbox", map[string]any{"all": first(args) == "--all"})
+			check(err)
+			fmt.Println(out)
+			return
+		}
 		out, err := Inbox(me, first(args) == "--all")
 		check(err)
 		fmt.Println(out)
 	case "retire":
 		me := must(WhoAmI(as, ""))
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			out, err := (&server{me: me}).call("retire", map[string]any{"undo": first(args) == "--undo"})
+			check(err)
+			fmt.Println(out)
+			return
+		}
 		check(Retire(me, first(args) != "--undo"))
 		fmt.Println("retirement updated")
 	case "install":
-		res, err := InstallWith("", line, as, local, runtime, InstallOptions{Seat: seat, Profile: profile, WakeWindow: wakeWindow})
+		res, err := InstallWith("", line, as, local, runtime, InstallOptions{
+			Seat:       seat,
+			Profile:    profile,
+			WakeWindow: wakeWindow,
+			LDRDir:     ldrDir,
+			LDRActor:   ldrActor,
+		})
 		check(err)
 		verb := "joined"
 		if res.Reinstall {
@@ -312,10 +358,14 @@ func main() {
 		for _, note := range res.Notes {
 			fmt.Printf("  note:     %s\n", note)
 		}
+		lineHint := ""
+		if line != "" {
+			lineHint = " --line " + res.Line
+		}
 		switch {
 		case runtime == "claude-channels":
 			fmt.Println("\nStart Claude here with: claude --dangerously-load-development-channels server:yip")
-			fmt.Println("Accept the preview warning yourself; organization policy still applies. After Claude acknowledges the probe, run yip doctor --runtime claude-channels.")
+			fmt.Printf("Accept the preview warning yourself; organization policy still applies. After Claude acknowledges the probe, run yip doctor --runtime claude-channels%s.\n", lineHint)
 		case runtime == "claude-rewake":
 			window := wakeWindow
 			if window == 0 {
@@ -323,12 +373,13 @@ func main() {
 			}
 			fmt.Printf("\nRestart Claude here. Each time a turn starts or ends, a background hook stays armed for %s:\n", window)
 			fmt.Println("a Yip notice then wakes the idle session (no Channels or tmux). Review new hooks in /hooks if asked.")
-			fmt.Println("Then: yip doctor --runtime claude-rewake")
+			fmt.Printf("Then: yip doctor --runtime claude-rewake%s\n", lineHint)
 		case runtime == "codex":
 			start, doc := "codex", "yip doctor --runtime codex"
 			if profile != "" {
 				start, doc = "codex -p "+profile+" -C /path/to/the/code", doc+" --profile "+profile
 			}
+			doc += lineHint
 			fmt.Printf("\nStart Codex with: %s   (restart an already-open session)\n", start)
 			fmt.Println("Review and trust the Yip hooks in /hooks. Delivery binds to the chat at its first Yip tool call;")
 			fmt.Printf("no UUID or separate dispatcher is needed. Then: %s\n", doc)
@@ -337,9 +388,9 @@ func main() {
 			fmt.Println("Live idle wakeups connect when the session runs its daemon listener via run_command (IsDaemon=true):")
 			fmt.Printf("  %s\n", agyListenCommand(res.Bin, res.Line, res.Agent))
 			fmt.Println("Multiple sessions from one launch folder can each call the Yip `bind` MCP tool with their own worktree;")
-			fmt.Println("the running listener follows the binding automatically. Then: yip doctor --runtime agy")
+			fmt.Printf("the running listener follows the binding automatically. Then: yip doctor --runtime agy%s\n", lineHint)
 		default:
-			fmt.Printf("\nRestart %s here, then yip doctor --runtime %s. Review and trust new hooks in the runtime.\n", runtime, runtime)
+			fmt.Printf("\nRestart %s here, then yip doctor --runtime %s%s. Review and trust new hooks in the runtime.\n", runtime, runtime, lineHint)
 		}
 	case "uninstall":
 		// Without an explicit line, leave the lines this checkout actually
@@ -430,6 +481,14 @@ func main() {
 		RunHookRuntime(args[0], as, runtime)
 	case "ring":
 		me := must(WhoAmI(as, ""))
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			out, err := (&server{me: me}).call("ring", nil)
+			check(err)
+			fmt.Println(out)
+			return
+		}
 		out, err := RingText(me)
 		check(err)
 		fmt.Println(out)
@@ -460,6 +519,14 @@ func main() {
 		fmt.Println(out)
 	case "bye":
 		me := must(WhoAmI(as, ""))
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			out, err := (&server{me: me}).call("bye", map[string]any{"call": first(args)})
+			check(err)
+			fmt.Println(out)
+			return
+		}
 		c, err := ResolveCall(first(args), me)
 		check(err)
 		check(SetBye(c, me))
@@ -470,6 +537,14 @@ func main() {
 		}
 	case "presence":
 		me, _ := WhoAmI(as, "")
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			out, err := (&server{me: me}).call("presence", map[string]any{"peer": first(args)})
+			check(err)
+			fmt.Println(out)
+			return
+		}
 		out, err := presenceText(first(args), me)
 		check(err)
 		fmt.Println(out)
@@ -486,6 +561,18 @@ func main() {
 			if n, err := strconv.Atoi(a); err == nil {
 				pids = append(pids, n)
 			}
+		}
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			rawPids := make([]any, len(pids))
+			for i, p := range pids {
+				rawPids[i] = float64(p)
+			}
+			out, err := (&server{me: me}).call("busy", map[string]any{"text": args[0], "pids": rawPids})
+			check(err)
+			fmt.Println(out)
+			return
 		}
 		check(SetBusy(me, args[0], pids))
 		fmt.Println("ok")
@@ -561,6 +648,14 @@ func main() {
 		check(Beat(me, ""))
 	case "calls":
 		me, _ := WhoAmI(as, "")
+		if att, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			out, err := ldrCallsListText(att, me)
+			check(err)
+			fmt.Println(out)
+			return
+		}
 		calls, err := ListCalls()
 		check(err)
 		if len(calls) == 0 {
@@ -578,6 +673,14 @@ func main() {
 		}
 	case "note":
 		me := must(WhoAmI(as, ""))
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			out, err := (&server{me: me}).call("note", map[string]any{"call": first(args), "body": stdinBody()})
+			check(err)
+			fmt.Println(out)
+			return
+		}
 		c, err := ResolveCall(first(args), me)
 		check(err)
 		body := stdinBody()
@@ -585,6 +688,11 @@ func main() {
 		check(err)
 		fmt.Printf("note %d on %s (floor unchanged: %s)\n", n, c.ID, floorOf(c))
 	case "ratify":
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			check(fmt.Errorf("local `yip ratify` is not supported on LDR-attached lines; human ratification requires the operator key via `yip ldr call ratify --dir <client-dir> --operator-key <key> --call <id> --body ...`"))
+		}
 		// The human seat. No MCP tool exists for this on purpose.
 		by := os.Getenv("USER")
 		args, by = takeFlag(args, "--by", by)
@@ -598,6 +706,11 @@ func main() {
 		check(err)
 		fmt.Printf("ratification %d recorded on %s as %s (human)\n", n, c.ID, by)
 	case "watch":
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			check(fmt.Errorf("local `yip watch` is not supported on LDR-attached lines; use `yip delivery listen` or `yip api wait`"))
+		}
 		me := must(WhoAmI(as, ""))
 		launch := must(launchIdentity(as, ""))
 		explicit := as != "" || os.Getenv("YIP_AGENT") != ""
@@ -629,6 +742,14 @@ func main() {
 		me := must(WhoAmI(as, ""))
 		var callID string
 		args, callID = takeFlag(args, "--call", "")
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			out, err := (&server{me: me}).call("dispute", map[string]any{"call": callID, "claim": first(args)})
+			check(err)
+			fmt.Println(out)
+			return
+		}
 		c, err := ResolveCall(callID, me)
 		check(err)
 		if claim := first(args); claim != "" {
@@ -654,17 +775,30 @@ func main() {
 		me := must(WhoAmI(as, ""))
 		var callID string
 		args, callID = takeFlag(args, "--call", "")
-		c, err := ResolveCall(callID, me)
-		check(err)
 		id, cmdStr := "", first(args)
 		if len(args) > 1 {
 			id, cmdStr = args[0], args[1]
 		}
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			out, err := (&server{me: me}).call("measure", map[string]any{"call": callID, "dispute": id, "cmd": cmdStr})
+			check(err)
+			fmt.Println(out)
+			return
+		}
+		c, err := ResolveCall(callID, me)
+		check(err)
 		d, err := ResolveDispute(c, id)
 		check(err)
 		check(SetMeasurement(c, d, me, cmdStr))
 		fmt.Printf("%s recorded for %s\n%s\n", me, d.ID, DisputeStatus(c, d))
 	case "settled":
+		if _, ok, err := loadLDRAttachment(); err != nil {
+			check(err)
+		} else if ok {
+			check(fmt.Errorf("local `yip settled` is not supported on LDR-attached lines; use `yip ldr call resolve --dir <client-dir> --from <actor> --call <id> --dispute <id> --detail ...`"))
+		}
 		me := must(WhoAmI(as, ""))
 		var callID string
 		args, callID = takeFlag(args, "--call", "")
@@ -690,21 +824,34 @@ func main() {
 		me := must(WhoAmI(as, ""))
 		printSetup(me)
 	case "switchboard":
-		// The human's live seat. It can ratify and arbitrate; it deliberately
-		// has no key that speaks as an agent -- see switchboard.go.
-		if err := Switchboard(parseSwitchboardArgs(args)); err != nil {
-			fmt.Fprintln(os.Stderr, "switchboard:", err)
-			os.Exit(1)
-		}
-	case "doctor":
-		if runtime == "claude-channels" {
-			me := must(WhoAmI(as, ""))
-			fmt.Println(EndpointStatus(me))
-			if !channelPreferred(me) {
-				os.Exit(1)
-			}
+		if hasFlag(args, "--snapshot-stream") {
+			check(serveSwitchboardSnapshots(context.Background(), os.Stdin, os.Stdout))
 			return
 		}
+		if first(args) == "--renderer-name" {
+			fmt.Println(switchboardRenderer)
+			return
+		}
+		switch first(args) {
+		case "--create-line":
+			check(createSwitchboardLine(args[1:]))
+		case "--arbitrate", "--reprobe":
+			message, err := switchboardOperator(args[0], args[1:])
+			check(err)
+			fmt.Println(message)
+		case "--reference":
+			check(Switchboard(parseSwitchboardArgs(args)))
+		default:
+			if line == "" && os.Getenv("YIP_LINE") == "" && os.Getenv("YIP_ROOT") == "" {
+				if hosts := linesHosting(checkoutRoot("")); len(hosts) == 1 {
+					activeLine = hosts[0]
+				}
+			}
+			check(launchSwitchboard(args))
+		}
+	case "doctor":
+		doctorExplicitLine = line
+		defer func() { doctorExplicitLine = "" }()
 		if runtime == "codex" {
 			check(CodexDoctor("", profile))
 			return
@@ -713,13 +860,32 @@ func main() {
 			check(AgyDoctor(""))
 			return
 		}
+		check(resolveDoctorLine(mcpConfiguredLine(checkoutRoot("")), filepath.Join(checkoutRoot(""), ".mcp.json")))
+		if runtime == "claude-channels" {
+			me := must(WhoAmI(as, ""))
+			ldrSummary, ldrErr := checkLDRDoctor(me)
+			fmt.Println(EndpointStatus(me))
+			if ldrSummary != "" {
+				fmt.Printf("ldr: %s\n", ldrSummary)
+			}
+			check(ldrErr)
+			if !channelPreferred(me) {
+				os.Exit(1)
+			}
+			return
+		}
 		if runtime == "claude-rewake" {
 			me := must(WhoAmI(as, ""))
 			_, hooksIn := hookInstalled(checkoutRoot(""))
 			if !strings.Contains(strings.Join(hooksIn, " "), "rewake (2/2)") {
 				check(fmt.Errorf("claude-rewake hooks missing for %s (found: %s); re-run yip install --runtime claude-rewake", me, orDash(strings.Join(hooksIn, ", "))))
 			}
+			ldrSummary, ldrErr := checkLDRDoctor(me)
+			check(ldrErr)
 			fmt.Printf("hooks: %s\ndelivery: %s\n", strings.Join(hooksIn, ", "), EndpointStatus(me))
+			if ldrSummary != "" {
+				fmt.Printf("ldr: %s\n", ldrSummary)
+			}
 			fmt.Println("Armed means a background waiter is running; it re-arms each time a turn starts or ends. This does not prove Claude woke: verify a notice is received and acknowledged.")
 			return
 		}
@@ -930,13 +1096,58 @@ func doctor(as string) {
 		say(true, "peers: none yet -- run `yip install` in another checkout")
 	}
 	if err == nil {
-		if rings, err := RingFor(me); err == nil {
+		ldrSummary, ldrErr := checkLDRDoctor(me)
+		if ldrErr != nil {
+			say(false, "ldr: %v", ldrErr)
+		} else if ldrSummary != "" {
+			say(true, "ldr: %s", ldrSummary)
+		} else if rings, rerr := RingFor(me); rerr == nil {
 			say(true, "ringing: %d", len(rings))
 		}
 	}
 	if !ok {
 		os.Exit(1)
 	}
+}
+
+var doctorExplicitLine string
+
+func resolveDoctorLine(configuredLine, source string) error {
+	configuredLine = strings.TrimSpace(configuredLine)
+	if configuredLine == "" {
+		return nil
+	}
+	want := slugify(configuredLine)
+	if doctorExplicitLine != "" && slugify(doctorExplicitLine) != want {
+		return fmt.Errorf("%s is configured for line %q, not --line %q", source, want, slugify(doctorExplicitLine))
+	}
+	if doctorExplicitLine == "" && os.Getenv("YIP_ROOT") == "" && os.Getenv("YIP_LINE") == "" {
+		activeLine = want
+	}
+	return nil
+}
+
+func mcpConfiguredLine(root string) string {
+	if m, err := readJSON(filepath.Join(root, ".mcp.json")); err == nil {
+		if servers, ok := m["mcpServers"].(map[string]any); ok {
+			if yipSrv, ok := servers["yip"].(map[string]any); ok {
+				rawArgs, _ := yipSrv["args"].([]any)
+				for i := 0; i+1 < len(rawArgs); i++ {
+					flag, _ := rawArgs[i].(string)
+					val, _ := rawArgs[i+1].(string)
+					if flag == "--line" && val != "" {
+						return val
+					}
+				}
+			}
+		}
+	}
+	if doctorExplicitLine == "" && os.Getenv("YIP_ROOT") == "" && os.Getenv("YIP_LINE") == "" {
+		if hosts := linesHosting(root); len(hosts) == 1 {
+			return hosts[0]
+		}
+	}
+	return ""
 }
 
 func orDash(s string) string {
