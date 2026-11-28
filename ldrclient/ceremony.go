@@ -26,18 +26,19 @@ func PathsAlias(a, b string) (bool, error) {
 			return true, nil
 		}
 	}
-	ca, err := canonicalPathForAliasCheck(a)
+	ca, err := CanonicalPath(a)
 	if err != nil {
 		return false, err
 	}
-	cb, err := canonicalPathForAliasCheck(b)
+	cb, err := CanonicalPath(b)
 	if err != nil {
 		return false, err
 	}
 	return ca == cb, nil
 }
 
-func canonicalPathForAliasCheck(p string) (string, error) {
+// CanonicalPath resolves existing ancestors and preserves an as-yet-uncreated suffix.
+func CanonicalPath(p string) (string, error) {
 	abs, err := filepath.Abs(p)
 	if err != nil {
 		return "", err

@@ -157,6 +157,8 @@ func run(screen tcell.Screen, yip, dir string) (foregroundArgs []string) {
 			args, body, err := a.arguments(values)
 			if err != nil {
 				actionStatus(err.Error(), false, true)
+			} else if a.command == "@wizard-serve" {
+				return append([]string{"ldr", "wizard", "serve"}, args[1:]...)
 			} else if a.command == "@serve" {
 				return append([]string{"relay", "serve"}, args[1:]...)
 			} else if a.command == "@line" && os.Getenv("YIP_ROOT") != "" {

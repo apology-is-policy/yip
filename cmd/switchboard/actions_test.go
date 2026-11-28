@@ -87,3 +87,17 @@ func TestActionArgumentsExpandFilesystemFieldsOnly(t *testing.T) {
 		})
 	}
 }
+
+func TestWizardSeatUsesActivatedClient(t *testing.T) {
+	for _, a := range actions {
+		if a.command == "@wizard-attach" {
+			got, _, err := a.arguments([]string{"/tmp/station one", "office", "codex", "alice"})
+			want := []string{"ldr", "attach", "--dir", "/tmp/station one/client", "--line", "office", "--as", "codex", "--actor", "alice"}
+			if err != nil || !reflect.DeepEqual(got, want) {
+				t.Fatalf("attach: %q %v", got, err)
+			}
+			return
+		}
+	}
+	t.Fatal("missing local attachment step")
+}

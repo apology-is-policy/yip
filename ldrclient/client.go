@@ -741,6 +741,37 @@ func (c *Client) Descriptor() (ldrcrypto.CreationDescriptor, [32]byte, [32]byte,
 	return c.desc, c.cfg.DescriptorDigest, c.cfg.GenesisAnchor, c.profDigest
 }
 
+// SignedDescriptor returns the original verified envelope for a portable invitation.
+func (c *Client) SignedDescriptor() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return bytes.Clone(c.cfg.SignedDescriptor)
+}
+
+// EnrollmentProgress checks the request against verified history and reports
+// whether a new epoch has committed since this particular admission.
+func (c *Client) EnrollmentProgress(id, requestID, digest string) (matched, rekeyed bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, entry := range c.entries {
+		if entry.decoded == nil {
+			continue
+		}
+		switch entry.decoded.OpType {
+		case "credential_enroll":
+			r := entry.decoded.Record
+			if r.Cred == id {
+				matched = r.JoinRequest == requestID && r.JoinRequestDigest == digest
+			}
+		case "key_epoch_activate":
+			if matched {
+				return true, true
+			}
+		}
+	}
+	return matched, false
+}
+
 // State returns a deep copy of the verified derived state.
 func (c *Client) State() ldrcore.State {
 	c.mu.Lock()

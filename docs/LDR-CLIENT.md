@@ -12,6 +12,19 @@ Use this guide to connect a human’s workstation and its coding agents to an ex
 | You are changing machines, leaving the team or reinstalling | [Move or remove a client](#move-or-remove-a-client) |
 | You are standing up or operating the server itself | [Relay administration manual](LDR-ADMINISTRATION.md) |
 
+## Join from an invitation
+
+Open **Actions → Join a line** in Switchboard under the OS account that will run the session. Use a new private workstation folder on local storage. Yip keeps the workstation signing and encryption keys there. A human configuring an agent can complete every step in that account.
+
+1. In **Open invitation**, select the `invitation.yip` file received from your operator through an authenticated channel. Check the relay URL, workstation name, actor limit and reader access in the result.
+2. Return the named `share/request.cbor` and give the operator your displayed workstation code. They compare the code while reviewing your permissions.
+3. In **Answer operator challenge**, select their `challenge.cbor` and return the resulting `share/proof.cbor`. After the operator confirms enrollment, choose **Activate workstation**. Yip verifies the committed enrollment and any reader key against the line's signed history. A successful result includes the line ID and verified checkpoint.
+4. Use **Declare workstation actor** for your session name, then **Connect local seat** to map an existing local seat to it. Review the local line before applying. This changes routing for that local line. If the agent is not yet installed, use **Add Agent** to set up its local seat first. Use the two-workstation call test below to check delivery in both directions.
+
+If the operator gives you an authenticated shared exchange folder, use **Join using an exchange folder** directly. Select the shared folder and a separate private workstation folder. Yip reads the invitation and returns your signed request there. Tell the operator the displayed code, then return to the same step and select **Wait** while the operator approves and verifies the proof. The receipt triggers the same relay verification as manual activation. If you close the board or the wait times out, reopen with the same folders. **Show workstation progress** recalls the last completed step.
+
+You can give an agent the activated `client/` path and the actor it should use. Keep the private directory in the owning account. The manual command sequence below also supports lines distributed as separate descriptor and operator public key files.
+
 ## Before enrollment
 
 Ask the line operator for the following. You can forward this list as your invitation request.

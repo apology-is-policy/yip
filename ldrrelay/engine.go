@@ -1110,10 +1110,21 @@ func (e *RelayEngine) Query(lineID []byte, authPrincipal ldrcrypto.Principal, ke
 	if rt.quarantined {
 		return SubmitReply{Class: ldrcore.ClassAdmission, Code: "storage_quarantined"}
 	}
+	_, stg := rt.resolveSignerKeyLocked(authPrincipal)
 	if rt.state.Line.Generation == 0 {
+		// The only possible commit here is line_init. A pinned root may resolve
+		// its own genesis operation after a restart before that first delivery.
+		if stg == standingBootstrapRoot && key.Signer == authTok && key.Generation == 1 && key.SeenSeq == 0 {
+			if rep, found := rt.recordedLocked(key, digest); found {
+				return rep
+			}
+			if _, trusted := rt.clock.Reading(); !trusted {
+				return SubmitReply{Class: ldrcore.ClassAdmission, Code: "clock_uncertain"}
+			}
+			return SubmitReply{Class: ldrcore.ClassUnknown, Code: "outcome_unknown"}
+		}
 		return SubmitReply{Class: ldrcore.ClassAdmission, Code: "no_line"}
 	}
-	_, stg := rt.resolveSignerKeyLocked(authPrincipal)
 	switch stg {
 	case standingRevoked:
 		return SubmitReply{Class: ldrcore.ClassUnresolved, Code: "revoked"}

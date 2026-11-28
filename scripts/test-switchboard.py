@@ -20,7 +20,7 @@ evidence = Path(sys.argv[2]).resolve()
 evidence.mkdir(parents=True, exist_ok=True)
 with tempfile.TemporaryDirectory(prefix='yip-pty-') as tmp:
     root = Path(tmp)
-    env = dict(os.environ, YIP_ROOT=str(root/'line'), YIP_HOME=str(root/'home'),
+    env = dict(os.environ, HOME=str(root), YIP_ROOT=str(root/'line'), YIP_HOME=str(root/'home'),
                YIP_LINE='isolated-ui-fixture', TERM='xterm-256color')
     env.pop('NO_COLOR', None)
     def cli(*args, body=None):
@@ -142,6 +142,37 @@ with tempfile.TemporaryDirectory(prefix='yip-pty-') as tmp:
                     wait_for(window_open, f'{label.decode()} to open')
                     os.write(master,key)
                     drain(.15)
+                def click_label(label, row_offset=0):
+                    rows = terminal_rows(output, 160, 44)
+                    y, row = next((y, row) for y, row in enumerate(rows) if label in row)
+                    x = row.index(label) + len(label) // 2 + 1
+                    for suffix in ('M', 'm'):
+                        os.write(master, f'\x1b[<0;{x};{y+1+row_offset}{suffix}'.encode())
+                        drain(.12)
+
+                for title, field in [('Set up a relay', 'Public HTTPS URL'),
+                                     ('Invite a workstation', 'Workstation name'),
+                                     ('Join a line', 'Invitation from operator')]:
+                    click_label('Actions')
+                    wait_for(lambda: any(title in row for row in terminal_rows(output,160,44)),
+                             f'{title} menu entry')
+                    click_label(title)
+                    wait_for(lambda: any(field in row for row in terminal_rows(output,160,44)),
+                             f'{title} first step')
+                    (evidence/(title.replace(' ', '-')+'.txt')).write_text(
+                        '\n'.join(terminal_rows(output,160,44)))
+                    if title == 'Set up a relay':
+                        click_label(field, row_offset=1)
+                        os.write(master, b'https://localhost:8443')
+                        wait_for(lambda: any('localhost:8443' in row for row in terminal_rows(output,160,44)),
+                                 'host URL to appear')
+                        click_label('Review')
+                        wait_for(lambda: any('Apply' in row for row in terminal_rows(output,160,44)),
+                                 'host identity review')
+                        click_label('Apply')
+                        bundle = root/'.yip-ldr/relay-host/share/host.yip'
+                        wait_for(bundle.exists, 'host identity bundle')
+                        assert json.loads(bundle.read_text())['url'] == 'https://localhost:8443'
                 os.write(master,b'q')
             else:
                 os.kill(int(pidfile.read_text()),signal.SIGTERM)

@@ -6,6 +6,8 @@ Use one signed project line, a private client directory per colleague’s workst
 
 For host operation, backup and key incidents use the [relay administration manual](LDR-ADMINISTRATION.md). For workstation enrollment, runtime configuration and agent handoff use the [relay client manual](LDR-CLIENT.md).
 
+For guided setup, start with **Switchboard → Actions → Set up a relay**. Existing operators can go directly to **Invite a workstation**. Colleagues use **Join a line**. [Guided administration](LDR-ADMINISTRATION.md#guided-setup-in-switchboard) · [Join from an invitation](LDR-CLIENT.md#join-from-an-invitation)
+
 ## 1. Relay administrator — prepare the shared host
 
 Run the relay under a dedicated, unprivileged service account with a private, persistent data directory. In that account, substitute your internal DNS name for `relay.internal` and generate the server certificate.

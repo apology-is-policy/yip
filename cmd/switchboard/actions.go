@@ -65,7 +65,31 @@ var callID = field("Call ID", "--call")
 var fromActor = field("Sending actor", "--from")
 var message = field("Message", "--body")
 var dispute = field("Dispute ID", "--dispute")
+var setupFolder = pathField("Private operator setup folder", "--workspace")
+var hostFolder = pathField("Private relay host folder", "--workspace")
+var inviteFolder = pathField("Private folder for this invitation", "--workspace")
+var memberFolder = pathField("Private workstation folder", "--workspace")
+var exchangeFolder = pathField("Authenticated exchange folder", "--exchange")
 var actions = []boardAction{
+	form("Set up a relay", "Create host identity", "ldr wizard host", hostFolder, field("Public HTTPS URL", "--url"), toggle("Use a WebSocket tunnel", "--tunnel")),
+	form("Set up a relay", "Prepare keys and sign line", "ldr wizard prepare", setupFolder, pathField("Host identity from relay", "--in"), optionalPath("First root key location", "--root-a"), optionalPath("Second root key location", "--root-b"), optionalPath("Operator key location", "--operator-key")),
+	form("Set up a relay", "Provision on relay host", "ldr wizard provision", hostFolder, pathField("Signed line from operator", "--in")),
+	form("Set up a relay", "Start relay here", "@wizard-serve", hostFolder, optional("Listener address override", "--listen")),
+	form("Set up a relay", "Initialize line", "ldr wizard initialize", setupFolder),
+	form("Set up a relay", "Show setup progress", "ldr wizard status", setupFolder),
+	form("Invite a workstation", "Create invitation", "ldr wizard invite", inviteFolder, field("Workstation name", "--namespace"), optionalPath("Operator setup folder", "--setup"), optional("Maximum actors (default 4)", "--actor-limit"), toggle("Exclude encrypted content", "--no-reader"), optionalPath("Existing operator client directory", "--admin-dir"), optionalPath("Existing operator signing key", "--operator-key")),
+	form("Invite a workstation", "Review workstation request", "ldr wizard review", inviteFolder, pathField("Request from workstation", "--in")),
+	form("Invite a workstation", "Approve workstation", "ldr wizard approve", inviteFolder, field("Code from workstation owner", "--code")),
+	form("Invite a workstation", "Complete enrollment", "ldr wizard admit", inviteFolder, pathField("Proof from workstation", "--in")),
+	form("Invite a workstation", "Pair using an exchange folder", "ldr wizard exchange-invite", inviteFolder, exchangeFolder, optional("Confirmed workstation code", "--code"), toggle("Wait for the workstation (2 minutes)", "--wait")),
+	form("Invite a workstation", "Show invitation progress", "ldr wizard status", inviteFolder),
+	form("Join a line", "Open invitation", "ldr wizard join", memberFolder, pathField("Invitation from operator", "--in")),
+	form("Join a line", "Answer operator challenge", "ldr wizard prove", memberFolder, pathField("Challenge from operator", "--in")),
+	form("Join a line", "Activate workstation", "ldr wizard activate", memberFolder),
+	form("Join a line", "Declare workstation actor", "@wizard-declare", memberFolder, actorField),
+	form("Join a line", "Connect local seat", "@wizard-attach", memberFolder, lineField, field("Local seat", "--as"), actorField),
+	form("Join a line", "Join using an exchange folder", "ldr wizard exchange-join", memberFolder, exchangeFolder, toggle("Wait for the operator (2 minutes)", "--wait")),
+	form("Join a line", "Show workstation progress", "ldr wizard status", memberFolder),
 	form("Connect to relay", "Inspect signed descriptor", "ldr inspect", descriptor),
 	form("Connect to relay", "Verify relay connection", "ldr inspect --probe", descriptor, digest),
 	form("Connect to relay", "Create workstation request", "ldr join request", descriptor, digest, clientDir, field("Workstation namespace", "--namespace"), optional("Actor limit", "--actor-limit"), toggle("Receive encrypted content", "--reader"), pathField("Save request to", "--out")),
@@ -291,6 +315,15 @@ func (a boardAction) arguments(values []string) (args []string, body string, err
 			args = append(args, f.flag)
 		}
 		args = append(args, v)
+	}
+	switch a.command {
+	case "@wizard-declare", "@wizard-attach":
+		command := []string{"ldr", "actor", "declare"}
+		if a.command == "@wizard-attach" {
+			command = []string{"ldr", "attach"}
+		}
+		command = append(command, "--dir", filepath.Join(args[2], "client"))
+		args = append(command, args[3:]...)
 	}
 	return args, body, nil
 }

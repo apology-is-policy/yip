@@ -23,6 +23,8 @@ import (
 
 const ldrUsage = `yip ldr -- Long Distance Relay client, equal-roots admin, and P3 enrollment ceremony.
 
+  yip ldr wizard help    Guided relay setup and workstation enrollment
+
   yip ldr inspect --descriptor <file> [--expect <trusted-digest> --probe]
 
   ROOT & LINE BOOTSTRAP (equal 1-of-2 roots, Ed25519 or ECDSA P-256)
@@ -68,6 +70,8 @@ func LDRCLI(args []string, out io.Writer) error {
 	}
 	group, rest := args[0], args[1:]
 	switch group {
+	case "wizard":
+		return wizardCLI(rest, out)
 	case "inspect":
 		rest, path := takeFlag(rest, "--descriptor", "")
 		rest, expected := takeFlag(rest, "--expect", "")
@@ -129,6 +133,10 @@ func ldrTimeoutCtx() (context.Context, context.CancelFunc) {
 }
 
 func ldrRootCLI(args []string, out io.Writer) error {
+	return ldrRootAction(args, out, "authorize_operator")
+}
+
+func ldrRootAction(args []string, out io.Writer, action string) error {
 	if len(args) == 0 {
 		return errors.New("usage: yip ldr root <keygen|descriptor|init-line|authorize-operator|replace-root|reader-request>")
 	}
@@ -391,43 +399,7 @@ func ldrRootCLI(args []string, out io.Writer) error {
 			return err
 		}
 		defer cl.Close()
-		cl.AttachRootKey(rootKM)
-
-		ctx, cancel := ldrTimeoutCtx()
-		defer cancel()
-		sess, err := cl.Dial(ctx, ldrcrypto.PrincipalRoot)
-		if err != nil {
-			return err
-		}
-		defer sess.Close()
-		desc, cd, _, _ := cl.Descriptor()
-		rk0, _ := desc.RootKeys[0].ToCBOR()
-		rk1, _ := desc.RootKeys[1].ToCBOR()
-		profMap, _ := desc.Profile.ToCBORMap()
-		opID, err := cl.ComposeAndPersist(ldrclient.ComposeParams{
-			Action: "line_init", Origin: ldrcore.OriginRoot, OpType: "line_init",
-			Fields: ldrcrypto.Map{
-				{Key: "descriptor_digest", Value: cd[:]},
-				{Key: "profile", Value: profMap},
-				{Key: "root_keys", Value: []any{rk0, rk1}},
-			},
-		})
-		if err != nil {
-			return err
-		}
-		rep, err := cl.Send(ctx, sess, opID)
-		if err != nil {
-			return err
-		}
-		if rep.Outcome.Kind != ldrcore.Committed {
-			return fmt.Errorf("line_init did not commit: %s %s %s", rep.Class, rep.Code, rep.Outcome.Reason)
-		}
-		if _, err := cl.Sync(ctx, sess); err != nil {
-			return err
-		}
-		return json.NewEncoder(out).Encode(map[string]any{
-			"op_id": opID, "seq": rep.Outcome.Seq, "head": hex.EncodeToString(rep.Head[:]),
-		})
+		return ldrInitializeClient(cl, rootKM, out, "line_init")
 
 	case "authorize-operator":
 		var dir, rootKeyPath, opPubPath string
@@ -468,7 +440,7 @@ func ldrRootCLI(args []string, out io.Writer) error {
 		}
 		st := cl.State()
 		opID, err := cl.ComposeAndPersist(ldrclient.ComposeParams{
-			Action: "authorize_operator", Origin: ldrcore.OriginRoot, OpType: "operator_key_authorize",
+			Action: action, Origin: ldrcore.OriginRoot, OpType: "operator_key_authorize",
 			Expect: ldrcrypto.ExpectMap{"root_rev": uint64(st.Line.RootRev)},
 			Fields: ldrcrypto.Map{{Key: "operator_key", Value: opCBOR}},
 		})
@@ -597,7 +569,51 @@ func ldrRootCLI(args []string, out io.Writer) error {
 	}
 }
 
+func ldrInitializeClient(cl *ldrclient.Client, rootKM *ldrclient.SigningKeyMaterial, out io.Writer, action string) error {
+	cl.AttachRootKey(rootKM)
+
+	ctx, cancel := ldrTimeoutCtx()
+	defer cancel()
+	sess, err := cl.Dial(ctx, ldrcrypto.PrincipalRoot)
+	if err != nil {
+		return err
+	}
+	defer sess.Close()
+	desc, cd, _, _ := cl.Descriptor()
+	rk0, _ := desc.RootKeys[0].ToCBOR()
+	rk1, _ := desc.RootKeys[1].ToCBOR()
+	profMap, _ := desc.Profile.ToCBORMap()
+	opID, err := cl.ComposeAndPersist(ldrclient.ComposeParams{
+		Action: action, Origin: ldrcore.OriginRoot, OpType: "line_init",
+		Fields: ldrcrypto.Map{
+			{Key: "descriptor_digest", Value: cd[:]},
+			{Key: "profile", Value: profMap},
+			{Key: "root_keys", Value: []any{rk0, rk1}},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	rep, err := cl.Send(ctx, sess, opID)
+	if err != nil {
+		return err
+	}
+	if rep.Outcome.Kind != ldrcore.Committed {
+		return fmt.Errorf("line_init did not commit: %s %s %s", rep.Class, rep.Code, rep.Outcome.Reason)
+	}
+	if _, err := cl.Sync(ctx, sess); err != nil {
+		return err
+	}
+	return json.NewEncoder(out).Encode(map[string]any{
+		"op_id": opID, "seq": rep.Outcome.Seq, "head": hex.EncodeToString(rep.Head[:]),
+	})
+}
+
 func ldrJoinCLI(args []string, out io.Writer) error {
+	return ldrJoinAction(args, out, "credential_enroll")
+}
+
+func ldrJoinAction(args []string, out io.Writer, action string) error {
 	if len(args) == 0 {
 		return errors.New("usage: yip ldr join <inspect|request|challenge|prove|enroll|activate|revoke>")
 	}
@@ -942,7 +958,7 @@ func ldrJoinCLI(args []string, out io.Writer) error {
 		skC, _ := req.SigningKey.ToCBOR()
 		ekC, _ := req.EncryptionKey.ToCBOR()
 		opID, err := cl.ComposeAndPersist(ldrclient.ComposeParams{
-			Action: "credential_enroll", Origin: ldrcore.OriginOperator, OpType: "credential_enroll",
+			Action: action, Origin: ldrcore.OriginOperator, OpType: "credential_enroll",
 			Fields: ldrcrypto.Map{
 				{Key: "cred_id", Value: req.CredID[:]},
 				{Key: "encryption_key", Value: ekC},
@@ -1003,6 +1019,10 @@ func ldrJoinCLI(args []string, out io.Writer) error {
 }
 
 func ldrEpochCLI(args []string, out io.Writer) error {
+	return ldrEpochAction(args, out, "epoch_activate", nil)
+}
+
+func ldrEpochAction(args []string, out io.Writer, action string, alreadyActive func(*ldrclient.Client) bool) error {
 	if len(args) == 0 || args[0] != "activate" {
 		return errors.New("usage: yip ldr epoch activate --dir <enrolled-reader-dir> --operator-key <file>")
 	}
@@ -1034,7 +1054,10 @@ func ldrEpochCLI(args []string, out io.Writer) error {
 	if _, err := cl.Anchor(ctx, sess); err != nil {
 		return err
 	}
-	opID, _, err := cl.ComposeEpochActivate("epoch_activate")
+	if alreadyActive != nil && alreadyActive(cl) {
+		return nil
+	}
+	opID, _, err := cl.ComposeEpochActivate(action)
 	if err != nil {
 		return err
 	}

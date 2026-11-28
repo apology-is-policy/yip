@@ -11,6 +11,31 @@ Use this manual to put a project line into service, admit colleagues, keep the r
 | Inspect the relay, change membership, or respond to loss | [Operate the relay](#operate-the-relay), [Keys and departures](#keys-and-departures), [Backup and recovery](#backup-and-recovery) |
 | Diagnose a failed step | [Fault isolation](#fault-isolation) |
 
+## Guided setup in Switchboard
+
+Open **Actions → Set up a relay**. Use the same version of Yip on the host, the operator workstation and each joining workstation. For each private folder, enter a new path on persistent local storage. Yip creates it with mode `0700`. The relay service account owns the host folder. Your personal operator account owns the setup folder. Only files explicitly named for transfer belong in the exchange channel.
+
+| Where | Step | What you do |
+|---|---|---|
+| Relay host | **Create host identity** | Enter the public HTTPS URL. For direct TLS use an origin such as `https://relay.internal:8443`. For an HTTPS edge proxy select **Use a WebSocket tunnel** and include its routed path, for example `https://relay.example.org/v1/tunnel`. Deliver `share/host.yip` to the operator over a channel that authenticates the sender. |
+| Operator workstation | **Prepare keys and sign line** | Select the host file. Choose three paths for file-backed signing keys or leave them blank for Yip to create them in the setup folder under `custody/`. An existing private Yip signing key at an explicitly chosen path can be used. Give the relay host the resulting `share/line.desc.cbor` through the trusted channel. |
+| Relay host | **Provision on relay host** | Select the signed line descriptor. The wizard verifies the signature and checks its origin against the host identity. It prints the service command. |
+| Relay host | **Start relay here** | Run in this terminal for a trial, or put the printed command under the service manager for persistent operation. Direct TLS uses the public URL port and listens on all interfaces for a non-loopback hostname. You can override the listener, for example with the office interface address. Tunnel mode uses HTTP on `127.0.0.1:8080` carrying pinned inner TLS. Configure DNS, the proxy route, firewall and service account on the host. |
+| Operator workstation | **Initialize line** | Reopen the operator setup folder once the relay is reachable. Yip initializes the line, authorizes the operator, enrolls its reader credential and establishes the first encryption epoch. Keep each root in separate custody. Keep the daily signing key and the `admin/` client available to the operator. |
+
+Either root can authorize a new operator. The default custody folder contains ordinary private key files, so choose your backup or offline storage before moving them. Hardware signing requires its own supported integration. **Show setup progress** recalls the last completed step. Repeating a completed enrollment with the same workspace and files preserves its keys and verifies its recorded membership.
+
+### Invite a colleague
+
+1. Choose **Actions → Invite a workstation → Create invitation**. Choose a fresh private folder for this invitation, the workstation name, its actor limit and whether it may read line content. Select the **Operator setup folder** from the previous table. On an existing line, use the existing operator client directory and signing key fields instead.
+2. Send `share/invitation.yip` to the owner over an authenticated channel. It contains the signed descriptor, public operator identity and signed offer for this workstation. Keep the private invitation folder until enrollment finishes. The operator still decides which workstation receives the grant.
+3. Open **Review workstation request** on the returned `request.cbor`. Read the grant. Compare the displayed code with the code the workstation owner gives you through an authenticated channel. Choose **Approve workstation** and enter that code. Send `share/challenge.cbor` to the owner.
+4. Open **Complete enrollment** with the returned `proof.cbor`. Yip verifies it, admits that credential and advances the encryption epoch for the line's entitled readers. Tell the owner to activate. The admin client must have an enrolled reader for this step. Each workstation needs its own invitation and private folder.
+
+**Automatic file exchange.** If you and the owner already share an authenticated, access-controlled sync channel, give this invitation its own empty exchange folder there. Each person uses the local path to their copy. Keep every key and private workspace outside that folder. After creating the invitation, select **Pair using an exchange folder**. The owner selects **Join using an exchange folder**. Yip transfers the public artifacts through the folder. Review the request, confirm the code with the owner, then apply the exchange step with that code. Both sides can select **Wait** to check for replies for up to two minutes. Reopen the same step to continue after a timeout. Keep the exchange folder available until the workstation reports its verified checkpoint. The relay needs no additional public port for this workflow.
+
+For a scripted setup, run `yip ldr wizard help` for the matching commands. The remaining sections cover individual operations, service hardening, backup and recovery.
+
 ## Roles and records
 
 A **relay host** stores and sequences signed operations for one or more lines. Each **line** has its own 16-byte ID, signed creation descriptor, membership, log and encryption epochs. One organization can host several lines on one listener. A Git repository, a DNS name and a local Yip line name each identify something different. Two teams that need different readership should use different signed lines, even if they share a repository.

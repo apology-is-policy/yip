@@ -281,6 +281,9 @@ enum View {
     Operator,
     Compose,
     Help,
+    SetupRelay,
+    InviteStation,
+    JoinLine,
     ViewCount
 };
 struct WindowSpec {
@@ -347,7 +350,23 @@ const WindowSpec windows[] = {
      "Choose the broadcast kind and recipients. Enter the message across as many lines as you need. Review "
      "shows the full draft. Apply sends it with the selected attribution. For a relay broadcast use an "
      "authorized operator key."},
-    {"Help", 76, 24, ""}};
+    {"Help", 76, 24, ""},
+    {"Set up a relay", 96, 38,
+     "Start on the relay host. Enter its public HTTPS URL. Select the tunnel option for a WebSocket route. "
+     "Send host.yip to the administrator through a trusted channel. On the operator workstation prepare the keys. "
+     "Blank key locations put new software keys in the private custody folder. Take the signed line back to the host, "
+     "provision it, and run the displayed service command. Initialize the line from the operator workstation, then store each root separately."},
+    {"Invite a workstation", 92, 36,
+     "Choose a new private folder for each invitation. The operator signs an offer for one workstation name "
+     "and actor limit. Send the invitation through an authenticated channel. Review the signed request and "
+     "compare the workstation code with its owner before approving. Return the challenge, then import the proof. "
+     "Alternatively choose Pair using an exchange folder to move the public files through a shared channel."},
+    {"Join a line", 88, 34,
+     "Receive the invitation through a channel where you know the operator. Choose a private folder on this "
+     "workstation. Yip creates its keys there. Return the request and tell the operator the displayed code. "
+     "After the challenge and proof exchange, activate to verify the grant against the relay log. "
+     "Use Join using an exchange folder if your operator shares an authenticated folder with you. "
+     "Only transfer the individual files named by the wizard."}};
 struct WindowState {
     bool open = false, focus = false, reviewing = false;
     int action = -1, result_state = 0;
@@ -384,11 +403,28 @@ void choose_action(View v, int index) {
     auto &w = desk[v];
     if (busy && v == result_owner)
         return;
+    if ((v == SetupRelay || v == InviteStation || v == JoinLine) && w.action >= 0) {
+        // Remember the folder even when the next step runs under another role.
+        for (auto &candidate : actions) {
+            if (candidate.group != actions[index].group) continue;
+            for (auto &next : candidate.fields)
+                for (const auto &previous : actions[w.action].fields)
+                    if (&next != &previous && next.label == previous.label &&
+                        next.label.find("folder") != std::string::npos)
+                        next.value = previous.value;
+        }
+    }
     w.action = index;
     w.reviewing = false;
     w.result.clear();
     w.result_state = 0;
     for (auto &f : actions[index].fields) {
+        if (!f.value[0] && f.label == "Private relay host folder")
+            std::snprintf(f.value.data(), f.value.size(), "~/.yip-ldr/relay-host");
+        if (!f.value[0] && f.label == "Private operator setup folder")
+            std::snprintf(f.value.data(), f.value.size(), "~/.yip-ldr/setup");
+        if (!f.value[0] && f.label == "Private workstation folder")
+            std::snprintf(f.value.data(), f.value.size(), "~/.yip-ldr/workstation");
         if (f.label == "Client directory" && actions[index].label != "Create workstation request" &&
             !attached_dir.empty() && !f.value[0])
             std::snprintf(f.value.data(), f.value.size(), "%s", attached_dir.c_str());
@@ -457,7 +493,7 @@ void config_form(View v) {
                     choose_action(v, i);
             ImGui::EndCombo();
         }
-        if (options.size() > 1 && ImGui::BeginCombo("Action", actions[active_form].label.c_str())) {
+        if (options.size() > 1 && ImGui::BeginCombo(v == SetupRelay || v == InviteStation || v == JoinLine ? "Step" : "Action", actions[active_form].label.c_str())) {
             for (int i : options)
                 if (actions[i].group == actions[active_form].group &&
                     ImGui::Selectable(actions[i].label.c_str(), active_form == i))
@@ -470,6 +506,22 @@ void config_form(View v) {
         ImGui::TextColored(fore_yellow, "%s", action.label.c_str());
         divider();
     }
+    if (v == SetupRelay || v == InviteStation || v == JoinLine) {
+        const char *guide = v == SetupRelay ? "Host and operator each keep a private setup folder." :
+            v == InviteStation ? "Use a separate private folder for each workstation you invite." :
+            "Keep the private workstation folder on this device.";
+        ImGui::TextWrapped("%s", guide);
+    }
+    if (action.label == "Create invitation")
+        ImGui::TextWrapped("Use the folder from Initialize line. Leave it empty for ~/.yip-ldr/setup.");
+    if (action.label == "Connect local seat")
+        ImGui::TextWrapped("Attaching routes calls on the selected local line through this workstation. Choose the local seat that will use this actor.");
+    if (action.label == "Start relay here")
+        ImGui::TextWrapped("Apply runs the relay in this terminal until Ctrl-C. Then initialize from the operator workstation.");
+    if (action.label == "Approve workstation")
+        ImGui::TextWrapped("Confirm the signed request and its permissions with the workstation owner before applying.");
+    if (action.label == "Prepare keys and sign line")
+        ImGui::TextWrapped("Leave key locations empty to create three private files in custody/. Each root can authorize an operator.");
     if (v == CreateLine)
         ImGui::TextWrapped("Choose a name with lowercase letters, digits and hyphens.");
     if (v == AddAgent)
@@ -494,7 +546,15 @@ void config_form(View v) {
     if (action.label == "Serve in this terminal")
         ImGui::TextWrapped("Apply closes this board and runs the relay in the foreground. Ctrl-C stops the relay.");
     ImGui::PushID(active_form);
+    bool show_extra = true;
     for (auto &field : action.fields) {
+        if (!reviewing && result_state != 1) {
+            if (action.label == "Prepare keys and sign line" && field.label.find("First root key") == 0)
+                show_extra = ImGui::CollapsingHeader("Choose key storage");
+            if (action.label == "Create invitation" && field.label.find("Existing operator client") == 0)
+                show_extra = ImGui::CollapsingHeader("Use an existing operator installation");
+            if (!show_extra) continue;
+        }
         if (v == AddAgent && ((field.label == "Checkout-local Claude settings" &&
                                std::string(action.fields[1].value.data()).find("claude") != 0) ||
                               (field.label.find("Worktree path") == 0 &&
@@ -588,6 +648,13 @@ void config_form(View v) {
                 ImGui::TextWrapped("%s", line.c_str());
         }
         ImGui::PopStyleColor();
+        if (result_state == 0 && (v == SetupRelay || v == InviteStation || v == JoinLine)) {
+            const int last = v == InviteStation ? 3 : 4;
+            auto it = std::find(options.begin(), options.end(), active_form);
+            if (it != options.end() && it - options.begin() < last && ImGui::Button("Next step"))
+                choose_action(v, *(it + 1));
+
+        }
     }
 }
 // Wrap toolbars by available cells, leaving their right gutter clear.
@@ -689,6 +756,7 @@ void pane_body(View v) {
         if (columns)
             ImGui::EndTable();
         divider();
+        toolbar({{"Set up a relay", SetupRelay}, {"Invite a workstation", InviteStation}, {"Join a line", JoinLine}});
         toolbar({{"Client operations", ClientTools},
                  {"Relay operator", Operator},
                  {"Line topology", Topology}});
@@ -1000,7 +1068,7 @@ extern "C" int board_frame(int width, int height, float seconds, int mouse_x, in
             ImGui::EndMenu();
         }
         if (live && ImGui::BeginMenu("Actions")) {
-            for (View v : {CreateLine, AddAgent, ManageLines, ManageAgents, Connect, Compose})
+            for (View v : {CreateLine, AddAgent, ManageLines, ManageAgents, SetupRelay, InviteStation, JoinLine, Connect, Compose})
                 if (ImGui::MenuItem(windows[v].title))
                     present(v);
             ImGui::EndMenu();
